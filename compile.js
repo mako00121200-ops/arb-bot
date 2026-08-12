@@ -13,6 +13,7 @@ export function compileFlashArbitrage() {
     settings: {
       optimizer: { enabled: true, runs: 200 },
       outputSelection: { "*": { "*": ["abi", "evm.bytecode.object"] } },
+            viaIR: true,
     },
   };
   const output = JSON.parse(solc.compile(JSON.stringify(input)));
