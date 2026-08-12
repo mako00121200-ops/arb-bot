@@ -1,0 +1,15 @@
+{
+  "name": "arb-bot",
+  "version": "0.1.0",
+  "description": "Arbitrum上でUniswap V3とSushiSwapの価格差をAaveフラッシュローンで自動裁定するボット",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ethers": "^6.13.4",
+    "solc": "^0.8.26",
+    "dotenv": "^16.4.5"
+  }
+}
