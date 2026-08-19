@@ -224,7 +224,7 @@ ${history.snapshots.length > 1 ? `<div class="card">
 }
 
 function startServer() {
-  const port = process.env.PORT || 3000;
+  const port = process.env.PORT || 8080;
   http.createServer((req, res) => {
     if (req.url === "/data.json") {
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
