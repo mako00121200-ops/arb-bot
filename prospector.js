@@ -1,11 +1,8 @@
 /**
- * 裁定機会の網羅的精査エンジン(モジュール版)
+ * 裁定機会の網羅的精査エンジン
  * ------------------------------------------------------------
  * DeFiLlamaの全プールデータから、「同一チェーン上で同じトークンペアが
  * 複数のDEXに存在する」組み合わせを洗い出し、裁定候補としてランキングする。
- *
- * 読み取り専用でガス代は一切かからないため、定期実行して
- * 時間帯ごとの傾向や新しいチェーンの出現を継続的に観測する。
  */
 
 const DEFILLAMA_POOLS = "https://yields.llama.fi/pools";
@@ -138,6 +135,7 @@ export async function runProspect({ minTvlUSD = 10000, topN = 50 } = {}) {
     scannedAt: new Date().toISOString(),
     stats: { totalPools, dexPoolCount, groupCount, arbitragableCount: arbitragable.length },
     chainSummary: chainSummary.slice(0, 30),
+    arbitragableRaw: arbitragable,
     topPairs: scored.slice(0, topN).map((a) => ({
       chain: a.chain, symbol: a.symbol, venueCount: a.venueCount,
       minTvl: a.minTvl, turnover: a.turnover, score: a.score,
