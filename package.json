@@ -1,10 +1,13 @@
 {
   "name": "arb-prospector",
-  "version": "1.0.0",
-  "description": "全チェーン・全DEXを網羅的に精査し、裁定機会がありそうな場所を継続的に観測するツール",
+  "version": "2.0.0",
+  "description": "全チェーン・全DEXを精査し、実際の価格差・安全性・最適サイズを測定する観測ツール",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
+  },
+  "dependencies": {
+    "ethers": "^6.13.4"
   }
 }
