@@ -75,7 +75,7 @@ export async function diagnoseSources() {
 const priceHistory = { BTC: [], ETH: [] };
 const MAX_HISTORY_SEC = 20 * 60;
 
-let ACTIVE_SOURCE = "coinbase";
+let ACTIVE_SOURCE = "okx"; // 診断の結果、Coinbase/Kraken/CoinGecko/OKXが接続可能。出来高の大きさからOKXを採用
 export function setActiveSource(name) { ACTIVE_SOURCE = name; }
 
 let sampleDiagCounter = 0;
