@@ -1,5 +1,5 @@
 import http from "http";
-import { sampleBinancePrices, fetchActiveShortDurationMarkets, analyzeMarket } from "./twap-oracle.js";
+import { sampleBinancePrices, fetchActiveShortDurationMarkets, analyzeMarket, diagnoseSources } from "./twap-oracle.js";
 import { checkLogicalConstraints, WATCHED_PAIRS } from "./logic-checker.js";
 import { recordSignal, resolveOpenPositions, getStats, getOpenCount, getRecentResolved } from "./paper-trader.js";
 
@@ -174,7 +174,7 @@ td{padding:6px 3px;border-bottom:1px solid #1c1c1c;}
 <div class="card">
   <div class="note">
     TWAP方式: Polymarketの5分/15分BTC/ETH市場は、終了直前30秒/60秒の平均価格で決済される(2026年8月〜)。<br>
-    Binance価格を継続記録し、残り時間内に平均が逆転する余地をボラティリティから見積もっている。<br>
+    価格ソースは起動時の診断結果を見て選定する。残り時間内に平均が逆転する余地をボラティリティから見積もっている。<br>
     ${lastError ? `<span style="color:#e74c3c;">エラー: ${lastError}</span>` : ''}
   </div>
 </div>
@@ -194,6 +194,7 @@ async function main() {
   console.log(`監視ペア数(論理矛盾): ${WATCHED_PAIRS.length}`);
   startServer();
 
+  await diagnoseSources();
   setInterval(async () => { await sampleBinancePrices(); sampleCount++; }, BINANCE_SAMPLE_INTERVAL_SEC * 1000);
   await sampleBinancePrices();
 
