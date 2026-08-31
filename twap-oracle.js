@@ -88,8 +88,10 @@ const SERIES_SLUGS = [
 async function fetchCurrentEventForSeries(seriesSlug) {
   try {
     const now = Date.now();
+    // 昇順(終了が近い順)に取得することで、まず「今まさに進行中」か「直後に来る」市場を先頭に持ってくる。
+    // end_date_min で「20分以上前に終わった古いデータ」は除外する。
     const minEndIso = new Date(now - 20 * 60 * 1000).toISOString();
-    const url = `${GAMMA_BASE}/events?series_slug=${seriesSlug}&closed=false&limit=50&order=endDate&ascending=false&end_date_min=${encodeURIComponent(minEndIso)}`;
+    const url = `${GAMMA_BASE}/events?series_slug=${seriesSlug}&closed=false&limit=50&order=endDate&ascending=true&end_date_min=${encodeURIComponent(minEndIso)}`;
     const res = await fetch(url);
     if (!res.ok) return null;
     const events = await res.json();
