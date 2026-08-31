@@ -77,35 +77,35 @@ function estimateConfidence(currentAvg, referencePrice, remainingSec, volatility
   return zScore * 0.68;
 }
 
-// ============ Polymarket側: 15分のBTC/ETH市場を取得 ============
-// 5分市場(btc/eth-up-or-down-5m)は実際に確認したところ、返ってくるイベントが
-// 2025年12月時点のもので止まっており、シリーズ自体が終了しているか名称が変わった可能性が高い。
-// 15分市場は正常に動作確認できたため、まずこちらだけで運用する。
+// ============ Polymarket側: 5分/15分のBTC/ETH市場を取得 ============
 const SERIES_SLUGS = [
+  { slug: "btc-up-or-down-5m", asset: "BTC", durationMin: 5 },
+  { slug: "eth-up-or-down-5m", asset: "ETH", durationMin: 5 },
   { slug: "btc-up-or-down-15m", asset: "BTC", durationMin: 15 },
   { slug: "eth-up-or-down-15m", asset: "ETH", durationMin: 15 },
 ];
 
 async function fetchCurrentEventForSeries(seriesSlug) {
   try {
-    const url = `${GAMMA_BASE}/events?series_slug=${seriesSlug}&closed=false&limit=10&order=endDate&ascending=true`;
-    const res = await fetch(url);
-    if (!res.ok) {
-      console.log(`[診断] ${seriesSlug}: HTTPエラー ${res.status}`);
-      return null;
-    }
-    const events = await res.json();
     const now = Date.now();
+    const minEndIso = new Date(now - 20 * 60 * 1000).toISOString();
+    const url = `${GAMMA_BASE}/events?series_slug=${seriesSlug}&closed=false&limit=50&order=endDate&ascending=false&end_date_min=${encodeURIComponent(minEndIso)}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const events = await res.json();
     if (!Array.isArray(events) || events.length === 0) return null;
 
-    const current = events.find((e) => {
+    const inProgress = events.find((e) => {
       const start = new Date(e.startDate ?? e.eventStartTime ?? e.startTime).getTime();
       const end = new Date(e.endDate).getTime();
       return start <= now && now < end;
-    }) ?? null;
-    return current;
+    });
+    if (inProgress) return inProgress;
+
+    const sorted = [...events].sort((a, b) =>
+      Math.abs(new Date(a.endDate).getTime() - now) - Math.abs(new Date(b.endDate).getTime() - now));
+    return sorted[0] ?? null;
   } catch (e) {
-    console.log(`[診断] ${seriesSlug}: 例外発生 ${e.message}`);
     return null;
   }
 }
