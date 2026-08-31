@@ -78,9 +78,6 @@ function estimateConfidence(currentAvg, referencePrice, remainingSec, volatility
 }
 
 // ============ Polymarket側: 5分/15分のBTC/ETH市場を取得 ============
-// Polymarketはこれらを「シリーズ」として管理している(例: series_slug=btc-up-or-down-5m)。
-// 各シリーズには常に約24時間分(288件)の未来の市場が事前に並んでおり、
-// 「今アクティブな市場」は eventStartTime <= 今 < endDate のものを自分で絞り込む必要がある。
 const SERIES_SLUGS = [
   { slug: "btc-up-or-down-5m", asset: "BTC", durationMin: 5 },
   { slug: "eth-up-or-down-5m", asset: "ETH", durationMin: 5 },
@@ -90,16 +87,32 @@ const SERIES_SLUGS = [
 
 async function fetchCurrentEventForSeries(seriesSlug) {
   try {
-    const res = await fetch(`${GAMMA_BASE}/events?series_slug=${seriesSlug}&closed=false&limit=10&order=endDate&ascending=true`);
-    if (!res.ok) return null;
+    const url = `${GAMMA_BASE}/events?series_slug=${seriesSlug}&closed=false&limit=10&order=endDate&ascending=true`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.log(`[診断] ${seriesSlug}: HTTPエラー ${res.status}`);
+      return null;
+    }
     const events = await res.json();
     const now = Date.now();
-    return events.find((e) => {
+    if (!Array.isArray(events) || events.length === 0) {
+      console.log(`[診断] ${seriesSlug}: イベントが0件返ってきた(APIの形式が想定と違う可能性)`);
+      return null;
+    }
+    const sample = events[0];
+    console.log(`[診断] ${seriesSlug}: ${events.length}件取得。先頭のフィールド: ` +
+      `startDate=${sample.startDate} eventStartTime=${sample.eventStartTime} endDate=${sample.endDate} ` +
+      `closed=${sample.closed} markets件数=${Array.isArray(sample.markets)?sample.markets.length:'配列でない'}`);
+
+    const current = events.find((e) => {
       const start = new Date(e.startDate ?? e.eventStartTime ?? e.startTime).getTime();
       const end = new Date(e.endDate).getTime();
       return start <= now && now < end;
     }) ?? null;
+    console.log(`[診断] ${seriesSlug}: 進行中のイベント ${current ? "見つかった(" + current.slug + ")" : "見つからなかった"}`);
+    return current;
   } catch (e) {
+    console.log(`[診断] ${seriesSlug}: 例外発生 ${e.message}`);
     return null;
   }
 }
