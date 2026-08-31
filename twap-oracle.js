@@ -77,10 +77,11 @@ function estimateConfidence(currentAvg, referencePrice, remainingSec, volatility
   return zScore * 0.68;
 }
 
-// ============ Polymarket側: 5分/15分のBTC/ETH市場を取得 ============
+// ============ Polymarket側: 15分のBTC/ETH市場を取得 ============
+// 5分市場(btc/eth-up-or-down-5m)は実際に確認したところ、返ってくるイベントが
+// 2025年12月時点のもので止まっており、シリーズ自体が終了しているか名称が変わった可能性が高い。
+// 15分市場は正常に動作確認できたため、まずこちらだけで運用する。
 const SERIES_SLUGS = [
-  { slug: "btc-up-or-down-5m", asset: "BTC", durationMin: 5 },
-  { slug: "eth-up-or-down-5m", asset: "ETH", durationMin: 5 },
   { slug: "btc-up-or-down-15m", asset: "BTC", durationMin: 15 },
   { slug: "eth-up-or-down-15m", asset: "ETH", durationMin: 15 },
 ];
@@ -95,21 +96,13 @@ async function fetchCurrentEventForSeries(seriesSlug) {
     }
     const events = await res.json();
     const now = Date.now();
-    if (!Array.isArray(events) || events.length === 0) {
-      console.log(`[診断] ${seriesSlug}: イベントが0件返ってきた(APIの形式が想定と違う可能性)`);
-      return null;
-    }
-    const sample = events[0];
-    console.log(`[診断] ${seriesSlug}: ${events.length}件取得。先頭のフィールド: ` +
-      `startDate=${sample.startDate} eventStartTime=${sample.eventStartTime} endDate=${sample.endDate} ` +
-      `closed=${sample.closed} markets件数=${Array.isArray(sample.markets)?sample.markets.length:'配列でない'}`);
+    if (!Array.isArray(events) || events.length === 0) return null;
 
     const current = events.find((e) => {
       const start = new Date(e.startDate ?? e.eventStartTime ?? e.startTime).getTime();
       const end = new Date(e.endDate).getTime();
       return start <= now && now < end;
     }) ?? null;
-    console.log(`[診断] ${seriesSlug}: 進行中のイベント ${current ? "見つかった(" + current.slug + ")" : "見つからなかった"}`);
     return current;
   } catch (e) {
     console.log(`[診断] ${seriesSlug}: 例外発生 ${e.message}`);
