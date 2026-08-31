@@ -18,7 +18,6 @@ const CLOB_BASE = "https://clob.polymarket.com";
 
 const SYMBOLS = { BTC: "BTCUSDT", ETH: "ETHUSDT" };
 
-// ============ Binance価格のローリング記録 ============
 const priceHistory = { BTC: [], ETH: [] };
 const MAX_HISTORY_SEC = 20 * 60;
 
@@ -67,4 +66,88 @@ function estimateVolatility(asset, lookbackSec = 300) {
 }
 
 function estimateConfidence(currentAvg, referencePrice, remainingSec, volatilityPerSec) {
-  if (!currentAvg || !referencePrice || !volatilityPerSec || remainingSec 
+  if (!currentAvg || !referencePrice || !volatilityPerSec || remainingSec <= 0) return 0;
+  const diff = Math.abs(currentAvg - referencePrice) / referencePrice;
+  const possibleMove = volatilityPerSec * Math.sqrt(remainingSec);
+  if (possibleMove <= 0) return diff > 0 ? 1 : 0;
+  const zScore = diff / possibleMove;
+  if (zScore >= 3) return 0.997;
+  if (zScore >= 2) return 0.95;
+  if (zScore >= 1) return 0.68;
+  return zScore * 0.68;
+}
+
+export async function fetchActiveShortDurationMarkets() {
+  const results = [];
+  try {
+    const res = await fetch(`${GAMMA_BASE}/markets?closed=false&limit=100&order=volume24hr&ascending=false&tag=crypto`);
+    if (!res.ok) return results;
+    const markets = await res.json();
+    for (const m of markets) {
+      const q = (m.question || "").toLowerCase();
+      const isShortDuration = /\b(5|15)[- ]?min/.test(q) || /\b(5|15)分/.test(q);
+      const asset = q.includes("bitcoin") || q.includes("btc") ? "BTC" : q.includes("ethereum") || q.includes("eth") ? "ETH" : null;
+      if (!isShortDuration || !asset) continue;
+      results.push({
+        id: m.id, slug: m.slug, question: m.question, asset,
+        endDate: m.endDate, startDate: m.startDate,
+        clobTokenIds: m.clobTokenIds ? JSON.parse(m.clobTokenIds) : null,
+        durationMin: /\b15/.test(q) ? 15 : 5,
+      });
+    }
+  } catch (e) {
+    console.warn("Polymarket市場取得失敗:", e.message);
+  }
+  return results;
+}
+
+async function fetchMidpoint(tokenId) {
+  try {
+    const res = await fetch(`${CLOB_BASE}/midpoint?token_id=${tokenId}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    return parseFloat(json.mid);
+  } catch (e) {
+    return null;
+  }
+}
+
+export async function analyzeMarket(market) {
+  const now = Date.now();
+  const endMs = new Date(market.endDate).getTime();
+  const remainingSec = (endMs - now) / 1000;
+  if (remainingSec <= 0 || remainingSec > market.durationMin * 60) return null;
+
+  const twapWindowSec = market.durationMin === 5 ? 30 : 60;
+  const windowStart = endMs - twapWindowSec * 1000;
+
+  if (now < windowStart) return null;
+
+  const samples = samplesInWindow(market.asset, windowStart, now);
+  const currentAvg = average(samples);
+  if (!currentAvg) return null;
+
+  const openSamples = samplesInWindow(market.asset, new Date(market.startDate).getTime(), new Date(market.startDate).getTime() + 5000);
+  const referencePrice = average(openSamples) ?? samples[0]?.p;
+  if (!referencePrice) return null;
+
+  const vol = estimateVolatility(market.asset);
+  const remainingInWindow = (endMs - now) / 1000;
+  const confidence = estimateConfidence(currentAvg, referencePrice, remainingInWindow, vol);
+  const impliedDirection = currentAvg >= referencePrice ? "UP" : "DOWN";
+
+  if (!market.clobTokenIds || market.clobTokenIds.length < 1) return null;
+  const marketPrice = await fetchMidpoint(market.clobTokenIds[0]);
+  if (marketPrice === null) return null;
+
+  const ourEstimate = impliedDirection === "UP" ? confidence : 1 - confidence;
+  const edge = ourEstimate - marketPrice;
+
+  return {
+    marketId: market.id, question: market.question, asset: market.asset,
+    remainingSec: Math.round(remainingInWindow),
+    currentAvg, referencePrice, impliedDirection, confidence,
+    marketPrice, ourEstimate, edge,
+    measuredAt: new Date().toISOString(),
+  };
+}
