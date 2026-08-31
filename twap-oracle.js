@@ -149,33 +149,56 @@ async function fetchMidpoint(tokenId) {
   }
 }
 
+let diagCounter = 0;
 export async function analyzeMarket(market) {
   const now = Date.now();
   const endMs = new Date(market.endDate).getTime();
   const remainingSec = (endMs - now) / 1000;
-  if (remainingSec <= 0 || remainingSec > market.durationMin * 60) return null;
+  diagCounter++;
+  const shouldLog = diagCounter % 3 === 0;
+
+  if (remainingSec <= 0 || remainingSec > market.durationMin * 60) {
+    if (shouldLog) console.log(`[診断] ${market.asset}(${market.durationMin}分): 対象外(残り${remainingSec.toFixed(0)}秒、期間${market.durationMin*60}秒)`);
+    return null;
+  }
 
   const twapWindowSec = market.durationMin === 5 ? 30 : 60;
   const windowStart = endMs - twapWindowSec * 1000;
 
-  if (now < windowStart) return null;
+  if (now < windowStart) {
+    if (shouldLog) console.log(`[診断] ${market.asset}(${market.durationMin}分): TWAP窓前(あと${((windowStart-now)/1000).toFixed(0)}秒で窓に入る)`);
+    return null;
+  }
 
   const samples = samplesInWindow(market.asset, windowStart, now);
   const currentAvg = average(samples);
-  if (!currentAvg) return null;
+  if (!currentAvg) {
+    console.log(`[診断] ${market.asset}: TWAP窓内だがサンプル無し(サンプル数${samples.length})`);
+    return null;
+  }
 
   const openSamples = samplesInWindow(market.asset, new Date(market.startDate).getTime(), new Date(market.startDate).getTime() + 5000);
   const referencePrice = average(openSamples) ?? samples[0]?.p;
-  if (!referencePrice) return null;
+  if (!referencePrice) {
+    console.log(`[診断] ${market.asset}: 参照価格なし`);
+    return null;
+  }
 
   const vol = estimateVolatility(market.asset);
   const remainingInWindow = (endMs - now) / 1000;
   const confidence = estimateConfidence(currentAvg, referencePrice, remainingInWindow, vol);
   const impliedDirection = currentAvg >= referencePrice ? "UP" : "DOWN";
 
-  if (!market.clobTokenIds || market.clobTokenIds.length < 1) return null;
+  if (!market.clobTokenIds || market.clobTokenIds.length < 1) {
+    console.log(`[診断] ${market.asset}: clobTokenIdsが無い(market.clobTokenIds=${JSON.stringify(market.clobTokenIds)})`);
+    return null;
+  }
   const marketPrice = await fetchMidpoint(market.clobTokenIds[0]);
-  if (marketPrice === null) return null;
+  if (marketPrice === null) {
+    console.log(`[診断] ${market.asset}: CLOB midpoint取得失敗(tokenId=${market.clobTokenIds[0]})`);
+    return null;
+  }
+  console.log(`[診断] ${market.asset}: 判定成功! 推定=${confidence.toFixed(3)} 市場価格=${marketPrice} 残り${remainingInWindow.toFixed(0)}秒`);
 
   const ourEstimate = impliedDirection === "UP" ? confidence : 1 - confidence;
   const edge = ourEstimate - marketPrice;
