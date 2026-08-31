@@ -50,3 +50,84 @@ export async function sampleBinancePrices() {
     priceHistory[asset] = priceHistory[asset].filter((s) => s.t >= cutoff);
   }
 }
+function samplesInWindow(asset, fromMs, toMs) {
+  return priceHistory[asset].filter((s) => s.t >= fromMs && s.t <= toMs);
+}
+
+function average(samples) {
+  if (samples.length === 0) return null;
+  return samples.reduce((s, x) => s + x.p, 0) / samples.length;
+}
+
+function estimateVolatility(asset, lookbackSec = 300) {
+  const now = Date.now();
+  const samples = samplesInWindow(asset, now - lookbackSec * 1000, now);
+  if (samples.length < 10) return null;
+  const returns = [];
+  for (let i = 1; i < samples.length; i++) {
+    const dt = (samples[i].t - samples[i - 1].t) / 1000;
+    if (dt <= 0) continue;
+    const r = (samples[i].p - samples[i - 1].p) / samples[i - 1].p;
+    returns.push(r / Math.sqrt(dt));
+  }
+  if (returns.length === 0) return null;
+  const mean = returns.reduce((s, x) => s + x, 0) / returns.length;
+  const variance = returns.reduce((s, x) => s + (x - mean) ** 2, 0) / returns.length;
+  return Math.sqrt(variance);
+}
+
+function estimateConfidence(currentAvg, referencePrice, remainingSec, volatilityPerSec) {
+  if (!currentAvg || !referencePrice || !volatilityPerSec || remainingSec <= 0) return 0;
+  const diff = Math.abs(currentAvg - referencePrice) / referencePrice;
+  const possibleMove = volatilityPerSec * Math.sqrt(remainingSec);
+  if (possibleMove <= 0) return diff > 0 ? 1 : 0;
+  const zScore = diff / possibleMove;
+  if (zScore >= 3) return 0.997;
+  if (zScore >= 2) return 0.95;
+  if (zScore >= 1) return 0.68;
+  return zScore * 0.68;
+}
+
+// ============ Polymarket側: 5分/15分のBTC/ETH市場を取得 ============
+const SERIES_SLUGS = [
+  { slug: "btc-up-or-down-5m", asset: "BTC", durationMin: 5 },
+  { slug: "eth-up-or-down-5m", asset: "ETH", durationMin: 5 },
+  { slug: "btc-up-or-down-15m", asset: "BTC", durationMin: 15 },
+  { slug: "eth-up-or-down-15m", asset: "ETH", durationMin: 15 },
+];
+
+async function fetchCurrentEventForSeries(seriesSlug) {
+  try {
+    const now = Date.now();
+    const minEndIso = new Date(now - 20 * 60 * 1000).toISOString();
+    const url = `${GAMMA_BASE}/events?series_slug=${seriesSlug}&closed=false&limit=50&order=endDate&ascending=true&end_date_min=${encodeURIComponent(minEndIso)}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const events = await res.json();
+    if (!Array.isArray(events) || events.length === 0) return null;
+
+    const inProgress = events.find((e) => {
+      const start = new Date(e.startDate ?? e.eventStartTime ?? e.startTime).getTime();
+      const end = new Date(e.endDate).getTime();
+      return start <= now && now < end;
+    });
+    if (inProgress) return inProgress;
+
+    const sorted = [...events].sort((a, b) =>
+      Math.abs(new Date(a.endDate).getTime() - now) - Math.abs(new Date(b.endDate).getTime() - now));
+    return sorted[0] ?? null;
+  } catch (e) {
+    return null;
+  }
+}
+
+export async function fetchActiveShortDurationMarkets() {
+  const results = [];
+  for (const series of SERIES_SLUGS) {
+    try {
+      const event = await fetchCurrentEventForSeries(series.slug);
+      if (!event) continue;
+      const market = Array.isArray(event.markets) ? event.markets[0] : event;
+      if (!market) continue;
+
+      results.push({
