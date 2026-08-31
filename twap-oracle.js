@@ -77,26 +77,57 @@ function estimateConfidence(currentAvg, referencePrice, remainingSec, volatility
   return zScore * 0.68;
 }
 
+// ============ Polymarket側: 5分/15分のBTC/ETH市場を取得 ============
+// Polymarketはこれらを「シリーズ」として管理している(例: series_slug=btc-up-or-down-5m)。
+// 各シリーズには常に約24時間分(288件)の未来の市場が事前に並んでおり、
+// 「今アクティブな市場」は eventStartTime <= 今 < endDate のものを自分で絞り込む必要がある。
+const SERIES_SLUGS = [
+  { slug: "btc-up-or-down-5m", asset: "BTC", durationMin: 5 },
+  { slug: "eth-up-or-down-5m", asset: "ETH", durationMin: 5 },
+  { slug: "btc-up-or-down-15m", asset: "BTC", durationMin: 15 },
+  { slug: "eth-up-or-down-15m", asset: "ETH", durationMin: 15 },
+];
+
+async function fetchCurrentEventForSeries(seriesSlug) {
+  try {
+    const res = await fetch(`${GAMMA_BASE}/events?series_slug=${seriesSlug}&closed=false&limit=10&order=endDate&ascending=true`);
+    if (!res.ok) return null;
+    const events = await res.json();
+    const now = Date.now();
+    return events.find((e) => {
+      const start = new Date(e.startDate ?? e.eventStartTime ?? e.startTime).getTime();
+      const end = new Date(e.endDate).getTime();
+      return start <= now && now < end;
+    }) ?? null;
+  } catch (e) {
+    return null;
+  }
+}
+
 export async function fetchActiveShortDurationMarkets() {
   const results = [];
-  try {
-    const res = await fetch(`${GAMMA_BASE}/markets?closed=false&limit=100&order=volume24hr&ascending=false&tag=crypto`);
-    if (!res.ok) return results;
-    const markets = await res.json();
-    for (const m of markets) {
-      const q = (m.question || "").toLowerCase();
-      const isShortDuration = /\b(5|15)[- ]?min/.test(q) || /\b(5|15)分/.test(q);
-      const asset = q.includes("bitcoin") || q.includes("btc") ? "BTC" : q.includes("ethereum") || q.includes("eth") ? "ETH" : null;
-      if (!isShortDuration || !asset) continue;
+  for (const series of SERIES_SLUGS) {
+    try {
+      const event = await fetchCurrentEventForSeries(series.slug);
+      if (!event) continue;
+      const market = Array.isArray(event.markets) ? event.markets[0] : event;
+      if (!market) continue;
+
       results.push({
-        id: m.id, slug: m.slug, question: m.question, asset,
-        endDate: m.endDate, startDate: m.startDate,
-        clobTokenIds: m.clobTokenIds ? JSON.parse(m.clobTokenIds) : null,
-        durationMin: /\b15/.test(q) ? 15 : 5,
+        id: market.id ?? event.id,
+        slug: market.slug ?? event.slug,
+        question: market.question ?? event.title,
+        asset: series.asset,
+        endDate: market.endDate ?? event.endDate,
+        startDate: market.startDate ?? event.startDate ?? event.eventStartTime,
+        clobTokenIds: market.clobTokenIds
+          ? (typeof market.clobTokenIds === "string" ? JSON.parse(market.clobTokenIds) : market.clobTokenIds)
+          : null,
+        durationMin: series.durationMin,
       });
+    } catch (e) {
+      console.warn(`シリーズ${series.slug}の取得失敗:`, e.message);
     }
-  } catch (e) {
-    console.warn("Polymarket市場取得失敗:", e.message);
   }
   return results;
 }
