@@ -12,17 +12,59 @@
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 
-/**
- * 監視するペアのリスト。
- * relation: "A>=B" は「Aの確率はBの確率以上でなければならない」という制約。
- * (例: 「共和党が勝つ」は「トランプ氏が勝つ」を含むので A>=B)
- *
- * slugはPolymarketの市場URLの末尾部分。実際に監視したいペアが見つかったら、
- * ここに追加していく想定(自動発見ではなく、人力での登録が前提)。
- */
 export const WATCHED_PAIRS = [
   // 例(実際のスラッグは都度確認して置き換える必要がある):
   // { label: "共和党 vs トランプ氏", slugA: "republican-wins-2028", slugB: "trump-wins-2028", relation: "A>=B" },
 ];
 
-async function fetchMarketPrice
+async function fetchMarketPrice(slug) {
+  try {
+    const res = await fetch(`${GAMMA_BASE}/markets?slug=${encodeURIComponent(slug)}`);
+    if (!res.ok) return null;
+    const arr = await res.json();
+    const m = arr?.[0];
+    if (!m) return null;
+    const prices = m.outcomePrices ? JSON.parse(m.outcomePrices) : null;
+    const yesPrice = prices ? parseFloat(prices[0]) : null;
+    return { slug, question: m.question, yesPrice, volume: m.volume, closed: m.closed };
+  } catch (e) {
+    return null;
+  }
+}
+
+export async function checkLogicalConstraints() {
+  const results = [];
+  for (const pair of WATCHED_PAIRS) {
+    const [a, b] = await Promise.all([fetchMarketPrice(pair.slugA), fetchMarketPrice(pair.slugB)]);
+    if (!a || !b || a.yesPrice === null || b.yesPrice === null) continue;
+    if (a.closed || b.closed) continue;
+
+    let violated = false;
+    let magnitude = 0;
+    if (pair.relation === "A>=B") {
+      violated = a.yesPrice < b.yesPrice;
+      magnitude = b.yesPrice - a.yesPrice;
+    } else if (pair.relation === "A<=B") {
+      violated = a.yesPrice > b.yesPrice;
+      magnitude = a.yesPrice - b.yesPrice;
+    }
+
+    results.push({
+      label: pair.label, relation: pair.relation,
+      marketA: a, marketB: b, violated, magnitude,
+      measuredAt: new Date().toISOString(),
+    });
+  }
+  return results;
+}
+
+export async function searchCandidatePairs(keyword) {
+  try {
+    const res = await fetch(`${GAMMA_BASE}/markets?closed=false&limit=30&order=volume24hr&ascending=false&_q=${encodeURIComponent(keyword)}`);
+    if (!res.ok) return [];
+    const markets = await res.json();
+    return markets.map((m) => ({ slug: m.slug, question: m.question, volume: m.volume }));
+  } catch (e) {
+    return [];
+  }
+}
