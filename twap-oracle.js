@@ -12,37 +12,93 @@
  * 実際の注文は一切出さない(紙上取引での検証のみ)。
  */
 
-const BINANCE_BASE = "https://api.binance.com";
+// Binanceは地域制限(HTTP 451)によりRailwayから直接アクセスできなかった。
+// 複数の候補を一斉に試し、実際にどれが繋がるかをログで確認する診断モードを用意した。
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 const CLOB_BASE = "https://clob.polymarket.com";
 
-const SYMBOLS = { BTC: "BTCUSDT", ETH: "ETHUSDT" };
+const SYMBOLS = { BTC: "BTC-USD", ETH: "ETH-USD" };
+
+const PRICE_SOURCES = {
+  coinbase: async (symbol) => {
+    const res = await fetch(`https://api.coinbase.com/v2/prices/${symbol}/spot`);
+    if (!res.ok) return { error: `HTTP ${res.status}` };
+    const json = await res.json();
+    return { price: parseFloat(json?.data?.amount) };
+  },
+  kraken: async (symbol) => {
+    const pair = symbol === "BTC-USD" ? "XBTUSD" : "ETHUSD";
+    const res = await fetch(`https://api.kraken.com/0/public/Ticker?pair=${pair}`);
+    if (!res.ok) return { error: `HTTP ${res.status}` };
+    const json = await res.json();
+    const key = Object.keys(json.result || {})[0];
+    return { price: parseFloat(json.result?.[key]?.c?.[0]) };
+  },
+  coingecko: async (symbol) => {
+    const id = symbol === "BTC-USD" ? "bitcoin" : "ethereum";
+    const res = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd`);
+    if (!res.ok) return { error: `HTTP ${res.status}` };
+    const json = await res.json();
+    return { price: parseFloat(json?.[id]?.usd) };
+  },
+  bitstamp: async (symbol) => {
+    const pair = symbol === "BTC-USD" ? "btcusd" : "ethusd";
+    const res = await fetch(`https://www.bitstamp.net/api/v2/ticker/${pair}/`);
+    if (!res.ok) return { error: `HTTP ${res.status}` };
+    const json = await res.json();
+    return { price: parseFloat(json?.last) };
+  },
+  okx: async (symbol) => {
+    const inst = symbol === "BTC-USD" ? "BTC-USDT" : "ETH-USDT";
+    const res = await fetch(`https://www.okx.com/api/v5/market/ticker?instId=${inst}`);
+    if (!res.ok) return { error: `HTTP ${res.status}` };
+    const json = await res.json();
+    return { price: parseFloat(json?.data?.[0]?.last) };
+  },
+};
+
+export async function diagnoseSources() {
+  console.log("=== 価格ソース診断開始 ===");
+  for (const [name, fn] of Object.entries(PRICE_SOURCES)) {
+    try {
+      const r = await fn("BTC-USD");
+      if (r.error) console.log(`[診断] ${name}: 失敗 - ${r.error}`);
+      else if (!isFinite(r.price)) console.log(`[診断] ${name}: 価格が不正 - ${JSON.stringify(r)}`);
+      else console.log(`[診断] ${name}: 成功! BTC=$${r.price}`);
+    } catch (e) {
+      console.log(`[診断] ${name}: 例外 - ${e.message}`);
+    }
+  }
+  console.log("=== 価格ソース診断終了 ===");
+}
 
 const priceHistory = { BTC: [], ETH: [] };
 const MAX_HISTORY_SEC = 20 * 60;
+
+let ACTIVE_SOURCE = "coinbase";
+export function setActiveSource(name) { ACTIVE_SOURCE = name; }
 
 let sampleDiagCounter = 0;
 export async function sampleBinancePrices() {
   const now = Date.now();
   sampleDiagCounter++;
   const shouldLog = sampleDiagCounter % 10 === 1;
+  const fn = PRICE_SOURCES[ACTIVE_SOURCE];
   for (const [asset, symbol] of Object.entries(SYMBOLS)) {
     try {
-      const res = await fetch(`${BINANCE_BASE}/api/v3/ticker/price?symbol=${symbol}`);
-      if (!res.ok) {
-        console.log(`[診断] Binance ${symbol}: HTTPエラー ${res.status} ${res.statusText}`);
+      const r = await fn(symbol);
+      if (r.error) {
+        console.log(`[診断] ${ACTIVE_SOURCE} ${symbol}: ${r.error}`);
         continue;
       }
-      const json = await res.json();
-      const price = parseFloat(json.price);
-      if (!isFinite(price)) {
-        console.log(`[診断] Binance ${symbol}: 価格が数値でない(${JSON.stringify(json)})`);
+      if (!isFinite(r.price)) {
+        console.log(`[診断] ${ACTIVE_SOURCE} ${symbol}: 価格が数値でない`);
         continue;
       }
-      priceHistory[asset].push({ t: now, p: price });
-      if (shouldLog) console.log(`[診断] Binance ${symbol}: 取得成功 $${price}(累計${priceHistory[asset].length}件)`);
+      priceHistory[asset].push({ t: now, p: r.price });
+      if (shouldLog) console.log(`[診断] ${ACTIVE_SOURCE} ${symbol}: 取得成功 $${r.price}(累計${priceHistory[asset].length}件)`);
     } catch (e) {
-      console.log(`[診断] Binance ${symbol}: 例外 ${e.message}`);
+      console.log(`[診断] ${ACTIVE_SOURCE} ${symbol}: 例外 ${e.message}`);
     }
   }
   const cutoff = now - MAX_HISTORY_SEC * 1000;
@@ -159,7 +215,10 @@ async function fetchMidpoint(tokenId) {
     return null;
   }
 }
-
+/**
+ * 1つの市場について、独自のTWAP計算による確信度と、
+ * Polymarketの表示価格を突き合わせ、歪みがあれば返す。
+ */
 let diagCounter = 0;
 export async function analyzeMarket(market) {
   const now = Date.now();
