@@ -12,8 +12,7 @@ import fs from "fs";
 
 const FILE = process.env.PAPER_TRADE_FILE || "/tmp/paper-trades.json";
 
-// Polymarketの想定コスト(手数料自体は0%だが、スプレッド・ガス代で実質的なコストが発生する)
-const ASSUMED_ROUNDTRIP_COST_PCT = 0.02; // 2%(保守的な見積もり。スプレッド+ガス+スリッページ)
+const ASSUMED_ROUNDTRIP_COST_PCT = 0.02;
 
 function load() {
   try {
@@ -60,29 +59,17 @@ export async function resolveOpenPositions(resolver) {
   save(state);
 }
 
-/**
- * Brierスコア: 予測確率と実際の結果の差を二乗して平均したもの。
- * 0に近いほど精度が高い。0.25=当てずっぽう、0.20=まずまず、0.12〜0.18=予測市場の集合知レベル。
- * 単純な勝率と違い、「どれだけ自信を持って正しく当てたか」を評価できる。
- *
- * 予測確率は meta.confidence(UP方向の確信度)を使い、実際にUPだったかで採点する。
- */
 function calcBrierScore(rows) {
-  const scored = rows.filter((r) => r.meta?.confidence !== undefined && r.meta?.confidence !== null);
+  const scored = rows.filter((r) => r.meta?.predictedProbUp !== undefined && r.meta?.predictedProbUp !== null);
   if (scored.length === 0) return null;
   const sum = scored.reduce((s, r) => {
-    const predictedUp = r.side === "UP" ? r.meta.confidence : 1 - r.meta.confidence;
+    const predictedUp = r.meta.predictedProbUp;
     const actualUp = r.outcome === "UP" ? 1 : 0;
     return s + (predictedUp - actualUp) ** 2;
   }, 0);
   return sum / scored.length;
 }
 
-/**
- * ズレの大きさ(edge)ごとに区分けして勝率を集計する。
- * 「ズレが大きいほど勝率も高い」という関係が実際に見えるかを確認するため。
- * もし見えなければ、推定ロジック自体を見直す必要がある。
- */
 function calcBucketedStats(rows, keyFn, buckets) {
   const result = buckets.map((b) => ({ ...b, count: 0, wins: 0 }));
   for (const r of rows) {
@@ -107,7 +94,6 @@ const TIME_BUCKETS = [
   { label: "30秒+", min: 30, max: Infinity },
 ];
 
-/** 戦略ごとの累積成績(勝率・純利益・Brierスコア・区分別勝率)を計算する */
 export function getStats(strategy = null) {
   const rows = strategy ? state.resolved.filter((r) => r.strategy === strategy) : state.resolved;
   if (rows.length === 0) {
