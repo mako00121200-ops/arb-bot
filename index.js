@@ -1,5 +1,6 @@
 import http from "http";
-import { sampleBinancePrices, fetchActiveShortDurationMarkets, analyzeMarket, diagnoseSources } from "./twap-oracle.js";
+import { sampleBinancePrices, fetchActiveShortDurationMarkets, analyzeMarket, diagnoseSources, recordPriceTick, recordPolymarketTick, recordPolymarketBook } from "./twap-oracle.js";
+import { startOkxFeed, startBybitFeed, startPolymarketFeed, updatePolymarketSubscription } from "./realtime.js";
 import { checkLogicalConstraints, WATCHED_PAIRS } from "./logic-checker.js";
 import { recordSignal, resolveOpenPositions, getStats, getOpenCount, getRecentResolved } from "./paper-trader.js";
 
@@ -30,11 +31,21 @@ let lastError = null;
 let sampleCount = 0;
 let twapCheckCount = 0;
 
+// ============ TWAPオラクル観測ループ ============
+let cachedMarkets = [];
+
+let twapCheckRunning = false;
+let lastTwapCheckAt = 0;
+const MIN_CHECK_INTERVAL_MS = 500;
+
 async function twapCheckOnce() {
+  const now = Date.now();
+  if (twapCheckRunning || now - lastTwapCheckAt < MIN_CHECK_INTERVAL_MS) return;
+  twapCheckRunning = true;
+  lastTwapCheckAt = now;
   try {
-    const markets = await fetchActiveShortDurationMarkets();
     const results = [];
-    for (const m of markets) {
+    for (const m of cachedMarkets) {
       const r = await analyzeMarket(m);
       if (r) results.push(r);
     }
@@ -44,10 +55,13 @@ async function twapCheckOnce() {
     for (const r of results) {
       if (Math.abs(r.edge) < EDGE_THRESHOLD) continue;
       const side = r.edge > 0 ? r.impliedDirection : (r.impliedDirection === "UP" ? "DOWN" : "UP");
-      const entryPrice = side === r.impliedDirection ? r.marketPrice : 1 - r.marketPrice;
+      const midpointPrice = side === r.impliedDirection ? r.marketPrice : 1 - r.marketPrice;
+      const realisticPrice = side === "UP" ? r.bestAsk : (r.bestBid !== null ? 1 - r.bestBid : null);
+      const entryPrice = realisticPrice ?? midpointPrice;
       const resolveAtMs = Date.now() + Math.max(r.remainingSec, 1) * 1000 + 15000;
       recordSignal("twap-oracle", side, entryPrice, resolveAtMs, {
         marketId: r.marketId, question: r.question, edge: r.edge, confidence: r.confidence,
+        remainingSecAtEntry: r.remainingSec, usedRealisticPrice: realisticPrice !== null,
       });
       console.log(`[TWAP] ${r.question}: 我々の推定${(r.ourEstimate*100).toFixed(1)}% vs 市場${(r.marketPrice*100).toFixed(1)}% ` +
         `(ズレ${(r.edge*100).toFixed(1)}pt, 残り${r.remainingSec}秒) → ${side}に紙上ベット記録`);
@@ -55,9 +69,12 @@ async function twapCheckOnce() {
   } catch (e) {
     lastError = e.message;
     console.error("TWAP観測エラー:", e.message);
+  } finally {
+    twapCheckRunning = false;
   }
 }
 
+// ============ 論理矛盾チェックループ ============
 async function logicCheckOnce() {
   if (WATCHED_PAIRS.length === 0) return;
   try {
@@ -76,6 +93,7 @@ async function logicCheckOnce() {
   }
 }
 
+// ============ 決済確認ループ ============
 async function resolveOnce() {
   await resolveOpenPositions(async (pos) => {
     try {
@@ -93,6 +111,7 @@ async function resolveOnce() {
   });
 }
 
+// ============ 状況確認ページ ============
 function renderPage() {
   const twapStats = getStats("twap-oracle");
   const logicStats = getStats("logic-checker");
@@ -144,9 +163,29 @@ td{padding:6px 3px;border-bottom:1px solid #1c1c1c;}
   </div>
   <div class="note">
     純損益は「1単位を賭け続けた場合」の確率ポイント換算。手数料相当(往復2%)は既に控除済み。<br>
+    実際の板情報(Bid/Ask)が取れた場合はそちらを使い、無ければ中間値で代用。<br>
     プラスが続けば戦略に優位性がある可能性、マイナスが続けば見送るべき。
   </div>
+  ${twapStats.brierScore !== null ? `<div class="note">
+    <b>Brierスコア: ${twapStats.brierScore.toFixed(3)}</b>(0に近いほど精度が高い。0.25=当てずっぽう、0.20=まずまず、0.12〜0.18=予測市場の集合知レベル)
+  </div>` : ''}
 </div>
+
+${twapStats.edgeBuckets?.some(b => b.count > 0) ? `<div class="card">
+  <h2>ズレの大きさ別 勝率(較正の確認)</h2>
+  <table><thead><tr><th>区分</th><th style="text-align:right;">件数</th><th style="text-align:right;">勝率</th></tr></thead>
+  <tbody>${twapStats.edgeBuckets.map(b => `<tr><td>${b.label}</td><td style="text-align:right;">${b.count}</td>
+    <td style="text-align:right;">${b.winRate !== null ? b.winRate.toFixed(0)+'%' : '-'}</td></tr>`).join('')}</tbody></table>
+  <div class="note">ズレが大きい区分ほど勝率も高くなっているのが理想。そうなっていなければ推定ロジックの見直しが必要。</div>
+</div>` : ''}
+
+${twapStats.timeBuckets?.some(b => b.count > 0) ? `<div class="card">
+  <h2>判定時の残り時間別 勝率</h2>
+  <table><thead><tr><th>区分</th><th style="text-align:right;">件数</th><th style="text-align:right;">勝率</th></tr></thead>
+  <tbody>${twapStats.timeBuckets.map(b => `<tr><td>${b.label}</td><td style="text-align:right;">${b.count}</td>
+    <td style="text-align:right;">${b.winRate !== null ? b.winRate.toFixed(0)+'%' : '-'}</td></tr>`).join('')}</tbody></table>
+  <div class="note">残り時間が短い(確定に近い)ほど勝率が高いのが理想。</div>
+</div>` : ''}
 
 <div class="card">
   <h2>今この瞬間の観測(TWAPオラクル)</h2>
@@ -174,7 +213,7 @@ td{padding:6px 3px;border-bottom:1px solid #1c1c1c;}
 <div class="card">
   <div class="note">
     TWAP方式: Polymarketの5分/15分BTC/ETH市場は、終了直前30秒/60秒の平均価格で決済される(2026年8月〜)。<br>
-    価格ソースは起動時の診断結果を見て選定する。残り時間内に平均が逆転する余地をボラティリティから見積もっている。<br>
+    Binance価格を継続記録し、残り時間内に平均が逆転する余地をボラティリティから見積もっている。<br>
     ${lastError ? `<span style="color:#e74c3c;">エラー: ${lastError}</span>` : ''}
   </div>
 </div>
@@ -189,16 +228,60 @@ function startServer() {
   }).listen(port, () => console.log(`観測所ページ: ポート${port}`));
 }
 
+// 現在監視中のPolymarketトークンID一覧(市場が入れ替わるたびに更新する)
+let currentTokenIds = [];
+
+/** 現在アクティブな市場を再取得し、Polymarket WebSocketの購読先を切り替える */
+async function refreshMarketSubscriptions() {
+  try {
+    const markets = await fetchActiveShortDurationMarkets();
+    cachedMarkets = markets;
+    const tokenIds = markets.flatMap((m) => m.clobTokenIds || []);
+    if (tokenIds.length > 0) {
+      updatePolymarketSubscription(tokenIds);
+      currentTokenIds = tokenIds;
+    }
+  } catch (e) {
+    console.error("市場購読の更新に失敗:", e.message);
+  }
+}
+
 async function main() {
-  console.log("=== 予測市場の歪み観測所 起動 ===");
+  console.log("=== 予測市場の歪み観測所(WebSocketリアルタイム版) 起動 ===");
   console.log(`監視ペア数(論理矛盾): ${WATCHED_PAIRS.length}`);
   startServer();
 
   await diagnoseSources();
-  setInterval(async () => { await sampleBinancePrices(); sampleCount++; }, BINANCE_SAMPLE_INTERVAL_SEC * 1000);
   await sampleBinancePrices();
 
-  setInterval(twapCheckOnce, TWAP_CHECK_INTERVAL_SEC * 1000);
+  let gotAnyPriceTick = false;
+  const onPriceTick = (asset, price, timestamp) => {
+    gotAnyPriceTick = true;
+    recordPriceTick(asset, price, timestamp);
+    sampleCount++;
+    twapCheckOnce();
+  };
+  startBybitFeed(onPriceTick);
+  setTimeout(() => {
+    if (!gotAnyPriceTick) {
+      console.log("[価格フィード] Bybitから15秒間データが無いため、OKXに切り替えます");
+      startOkxFeed(onPriceTick);
+    }
+  }, 15000);
+
+  startPolymarketFeed(
+    (tokenId, price, timestamp) => {
+      recordPolymarketTick(tokenId, price);
+      if (currentTokenIds.includes(tokenId)) twapCheckOnce();
+    },
+    (tokenId, bestBid, bestAsk) => {
+      recordPolymarketBook(tokenId, bestBid, bestAsk);
+    }
+  );
+
+  await refreshMarketSubscriptions();
+  setInterval(refreshMarketSubscriptions, 60 * 1000);
+
   setInterval(logicCheckOnce, LOGIC_CHECK_INTERVAL_SEC * 1000);
   setInterval(resolveOnce, RESOLVE_CHECK_INTERVAL_SEC * 1000);
 }
