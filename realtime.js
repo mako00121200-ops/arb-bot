@@ -89,8 +89,6 @@ export function startOkxFeed(onTick) {
 }
 
 // ============ Bybitのリアルタイム価格ストリーム ============
-// 米国含む主要地域や、一部クラウド事業者のIP帯をブロックしているとの報告があるため、
-// Railwayから実際に繋がるかは起動時のログで確認する必要がある。
 let bybitSocket = null;
 let bybitReconnectDelay = 1000;
 let bybitLastDataAt = Date.now();
@@ -173,7 +171,7 @@ let polyWatchdogTimer = null;
 function sendPolySubscription() {
   if (!polySocket || polySocket.readyState !== 1) return;
   if (currentSubscribedTokens.length === 0) return;
-  polySocket.send(JSON.stringify({ assets_ids: currentSubscribedTokens, type: "market" }));
+  polySocket.send(JSON.stringify({ assets_ids: currentSubscribedTokens, type: "market", custom_feature_enabled: true }));
 }
 
 export function startPolymarketFeed(onUpdate, onBook) {
@@ -219,6 +217,12 @@ export function startPolymarketFeed(onUpdate, onBook) {
             const tokenId = msg.asset_id;
             const bestBid = msg.bids?.length ? parseFloat(msg.bids[msg.bids.length - 1].price) : null;
             const bestAsk = msg.asks?.length ? parseFloat(msg.asks[msg.asks.length - 1].price) : null;
+            if (tokenId) polyOnBookCallback(tokenId, bestBid, bestAsk);
+          }
+          if (msg.event_type === "best_bid_ask" && polyOnBookCallback) {
+            const tokenId = msg.asset_id;
+            const bestBid = msg.best_bid !== undefined ? parseFloat(msg.best_bid) : null;
+            const bestAsk = msg.best_ask !== undefined ? parseFloat(msg.best_ask) : null;
             if (tokenId) polyOnBookCallback(tokenId, bestBid, bestAsk);
           }
         }
