@@ -12,8 +12,6 @@
  * 実際の注文は一切出さない(紙上取引での検証のみ)。
  */
 
-// Binanceは地域制限(HTTP 451)によりRailwayから直接アクセスできなかった。
-// 複数の候補を一斉に試し、実際にどれが繋がるかをログで確認する診断モードを用意した。
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 const CLOB_BASE = "https://clob.polymarket.com";
 
@@ -75,35 +73,31 @@ export async function diagnoseSources() {
 const priceHistory = { BTC: [], ETH: [] };
 const MAX_HISTORY_SEC = 20 * 60;
 
-let ACTIVE_SOURCE = "okx"; // 診断の結果、Coinbase/Kraken/CoinGecko/OKXが接続可能。出来高の大きさからOKXを採用
+let ACTIVE_SOURCE = "okx";
 export function setActiveSource(name) { ACTIVE_SOURCE = name; }
 
-let sampleDiagCounter = 0;
+let tickCount = 0;
+export function recordPriceTick(asset, price, timestamp) {
+  if (!priceHistory[asset]) return;
+  priceHistory[asset].push({ t: timestamp, p: price });
+  tickCount++;
+  const cutoff = timestamp - MAX_HISTORY_SEC * 1000;
+  if (tickCount % 100 === 0) {
+    for (const a of Object.keys(priceHistory)) {
+      priceHistory[a] = priceHistory[a].filter((s) => s.t >= cutoff);
+    }
+  }
+}
+
 export async function sampleBinancePrices() {
   const now = Date.now();
-  sampleDiagCounter++;
-  const shouldLog = sampleDiagCounter % 10 === 1;
   const fn = PRICE_SOURCES[ACTIVE_SOURCE];
   for (const [asset, symbol] of Object.entries(SYMBOLS)) {
     try {
       const r = await fn(symbol);
-      if (r.error) {
-        console.log(`[診断] ${ACTIVE_SOURCE} ${symbol}: ${r.error}`);
-        continue;
-      }
-      if (!isFinite(r.price)) {
-        console.log(`[診断] ${ACTIVE_SOURCE} ${symbol}: 価格が数値でない`);
-        continue;
-      }
+      if (r.error || !isFinite(r.price)) continue;
       priceHistory[asset].push({ t: now, p: r.price });
-      if (shouldLog) console.log(`[診断] ${ACTIVE_SOURCE} ${symbol}: 取得成功 $${r.price}(累計${priceHistory[asset].length}件)`);
-    } catch (e) {
-      console.log(`[診断] ${ACTIVE_SOURCE} ${symbol}: 例外 ${e.message}`);
-    }
-  }
-  const cutoff = now - MAX_HISTORY_SEC * 1000;
-  for (const asset of Object.keys(priceHistory)) {
-    priceHistory[asset] = priceHistory[asset].filter((s) => s.t >= cutoff);
+    } catch (e) {}
   }
 }
 function samplesInWindow(asset, fromMs, toMs) {
@@ -205,7 +199,21 @@ export async function fetchActiveShortDurationMarkets() {
   return results;
 }
 
+const livePolyPrices = {};
+export function recordPolymarketTick(tokenId, price) {
+  livePolyPrices[tokenId] = price;
+}
+
+const livePolyBook = {};
+export function recordPolymarketBook(tokenId, bestBid, bestAsk) {
+  livePolyBook[tokenId] = { bestBid, bestAsk, at: Date.now() };
+}
+export function getBook(tokenId) {
+  return livePolyBook[tokenId] ?? null;
+}
+
 async function fetchMidpoint(tokenId) {
+  if (livePolyPrices[tokenId] !== undefined) return livePolyPrices[tokenId];
   try {
     const res = await fetch(`${CLOB_BASE}/midpoint?token_id=${tokenId}`);
     if (!res.ok) return null;
@@ -215,10 +223,7 @@ async function fetchMidpoint(tokenId) {
     return null;
   }
 }
-/**
- * 1つの市場について、独自のTWAP計算による確信度と、
- * Polymarketの表示価格を突き合わせ、歪みがあれば返す。
- */
+
 let diagCounter = 0;
 export async function analyzeMarket(market) {
   const now = Date.now();
@@ -273,11 +278,14 @@ export async function analyzeMarket(market) {
   const ourEstimate = impliedDirection === "UP" ? confidence : 1 - confidence;
   const edge = ourEstimate - marketPrice;
 
+  const book = getBook(market.clobTokenIds[0]);
+
   return {
     marketId: market.id, question: market.question, asset: market.asset,
     remainingSec: Math.round(remainingInWindow),
     currentAvg, referencePrice, impliedDirection, confidence,
     marketPrice, ourEstimate, edge,
+    bestBid: book?.bestBid ?? null, bestAsk: book?.bestAsk ?? null,
     measuredAt: new Date().toISOString(),
   };
 }
