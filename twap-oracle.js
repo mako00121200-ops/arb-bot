@@ -139,6 +139,7 @@ function estimateConfidence(currentAvg, referencePrice, remainingSec, volatility
 }
 
 // ============ Polymarket側: 5分/15分のBTC/ETH市場を取得 ============
+const loggedMarketIds = new Set();
 const SERIES_SLUGS = [
   { slug: "btc-up-or-down-5m", asset: "BTC", durationMin: 5 },
   { slug: "eth-up-or-down-5m", asset: "ETH", durationMin: 5 },
@@ -173,12 +174,26 @@ async function fetchCurrentEventForSeries(seriesSlug) {
 
 export async function fetchActiveShortDurationMarkets() {
   const results = [];
+
   for (const series of SERIES_SLUGS) {
     try {
       const event = await fetchCurrentEventForSeries(series.slug);
       if (!event) continue;
       const market = Array.isArray(event.markets) ? event.markets[0] : event;
       if (!market) continue;
+
+      const parsedTokenIds = market.clobTokenIds
+        ? (typeof market.clobTokenIds === "string" ? JSON.parse(market.clobTokenIds) : market.clobTokenIds)
+        : null;
+
+      const parsedOutcomes = market.outcomes
+        ? (typeof market.outcomes === "string" ? JSON.parse(market.outcomes) : market.outcomes)
+        : null;
+      let upTokenId = parsedTokenIds?.[0] ?? null;
+      if (parsedOutcomes && parsedTokenIds) {
+        const upIndex = parsedOutcomes.findIndex((o) => /up/i.test(String(o)));
+        if (upIndex >= 0 && parsedTokenIds[upIndex]) upTokenId = parsedTokenIds[upIndex];
+      }
 
       results.push({
         id: market.id ?? event.id,
@@ -187,11 +202,15 @@ export async function fetchActiveShortDurationMarkets() {
         asset: series.asset,
         endDate: market.endDate ?? event.endDate,
         startDate: market.startDate ?? event.startDate ?? event.eventStartTime,
-        clobTokenIds: market.clobTokenIds
-          ? (typeof market.clobTokenIds === "string" ? JSON.parse(market.clobTokenIds) : market.clobTokenIds)
-          : null,
+        clobTokenIds: parsedTokenIds,
+        upTokenId,
         durationMin: series.durationMin,
       });
+      if (!loggedMarketIds.has(market.id)) {
+        loggedMarketIds.add(market.id);
+        console.log(`[診断] 新しい市場: ${market.question ?? event.title} / clobTokenIds=${JSON.stringify(parsedTokenIds)} / outcomes=${JSON.stringify(parsedOutcomes)} / 判定したUPトークン=${upTokenId?.slice(0,12)}...`);
+      }
+
     } catch (e) {
       console.warn(`シリーズ${series.slug}の取得失敗:`, e.message);
     }
@@ -212,14 +231,26 @@ export function getBook(tokenId) {
   return livePolyBook[tokenId] ?? null;
 }
 
+let midpointDiagCount = 0;
 async function fetchMidpoint(tokenId) {
-  if (livePolyPrices[tokenId] !== undefined) return livePolyPrices[tokenId];
+  midpointDiagCount++;
+  const shouldLog = midpointDiagCount % 5 === 1;
+  if (livePolyPrices[tokenId] !== undefined) {
+    if (shouldLog) console.log(`[診断] fetchMidpoint: WebSocketキャッシュから取得 tokenId=${tokenId.slice(0,12)}... 値=${livePolyPrices[tokenId]}`);
+    return livePolyPrices[tokenId];
+  }
   try {
     const res = await fetch(`${CLOB_BASE}/midpoint?token_id=${tokenId}`);
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.log(`[診断] fetchMidpoint: REST APIエラー tokenId=${tokenId.slice(0,12)}... HTTP${res.status}`);
+      return null;
+    }
     const json = await res.json();
-    return parseFloat(json.mid);
+    const val = parseFloat(json.mid);
+    if (shouldLog) console.log(`[診断] fetchMidpoint: REST APIから取得 tokenId=${tokenId.slice(0,12)}... 生レスポンス=${JSON.stringify(json)} 解析値=${val}`);
+    return val;
   } catch (e) {
+    console.log(`[診断] fetchMidpoint: 例外 ${e.message}`);
     return null;
   }
 }
@@ -264,13 +295,13 @@ export async function analyzeMarket(market) {
   const confidence = estimateConfidence(currentAvg, referencePrice, remainingInWindow, vol);
   const impliedDirection = currentAvg >= referencePrice ? "UP" : "DOWN";
 
-  if (!market.clobTokenIds || market.clobTokenIds.length < 1) {
-    console.log(`[診断] ${market.asset}: clobTokenIdsが無い(market.clobTokenIds=${JSON.stringify(market.clobTokenIds)})`);
+  if (!market.upTokenId) {
+    console.log(`[診断] ${market.asset}: UPトークンIDが無い(clobTokenIds=${JSON.stringify(market.clobTokenIds)})`);
     return null;
   }
-  const marketPrice = await fetchMidpoint(market.clobTokenIds[0]);
+  const marketPrice = await fetchMidpoint(market.upTokenId);
   if (marketPrice === null) {
-    console.log(`[診断] ${market.asset}: CLOB midpoint取得失敗(tokenId=${market.clobTokenIds[0]})`);
+    console.log(`[診断] ${market.asset}: CLOB midpoint取得失敗(tokenId=${market.upTokenId})`);
     return null;
   }
   console.log(`[診断] ${market.asset}: 判定成功! 推定=${confidence.toFixed(3)} 市場価格=${marketPrice} 残り${remainingInWindow.toFixed(0)}秒`);
@@ -278,7 +309,7 @@ export async function analyzeMarket(market) {
   const ourEstimate = impliedDirection === "UP" ? confidence : 1 - confidence;
   const edge = ourEstimate - marketPrice;
 
-  const book = getBook(market.clobTokenIds[0]);
+  const book = getBook(market.upTokenId);
 
   return {
     marketId: market.id, question: market.question, asset: market.asset,
