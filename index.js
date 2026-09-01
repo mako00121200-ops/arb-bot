@@ -1,66 +1,13 @@
-import http from "http";
-import { sampleBinancePrices, fetchActiveShortDurationMarkets, analyzeMarket, diagnoseSources, recordPriceTick, recordPolymarketTick, recordPolymarketBook } from "./twap-oracle.js";
-import { startOkxFeed, startBybitFeed, startPolymarketFeed, updatePolymarketSubscription } from "./realtime.js";
-import { checkLogicalConstraints, WATCHED_PAIRS } from "./logic-checker.js";
-import { recordSignal, resolveOpenPositions, getStats, getOpenCount, getRecentResolved } from "./paper-trader.js";
-
-/**
- * 予測市場の歪み観測所
- * ------------------------------------------------------------
- * DEXの価格裁定(旧バージョン)は2日間の観測で機会ゼロだったため、
- * 予測市場(Polymarket)の2つの歪みに絞って観測所を作り直した。
- *
- *  1. TWAPオラクル観測: Polymarketの5分/15分BTC/ETH市場が2026年8月から
- *     採用したTWAP決済方式を自前で計算し、市場の表示価格とのズレを検出
- *  2. 論理矛盾チェッカー: 「AがBを含むならA≧Bのはず」といった
- *     算数的に成り立つべき関係の破れを検出
- *
- * 実際の注文は一切出さない。両方とも「もし賭けていたら」を記録し、
- * 市場確定後に勝率・純利益(手数料込み)を自動集計する。
- */
-
-const BINANCE_SAMPLE_INTERVAL_SEC = parseInt(process.env.BINANCE_SAMPLE_INTERVAL_SEC || "2", 10);
-const TWAP_CHECK_INTERVAL_SEC = parseInt(process.env.TWAP_CHECK_INTERVAL_SEC || "5", 10);
-const LOGIC_CHECK_INTERVAL_SEC = parseInt(process.env.LOGIC_CHECK_INTERVAL_SEC || "60", 10);
-const RESOLVE_CHECK_INTERVAL_SEC = parseInt(process.env.RESOLVE_CHECK_INTERVAL_SEC || "30", 10);
-const EDGE_THRESHOLD = parseFloat(process.env.EDGE_THRESHOLD || "0.05");
-
-let latestTwapSignals = [];
-let latestLogicSignals = [];
-let lastError = null;
-let sampleCount = 0;
-let twapCheckCount = 0;
-
-// ============ TWAPオラクル観測ループ ============
-let cachedMarkets = [];
-
-let twapCheckRunning = false;
-let lastTwapCheckAt = 0;
-const MIN_CHECK_INTERVAL_MS = 500;
-
-async function twapCheckOnce() {
-  const now = Date.now();
-  if (twapCheckRunning || now - lastTwapCheckAt < MIN_CHECK_INTERVAL_MS) return;
-  twapCheckRunning = true;
-  lastTwapCheckAt = now;
-  try {
-    const results = [];
-    for (const m of cachedMarkets) {
-      const r = await analyzeMarket(m);
-      if (r) results.push(r);
-    }
-    latestTwapSignals = results;
-    twapCheckCount++;
-
-    for (const r of results) {
-      if (Math.abs(r.edge) < EDGE_THRESHOLD) continue;
-      const side = r.edge > 0 ? r.impliedDirection : (r.impliedDirection === "UP" ? "DOWN" : "UP");
-      const midpointPrice = side === r.impliedDirection ? r.marketPrice : 1 - r.marketPrice;
+      // 以前は impliedDirection にも依存させていたため、impliedDirectionがDOWNの場合に
+      // 逆方向を記録してしまうバグがあった(Brierスコアが0.5近辺になっていた原因)。
+      const side = r.edge > 0 ? "UP" : "DOWN";
+      const midpointPrice = side === "UP" ? r.marketPrice : 1 - r.marketPrice;
       const realisticPrice = side === "UP" ? r.bestAsk : (r.bestBid !== null ? 1 - r.bestBid : null);
       const entryPrice = realisticPrice ?? midpointPrice;
       const resolveAtMs = Date.now() + Math.max(r.remainingSec, 1) * 1000 + 15000;
       recordSignal("twap-oracle", side, entryPrice, resolveAtMs, {
-        marketId: r.marketId, question: r.question, edge: r.edge, confidence: r.confidence,
+        marketId: r.marketId, question: r.question, edge: r.edge,
+        predictedProbUp: r.ourEstimate,
         remainingSecAtEntry: r.remainingSec, usedRealisticPrice: realisticPrice !== null,
       });
       console.log(`[TWAP] ${r.question}: 我々の推定${(r.ourEstimate*100).toFixed(1)}% vs 市場${(r.marketPrice*100).toFixed(1)}% ` +
@@ -231,7 +178,6 @@ function startServer() {
 // 現在監視中のPolymarketトークンID一覧(市場が入れ替わるたびに更新する)
 let currentTokenIds = [];
 
-/** 現在アクティブな市場を再取得し、Polymarket WebSocketの購読先を切り替える */
 async function refreshMarketSubscriptions() {
   try {
     const markets = await fetchActiveShortDurationMarkets();
