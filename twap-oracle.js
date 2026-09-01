@@ -219,8 +219,8 @@ export async function fetchActiveShortDurationMarkets() {
 }
 
 const livePolyPrices = {};
-export function recordPolymarketTick(tokenId, price) {
-  livePolyPrices[tokenId] = price;
+export function recordPolymarketTick(tokenId, price, timestamp) {
+  livePolyPrices[tokenId] = { price, at: timestamp ?? Date.now() };
 }
 
 const livePolyBook = {};
@@ -235,9 +235,11 @@ let midpointDiagCount = 0;
 async function fetchMidpoint(tokenId) {
   midpointDiagCount++;
   const shouldLog = midpointDiagCount % 5 === 1;
-  if (livePolyPrices[tokenId] !== undefined) {
-    if (shouldLog) console.log(`[診断] fetchMidpoint: WebSocketキャッシュから取得 tokenId=${tokenId.slice(0,12)}... 値=${livePolyPrices[tokenId]}`);
-    return livePolyPrices[tokenId];
+  const cached = livePolyPrices[tokenId];
+  if (cached !== undefined) {
+    const ageSec = (Date.now() - cached.at) / 1000;
+    if (shouldLog) console.log(`[診断] fetchMidpoint: WebSocketキャッシュから取得 tokenId=${tokenId.slice(0,12)}... 値=${cached.price} 経過${ageSec.toFixed(1)}秒`);
+    return { price: cached.price, ageSec };
   }
   try {
     const res = await fetch(`${CLOB_BASE}/midpoint?token_id=${tokenId}`);
@@ -248,7 +250,7 @@ async function fetchMidpoint(tokenId) {
     const json = await res.json();
     const val = parseFloat(json.mid);
     if (shouldLog) console.log(`[診断] fetchMidpoint: REST APIから取得 tokenId=${tokenId.slice(0,12)}... 生レスポンス=${JSON.stringify(json)} 解析値=${val}`);
-    return val;
+    return { price: val, ageSec: 0 };
   } catch (e) {
     console.log(`[診断] fetchMidpoint: 例外 ${e.message}`);
     return null;
@@ -299,12 +301,13 @@ export async function analyzeMarket(market) {
     console.log(`[診断] ${market.asset}: UPトークンIDが無い(clobTokenIds=${JSON.stringify(market.clobTokenIds)})`);
     return null;
   }
-  const marketPrice = await fetchMidpoint(market.upTokenId);
-  if (marketPrice === null) {
+  const midpointResult = await fetchMidpoint(market.upTokenId);
+  if (midpointResult === null) {
     console.log(`[診断] ${market.asset}: CLOB midpoint取得失敗(tokenId=${market.upTokenId})`);
     return null;
   }
-  console.log(`[診断] ${market.asset}: 判定成功! 推定=${confidence.toFixed(3)} 市場価格=${marketPrice} 残り${remainingInWindow.toFixed(0)}秒`);
+  const { price: marketPrice, ageSec: marketPriceAgeSec } = midpointResult;
+  console.log(`[診断] ${market.asset}: 判定成功! 推定=${confidence.toFixed(3)} 市場価格=${marketPrice}(${marketPriceAgeSec.toFixed(1)}秒前の情報) 残り${remainingInWindow.toFixed(0)}秒`);
 
   const ourEstimate = impliedDirection === "UP" ? confidence : 1 - confidence;
   const edge = ourEstimate - marketPrice;
@@ -315,7 +318,7 @@ export async function analyzeMarket(market) {
     marketId: market.id, question: market.question, asset: market.asset,
     remainingSec: Math.round(remainingInWindow),
     currentAvg, referencePrice, impliedDirection, confidence,
-    marketPrice, ourEstimate, edge,
+    marketPrice, marketPriceAgeSec, ourEstimate, edge,
     bestBid: book?.bestBid ?? null, bestAsk: book?.bestAsk ?? null,
     measuredAt: new Date().toISOString(),
   };
