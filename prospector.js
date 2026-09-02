@@ -151,12 +151,14 @@ export async function runProspect({ minTvlUSD = 10000, topN = 50 } = {}) {
     chainSummary: chainSummary.slice(0, 30),
     arbitragableRaw: arbitragable,
     topPairs: scored.slice(0, topN).map((a) => ({
-      chain: a.chain, symbol: a.symbol, venueCount: a.venueCount,
+      chain: a.chain, symbol: a.symbol, tokenA: a.tokenA, tokenB: a.tokenB,
+      venueCount: a.venueCount,
       minTvl: a.minTvl, turnover: a.turnover, score: a.score,
       venues: a.venues.map((v) => ({ project: v.project, tvlUsd: v.tvlUsd })),
     })),
     quietPairs: quiet.slice(0, 40).map((a) => ({
-      chain: a.chain, symbol: a.symbol, venueCount: a.venueCount,
+      chain: a.chain, symbol: a.symbol, tokenA: a.tokenA, tokenB: a.tokenB,
+      venueCount: a.venueCount,
       minTvl: a.minTvl, turnover: a.turnover,
       venues: a.venues.map((v) => v.project),
     })),
