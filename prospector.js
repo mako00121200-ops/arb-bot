@@ -3,9 +3,23 @@
  * ------------------------------------------------------------
  * DeFiLlamaの全プールデータから、「同一チェーン上で同じトークンペアが
  * 複数のDEXに存在する」組み合わせを洗い出し、裁定候補としてランキングする。
+ *
+ * 修正点: DeFiLlamaへのfetchにタイムアウトを追加(固まったまま
+ * 止まらないように)。
  */
 
 const DEFILLAMA_POOLS = "https://yields.llama.fi/pools";
+const PROSPECTOR_FETCH_TIMEOUT_MS = 25000; // 25秒でタイムアウト
+
+async function fetchWithTimeout(url, timeoutMs = PROSPECTOR_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 const DEX_KEYWORDS = [
   "swap", "dex", "uniswap", "sushi", "curve", "balancer", "pancake",
@@ -24,7 +38,7 @@ export function isDexProject(project) {
 }
 
 export async function fetchAllPools() {
-  const res = await fetch(DEFILLAMA_POOLS);
+  const res = await fetchWithTimeout(DEFILLAMA_POOLS);
   if (!res.ok) throw new Error(`DeFiLlama HTTP ${res.status}`);
   const json = await res.json();
   return json.data || [];
