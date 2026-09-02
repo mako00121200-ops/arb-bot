@@ -3,7 +3,264 @@ import { sampleBinancePrices, fetchActiveShortDurationMarkets, analyzeMarket, di
 import { startOkxFeed, startBybitFeed, startPolymarketFeed, updatePolymarketSubscription } from "./realtime.js";
 import { checkLogicalConstraints, WATCHED_PAIRS } from "./logic-checker.js";
 import { recordSignal, resolveOpenPositions, getStats, getOpenCount, getRecentResolved } from "./paper-trader.js";
-import { runWatchCycle, getRecentObservations } from "./dex-arb-watcher.js";
+import fs from "fs";
+import { runProspect } from "./prospector.js";
+
+const DEX_FETCH_TIMEOUT_MS = 20000;
+
+async function dexFetchWithTimeout(url, timeoutMs = DEX_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function dexGetAmountOut(amountIn, reserveIn, reserveOut, feeRetain) {
+  if (amountIn <= 0) return 0;
+  const amountInWithFee = amountIn * feeRetain;
+  return (reserveOut * amountInWithFee) / (reserveIn + amountInWithFee);
+}
+
+function dexComputeOptimalArbitrage(pool1, pool2) {
+  const a = pool1.reserveY;
+  const A = pool1.reserveX;
+  const X2 = pool2.reserveX;
+  const Y2 = pool2.reserveY;
+  const g1 = 1 - pool1.fee;
+  const g2 = 1 - pool2.fee;
+
+  const P = Y2 * g2 * A;
+  const Q = X2 * a;
+  const R = X2 + g2 * A;
+  const inner = g1 * P * Q;
+
+  if (inner <= Q * Q) {
+    return { amountIn: 0, grossProfit: 0, profitable: false };
+  }
+
+  const s = Math.sqrt(inner) - Q;
+  const theoreticalAmountIn = s / (g1 * R);
+
+  if (theoreticalAmountIn <= 0) {
+    return { amountIn: 0, grossProfit: 0, profitable: false };
+  }
+
+  const simulateProfit = (t) => {
+    const xOut = dexGetAmountOut(t, a, A, g1);
+    const yOut = dexGetAmountOut(xOut, X2, Y2, g2);
+    return yOut - t;
+  };
+
+  let bestT = theoreticalAmountIn;
+  let bestProfit = simulateProfit(theoreticalAmountIn);
+
+  for (let mult = 0.5; mult <= 1.5; mult += 0.01) {
+    const t = theoreticalAmountIn * mult;
+    const p = simulateProfit(t);
+    if (p > bestProfit) {
+      bestProfit = p;
+      bestT = t;
+    }
+  }
+
+  return { amountIn: bestT, grossProfit: bestProfit, profitable: bestProfit > 0 };
+}
+
+function dexEvaluateOpportunity({ cheapPool, expensivePool, gasCostInY, slippageBuffer = 0, pairLabel = "" }) {
+  const priceCheap = cheapPool.reserveY / cheapPool.reserveX;
+  const priceExpensive = expensivePool.reserveY / expensivePool.reserveX;
+
+  const result = dexComputeOptimalArbitrage(cheapPool, expensivePool);
+  const grossProfit = result.grossProfit;
+  const slippageCost = grossProfit * slippageBuffer;
+  const netProfit = grossProfit - gasCostInY - slippageCost;
+
+  return {
+    timestamp: new Date().toISOString(),
+    pairLabel,
+    priceDiffPercent: ((priceExpensive - priceCheap) / priceCheap) * 100,
+    optimalAmountIn: result.amountIn,
+    grossProfit,
+    gasCostInY,
+    slippageCost,
+    netProfit,
+    profitable: netProfit > 0,
+  };
+}
+
+const DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/latest/dex/tokens/";
+const DEX_LOG_FILE = process.env.WATCHER_LOG_FILE || "/tmp/dex-arb-observations.json";
+
+const DEX_DEFAULT_FEE_BY_DEX = {
+  uniswap: 0.003,
+  aerodrome: 0.0005,
+  "aerodrome-slipstream": 0.0005,
+  sushiswap: 0.003,
+  camelot: 0.003,
+  velodrome: 0.0005,
+  default: 0.003,
+};
+
+function dexGetFeeForDex(dexId) {
+  return DEX_DEFAULT_FEE_BY_DEX[(dexId || "").toLowerCase()] ?? DEX_DEFAULT_FEE_BY_DEX.default;
+}
+
+function dexNormalizeChain(chain) {
+  const map = { base: "base", arbitrum: "arbitrum", optimism: "optimism", ethereum: "ethereum" };
+  return map[(chain || "").toLowerCase()] || (chain || "").toLowerCase();
+}
+
+function dexLoadLog() {
+  try {
+    if (fs.existsSync(DEX_LOG_FILE)) return JSON.parse(fs.readFileSync(DEX_LOG_FILE, "utf8"));
+  } catch (e) {}
+  return [];
+}
+
+function dexSaveLog(entries) {
+  try {
+    const trimmed = entries.length > 2000 ? entries.slice(-2000) : entries;
+    fs.writeFileSync(DEX_LOG_FILE, JSON.stringify(trimmed));
+  } catch (e) {
+    console.warn("観測ログの保存に失敗:", e.message);
+  }
+}
+
+async function dexFetchPairsForToken(tokenAddress, chain, otherTokenAddress) {
+  const res = await dexFetchWithTimeout(DEXSCREENER_TOKEN_API + tokenAddress);
+  if (!res.ok) throw new Error(`DexScreener HTTP ${res.status}`);
+  const json = await res.json();
+  const pairs = json.pairs || [];
+  const targetChain = dexNormalizeChain(chain);
+  const other = otherTokenAddress.toLowerCase();
+
+  return pairs.filter((p) => {
+    if ((p.chainId || "").toLowerCase() !== targetChain) return false;
+    const base = (p.baseToken?.address || "").toLowerCase();
+    const quote = (p.quoteToken?.address || "").toLowerCase();
+    return base === other || quote === other;
+  });
+}
+
+function dexToPoolShape(pair, targetTokenAddress) {
+  const baseIsTarget = (pair.baseToken?.address || "").toLowerCase() === targetTokenAddress.toLowerCase();
+  const reserveX = baseIsTarget ? pair.liquidity?.base : pair.liquidity?.quote;
+  const reserveY = baseIsTarget ? pair.liquidity?.quote : pair.liquidity?.base;
+
+  if (!reserveX || !reserveY) return null;
+
+  return {
+    dexId: pair.dexId,
+    pairAddress: pair.pairAddress,
+    reserveX,
+    reserveY,
+    fee: dexGetFeeForDex(pair.dexId),
+    priceUsd: pair.priceUsd,
+  };
+}
+
+async function dexWatchOnePair(candidate, gasCostUsd) {
+  const rawPairs = await dexFetchPairsForToken(candidate.tokenA, candidate.chain, candidate.tokenB);
+
+  const pools = rawPairs
+    .map((p) => dexToPoolShape(p, candidate.tokenA))
+    .filter(Boolean)
+    .sort((a, b) => b.reserveX + b.reserveY - (a.reserveX + a.reserveY));
+
+  if (pools.length < 2) return null;
+
+  const [poolA, poolB] = pools;
+  const priceA = poolA.reserveY / poolA.reserveX;
+  const priceB = poolB.reserveY / poolB.reserveX;
+  const [cheapPool, expensivePool] = priceA < priceB ? [poolA, poolB] : [poolB, poolA];
+
+  const result = dexEvaluateOpportunity({
+    cheapPool,
+    expensivePool,
+    gasCostInY: gasCostUsd,
+    slippageBuffer: 0.002,
+    pairLabel: `${candidate.symbol} on ${candidate.chain} (${cheapPool.dexId} -> ${expensivePool.dexId})`,
+  });
+
+  return {
+    ...result,
+    chain: candidate.chain,
+    tokenA: candidate.tokenA,
+    tokenB: candidate.tokenB,
+    cheapDex: cheapPool.dexId,
+    expensiveDex: expensivePool.dexId,
+  };
+}
+
+const DEX_PROSPECT_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
+
+let dexCachedCandidates = [];
+let dexLastProspectAt = 0;
+let dexProspectRefreshing = false;
+
+async function dexGetCandidates(topN) {
+  const now = Date.now();
+  const needsRefresh = dexCachedCandidates.length === 0 || now - dexLastProspectAt > DEX_PROSPECT_REFRESH_INTERVAL_MS;
+
+  if (needsRefresh && !dexProspectRefreshing) {
+    dexProspectRefreshing = true;
+    try {
+      console.log("[DEX] 候補ペアを再選定中(DeFiLlama全件取得。数十秒かかることがあります)...");
+      const prospect = await runProspect({ minTvlUSD: 20000, topN: 30 });
+      dexCachedCandidates = prospect.topPairs;
+      dexLastProspectAt = now;
+      console.log(`[DEX] 候補ペア再選定完了: ${dexCachedCandidates.length}件`);
+    } catch (e) {
+      console.error("[DEX] 候補ペア選定に失敗(前回のキャッシュを使い続けます):", e.message);
+    } finally {
+      dexProspectRefreshing = false;
+    }
+  }
+
+  return dexCachedCandidates.slice(0, topN);
+}
+
+async function runWatchCycle({ topN = 8, gasCostUsd = 0.15 } = {}) {
+  console.log("[DEX] 観測サイクル開始");
+  const candidates = await dexGetCandidates(topN);
+
+  if (candidates.length === 0) {
+    console.log("[DEX] 候補ペアがまだありません(初回の選定待ち、または失敗)");
+    return { scannedAt: new Date().toISOString(), checked: 0, logged: 0, results: [] };
+  }
+
+  const log = dexLoadLog();
+  const results = [];
+
+  for (const candidate of candidates) {
+    try {
+      const observed = await dexWatchOnePair(candidate, gasCostUsd);
+      if (observed) {
+        results.push(observed);
+        log.push(observed);
+      }
+    } catch (e) {
+      console.warn(`[DEX] 観測失敗 (${candidate.symbol} / ${candidate.chain}):`, e.message);
+    }
+  }
+
+  dexSaveLog(log);
+  console.log(`[DEX] 観測サイクル完了: 対象${candidates.length}件・記録${results.length}件・黒字${results.filter(r=>r.profitable).length}件`);
+
+  return {
+    scannedAt: new Date().toISOString(),
+    checked: candidates.length,
+    logged: results.length,
+    results,
+  };
+}
+
+function getRecentObservations(n = 50) {
+  return dexLoadLog().slice(-n).reverse();
+}
 
 const BINANCE_SAMPLE_INTERVAL_SEC = parseInt(process.env.BINANCE_SAMPLE_INTERVAL_SEC || "2", 10);
 const TWAP_CHECK_INTERVAL_SEC = parseInt(process.env.TWAP_CHECK_INTERVAL_SEC || "5", 10);
@@ -28,7 +285,6 @@ const recordedMarketIds = new Set();
 const MAX_RECORDED_IDS = 2000;
 const marketIdToUpTokenId = new Map();
 
-// --- DEXアービトラージ観測(Base等) 用の状態 ---
 let dexWatchRunning = false;
 let dexWatchCount = 0;
 let lastDexWatchAt = null;
@@ -119,7 +375,6 @@ async function resolveOnce() {
   });
 }
 
-// --- DEXアービトラージ観測を1サイクル実行する ---
 async function dexWatchOnce() {
   if (dexWatchRunning) return;
   dexWatchRunning = true;
@@ -169,7 +424,6 @@ function renderPage() {
     <td style="text-align:right;color:${t.netPnl>=0?'#2ecc71':'#e74c3c'};">${t.netPnl>=0?'+':''}${(t.netPnl*100).toFixed(1)}pt</td></tr>`;
   }).join("") || `<tr><td colspan="6" style="color:#888;">まだ確定した紙上取引はありません</td></tr>`;
 
-  // --- DEXアービトラージ観測の集計 ---
   const dexObservations = getRecentObservations(500);
   const dexProfitableAll = dexObservations.filter((r) => r.profitable);
   const dexBest = dexObservations.reduce((best, r) => (!best || r.netProfit > best.netProfit ? r : best), null);
@@ -366,7 +620,6 @@ async function main() {
   setInterval(logicCheckOnce, LOGIC_CHECK_INTERVAL_SEC * 1000);
   setInterval(resolveOnce, RESOLVE_CHECK_INTERVAL_SEC * 1000);
 
-  // --- DEXアービトラージ観測を開始(起動直後に1回、以後は一定間隔で) ---
   dexWatchOnce();
   setInterval(dexWatchOnce, DEX_WATCH_INTERVAL_SEC * 1000);
 }
