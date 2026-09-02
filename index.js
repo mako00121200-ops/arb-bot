@@ -1,5 +1,5 @@
 import http from "http";
-import { sampleBinancePrices, fetchActiveShortDurationMarkets, analyzeMarket, diagnoseSources, recordPriceTick, recordPolymarketTick, recordPolymarketBook } from "./twap-oracle.js";
+import { sampleBinancePrices, fetchActiveShortDurationMarkets, analyzeMarket, diagnoseSources, recordPriceTick, recordPolymarketTick, recordPolymarketBook, checkComplementArb, getDetectedComplementArbs, checkBacktestFeasibility } from "./twap-oracle.js";
 import { startOkxFeed, startBybitFeed, startPolymarketFeed, updatePolymarketSubscription } from "./realtime.js";
 import { checkLogicalConstraints, WATCHED_PAIRS } from "./logic-checker.js";
 import { recordSignal, resolveOpenPositions, getStats, getOpenCount, getRecentResolved } from "./paper-trader.js";
@@ -22,6 +22,10 @@ let twapCheckRunning = false;
 let lastTwapCheckAt = 0;
 const MIN_CHECK_INTERVAL_MS = 500;
 
+const recordedMarketIds = new Set();
+const MAX_RECORDED_IDS = 2000;
+const marketIdToUpTokenId = new Map();
+
 async function twapCheckOnce() {
   const now = Date.now();
   if (twapCheckRunning || now - lastTwapCheckAt < MIN_CHECK_INTERVAL_MS) return;
@@ -31,13 +35,20 @@ async function twapCheckOnce() {
     const results = [];
     for (const m of cachedMarkets) {
       const r = await analyzeMarket(m);
-      if (r) results.push(r);
+      if (r) { results.push(r); marketIdToUpTokenId.set(r.marketId, m.upTokenId); }
+      checkComplementArb(m);
     }
     latestTwapSignals = results;
     twapCheckCount++;
 
     for (const r of results) {
       if (Math.abs(r.edge) < EDGE_THRESHOLD) continue;
+      if (recordedMarketIds.has(r.marketId)) continue;
+      recordedMarketIds.add(r.marketId);
+      if (recordedMarketIds.size > MAX_RECORDED_IDS) {
+        const oldest = recordedMarketIds.values().next().value;
+        recordedMarketIds.delete(oldest);
+      }
       const side = r.edge > 0 ? "UP" : "DOWN";
       const midpointPrice = side === "UP" ? r.marketPrice : 1 - r.marketPrice;
       const realisticPrice = side === "UP" ? r.bestAsk : (r.bestBid !== null ? 1 - r.bestBid : null);
@@ -48,6 +59,7 @@ async function twapCheckOnce() {
         predictedProbUp: r.ourEstimate,
         remainingSecAtEntry: r.remainingSec, usedRealisticPrice: realisticPrice !== null,
         marketPriceAgeSecAtEntry: r.marketPriceAgeSec,
+        upTokenIdForBacktest: marketIdToUpTokenId.get(r.marketId) ?? null,
       });
       console.log(`[TWAP] ${r.question}: 我々の推定${(r.ourEstimate*100).toFixed(1)}% vs 市場${(r.marketPrice*100).toFixed(1)}%(${r.marketPriceAgeSec?.toFixed(1)}秒前) ` +
         `(ズレ${(r.edge*100).toFixed(1)}pt, 残り${r.remainingSec}秒) → ${side}に紙上ベット記録`);
@@ -88,6 +100,9 @@ async function resolveOnce() {
       const prices = m.outcomePrices ? JSON.parse(m.outcomePrices) : null;
       if (!prices) return { outcome: null };
       const upWon = parseFloat(prices[0]) > 0.5;
+      if (pos.meta.upTokenIdForBacktest) {
+        checkBacktestFeasibility(pos.meta.upTokenIdForBacktest, new Date(m.endDate).getTime());
+      }
       return { outcome: upWon ? "UP" : "DOWN" };
     } catch (e) {
       return { outcome: null };
@@ -98,6 +113,7 @@ async function resolveOnce() {
 function renderPage() {
   const twapStats = getStats("twap-oracle");
   const logicStats = getStats("logic-checker");
+  const complementArbs = getDetectedComplementArbs();
   const recentTrades = getRecentResolved(15);
 
   const twapRows = latestTwapSignals.slice(0, 15).map((r, i) => {
@@ -176,6 +192,19 @@ ${twapStats.priceAgeBuckets?.some(b => b.count > 0) ? `<div class="card">
   <tbody>${twapStats.priceAgeBuckets.map(b => `<tr><td>${b.label}</td><td style="text-align:right;">${b.count}</td>
     <td style="text-align:right;">${b.winRate !== null ? b.winRate.toFixed(0)+'%' : '-'}</td></tr>`).join('')}</tbody></table>
   <div class="note">古い価格の区分ほど勝率が高ければ「反応遅れを突けている」証拠。差が無ければ単なる逆張りの疑い。</div>
+</div>` : ''}
+
+${complementArbs.length > 0 ? `<div class="card">
+  <h2>💎 コンプリメント裁定(理論上ノーリスク)</h2>
+  <div class="stat">
+    <div><div class="v">${complementArbs.length}</div><div class="l">検出件数</div></div>
+    <div><div class="v" style="color:#2ecc71;">${(complementArbs.reduce((s,a)=>s+a.margin,0)*100).toFixed(1)}%</div><div class="l">合計利益余地</div></div>
+  </div>
+  <table><thead><tr><th>#</th><th>市場</th><th style="text-align:right;">UP</th><th style="text-align:right;">DOWN</th><th style="text-align:right;">利益余地</th></tr></thead>
+  <tbody>${complementArbs.slice(0,10).map((a,i) => `<tr><td>${i+1}</td><td style="font-size:9px;">${a.question.slice(0,25)}</td>
+    <td style="text-align:right;">${a.upAsk.toFixed(3)}</td><td style="text-align:right;">${a.downAsk.toFixed(3)}</td>
+    <td style="text-align:right;color:#2ecc71;">+${(a.margin*100).toFixed(1)}%</td></tr>`).join('')}</tbody></table>
+  <div class="note">UP+DOWNの合計が$1未満のため、両方買ってMergeすれば結果に関わらず利益が出る、理論上ノーリスクな機会。</div>
 </div>` : ''}
 
 <div class="card">
