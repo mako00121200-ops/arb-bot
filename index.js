@@ -625,3 +625,4 @@ async function main() {
 }
 
 main().catch((e) => { console.error("致命的エラー:", e); process.exit(1); });
+
