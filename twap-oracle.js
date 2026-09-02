@@ -138,7 +138,6 @@ function estimateConfidence(currentAvg, referencePrice, remainingSec, volatility
   return zScore * 0.68;
 }
 
-// ============ Polymarket側: 5分/15分のBTC/ETH市場を取得 ============
 const loggedMarketIds = new Set();
 const SERIES_SLUGS = [
   { slug: "btc-up-or-down-5m", asset: "BTC", durationMin: 5 },
@@ -190,9 +189,12 @@ export async function fetchActiveShortDurationMarkets() {
         ? (typeof market.outcomes === "string" ? JSON.parse(market.outcomes) : market.outcomes)
         : null;
       let upTokenId = parsedTokenIds?.[0] ?? null;
+      let downTokenId = parsedTokenIds?.[1] ?? null;
       if (parsedOutcomes && parsedTokenIds) {
         const upIndex = parsedOutcomes.findIndex((o) => /up/i.test(String(o)));
+        const downIndex = parsedOutcomes.findIndex((o) => /down/i.test(String(o)));
         if (upIndex >= 0 && parsedTokenIds[upIndex]) upTokenId = parsedTokenIds[upIndex];
+        if (downIndex >= 0 && parsedTokenIds[downIndex]) downTokenId = parsedTokenIds[downIndex];
       }
 
       results.push({
@@ -203,7 +205,7 @@ export async function fetchActiveShortDurationMarkets() {
         endDate: market.endDate ?? event.endDate,
         startDate: market.startDate ?? event.startDate ?? event.eventStartTime,
         clobTokenIds: parsedTokenIds,
-        upTokenId,
+        upTokenId, downTokenId,
         durationMin: series.durationMin,
       });
       if (!loggedMarketIds.has(market.id)) {
@@ -314,12 +316,75 @@ export async function analyzeMarket(market) {
 
   const book = getBook(market.upTokenId);
 
+  let beyondHalfSpread = null;
+  if (book?.bestBid !== null && book?.bestBid !== undefined && book?.bestAsk !== null && book?.bestAsk !== undefined) {
+    const halfSpread = (book.bestAsk - book.bestBid) / 2;
+    beyondHalfSpread = Math.abs(edge) > halfSpread;
+  }
+
   return {
     marketId: market.id, question: market.question, asset: market.asset,
     remainingSec: Math.round(remainingInWindow),
     currentAvg, referencePrice, impliedDirection, confidence,
-    marketPrice, marketPriceAgeSec, ourEstimate, edge,
+    marketPrice, marketPriceAgeSec, ourEstimate, edge, beyondHalfSpread,
     bestBid: book?.bestBid ?? null, bestAsk: book?.bestAsk ?? null,
     measuredAt: new Date().toISOString(),
   };
+}
+
+const detectedComplementArbs = [];
+const complementArbMarketIds = new Set();
+
+export function checkComplementArb(market) {
+  if (!market.upTokenId || !market.downTokenId) return null;
+  const upBook = getBook(market.upTokenId);
+  const downBook = getBook(market.downTokenId);
+  if (!upBook?.bestAsk || !downBook?.bestAsk) return null;
+
+  const totalCost = upBook.bestAsk + downBook.bestAsk;
+  const margin = 1 - totalCost;
+  const MIN_MARGIN = 0.02;
+
+  if (margin > MIN_MARGIN) {
+    const key = `${market.id}`;
+    if (!complementArbMarketIds.has(key)) {
+      complementArbMarketIds.add(key);
+      const entry = {
+        marketId: market.id, question: market.question, asset: market.asset,
+        upAsk: upBook.bestAsk, downAsk: downBook.bestAsk, margin,
+        detectedAt: new Date().toISOString(),
+      };
+      detectedComplementArbs.push(entry);
+      if (detectedComplementArbs.length > 200) detectedComplementArbs.shift();
+      console.log(`[コンプリメント裁定] ${market.question}: UP=${upBook.bestAsk} + DOWN=${downBook.bestAsk} = ${totalCost.toFixed(3)}(利益余地 ${(margin*100).toFixed(1)}%)`);
+      return entry;
+    }
+  }
+  return null;
+}
+export function getDetectedComplementArbs() { return [...detectedComplementArbs].reverse(); }
+
+let backtestFeasibilityChecked = false;
+export async function checkBacktestFeasibility(closedMarketTokenId, endTimeMs) {
+  if (backtestFeasibilityChecked || !closedMarketTokenId) return;
+  backtestFeasibilityChecked = true;
+  try {
+    const startTs = Math.floor((endTimeMs - 5 * 60 * 1000) / 1000);
+    const endTs = Math.floor(endTimeMs / 1000);
+    const url = `${CLOB_BASE}/prices-history?market=${closedMarketTokenId}&startTs=${startTs}&endTs=${endTs}&fidelity=1`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.log(`[診断] 過去データ検証: HTTPエラー ${res.status}(バックテストは実現困難と判断)`);
+      return;
+    }
+    const json = await res.json();
+    const count = json?.history?.length ?? 0;
+    if (count === 0) {
+      console.log(`[診断] 過去データ検証: 終了済み市場で細かい粒度(1分)のデータが0件。海外で報告されていたバグの通り、バックテストは困難な可能性が高い。`);
+    } else {
+      console.log(`[診断] 過去データ検証: 成功! ${count}件のデータポイントを取得できた。バックテストは実現可能な可能性が高い。サンプル: ${JSON.stringify(json.history.slice(0,3))}`);
+    }
+  } catch (e) {
+    console.log(`[診断] 過去データ検証: 例外 ${e.message}`);
+  }
 }
