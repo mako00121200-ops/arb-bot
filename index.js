@@ -4,21 +4,6 @@ import { startOkxFeed, startBybitFeed, startPolymarketFeed, updatePolymarketSubs
 import { checkLogicalConstraints, WATCHED_PAIRS } from "./logic-checker.js";
 import { recordSignal, resolveOpenPositions, getStats, getOpenCount, getRecentResolved } from "./paper-trader.js";
 
-/**
- * 予測市場の歪み観測所
- * ------------------------------------------------------------
- * DEXの価格裁定(旧バージョン)は2日間の観測で機会ゼロだったため、
- * 予測市場(Polymarket)の2つの歪みに絞って観測所を作り直した。
- *
- *  1. TWAPオラクル観測: Polymarketの5分/15分BTC/ETH市場が2026年8月から
- *     採用したTWAP決済方式を自前で計算し、市場の表示価格とのズレを検出
- *  2. 論理矛盾チェッカー: 「AがBを含むならA≧Bのはず」といった
- *     算数的に成り立つべき関係の破れを検出
- *
- * 実際の注文は一切出さない。両方とも「もし賭けていたら」を記録し、
- * 市場確定後に勝率・純利益(手数料込み)を自動集計する。
- */
-
 const BINANCE_SAMPLE_INTERVAL_SEC = parseInt(process.env.BINANCE_SAMPLE_INTERVAL_SEC || "2", 10);
 const TWAP_CHECK_INTERVAL_SEC = parseInt(process.env.TWAP_CHECK_INTERVAL_SEC || "5", 10);
 const LOGIC_CHECK_INTERVAL_SEC = parseInt(process.env.LOGIC_CHECK_INTERVAL_SEC || "60", 10);
@@ -31,7 +16,6 @@ let lastError = null;
 let sampleCount = 0;
 let twapCheckCount = 0;
 
-// ============ TWAPオラクル観測ループ ============
 let cachedMarkets = [];
 
 let twapCheckRunning = false;
@@ -63,8 +47,9 @@ async function twapCheckOnce() {
         marketId: r.marketId, question: r.question, edge: r.edge,
         predictedProbUp: r.ourEstimate,
         remainingSecAtEntry: r.remainingSec, usedRealisticPrice: realisticPrice !== null,
+        marketPriceAgeSecAtEntry: r.marketPriceAgeSec,
       });
-      console.log(`[TWAP] ${r.question}: 我々の推定${(r.ourEstimate*100).toFixed(1)}% vs 市場${(r.marketPrice*100).toFixed(1)}% ` +
+      console.log(`[TWAP] ${r.question}: 我々の推定${(r.ourEstimate*100).toFixed(1)}% vs 市場${(r.marketPrice*100).toFixed(1)}%(${r.marketPriceAgeSec?.toFixed(1)}秒前) ` +
         `(ズレ${(r.edge*100).toFixed(1)}pt, 残り${r.remainingSec}秒) → ${side}に紙上ベット記録`);
     }
   } catch (e) {
@@ -75,26 +60,13 @@ async function twapCheckOnce() {
   }
 }
 
-// ============ 論理矛盾チェックループ ============
 async function logicCheckOnce() {
   if (WATCHED_PAIRS.length === 0) return;
   try {
     const results = await checkLogicalConstraints();
     latestLogicSignals = results;
     for (const r of results) {
-      if (!r.violated || r.magnitude < EDGE_THRESHOLD) continue;
-      const resolveAtMs = Date.now() + 24 * 60 * 60 * 1000;
-      recordSignal("logic-checker", "A", r.marketA.yesPrice, resolveAtMs, {
-        label: r.label, edge: r.magnitude, marketA: r.marketA.slug, marketB: r.marketB.slug,
-      });
-      console.log(`[論理矛盾] ${r.label}: 矛盾を検出(差${(r.magnitude*100).toFixed(1)}pt) → 紙上ベット記録`);
-    }
-  } catch (e) {
-    console.error("論理矛盾チェックエラー:", e.message);
-  }
-}
-
-// ============ 決済確認ループ ============
+      if (!r.violated || r.magnitude 
 async function resolveOnce() {
   await resolveOpenPositions(async (pos) => {
     try {
@@ -112,7 +84,6 @@ async function resolveOnce() {
   });
 }
 
-// ============ 状況確認ページ ============
 function renderPage() {
   const twapStats = getStats("twap-oracle");
   const logicStats = getStats("logic-checker");
@@ -188,6 +159,14 @@ ${twapStats.timeBuckets?.some(b => b.count > 0) ? `<div class="card">
   <div class="note">残り時間が短い(確定に近い)ほど勝率が高いのが理想。</div>
 </div>` : ''}
 
+${twapStats.priceAgeBuckets?.some(b => b.count > 0) ? `<div class="card">
+  <h2>市場価格の「古さ」別 勝率</h2>
+  <table><thead><tr><th>区分</th><th style="text-align:right;">件数</th><th style="text-align:right;">勝率</th></tr></thead>
+  <tbody>${twapStats.priceAgeBuckets.map(b => `<tr><td>${b.label}</td><td style="text-align:right;">${b.count}</td>
+    <td style="text-align:right;">${b.winRate !== null ? b.winRate.toFixed(0)+'%' : '-'}</td></tr>`).join('')}</tbody></table>
+  <div class="note">古い価格の区分ほど勝率が高ければ「反応遅れを突けている」証拠。差が無ければ単なる逆張りの疑い。</div>
+</div>` : ''}
+
 <div class="card">
   <h2>今この瞬間の観測(TWAPオラクル)</h2>
   <table><thead><tr><th>#</th><th>資産</th><th>市場</th><th style="text-align:right;">残り</th><th style="text-align:right;">推定確率</th><th style="text-align:right;">市場価格</th><th style="text-align:right;">ズレ</th></tr></thead>
@@ -229,7 +208,6 @@ function startServer() {
   }).listen(port, () => console.log(`観測所ページ: ポート${port}`));
 }
 
-// 現在監視中のPolymarketトークンID一覧(市場が入れ替わるたびに更新する)
 let currentTokenIds = [];
 
 async function refreshMarketSubscriptions() {
@@ -271,7 +249,7 @@ async function main() {
 
   startPolymarketFeed(
     (tokenId, price, timestamp) => {
-      recordPolymarketTick(tokenId, price);
+      recordPolymarketTick(tokenId, price, timestamp);
       if (currentTokenIds.includes(tokenId)) twapCheckOnce();
     },
     (tokenId, bestBid, bestAsk) => {
