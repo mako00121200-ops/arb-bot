@@ -3,12 +3,14 @@ import { sampleBinancePrices, fetchActiveShortDurationMarkets, analyzeMarket, di
 import { startOkxFeed, startBybitFeed, startPolymarketFeed, updatePolymarketSubscription } from "./realtime.js";
 import { checkLogicalConstraints, WATCHED_PAIRS } from "./logic-checker.js";
 import { recordSignal, resolveOpenPositions, getStats, getOpenCount, getRecentResolved } from "./paper-trader.js";
+import { runWatchCycle, getRecentObservations } from "./dex-arb-watcher.js";
 
 const BINANCE_SAMPLE_INTERVAL_SEC = parseInt(process.env.BINANCE_SAMPLE_INTERVAL_SEC || "2", 10);
 const TWAP_CHECK_INTERVAL_SEC = parseInt(process.env.TWAP_CHECK_INTERVAL_SEC || "5", 10);
 const LOGIC_CHECK_INTERVAL_SEC = parseInt(process.env.LOGIC_CHECK_INTERVAL_SEC || "60", 10);
 const RESOLVE_CHECK_INTERVAL_SEC = parseInt(process.env.RESOLVE_CHECK_INTERVAL_SEC || "30", 10);
 const EDGE_THRESHOLD = parseFloat(process.env.EDGE_THRESHOLD || "0.05");
+const DEX_WATCH_INTERVAL_SEC = parseInt(process.env.DEX_WATCH_INTERVAL_SEC || "180", 10);
 
 let latestTwapSignals = [];
 let latestLogicSignals = [];
@@ -25,6 +27,13 @@ const MIN_CHECK_INTERVAL_MS = 500;
 const recordedMarketIds = new Set();
 const MAX_RECORDED_IDS = 2000;
 const marketIdToUpTokenId = new Map();
+
+// --- DEXアービトラージ観測(Base等) 用の状態 ---
+let dexWatchRunning = false;
+let dexWatchCount = 0;
+let lastDexWatchAt = null;
+let lastDexError = null;
+let latestDexResults = [];
 
 async function twapCheckOnce() {
   const now = Date.now();
@@ -110,6 +119,32 @@ async function resolveOnce() {
   });
 }
 
+// --- DEXアービトラージ観測を1サイクル実行する ---
+async function dexWatchOnce() {
+  if (dexWatchRunning) return;
+  dexWatchRunning = true;
+  try {
+    const result = await runWatchCycle({ topN: 8, gasCostUsd: 0.15 });
+    latestDexResults = result.results;
+    dexWatchCount++;
+    lastDexWatchAt = new Date().toISOString();
+
+    const profitable = result.results.filter((r) => r.profitable);
+    if (profitable.length > 0) {
+      for (const r of profitable) {
+        console.log(`[DEX] ${r.pairLabel}: 純利益 +$${r.netProfit.toFixed(2)}(価格差${r.priceDiffPercent.toFixed(2)}%)`);
+      }
+    } else {
+      console.log(`[DEX] 観測${result.checked}件・記録${result.logged}件・黒字0件`);
+    }
+  } catch (e) {
+    lastDexError = e.message;
+    console.error("DEX観測エラー:", e.message);
+  } finally {
+    dexWatchRunning = false;
+  }
+}
+
 function renderPage() {
   const twapStats = getStats("twap-oracle");
   const logicStats = getStats("logic-checker");
@@ -134,6 +169,18 @@ function renderPage() {
     <td style="text-align:right;color:${t.netPnl>=0?'#2ecc71':'#e74c3c'};">${t.netPnl>=0?'+':''}${(t.netPnl*100).toFixed(1)}pt</td></tr>`;
   }).join("") || `<tr><td colspan="6" style="color:#888;">まだ確定した紙上取引はありません</td></tr>`;
 
+  // --- DEXアービトラージ観測の集計 ---
+  const dexObservations = getRecentObservations(500);
+  const dexProfitableAll = dexObservations.filter((r) => r.profitable);
+  const dexBest = dexObservations.reduce((best, r) => (!best || r.netProfit > best.netProfit ? r : best), null);
+
+  const dexRows = latestDexResults.slice(0, 15).map((r, i) => {
+    const color = r.profitable ? "#2ecc71" : "#888";
+    return `<tr><td>${i+1}</td><td style="font-size:9px;">${r.pairLabel}</td>
+    <td style="text-align:right;">${r.priceDiffPercent.toFixed(2)}%</td>
+    <td style="text-align:right;color:${color};font-weight:600;">${r.netProfit>=0?'+':''}$${r.netProfit.toFixed(2)}</td></tr>`;
+  }).join("") || `<tr><td colspan="4" style="color:#888;">観測データがまだありません(次のサイクルを待機中)</td></tr>`;
+
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="refresh" content="30">
 <title>予測市場の歪み観測所</title><style>
@@ -150,7 +197,23 @@ td{padding:6px 3px;border-bottom:1px solid #1c1c1c;}
 .stat .v{font-size:17px;font-weight:600;} .stat .l{font-size:8.5px;color:#888;margin-top:2px;}
 </style></head><body>
 <h1>🎯 予測市場の歪み観測所</h1>
-<div class="sub">紙上取引のみ(実際の注文は出しません) / 観測${sampleCount}回・TWAPチェック${twapCheckCount}回</div>
+<div class="sub">紙上取引のみ(実際の注文は出しません) / 観測${sampleCount}回・TWAPチェック${twapCheckCount}回・DEX観測${dexWatchCount}回</div>
+
+<div class="card">
+  <h2>🔍 DEXアービトラージ観測(Base等)</h2>
+  <div class="stat">
+    <div><div class="v">${dexObservations.length}</div><div class="l">記録件数</div></div>
+    <div><div class="v" style="color:${dexProfitableAll.length>0?'#2ecc71':'#888'};">${dexProfitableAll.length}</div><div class="l">黒字だった件数</div></div>
+    <div><div class="v" style="color:${dexBest && dexBest.netProfit>=0?'#2ecc71':'#e74c3c'};">${dexBest ? (dexBest.netProfit>=0?'+':'')+'$'+dexBest.netProfit.toFixed(2) : '-'}</div><div class="l">最高純利益</div></div>
+    <div><div class="v">${lastDexWatchAt ? new Date(lastDexWatchAt).toLocaleTimeString('ja-JP') : '-'}</div><div class="l">最終観測時刻</div></div>
+  </div>
+  <table><thead><tr><th>#</th><th>ペア</th><th style="text-align:right;">価格差</th><th style="text-align:right;">純利益</th></tr></thead>
+  <tbody>${dexRows}</tbody></table>
+  <div class="note">
+    prospector.jsが選んだ候補ペアを、DexScreenerのデータで観測 → ガス代・手数料込みの純利益を計算して記録。<br>
+    実際の注文は出していません(紙上観測のみ)。${lastDexError ? `<br><span style="color:#e74c3c;">エラー: ${lastDexError}</span>` : ''}
+  </div>
+</div>
 
 <div class="card">
   <h2>📈 TWAPオラクル戦略 成績</h2>
@@ -302,6 +365,10 @@ async function main() {
 
   setInterval(logicCheckOnce, LOGIC_CHECK_INTERVAL_SEC * 1000);
   setInterval(resolveOnce, RESOLVE_CHECK_INTERVAL_SEC * 1000);
+
+  // --- DEXアービトラージ観測を開始(起動直後に1回、以後は一定間隔で) ---
+  dexWatchOnce();
+  setInterval(dexWatchOnce, DEX_WATCH_INTERVAL_SEC * 1000);
 }
 
 main().catch((e) => { console.error("致命的エラー:", e); process.exit(1); });
