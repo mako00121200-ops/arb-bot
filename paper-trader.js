@@ -93,13 +93,19 @@ const TIME_BUCKETS = [
   { label: "10-30秒", min: 10, max: 30 },
   { label: "30秒+", min: 30, max: Infinity },
 ];
+const PRICE_AGE_BUCKETS = [
+  { label: "0-1秒(最新)", min: 0, max: 1 },
+  { label: "1-3秒", min: 1, max: 3 },
+  { label: "3-10秒", min: 3, max: 10 },
+  { label: "10秒+(古い)", min: 10, max: Infinity },
+];
 
 export function getStats(strategy = null) {
   const rows = strategy ? state.resolved.filter((r) => r.strategy === strategy) : state.resolved;
   if (rows.length === 0) {
     return {
       count: 0, wins: 0, winRate: 0, totalNetPnl: 0, avgNetPnl: 0, avgEdgeAtEntry: null,
-      brierScore: null, edgeBuckets: [], timeBuckets: [],
+      brierScore: null, edgeBuckets: [], timeBuckets: [], priceAgeBuckets: [],
     };
   }
   const wins = rows.filter((r) => r.won).length;
@@ -115,6 +121,7 @@ export function getStats(strategy = null) {
     brierScore: calcBrierScore(rows),
     edgeBuckets: calcBucketedStats(rows, (r) => Math.abs(r.meta?.edge), EDGE_BUCKETS),
     timeBuckets: calcBucketedStats(rows, (r) => r.meta?.remainingSecAtEntry, TIME_BUCKETS),
+    priceAgeBuckets: calcBucketedStats(rows, (r) => r.meta?.marketPriceAgeSecAtEntry, PRICE_AGE_BUCKETS),
   };
 }
 
