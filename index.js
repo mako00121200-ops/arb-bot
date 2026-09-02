@@ -66,7 +66,18 @@ async function logicCheckOnce() {
     const results = await checkLogicalConstraints();
     latestLogicSignals = results;
     for (const r of results) {
-      if (!r.violated || r.magnitude 
+      if (!r.violated || r.magnitude < EDGE_THRESHOLD) continue;
+      const resolveAtMs = Date.now() + 24 * 60 * 60 * 1000;
+      recordSignal("logic-checker", "A", r.marketA.yesPrice, resolveAtMs, {
+        label: r.label, edge: r.magnitude, marketA: r.marketA.slug, marketB: r.marketB.slug,
+      });
+      console.log(`[論理矛盾] ${r.label}: 矛盾を検出(差${(r.magnitude*100).toFixed(1)}pt) → 紙上ベット記録`);
+    }
+  } catch (e) {
+    console.error("論理矛盾チェックエラー:", e.message);
+  }
+}
+
 async function resolveOnce() {
   await resolveOpenPositions(async (pos) => {
     try {
