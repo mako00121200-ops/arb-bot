@@ -355,6 +355,7 @@ function getPersistenceSummary() {
 const DEX_PROSPECT_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 
 let dexCachedCandidates = [];
+let dexCandidateRotationOffset = 0;
 const poolAddressToCandidate = new Map();
 let onchainReactionCount = 0;
 let onchainLatencyLog = [];
@@ -403,6 +404,7 @@ async function dexGetCandidates(topN) {
       const prospect = await runProspect({ minTvlUSD: 20000, topN: 30 });
       dexCachedCandidates = prospect.topPairs;
       dexLastProspectAt = now;
+      dexCandidateRotationOffset = 0;
       console.log(`[DEX] 候補ペア再選定完了: ${dexCachedCandidates.length}件`);
     } catch (e) {
       console.error("[DEX] 候補ペア選定に失敗(前回のキャッシュを使い続けます):", e.message);
@@ -411,7 +413,21 @@ async function dexGetCandidates(topN) {
     }
   }
 
-  return dexCachedCandidates.slice(0, topN);
+  const total = dexCachedCandidates.length;
+  if (total === 0) return [];
+
+  // 毎回同じ上位N件だけを見るのではなく、キャッシュ済みの全候補を
+  // 順番にローテーションして観測する。こうすることでDeFiLlamaへの
+  // 追加リクエストなしに、1時間待たず短時間で全候補を一巡できる。
+  const batchSize = Math.min(topN, total);
+  const start = dexCandidateRotationOffset % total;
+  const selected = [];
+  for (let i = 0; i < batchSize; i++) {
+    selected.push(dexCachedCandidates[(start + i) % total]);
+  }
+  dexCandidateRotationOffset = (start + batchSize) % total;
+
+  return selected;
 }
 
 async function runWatchCycle({ topN = 8 } = {}) {
