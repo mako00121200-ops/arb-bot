@@ -114,6 +114,20 @@ function dexNormalizeChain(chain) {
   return map[(chain || "").toLowerCase()] || (chain || "").toLowerCase();
 }
 
+// チェーンごとの想定ガス代(USD)。イーサリアムL1はL2群より一桁以上高いため、
+// 一律の値を使うと「小さな価格差」を誤って黒字判定してしまう。
+const CHAIN_GAS_COST_USD = {
+  base: 0.05,
+  arbitrum: 0.10,
+  optimism: 0.05,
+  ethereum: 8.0,
+  polygon: 0.02,
+};
+function getGasCostForChain(chain) {
+  const key = dexNormalizeChain(chain);
+  return CHAIN_GAS_COST_USD[key] ?? 0.25;
+}
+
 function dexLoadLog() {
   try {
     if (fs.existsSync(DEX_LOG_FILE)) return JSON.parse(fs.readFileSync(DEX_LOG_FILE, "utf8"));
@@ -132,36 +146,45 @@ function dexSaveLog(entries) {
   }
 }
 
+// tokenAだけで検索すると、人気トークン(WETH等)は上位30件がUSDC等の
+// 出来高最大ペアで埋まり、本命のペアが枠外に押し出されることがある。
+// tokenA・tokenB両方で検索して結果を合成することで、この取りこぼしを防ぐ。
 async function dexFetchPairsForToken(tokenAddress, chain, otherTokenAddress) {
-  const res = await dexFetchWithTimeout(DEXSCREENER_TOKEN_API + tokenAddress);
-  if (!res.ok) throw new Error(`DexScreener HTTP ${res.status}`);
-  const json = await res.json();
-  const pairs = json.pairs || [];
   const targetChain = dexNormalizeChain(chain);
+  const target = tokenAddress.toLowerCase();
   const other = otherTokenAddress.toLowerCase();
 
-  const filtered = pairs.filter((p) => {
+  const [resA, resB] = await Promise.all([
+    dexFetchWithTimeout(DEXSCREENER_TOKEN_API + tokenAddress),
+    dexFetchWithTimeout(DEXSCREENER_TOKEN_API + otherTokenAddress),
+  ]);
+  if (!resA.ok && !resB.ok) {
+    throw new Error(`DexScreener HTTP ${resA.status}/${resB.status}`);
+  }
+
+  const pairsA = resA.ok ? (await resA.json()).pairs || [] : [];
+  const pairsB = resB.ok ? (await resB.json()).pairs || [] : [];
+
+  const merged = new Map();
+  for (const p of [...pairsA, ...pairsB]) {
+    if (p.pairAddress) merged.set(p.pairAddress, p);
+  }
+  const allPairs = [...merged.values()];
+
+  const filtered = allPairs.filter((p) => {
     if ((p.chainId || "").toLowerCase() !== targetChain) return false;
     const base = (p.baseToken?.address || "").toLowerCase();
     const quote = (p.quoteToken?.address || "").toLowerCase();
-    return base === other || quote === other;
+    const hasTarget = base === target || quote === target;
+    const hasOther = base === other || quote === other;
+    return hasTarget && hasOther;
   });
 
-  const rawChainIds = [...new Set(pairs.map((p) => p.chainId))];
-  console.log(`[DEX診断] candidate.chain="${chain}" → 正規化後="${targetChain}" / DexScreener生件数=${pairs.length}(chainId内訳: ${JSON.stringify(rawChainIds)}) / フィルター後=${filtered.length}件(うちDEX一覧: ${JSON.stringify([...new Set(filtered.map(p=>p.dexId))])})`);
+  const rawChainIds = [...new Set(allPairs.map((p) => p.chainId))];
+  console.log(`[DEX診断] candidate.chain="${chain}" → 正規化後="${targetChain}" / DexScreener取得件数=${allPairs.length}件(tokenA検索${pairsA.length}件+tokenB検索${pairsB.length}件、重複除去後・chainId内訳: ${JSON.stringify(rawChainIds)}) / フィルター後=${filtered.length}件(うちDEX一覧: ${JSON.stringify([...new Set(filtered.map(p=>p.dexId))])})`);
 
   if (filtered.length === 0) {
-    const onTargetChain = pairs.filter((p) => (p.chainId || "").toLowerCase() === targetChain);
-    if (onTargetChain.length > 0) {
-      const otherAddrs = onTargetChain.map((p) => {
-        const base = (p.baseToken?.address || "").toLowerCase();
-        const quote = (p.quoteToken?.address || "").toLowerCase();
-        return base === tokenAddress.toLowerCase() ? quote : base;
-      });
-      console.log(`[DEX診断詳細] ${chain}上にtokenA(${tokenAddress.toLowerCase()})のペアは${onTargetChain.length}件あったが、期待したtokenB(${other})とは不一致。実際の相手トークン: ${JSON.stringify(otherAddrs.slice(0,5))}`);
-    } else {
-      console.log(`[DEX診断詳細] tokenA(${tokenAddress.toLowerCase()})は${chain}上に1件もペアが見つからなかった(見つかった先チェーン: ${JSON.stringify(rawChainIds)})`);
-    }
+    console.log(`[DEX診断詳細] tokenA(${target})・tokenB(${other})両方で検索したが、${chain}上で両方を含むペアが見つからなかった`);
   }
 
   return filtered;
@@ -213,7 +236,8 @@ function dexToPoolShape(pair, targetTokenAddress) {
   };
 }
 
-async function dexWatchOnePair(candidate, gasCostUsd) {
+async function dexWatchOnePair(candidate) {
+  const gasCostUsd = getGasCostForChain(candidate.chain);
   const rawPairs = await dexFetchPairsForToken(candidate.tokenA, candidate.chain, candidate.tokenB);
 
   const pools = rawPairs
@@ -272,7 +296,7 @@ function dexSavePersistenceLog(entries) {
   }
 }
 
-function trackPersistence(candidate, gasCostUsd, initialResult) {
+function trackPersistence(candidate, initialResult) {
   const trackingId = `${candidate.chain}-${candidate.symbol}-${Date.now()}`;
   const record = {
     trackingId,
@@ -289,7 +313,7 @@ function trackPersistence(candidate, gasCostUsd, initialResult) {
   for (const delaySec of PERSISTENCE_CHECK_DELAYS_SEC) {
     setTimeout(async () => {
       try {
-        const followUp = await dexWatchOnePair(candidate, gasCostUsd);
+        const followUp = await dexWatchOnePair(candidate);
         const entry = followUp
           ? { delaySec, stillExists: true, priceDiffPercent: followUp.priceDiffPercent, netProfit: followUp.netProfit }
           : { delaySec, stillExists: false, priceDiffPercent: null, netProfit: null };
@@ -339,7 +363,7 @@ async function handleOnchainSync(chainName, poolAddress, reserve0, reserve1, rec
   const entry = poolAddressToCandidate.get(poolAddress);
   if (!entry) return;
   try {
-    const observed = await dexWatchOnePair(entry.candidate, entry.gasCostUsd);
+    const observed = await dexWatchOnePair(entry.candidate);
     const latencyMs = Date.now() - receivedAt;
     onchainReactionCount++;
     onchainLatencyLog.push(latencyMs);
@@ -390,7 +414,7 @@ async function dexGetCandidates(topN) {
   return dexCachedCandidates.slice(0, topN);
 }
 
-async function runWatchCycle({ topN = 8, gasCostUsd = 0.15 } = {}) {
+async function runWatchCycle({ topN = 8 } = {}) {
   console.log("[DEX] 観測サイクル開始");
   const candidates = await dexGetCandidates(topN);
 
@@ -404,16 +428,16 @@ async function runWatchCycle({ topN = 8, gasCostUsd = 0.15 } = {}) {
 
   for (const candidate of candidates) {
     try {
-      const observed = await dexWatchOnePair(candidate, gasCostUsd);
+      const observed = await dexWatchOnePair(candidate);
       if (observed) {
         results.push(observed);
         log.push(observed);
         if (Math.abs(observed.priceDiffPercent) >= PERSISTENCE_TRIGGER_THRESHOLD_PCT) {
-          trackPersistence(candidate, gasCostUsd, observed);
+          trackPersistence(candidate, observed);
         }
         if (observed.cheapPoolAddress && observed.expensivePoolAddress) {
-          poolAddressToCandidate.set(observed.cheapPoolAddress, { candidate, gasCostUsd });
-          poolAddressToCandidate.set(observed.expensivePoolAddress, { candidate, gasCostUsd });
+          poolAddressToCandidate.set(observed.cheapPoolAddress, { candidate });
+          poolAddressToCandidate.set(observed.expensivePoolAddress, { candidate });
           updatePoolSubscriptions(candidate.chain, [observed.cheapPoolAddress, observed.expensivePoolAddress]);
         }
       }
@@ -554,7 +578,7 @@ async function dexWatchOnce() {
   if (dexWatchRunning) return;
   dexWatchRunning = true;
   try {
-    const result = await runWatchCycle({ topN: 8, gasCostUsd: 0.25 });
+    const result = await runWatchCycle({ topN: 8 });
     latestDexResults = result.results;
     dexWatchCount++;
     lastDexWatchAt = new Date().toISOString();
