@@ -150,6 +150,20 @@ async function dexFetchPairsForToken(tokenAddress, chain, otherTokenAddress) {
   const rawChainIds = [...new Set(pairs.map((p) => p.chainId))];
   console.log(`[DEX診断] candidate.chain="${chain}" → 正規化後="${targetChain}" / DexScreener生件数=${pairs.length}(chainId内訳: ${JSON.stringify(rawChainIds)}) / フィルター後=${filtered.length}件(うちDEX一覧: ${JSON.stringify([...new Set(filtered.map(p=>p.dexId))])})`);
 
+  if (filtered.length === 0) {
+    const onTargetChain = pairs.filter((p) => (p.chainId || "").toLowerCase() === targetChain);
+    if (onTargetChain.length > 0) {
+      const otherAddrs = onTargetChain.map((p) => {
+        const base = (p.baseToken?.address || "").toLowerCase();
+        const quote = (p.quoteToken?.address || "").toLowerCase();
+        return base === tokenAddress.toLowerCase() ? quote : base;
+      });
+      console.log(`[DEX診断詳細] ${chain}上にtokenA(${tokenAddress.toLowerCase()})のペアは${onTargetChain.length}件あったが、期待したtokenB(${other})とは不一致。実際の相手トークン: ${JSON.stringify(otherAddrs.slice(0,5))}`);
+    } else {
+      console.log(`[DEX診断詳細] tokenA(${tokenAddress.toLowerCase()})は${chain}上に1件もペアが見つからなかった(見つかった先チェーン: ${JSON.stringify(rawChainIds)})`);
+    }
+  }
+
   return filtered;
 }
 
