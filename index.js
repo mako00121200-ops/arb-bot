@@ -647,7 +647,7 @@ function renderPage() {
 
   const dexObservations = getRecentObservations(500);
   const dexProfitableAll = dexObservations.filter((r) => r.profitable);
-  const dexBest = dexObservations.reduce((best, r) => (!best || r.netProfit > best.netProfit ? r : best), null);
+  const dexCumulativeProfit = dexProfitableAll.reduce((s, r) => s + r.netProfit, 0);
   const persistenceSummary = getPersistenceSummary();
   const onchainLatencyStats = getOnchainLatencyStats();
 
@@ -681,7 +681,7 @@ td{padding:6px 3px;border-bottom:1px solid #1c1c1c;}
   <div class="stat">
     <div><div class="v">${dexObservations.length}</div><div class="l">記録件数</div></div>
     <div><div class="v" style="color:${dexProfitableAll.length>0?'#2ecc71':'#888'};">${dexProfitableAll.length}</div><div class="l">黒字だった件数</div></div>
-    <div><div class="v" style="color:${dexBest && dexBest.netProfit>=0?'#2ecc71':'#e74c3c'};">${dexBest ? (dexBest.netProfit>=0?'+':'')+'$'+dexBest.netProfit.toFixed(2) : '-'}</div><div class="l">最高純利益</div></div>
+    <div><div class="v" style="color:${dexCumulativeProfit>=0?'#2ecc71':'#e74c3c'};">${dexCumulativeProfit>=0?'+':''}$${dexCumulativeProfit.toFixed(2)}</div><div class="l">累積純利益(黒字分の合計)</div></div>
     <div><div class="v">${lastDexWatchAt ? new Date(lastDexWatchAt).toLocaleTimeString('ja-JP') : '-'}</div><div class="l">最終観測時刻</div></div>
   </div>
   <table><thead><tr><th>#</th><th>ペア</th><th style="text-align:right;">価格差</th><th style="text-align:right;">純利益</th></tr></thead>
