@@ -10,6 +10,12 @@
  * 実際に計算し、市場の表示価格とズレがあれば記録する。
  *
  * 実際の注文は一切出さない(紙上取引での検証のみ)。
+ *
+ * 修正点: fetchMidpointが、WebSocketキャッシュの鮮度を確認せずに
+ * 何分前の価格でも「現在価格」として使ってしまっていた。
+ * 5〜15分の短期市場でこれをやると、古い価格と比較して存在しない
+ * 歪みを検知してしまう。キャッシュが古すぎる場合はREST APIで
+ * 取り直すようにした。
  */
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
@@ -233,6 +239,8 @@ export function getBook(tokenId) {
   return livePolyBook[tokenId] ?? null;
 }
 
+const MAX_CACHE_AGE_SEC = 15;
+
 let midpointDiagCount = 0;
 async function fetchMidpoint(tokenId) {
   midpointDiagCount++;
@@ -240,8 +248,11 @@ async function fetchMidpoint(tokenId) {
   const cached = livePolyPrices[tokenId];
   if (cached !== undefined) {
     const ageSec = (Date.now() - cached.at) / 1000;
-    if (shouldLog) console.log(`[診断] fetchMidpoint: WebSocketキャッシュから取得 tokenId=${tokenId.slice(0,12)}... 値=${cached.price} 経過${ageSec.toFixed(1)}秒`);
-    return { price: cached.price, ageSec };
+    if (ageSec <= MAX_CACHE_AGE_SEC) {
+      if (shouldLog) console.log(`[診断] fetchMidpoint: WebSocketキャッシュから取得 tokenId=${tokenId.slice(0,12)}... 値=${cached.price} 経過${ageSec.toFixed(1)}秒`);
+      return { price: cached.price, ageSec };
+    }
+    if (shouldLog) console.log(`[診断] fetchMidpoint: キャッシュが${ageSec.toFixed(1)}秒前と古すぎるためREST APIで取り直します tokenId=${tokenId.slice(0,12)}...`);
   }
   try {
     const res = await fetch(`${CLOB_BASE}/midpoint?token_id=${tokenId}`);
