@@ -44,6 +44,7 @@ const chainReconnectDelays = {};
 const chainLastDataAt = {};
 const chainSubscribedPools = {};
 const chainWatchdogTimers = {};
+const chainIntentionalClose = {};
 let globalOnSync = null;
 
 function sendSubscription(chainName) {
@@ -93,6 +94,10 @@ function connectChain(chainName, wsUrl) {
     });
 
     socket.addEventListener("close", () => {
+      if (chainIntentionalClose[chainName]) {
+        chainIntentionalClose[chainName] = false;
+        return;
+      }
       console.log(`[オンチェーン] ${chainName}: 切断。再接続します…`);
       scheduleReconnect();
     });
@@ -111,6 +116,7 @@ function connectChain(chainName, wsUrl) {
     const last = chainLastDataAt[chainName] ?? Date.now();
     if (Date.now() - last > DATA_TIMEOUT_MS) {
       console.log(`[オンチェーン] ${chainName}: 無応答を検知。強制再接続します…`);
+      chainIntentionalClose[chainName] = true;
       try { chainSockets[chainName]?.close(); } catch (e) {}
       chainLastDataAt[chainName] = Date.now();
       connect();
