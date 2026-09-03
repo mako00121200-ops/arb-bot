@@ -1,14 +1,12 @@
 /**
- * リアルタイム価格フィード(WebSocket版) v2
+ * リアルタイム価格フィード(WebSocket版) v3
  * ------------------------------------------------------------
- * v1からの変更点(重要な修正):
- *   OKX・Polymarketともに、接続を維持するには「ping/pong」を
- *   アプリケーション側で明示的にやり取りする必要がある仕様だった。
- *   これが無いと約30秒で接続が切れる。さらに厄介なことに、
- *   「見た目は接続中(close/errorイベントが来ない)なのに、実際は
- *   データが流れてこなくなる」壊れ方もあるとの報告が複数あったため、
- *   「最後にデータを受け取ってから一定時間が経ったら強制再接続する」
- *   監視の仕組みも追加した。
+ * v2からの変更点(重要な修正):
+ *   1. 強制再接続時に、close イベント側でも重複して再接続予約が
+ *      走ってしまうバグを修正(意図的なcloseかどうかをフラグで判定)。
+ *   2. OKXの ping/pong の向きが逆だった。OKXの仕様ではサーバーからの
+ *      pingを待つだけでなく、クライアント側からも能動的にpingを
+ *      送る必要があるため、Bybit同様の定期ping送信を追加。
  */
 
 const OKX_WS_URL = "wss://ws.okx.com:8443/ws/v5/public";
@@ -25,31 +23,41 @@ let okxSocket = null;
 let okxReconnectDelay = 1000;
 let okxLastDataAt = Date.now();
 let okxWatchdogTimer = null;
+let okxPingTimer = null;
+let okxIntentionalClose = false;
 
 export function startOkxFeed(onTick) {
   function connect() {
+    let socket;
     try {
-      okxSocket = new WebSocket(OKX_WS_URL);
+      socket = new WebSocket(OKX_WS_URL);
+      okxSocket = socket;
     } catch (e) {
       console.log(`[診断] OKX WebSocket接続失敗: ${e.message}`);
       scheduleReconnect();
       return;
     }
 
-    okxSocket.addEventListener("open", () => {
+    socket.addEventListener("open", () => {
       okxReconnectDelay = 1000;
       okxLastDataAt = Date.now();
       const args = Object.keys(OKX_INSTRUMENTS).map((instId) => ({ channel: "tickers", instId }));
-      okxSocket.send(JSON.stringify({ op: "subscribe", args }));
+      socket.send(JSON.stringify({ op: "subscribe", args }));
       console.log("[OKX WebSocket] 接続完了・購読開始");
+
+      if (okxPingTimer) clearInterval(okxPingTimer);
+      okxPingTimer = setInterval(() => {
+        if (okxSocket?.readyState === 1) okxSocket.send("ping");
+      }, 20000);
     });
 
-    okxSocket.addEventListener("message", (event) => {
+    socket.addEventListener("message", (event) => {
       okxLastDataAt = Date.now();
       if (event.data === "ping") {
-        okxSocket.send("pong");
+        socket.send("pong");
         return;
       }
+      if (event.data === "pong") return;
       try {
         const msg = JSON.parse(event.data);
         if (msg.event) return;
@@ -62,12 +70,17 @@ export function startOkxFeed(onTick) {
       } catch (e) {}
     });
 
-    okxSocket.addEventListener("close", () => {
+    socket.addEventListener("close", () => {
+      if (okxIntentionalClose) {
+        okxIntentionalClose = false;
+        return;
+      }
       console.log("[OKX WebSocket] 切断。再接続します…");
+      if (okxPingTimer) clearInterval(okxPingTimer);
       scheduleReconnect();
     });
 
-    okxSocket.addEventListener("error", () => {});
+    socket.addEventListener("error", () => {});
   }
 
   function scheduleReconnect() {
@@ -79,6 +92,8 @@ export function startOkxFeed(onTick) {
   okxWatchdogTimer = setInterval(() => {
     if (Date.now() - okxLastDataAt > DATA_TIMEOUT_MS) {
       console.log("[OKX WebSocket] 無応答を検知。強制再接続します…");
+      okxIntentionalClose = true;
+      if (okxPingTimer) clearInterval(okxPingTimer);
       try { okxSocket?.close(); } catch (e) {}
       okxLastDataAt = Date.now();
       connect();
@@ -94,22 +109,25 @@ let bybitReconnectDelay = 1000;
 let bybitLastDataAt = Date.now();
 let bybitWatchdogTimer = null;
 let bybitPingTimer = null;
+let bybitIntentionalClose = false;
 
 export function startBybitFeed(onTick) {
   function connect() {
+    let socket;
     try {
-      bybitSocket = new WebSocket(BYBIT_WS_URL);
+      socket = new WebSocket(BYBIT_WS_URL);
+      bybitSocket = socket;
     } catch (e) {
       console.log(`[診断] Bybit WebSocket接続失敗: ${e.message}`);
       scheduleReconnect();
       return;
     }
 
-    bybitSocket.addEventListener("open", () => {
+    socket.addEventListener("open", () => {
       bybitReconnectDelay = 1000;
       bybitLastDataAt = Date.now();
       const args = Object.keys(BYBIT_INSTRUMENTS).map((s) => `tickers.${s}`);
-      bybitSocket.send(JSON.stringify({ op: "subscribe", args }));
+      socket.send(JSON.stringify({ op: "subscribe", args }));
       console.log("[Bybit WebSocket] 接続完了・購読開始");
 
       if (bybitPingTimer) clearInterval(bybitPingTimer);
@@ -118,7 +136,7 @@ export function startBybitFeed(onTick) {
       }, 20000);
     });
 
-    bybitSocket.addEventListener("message", (event) => {
+    socket.addEventListener("message", (event) => {
       bybitLastDataAt = Date.now();
       try {
         const msg = JSON.parse(event.data);
@@ -131,13 +149,17 @@ export function startBybitFeed(onTick) {
       } catch (e) {}
     });
 
-    bybitSocket.addEventListener("close", () => {
+    socket.addEventListener("close", () => {
+      if (bybitIntentionalClose) {
+        bybitIntentionalClose = false;
+        return;
+      }
       console.log("[Bybit WebSocket] 切断。再接続します…");
       if (bybitPingTimer) clearInterval(bybitPingTimer);
       scheduleReconnect();
     });
 
-    bybitSocket.addEventListener("error", () => {});
+    socket.addEventListener("error", () => {});
   }
 
   function scheduleReconnect() {
@@ -149,6 +171,8 @@ export function startBybitFeed(onTick) {
   bybitWatchdogTimer = setInterval(() => {
     if (Date.now() - bybitLastDataAt > DATA_TIMEOUT_MS) {
       console.log("[Bybit WebSocket] 無応答を検知。強制再接続します…");
+      bybitIntentionalClose = true;
+      if (bybitPingTimer) clearInterval(bybitPingTimer);
       try { bybitSocket?.close(); } catch (e) {}
       bybitLastDataAt = Date.now();
       connect();
@@ -167,6 +191,7 @@ let polyOnBookCallback = null;
 let polyLastDataAt = Date.now();
 let polyPingTimer = null;
 let polyWatchdogTimer = null;
+let polyIntentionalClose = false;
 
 function sendPolySubscription() {
   if (!polySocket || polySocket.readyState !== 1) return;
@@ -179,15 +204,17 @@ export function startPolymarketFeed(onUpdate, onBook) {
   polyOnBookCallback = onBook;
 
   function connect() {
+    let socket;
     try {
-      polySocket = new WebSocket(POLYMARKET_WS_URL);
+      socket = new WebSocket(POLYMARKET_WS_URL);
+      polySocket = socket;
     } catch (e) {
       console.log(`[診断] Polymarket WebSocket接続失敗: ${e.message}`);
       scheduleReconnect();
       return;
     }
 
-    polySocket.addEventListener("open", () => {
+    socket.addEventListener("open", () => {
       polyReconnectDelay = 1000;
       polyLastDataAt = Date.now();
       console.log("[Polymarket WebSocket] 接続完了");
@@ -199,7 +226,7 @@ export function startPolymarketFeed(onUpdate, onBook) {
       }, 10000);
     });
 
-    polySocket.addEventListener("message", (event) => {
+    socket.addEventListener("message", (event) => {
       polyLastDataAt = Date.now();
       if (event.data === "PONG" || event.data === "pong") return;
       try {
@@ -229,13 +256,17 @@ export function startPolymarketFeed(onUpdate, onBook) {
       } catch (e) {}
     });
 
-    polySocket.addEventListener("close", () => {
+    socket.addEventListener("close", () => {
+      if (polyIntentionalClose) {
+        polyIntentionalClose = false;
+        return;
+      }
       console.log("[Polymarket WebSocket] 切断。再接続します…");
       if (polyPingTimer) clearInterval(polyPingTimer);
       scheduleReconnect();
     });
 
-    polySocket.addEventListener("error", () => {});
+    socket.addEventListener("error", () => {});
   }
 
   function scheduleReconnect() {
@@ -247,6 +278,8 @@ export function startPolymarketFeed(onUpdate, onBook) {
   polyWatchdogTimer = setInterval(() => {
     if (Date.now() - polyLastDataAt > DATA_TIMEOUT_MS) {
       console.log("[Polymarket WebSocket] 無応答を検知。強制再接続します…");
+      polyIntentionalClose = true;
+      if (polyPingTimer) clearInterval(polyPingTimer);
       try { polySocket?.close(); } catch (e) {}
       polyLastDataAt = Date.now();
       connect();
