@@ -6,7 +6,19 @@ import { recordSignal, resolveOpenPositions, getStats, getOpenCount, getRecentRe
 import fs from "fs";
 import { runProspect } from "./prospector.js";
 
-const DEX_FETCH_TIMEOUT_MS = 20000;
+/**
+ * ============================================================
+ * DEXアービトラージ観測ウォッチャー
+ * ------------------------------------------------------------
+ * 新規ファイルを作らずに済むよう、index.js に直接まとめている。
+ * 修正点:
+ *   1) すべてのfetchにタイムアウトを追加(固まったまま止まらないように)
+ *   2) DeFiLlamaの全プール取得(重い)は毎サイクルではなく
+ *      PROSPECT_REFRESH_INTERVAL_MSごとにキャッシュを更新する方式
+ * ============================================================
+ */
+
+const DEX_FETCH_TIMEOUT_MS = 20000; // 20秒でタイムアウト
 
 async function dexFetchWithTimeout(url, timeoutMs = DEX_FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
@@ -116,7 +128,9 @@ function dexNormalizeChain(chain) {
 function dexLoadLog() {
   try {
     if (fs.existsSync(DEX_LOG_FILE)) return JSON.parse(fs.readFileSync(DEX_LOG_FILE, "utf8"));
-  } catch (e) {}
+  } catch (e) {
+    /* 読み込み失敗時は空ログから再開 */
+  }
   return [];
 }
 
@@ -146,11 +160,21 @@ async function dexFetchPairsForToken(tokenAddress, chain, otherTokenAddress) {
 }
 
 function dexToPoolShape(pair, targetTokenAddress) {
-  const baseIsTarget = (pair.baseToken?.address || "").toLowerCase() === targetTokenAddress.toLowerCase();
-  const reserveX = baseIsTarget ? pair.liquidity?.base : pair.liquidity?.quote;
-  const reserveY = baseIsTarget ? pair.liquidity?.quote : pair.liquidity?.base;
+  const liqBase = pair.liquidity?.base;
+  const liqQuote = pair.liquidity?.quote;
+  const priceNative = parseFloat(pair.priceNative);
 
-  if (!reserveX || !reserveY) return null;
+  if (!liqBase || !liqQuote || !priceNative || !isFinite(priceNative)) return null;
+
+  // 自己整合性チェック: 準備量から逆算した価格と、DexScreenerが報告している
+  // 価格が大きく乖離しているプールは、データが壊れている/信頼できないとみなし除外する
+  const impliedPrice = liqQuote / liqBase;
+  const deviation = Math.abs(impliedPrice - priceNative) / priceNative;
+  if (deviation > 0.05) return null;
+
+  const baseIsTarget = (pair.baseToken?.address || "").toLowerCase() === targetTokenAddress.toLowerCase();
+  const reserveX = baseIsTarget ? liqBase : liqQuote;
+  const reserveY = baseIsTarget ? liqQuote : liqBase;
 
   return {
     dexId: pair.dexId,
@@ -185,6 +209,14 @@ async function dexWatchOnePair(candidate, gasCostUsd) {
     pairLabel: `${candidate.symbol} on ${candidate.chain} (${cheapPool.dexId} -> ${expensivePool.dexId})`,
   });
 
+  // 最終安全確認: 実際のDEX間裁定で20%を超える価格差が生きたまま残ることは
+  // 現実的にありえない(研究上、実在する差はほぼ1%未満)。これを超える場合は
+  // データの誤りとみなし、記録せずに捨てる。
+  if (Math.abs(result.priceDiffPercent) > 20) {
+    console.warn(`[DEX] 異常な価格差を検出、データ不備として除外 (${candidate.symbol} / ${candidate.chain}): ${result.priceDiffPercent.toFixed(1)}%`);
+    return null;
+  }
+
   return {
     ...result,
     chain: candidate.chain,
@@ -195,7 +227,7 @@ async function dexWatchOnePair(candidate, gasCostUsd) {
   };
 }
 
-const DEX_PROSPECT_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
+const DEX_PROSPECT_REFRESH_INTERVAL_MS = 60 * 60 * 1000; // 1時間ごとに候補を更新
 
 let dexCachedCandidates = [];
 let dexLastProspectAt = 0;
@@ -285,6 +317,7 @@ const recordedMarketIds = new Set();
 const MAX_RECORDED_IDS = 2000;
 const marketIdToUpTokenId = new Map();
 
+// --- DEXアービトラージ観測(Base等) 用の状態 ---
 let dexWatchRunning = false;
 let dexWatchCount = 0;
 let lastDexWatchAt = null;
@@ -375,6 +408,7 @@ async function resolveOnce() {
   });
 }
 
+// --- DEXアービトラージ観測を1サイクル実行する ---
 async function dexWatchOnce() {
   if (dexWatchRunning) return;
   dexWatchRunning = true;
@@ -424,6 +458,7 @@ function renderPage() {
     <td style="text-align:right;color:${t.netPnl>=0?'#2ecc71':'#e74c3c'};">${t.netPnl>=0?'+':''}${(t.netPnl*100).toFixed(1)}pt</td></tr>`;
   }).join("") || `<tr><td colspan="6" style="color:#888;">まだ確定した紙上取引はありません</td></tr>`;
 
+  // --- DEXアービトラージ観測の集計 ---
   const dexObservations = getRecentObservations(500);
   const dexProfitableAll = dexObservations.filter((r) => r.profitable);
   const dexBest = dexObservations.reduce((best, r) => (!best || r.netProfit > best.netProfit ? r : best), null);
@@ -620,6 +655,7 @@ async function main() {
   setInterval(logicCheckOnce, LOGIC_CHECK_INTERVAL_SEC * 1000);
   setInterval(resolveOnce, RESOLVE_CHECK_INTERVAL_SEC * 1000);
 
+  // --- DEXアービトラージ観測を開始(起動直後に1回、以後は一定間隔で) ---
   dexWatchOnce();
   setInterval(dexWatchOnce, DEX_WATCH_INTERVAL_SEC * 1000);
 }
