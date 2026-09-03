@@ -6,19 +6,7 @@ import { recordSignal, resolveOpenPositions, getStats, getOpenCount, getRecentRe
 import fs from "fs";
 import { runProspect } from "./prospector.js";
 
-/**
- * ============================================================
- * DEXアービトラージ観測ウォッチャー
- * ------------------------------------------------------------
- * 新規ファイルを作らずに済むよう、index.js に直接まとめている。
- * 修正点:
- *   1) すべてのfetchにタイムアウトを追加(固まったまま止まらないように)
- *   2) DeFiLlamaの全プール取得(重い)は毎サイクルではなく
- *      PROSPECT_REFRESH_INTERVAL_MSごとにキャッシュを更新する方式
- * ============================================================
- */
-
-const DEX_FETCH_TIMEOUT_MS = 20000; // 20秒でタイムアウト
+const DEX_FETCH_TIMEOUT_MS = 20000;
 
 async function dexFetchWithTimeout(url, timeoutMs = DEX_FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
@@ -151,26 +139,50 @@ async function dexFetchPairsForToken(tokenAddress, chain, otherTokenAddress) {
   const targetChain = dexNormalizeChain(chain);
   const other = otherTokenAddress.toLowerCase();
 
-  return pairs.filter((p) => {
+  const filtered = pairs.filter((p) => {
     if ((p.chainId || "").toLowerCase() !== targetChain) return false;
     const base = (p.baseToken?.address || "").toLowerCase();
     const quote = (p.quoteToken?.address || "").toLowerCase();
     return base === other || quote === other;
   });
+
+  const rawChainIds = [...new Set(pairs.map((p) => p.chainId))];
+  console.log(`[DEX診断] candidate.chain="${chain}" → 正規化後="${targetChain}" / DexScreener生件数=${pairs.length}(chainId内訳: ${JSON.stringify(rawChainIds)}) / フィルター後=${filtered.length}件(うちDEX一覧: ${JSON.stringify([...new Set(filtered.map(p=>p.dexId))])})`);
+
+  return filtered;
+}
+
+const CONCENTRATED_LIQUIDITY_DEX_IDS = new Set([
+  "aerodrome-slipstream", "velodrome-slipstream", "pancakeswap-v3", "uniswap-v3",
+]);
+function isConcentratedLiquidity(pair) {
+  const labels = (pair.labels || []).map((l) => String(l).toLowerCase());
+  if (labels.some((l) => /v3|concentrated|slipstream|\bcl\b/.test(l))) return true;
+  if (CONCENTRATED_LIQUIDITY_DEX_IDS.has((pair.dexId || "").toLowerCase())) return true;
+  return false;
 }
 
 function dexToPoolShape(pair, targetTokenAddress) {
+  if (isConcentratedLiquidity(pair)) {
+    console.log(`[DEX診断] ${pair.dexId}: 集中流動性型(V3方式)のため除外(labels=${JSON.stringify(pair.labels)}) - 今の計算式は通用しないため`);
+    return null;
+  }
+
   const liqBase = pair.liquidity?.base;
   const liqQuote = pair.liquidity?.quote;
   const priceNative = parseFloat(pair.priceNative);
 
-  if (!liqBase || !liqQuote || !priceNative || !isFinite(priceNative)) return null;
+  if (!liqBase || !liqQuote || !priceNative || !isFinite(priceNative)) {
+    console.log(`[DEX診断] ${pair.dexId}: liquidity情報が不完全のため除外(liqBase=${liqBase}, liqQuote=${liqQuote}, priceNative=${pair.priceNative})`);
+    return null;
+  }
 
-  // 自己整合性チェック: 準備量から逆算した価格と、DexScreenerが報告している
-  // 価格が大きく乖離しているプールは、データが壊れている/信頼できないとみなし除外する
   const impliedPrice = liqQuote / liqBase;
   const deviation = Math.abs(impliedPrice - priceNative) / priceNative;
-  if (deviation > 0.05) return null;
+  if (deviation > 0.05) {
+    console.log(`[DEX診断] ${pair.dexId}: 自己整合性チェック不合格のため除外(逆算価格=${impliedPrice.toFixed(6)}, 公表価格=${priceNative}, 乖離=${(deviation*100).toFixed(1)}%)`);
+    return null;
+  }
 
   const baseIsTarget = (pair.baseToken?.address || "").toLowerCase() === targetTokenAddress.toLowerCase();
   const reserveX = baseIsTarget ? liqBase : liqQuote;
@@ -209,9 +221,6 @@ async function dexWatchOnePair(candidate, gasCostUsd) {
     pairLabel: `${candidate.symbol} on ${candidate.chain} (${cheapPool.dexId} -> ${expensivePool.dexId})`,
   });
 
-  // 最終安全確認: 実際のDEX間裁定で20%を超える価格差が生きたまま残ることは
-  // 現実的にありえない(研究上、実在する差はほぼ1%未満)。これを超える場合は
-  // データの誤りとみなし、記録せずに捨てる。
   if (Math.abs(result.priceDiffPercent) > 20) {
     console.warn(`[DEX] 異常な価格差を検出、データ不備として除外 (${candidate.symbol} / ${candidate.chain}): ${result.priceDiffPercent.toFixed(1)}%`);
     return null;
@@ -227,7 +236,82 @@ async function dexWatchOnePair(candidate, gasCostUsd) {
   };
 }
 
-const DEX_PROSPECT_REFRESH_INTERVAL_MS = 60 * 60 * 1000; // 1時間ごとに候補を更新
+const DEX_PERSISTENCE_LOG_FILE = process.env.PERSISTENCE_LOG_FILE || "/tmp/dex-persistence-log.json";
+const PERSISTENCE_CHECK_DELAYS_SEC = [5, 15, 30, 60];
+const PERSISTENCE_TRIGGER_THRESHOLD_PCT = 0.1;
+
+function dexLoadPersistenceLog() {
+  try {
+    if (fs.existsSync(DEX_PERSISTENCE_LOG_FILE)) return JSON.parse(fs.readFileSync(DEX_PERSISTENCE_LOG_FILE, "utf8"));
+  } catch (e) {}
+  return [];
+}
+function dexSavePersistenceLog(entries) {
+  try {
+    const trimmed = entries.length > 500 ? entries.slice(-500) : entries;
+    fs.writeFileSync(DEX_PERSISTENCE_LOG_FILE, JSON.stringify(trimmed));
+  } catch (e) {
+    console.warn("持続性ログの保存に失敗:", e.message);
+  }
+}
+
+function trackPersistence(candidate, gasCostUsd, initialResult) {
+  const trackingId = `${candidate.chain}-${candidate.symbol}-${Date.now()}`;
+  const record = {
+    trackingId,
+    pairLabel: initialResult.pairLabel,
+    chain: candidate.chain,
+    detectedAt: initialResult.timestamp,
+    initialPriceDiffPercent: initialResult.priceDiffPercent,
+    initialNetProfit: initialResult.netProfit,
+    followUps: [],
+  };
+
+  console.log(`[DEX持続性] 追跡開始: ${initialResult.pairLabel}(初回ズレ${initialResult.priceDiffPercent.toFixed(2)}%) → 5/15/30/60秒後に再チェックします`);
+
+  for (const delaySec of PERSISTENCE_CHECK_DELAYS_SEC) {
+    setTimeout(async () => {
+      try {
+        const followUp = await dexWatchOnePair(candidate, gasCostUsd);
+        const entry = followUp
+          ? { delaySec, stillExists: true, priceDiffPercent: followUp.priceDiffPercent, netProfit: followUp.netProfit }
+          : { delaySec, stillExists: false, priceDiffPercent: null, netProfit: null };
+        record.followUps.push(entry);
+        console.log(`[DEX持続性] ${initialResult.pairLabel} の${delaySec}秒後: ${entry.stillExists ? `まだ残っている(ズレ${entry.priceDiffPercent.toFixed(2)}%)` : "消えていた"}`);
+
+        if (delaySec === PERSISTENCE_CHECK_DELAYS_SEC[PERSISTENCE_CHECK_DELAYS_SEC.length - 1]) {
+          const log = dexLoadPersistenceLog();
+          log.push(record);
+          dexSavePersistenceLog(log);
+        }
+      } catch (e) {
+        console.warn(`[DEX持続性] 再チェック失敗(${delaySec}秒後):`, e.message);
+      }
+    }, delaySec * 1000);
+  }
+}
+
+function getPersistenceSummary() {
+  const log = dexLoadPersistenceLog();
+  if (log.length === 0) return null;
+
+  const summary = PERSISTENCE_CHECK_DELAYS_SEC.map((delaySec) => {
+    const withThisDelay = log
+      .map((r) => r.followUps.find((f) => f.delaySec === delaySec))
+      .filter(Boolean);
+    const stillExisting = withThisDelay.filter((f) => f.stillExists).length;
+    return {
+      delaySec,
+      total: withThisDelay.length,
+      stillExisting,
+      survivalRate: withThisDelay.length > 0 ? (stillExisting / withThisDelay.length) * 100 : null,
+    };
+  });
+
+  return { trackedCount: log.length, byDelay: summary };
+}
+
+const DEX_PROSPECT_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 
 let dexCachedCandidates = [];
 let dexLastProspectAt = 0;
@@ -273,6 +357,9 @@ async function runWatchCycle({ topN = 8, gasCostUsd = 0.15 } = {}) {
       if (observed) {
         results.push(observed);
         log.push(observed);
+        if (Math.abs(observed.priceDiffPercent) >= PERSISTENCE_TRIGGER_THRESHOLD_PCT) {
+          trackPersistence(candidate, gasCostUsd, observed);
+        }
       }
     } catch (e) {
       console.warn(`[DEX] 観測失敗 (${candidate.symbol} / ${candidate.chain}):`, e.message);
@@ -317,7 +404,6 @@ const recordedMarketIds = new Set();
 const MAX_RECORDED_IDS = 2000;
 const marketIdToUpTokenId = new Map();
 
-// --- DEXアービトラージ観測(Base等) 用の状態 ---
 let dexWatchRunning = false;
 let dexWatchCount = 0;
 let lastDexWatchAt = null;
@@ -408,12 +494,11 @@ async function resolveOnce() {
   });
 }
 
-// --- DEXアービトラージ観測を1サイクル実行する ---
 async function dexWatchOnce() {
   if (dexWatchRunning) return;
   dexWatchRunning = true;
   try {
-    const result = await runWatchCycle({ topN: 8, gasCostUsd: 0.15 });
+    const result = await runWatchCycle({ topN: 8, gasCostUsd: 0.25 });
     latestDexResults = result.results;
     dexWatchCount++;
     lastDexWatchAt = new Date().toISOString();
@@ -458,10 +543,10 @@ function renderPage() {
     <td style="text-align:right;color:${t.netPnl>=0?'#2ecc71':'#e74c3c'};">${t.netPnl>=0?'+':''}${(t.netPnl*100).toFixed(1)}pt</td></tr>`;
   }).join("") || `<tr><td colspan="6" style="color:#888;">まだ確定した紙上取引はありません</td></tr>`;
 
-  // --- DEXアービトラージ観測の集計 ---
   const dexObservations = getRecentObservations(500);
   const dexProfitableAll = dexObservations.filter((r) => r.profitable);
   const dexBest = dexObservations.reduce((best, r) => (!best || r.netProfit > best.netProfit ? r : best), null);
+  const persistenceSummary = getPersistenceSummary();
 
   const dexRows = latestDexResults.slice(0, 15).map((r, i) => {
     const color = r.profitable ? "#2ecc71" : "#888";
@@ -503,6 +588,17 @@ td{padding:6px 3px;border-bottom:1px solid #1c1c1c;}
     実際の注文は出していません(紙上観測のみ)。${lastDexError ? `<br><span style="color:#e74c3c;">エラー: ${lastDexError}</span>` : ''}
   </div>
 </div>
+
+${persistenceSummary ? `<div class="card">
+  <h2>⏱️ 歪みの持続性(最重要データ)</h2>
+  <table><thead><tr><th>経過時間</th><th style="text-align:right;">追跡件数</th><th style="text-align:right;">まだ残っていた割合</th></tr></thead>
+  <tbody>${persistenceSummary.byDelay.map(d => `<tr><td>${d.delaySec}秒後</td><td style="text-align:right;">${d.total}</td>
+    <td style="text-align:right;color:${d.survivalRate!==null && d.survivalRate>50?'#2ecc71':'#e74c3c'};">${d.survivalRate!==null ? d.survivalRate.toFixed(0)+'%' : '-'}</td></tr>`).join('')}</tbody></table>
+  <div class="note">
+    検知した歪みが、その後も残っていたかを実測(追跡件数${persistenceSummary.trackedCount}件)。<br>
+    60秒後の残存率が低ければ、今の3分間隔の観測では間に合わない証拠。高ければ、この間隔でも十分捕まえられる可能性がある。
+  </div>
+</div>` : ''}
 
 <div class="card">
   <h2>📈 TWAPオラクル戦略 成績</h2>
@@ -655,7 +751,6 @@ async function main() {
   setInterval(logicCheckOnce, LOGIC_CHECK_INTERVAL_SEC * 1000);
   setInterval(resolveOnce, RESOLVE_CHECK_INTERVAL_SEC * 1000);
 
-  // --- DEXアービトラージ観測を開始(起動直後に1回、以後は一定間隔で) ---
   dexWatchOnce();
   setInterval(dexWatchOnce, DEX_WATCH_INTERVAL_SEC * 1000);
 }
