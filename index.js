@@ -5,6 +5,7 @@ import { checkLogicalConstraints, WATCHED_PAIRS } from "./logic-checker.js";
 import { recordSignal, resolveOpenPositions, getStats, getOpenCount, getRecentResolved } from "./paper-trader.js";
 import fs from "fs";
 import { runProspect } from "./prospector.js";
+import { startOnchainFeeds, updatePoolSubscriptions } from "./dex-onchain-realtime.js";
 
 const DEX_FETCH_TIMEOUT_MS = 20000;
 
@@ -233,6 +234,8 @@ async function dexWatchOnePair(candidate, gasCostUsd) {
     tokenB: candidate.tokenB,
     cheapDex: cheapPool.dexId,
     expensiveDex: expensivePool.dexId,
+    cheapPoolAddress: cheapPool.pairAddress,
+    expensivePoolAddress: expensivePool.pairAddress,
   };
 }
 
@@ -314,6 +317,40 @@ function getPersistenceSummary() {
 const DEX_PROSPECT_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 
 let dexCachedCandidates = [];
+const poolAddressToCandidate = new Map();
+let onchainReactionCount = 0;
+let onchainLatencyLog = [];
+
+async function handleOnchainSync(chainName, poolAddress, reserve0, reserve1, receivedAt) {
+  const entry = poolAddressToCandidate.get(poolAddress);
+  if (!entry) return;
+  try {
+    const observed = await dexWatchOnePair(entry.candidate, entry.gasCostUsd);
+    const latencyMs = Date.now() - receivedAt;
+    onchainReactionCount++;
+    onchainLatencyLog.push(latencyMs);
+    if (onchainLatencyLog.length > 200) onchainLatencyLog.shift();
+
+    if (observed) {
+      latestDexResults = [observed, ...latestDexResults].slice(0, 30);
+      const log = dexLoadLog();
+      log.push({ ...observed, viaOnchainEvent: true, reactionLatencyMs: latencyMs });
+      dexSaveLog(log);
+      console.log(`[オンチェーン反応] ${observed.pairLabel}: Sync検知から${latencyMs}ms後に再評価完了(ズレ${observed.priceDiffPercent.toFixed(2)}%、純利益${observed.netProfit>=0?'+':''}$${observed.netProfit.toFixed(2)})`);
+    }
+  } catch (e) {
+    console.warn(`[オンチェーン反応] 再評価失敗:`, e.message);
+  }
+}
+
+function getOnchainLatencyStats() {
+  if (onchainLatencyLog.length === 0) return null;
+  const sorted = [...onchainLatencyLog].sort((a, b) => a - b);
+  const avg = sorted.reduce((s, v) => s + v, 0) / sorted.length;
+  const median = sorted[Math.floor(sorted.length / 2)];
+  return { count: onchainReactionCount, avgMs: avg, medianMs: median, minMs: sorted[0], maxMs: sorted[sorted.length - 1] };
+}
+
 let dexLastProspectAt = 0;
 let dexProspectRefreshing = false;
 
@@ -359,6 +396,11 @@ async function runWatchCycle({ topN = 8, gasCostUsd = 0.15 } = {}) {
         log.push(observed);
         if (Math.abs(observed.priceDiffPercent) >= PERSISTENCE_TRIGGER_THRESHOLD_PCT) {
           trackPersistence(candidate, gasCostUsd, observed);
+        }
+        if (observed.cheapPoolAddress && observed.expensivePoolAddress) {
+          poolAddressToCandidate.set(observed.cheapPoolAddress, { candidate, gasCostUsd });
+          poolAddressToCandidate.set(observed.expensivePoolAddress, { candidate, gasCostUsd });
+          updatePoolSubscriptions(candidate.chain, [observed.cheapPoolAddress, observed.expensivePoolAddress]);
         }
       }
     } catch (e) {
@@ -547,6 +589,7 @@ function renderPage() {
   const dexProfitableAll = dexObservations.filter((r) => r.profitable);
   const dexBest = dexObservations.reduce((best, r) => (!best || r.netProfit > best.netProfit ? r : best), null);
   const persistenceSummary = getPersistenceSummary();
+  const onchainLatencyStats = getOnchainLatencyStats();
 
   const dexRows = latestDexResults.slice(0, 15).map((r, i) => {
     const color = r.profitable ? "#2ecc71" : "#888";
@@ -598,6 +641,17 @@ ${persistenceSummary ? `<div class="card">
     検知した歪みが、その後も残っていたかを実測(追跡件数${persistenceSummary.trackedCount}件)。<br>
     60秒後の残存率が低ければ、今の3分間隔の観測では間に合わない証拠。高ければ、この間隔でも十分捕まえられる可能性がある。
   </div>
+</div>` : ''}
+
+${onchainLatencyStats ? `<div class="card">
+  <h2>⚡ オンチェーン反応速度</h2>
+  <div class="stat">
+    <div><div class="v">${onchainLatencyStats.count}</div><div class="l">反応回数</div></div>
+    <div><div class="v">${onchainLatencyStats.medianMs.toFixed(0)}ms</div><div class="l">中央値</div></div>
+    <div><div class="v">${onchainLatencyStats.minMs.toFixed(0)}ms</div><div class="l">最速</div></div>
+    <div><div class="v">${onchainLatencyStats.maxMs.toFixed(0)}ms</div><div class="l">最遅</div></div>
+  </div>
+  <div class="note">Syncイベントを検知してから、再評価が完了するまでの実測時間。3分間隔のポーリングと比べ、どれだけ速く反応できているかの指標。</div>
 </div>` : ''}
 
 <div class="card">
@@ -753,6 +807,8 @@ async function main() {
 
   dexWatchOnce();
   setInterval(dexWatchOnce, DEX_WATCH_INTERVAL_SEC * 1000);
+
+  startOnchainFeeds(handleOnchainSync);
 }
 
 main().catch((e) => { console.error("致命的エラー:", e); process.exit(1); });
