@@ -233,6 +233,7 @@ function dexToPoolShape(pair, targetTokenAddress) {
     reserveY,
     fee: dexGetFeeForDex(pair.dexId),
     priceUsd: pair.priceUsd,
+    liquidityUsd: (pair.liquidity?.usd ?? null),
   };
 }
 
@@ -274,6 +275,8 @@ async function dexWatchOnePair(candidate) {
     expensiveDex: expensivePool.dexId,
     cheapPoolAddress: cheapPool.pairAddress,
     expensivePoolAddress: expensivePool.pairAddress,
+    cheapPoolLiquidityUsd: cheapPool.liquidityUsd,
+    expensivePoolLiquidityUsd: expensivePool.liquidityUsd,
   };
 }
 
@@ -602,7 +605,10 @@ async function dexWatchOnce() {
     const profitable = result.results.filter((r) => r.profitable);
     if (profitable.length > 0) {
       for (const r of profitable) {
-        console.log(`[DEX] ${r.pairLabel}: 純利益 +$${r.netProfit.toFixed(2)}(価格差${r.priceDiffPercent.toFixed(2)}%)`);
+        const liq = [r.cheapPoolLiquidityUsd, r.expensivePoolLiquidityUsd]
+          .map((v) => v !== null && v !== undefined ? `$${Math.round(v).toLocaleString()}` : "不明")
+          .join(" / ");
+        console.log(`[DEX] ${r.pairLabel}: 純利益 +$${r.netProfit.toFixed(2)}(価格差${r.priceDiffPercent.toFixed(2)}%、最適投入量=${r.optimalAmountIn.toFixed(4)}、両プール流動性=${liq}）`);
       }
     } else {
       console.log(`[DEX] 観測${result.checked}件・記録${result.logged}件・黒字0件`);
