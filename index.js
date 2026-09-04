@@ -112,12 +112,18 @@ function dexNormalizeChain(chain) {
 
 // チェーンごとの想定ガス代(USD)。イーサリアムL1はL2群より一桁以上高いため、
 // 一律の値を使うと「小さな価格差」を誤って黒字判定してしまう。
+// bsc/binance/bnbは、DeFiLlamaがどの表記を使っているか未確定なため
+// 念のため全パターンを登録している。
 const CHAIN_GAS_COST_USD = {
   base: 0.05,
   arbitrum: 0.10,
   optimism: 0.05,
   ethereum: 8.0,
   polygon: 0.02,
+  avalanche: 0.05,
+  bsc: 0.10,
+  binance: 0.10,
+  bnb: 0.10,
 };
 function getGasCostForChain(chain) {
   const key = dexNormalizeChain(chain);
@@ -617,6 +623,7 @@ function renderAboutPage() {
   <h2>① 候補ペアの選定(1時間ごと)</h2>
   <div class="note">
     DeFiLlamaから全DEXプールのデータを取得し、「同じトークンペアが複数のDEXに存在する組み合わせ」を洗い出します。<br>
+    Ethereumはガス代が確実に利益を上回るため除外しています。それ以外の全チェーン(Base, Arbitrum, Optimism, Polygon, Avalanche, BSC等)が対象です。<br>
     流動性・出来高の少なさからスコアリングして上位30件をキャッシュします(prospector.js)。<br>
     このデータ自体はファイルには保存せず、メモリ上に1時間だけ保持します。
   </div>
