@@ -245,6 +245,16 @@ async function dexWatchOnePair(candidate) {
   if (pools.length < 2) return null;
 
   const [poolA, poolB] = pools;
+
+  // 同じDEX名同士(例: aerodrome vs aerodrome)は、AerodromeやVelodrome系に
+  // ある「Volatile」「Stable」という異なる計算式のプールを取り違えている
+  // 可能性が高い。今のコードはVolatile(x*y=k)しか対応していないため、
+  // 安全のため除外する。
+  if (poolA.dexId === poolB.dexId) {
+    console.log(`[DEX診断] ${candidate.symbol} on ${candidate.chain}: 同じDEX名同士(${poolA.dexId})のため除外(Stable/Volatileプールの取り違えの可能性 - 今の計算式では区別できないため)`);
+    return null;
+  }
+
   const priceA = poolA.reserveY / poolA.reserveX;
   const priceB = poolB.reserveY / poolB.reserveX;
   const [cheapPool, expensivePool] = priceA < priceB ? [poolA, poolB] : [poolB, poolA];
@@ -622,8 +632,9 @@ function renderAboutPage() {
     <tr><td>両プールの流動性($)</td><td>取引の実現性を判断する材料</td></tr>
   </tbody></table>
   <div class="note">
-    サーバー内のファイル(/tmp)に保存、最大2000件まで(超えた分は古い順に削除)。<br>
-    Railwayの再デプロイ時にファイルが消える可能性があります。
+    サーバー内の永続ディスク(/data)に保存、最大2000件まで(超えた分は古い順に削除)。<br>
+    再デプロイしてもデータは消えません。<br>
+    同じDEX名同士(例:aerodrome→aerodrome)の組み合わせは、AerodromeやVelodrome系にある「Stable」「Volatile」という異なる計算式のプールを取り違えている可能性があるため、除外しています。
   </div>
 </div>
 
@@ -632,7 +643,7 @@ function renderAboutPage() {
   <div class="note">
     価格差が一定以上(0.1%)見つかった時だけ、5秒後・15秒後・30秒後・60秒後に同じペアを再チェックし、「まだ残っていたか」を記録します。<br>
     他のbotにどれくらいの速さで価格差を埋められているかを見るためのデータです。<br>
-    最大500件まで、同じく/tmpに保存されます。
+    最大500件まで、同じく/dataに保存されます。
   </div>
 </div>
 
