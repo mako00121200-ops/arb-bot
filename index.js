@@ -488,10 +488,6 @@ async function runWatchCycle({ topN = 8 } = {}) {
   };
 }
 
-function getRecentObservations(n = 50) {
-  return dexLoadLog().slice(-n).reverse();
-}
-
 const DEX_WATCH_INTERVAL_SEC = parseInt(process.env.DEX_WATCH_INTERVAL_SEC || "180", 10);
 
 let dexWatchRunning = false;
@@ -545,7 +541,10 @@ a{color:#6fae62;}
 `;
 
 function renderPage() {
-  const dexObservations = getRecentObservations(500);
+  // 累積系の集計(記録件数・黒字件数・累積純利益)は、直近だけに絞ると
+  // 古い黒字記録が集計から漏れて数字が縮んで見える。保存済みの全件
+  // (最大2000件)を対象に集計する。
+  const dexObservations = dexLoadLog();
   const dexProfitableAll = dexObservations.filter((r) => r.profitable);
   const dexCumulativeProfit = dexProfitableAll.reduce((s, r) => s + r.netProfit, 0);
   const persistenceSummary = getPersistenceSummary();
@@ -576,6 +575,7 @@ function renderPage() {
   <tbody>${dexRows}</tbody></table>
   <div class="note">
     prospector.jsが選んだ候補ペアを、DexScreenerのデータで観測 → ガス代・手数料込みの純利益を計算して記録。<br>
+    記録件数・黒字件数・累積純利益は保存済みの全件(最大2000件)集計です。<br>
     実際の注文は出していません(紙上観測のみ)。${lastDexError ? `<br><span style="color:#e74c3c;">エラー: ${lastDexError}</span>` : ''}
   </div>
 </div>
@@ -640,6 +640,7 @@ function renderAboutPage() {
   <div class="note">
     サーバー内の永続ディスク(/data)に保存、最大2000件まで(超えた分は古い順に削除)。<br>
     再デプロイしてもデータは消えません。<br>
+    ダッシュボードの記録件数・黒字件数・累積純利益は、この保存済み全件(最大2000件)を集計したものです。<br>
     同じDEX名同士(例:aerodrome→aerodrome)の組み合わせは、AerodromeやVelodrome系にある「Stable」「Volatile」という異なる計算式のプールを取り違えている可能性があるため、除外しています(過去に保存されたデータも読み込み時に除外されます)。
   </div>
 </div>
