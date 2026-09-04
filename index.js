@@ -124,9 +124,15 @@ function getGasCostForChain(chain) {
   return CHAIN_GAS_COST_USD[key] ?? 0.25;
 }
 
+// 過去(修正前)に「同じDEX名同士」の誤ったペアが記録済みの場合があるため、
+// 読み込み時にも同じ基準で弾く。新規記録だけでなく、既存ログの
+// 累積純利益にも過去の異常値が混ざらないようにするため。
 function dexLoadLog() {
   try {
-    if (fs.existsSync(DEX_LOG_FILE)) return JSON.parse(fs.readFileSync(DEX_LOG_FILE, "utf8"));
+    if (fs.existsSync(DEX_LOG_FILE)) {
+      const entries = JSON.parse(fs.readFileSync(DEX_LOG_FILE, "utf8"));
+      return entries.filter((e) => e.cheapDex !== e.expensiveDex);
+    }
   } catch (e) {
     /* 読み込み失敗時は空ログから再開 */
   }
@@ -634,7 +640,7 @@ function renderAboutPage() {
   <div class="note">
     サーバー内の永続ディスク(/data)に保存、最大2000件まで(超えた分は古い順に削除)。<br>
     再デプロイしてもデータは消えません。<br>
-    同じDEX名同士(例:aerodrome→aerodrome)の組み合わせは、AerodromeやVelodrome系にある「Stable」「Volatile」という異なる計算式のプールを取り違えている可能性があるため、除外しています。
+    同じDEX名同士(例:aerodrome→aerodrome)の組み合わせは、AerodromeやVelodrome系にある「Stable」「Volatile」という異なる計算式のプールを取り違えている可能性があるため、除外しています(過去に保存されたデータも読み込み時に除外されます)。
   </div>
 </div>
 
