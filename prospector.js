@@ -6,10 +6,16 @@
  *
  * 修正点: DeFiLlamaへのfetchにタイムアウトを追加(固まったまま
  * 止まらないように)。
+ *
+ * 修正点2: Ethereumは実測の結果、ガス代($8想定)がほぼ確実に
+ * 価格差を食い潰すことが分かったため、候補選定の段階で除外する。
+ * これによりローテーションの枠を他の安いチェーンに使える。
  */
 
 const DEFILLAMA_POOLS = "https://yields.llama.fi/pools";
 const PROSPECTOR_FETCH_TIMEOUT_MS = 25000; // 25秒でタイムアウト
+
+const EXCLUDED_CHAINS = new Set(["ethereum"]);
 
 async function fetchWithTimeout(url, timeoutMs = PROSPECTOR_FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
@@ -48,11 +54,16 @@ export async function fetchAllPools() {
 export function findArbitragablePairs(pools, { minTvlUSD = 10000 } = {}) {
   const groups = new Map();
   let dexPoolCount = 0;
+  let excludedChainCount = 0;
 
   for (const p of pools) {
     if (!isDexProject(p.project)) continue;
     if (!p.underlyingTokens || p.underlyingTokens.length !== 2) continue;
     if ((p.tvlUsd || 0) < minTvlUSD) continue;
+    if (EXCLUDED_CHAINS.has((p.chain || "").toLowerCase())) {
+      excludedChainCount++;
+      continue;
+    }
     dexPoolCount++;
 
     const toks = p.underlyingTokens.map((t) => String(t).toLowerCase());
@@ -93,7 +104,7 @@ export function findArbitragablePairs(pools, { minTvlUSD = 10000 } = {}) {
     });
   }
 
-  return { arbitragable, dexPoolCount, groupCount: groups.size, totalPools: pools.length };
+  return { arbitragable, dexPoolCount, excludedChainCount, groupCount: groups.size, totalPools: pools.length };
 }
 
 export function summarizeByChain(arbitragable) {
@@ -132,8 +143,10 @@ export function scoreOpportunity(a) {
 /** 1回分の精査を実行し、結果をまとめて返す */
 export async function runProspect({ minTvlUSD = 10000, topN = 50 } = {}) {
   const pools = await fetchAllPools();
-  const { arbitragable, dexPoolCount, groupCount, totalPools } =
+  const { arbitragable, dexPoolCount, excludedChainCount, groupCount, totalPools } =
     findArbitragablePairs(pools, { minTvlUSD });
+
+  console.log(`[Prospector] Ethereumのプールを${excludedChainCount}件除外(ガス代がほぼ確実に価格差を食い潰すため)`);
 
   const chainSummary = summarizeByChain(arbitragable);
 
@@ -147,7 +160,7 @@ export async function runProspect({ minTvlUSD = 10000, topN = 50 } = {}) {
 
   return {
     scannedAt: new Date().toISOString(),
-    stats: { totalPools, dexPoolCount, groupCount, arbitragableCount: arbitragable.length },
+    stats: { totalPools, dexPoolCount, excludedChainCount, groupCount, arbitragableCount: arbitragable.length },
     chainSummary: chainSummary.slice(0, 30),
     arbitragableRaw: arbitragable,
     topPairs: scored.slice(0, topN).map((a) => ({
