@@ -105,8 +105,17 @@ function dexGetFeeForDex(dexId) {
   return DEX_DEFAULT_FEE_BY_DEX[(dexId || "").toLowerCase()] ?? DEX_DEFAULT_FEE_BY_DEX.default;
 }
 
+// DeFiLlamaとDexScreenerでチェーンの表記が一致しない場合がある。
+// 特にOptimismはDeFiLlamaが"OP Mainnet"、DexScreenerが"optimism"と
+// 表記しており、変換しないと候補が常に0件になってしまっていた。
 function dexNormalizeChain(chain) {
-  const map = { base: "base", arbitrum: "arbitrum", optimism: "optimism", ethereum: "ethereum" };
+  const map = {
+    base: "base",
+    arbitrum: "arbitrum",
+    optimism: "optimism",
+    "op mainnet": "optimism",
+    ethereum: "ethereum",
+  };
   return map[(chain || "").toLowerCase()] || (chain || "").toLowerCase();
 }
 
