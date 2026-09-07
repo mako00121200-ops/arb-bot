@@ -142,20 +142,28 @@ function dexNormalizeChain(chain) {
   return map[(chain || "").toLowerCase()] || (chain || "").toLowerCase();
 }
 
-// チェーンごとの想定ガス代(USD)。イーサリアムL1はL2群より一桁以上高いため、
-// 一律の値を使うと「小さな価格差」を誤って黒字判定してしまう。
-// bsc/binance/bnbは、DeFiLlamaがどの表記を使っているか未確定なため
-// 念のため全パターンを登録している。
+// チェーンごとの想定ガス代(USD)。2026年時点の実測レンジを調査して設定:
+//  - Base/Arbitrum/Optimism: L2群で$0.01〜0.40程度の最安クラス
+//  - Polygon: 以前より相対的に値上がりしており、BSCと同格の$0.05〜0.50帯
+//    (旧設定$0.02は低すぎたため引き上げ)
+//  - BSC: $0.05〜0.50
+//  - Avalanche: $0.01〜0.10
+//  - Flare: SparkDEX/BlazeSwapは実在の監査済みDEXだが、ネットワーク自体は
+//    新しく小さい。ガス代自体は20倍値上げ提案後でも「1セント未満」との
+//    記載があり、他チェーンよりむしろ安い可能性が高い
+//  - イーサリアムL1は一桁以上高いため、一律の値を使うと「小さな価格差」を
+//    誤って黒字判定してしまう
 const CHAIN_GAS_COST_USD = {
   base: 0.05,
   arbitrum: 0.10,
   optimism: 0.05,
   ethereum: 8.0,
-  polygon: 0.02,
+  polygon: 0.05,
   avalanche: 0.05,
   bsc: 0.10,
   binance: 0.10,
   bnb: 0.10,
+  flare: 0.02,
 };
 function getGasCostForChain(chain) {
   const key = dexNormalizeChain(chain);
@@ -740,7 +748,7 @@ function renderAboutPage() {
   <h2>① 候補ペアの選定(1時間ごと)</h2>
   <div class="note">
     DeFiLlamaから全DEXプールのデータを取得し、「同じトークンペアが複数のDEXに存在する組み合わせ」を洗い出します。<br>
-    Ethereumはガス代が確実に利益を上回るため除外しています。それ以外の全チェーン(Base, Arbitrum, Optimism, Polygon, Avalanche, BSC等)が対象です。<br>
+    Ethereumはガス代が確実に利益を上回るため除外しています。それ以外の全チェーン(Base, Arbitrum, Optimism, Polygon, Avalanche, BSC, Flare等)が対象です。<br>
     流動性・出来高の少なさからスコアリングして上位60件をキャッシュします(prospector.js)。<br>
     このデータ自体はファイルには保存せず、メモリ上に1時間だけ保持します。
   </div>
