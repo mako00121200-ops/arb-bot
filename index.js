@@ -139,14 +139,30 @@ function getGasCostForChain(chain) {
   return CHAIN_GAS_COST_USD[key] ?? 0.25;
 }
 
-// 過去(修正前)に「同じDEX名同士」の誤ったペアが記録済みの場合があるため、
-// 読み込み時にも同じ基準で弾く。新規記録だけでなく、既存ログの
-// 累積純利益にも過去の異常値が混ざらないようにするため。
+// 両プールとも流動性が厚い(=プロのbotが常時監視している)のに
+// 大きな価格差が残っている場合、本物の機会ではなくデータ取得時の
+// ズレ・プール種別の誤判定である可能性が高い(WETH-USDC on Base で
+// 2回実際に確認済み: PancakeSwap V3プールが除外の網をすり抜けていた)。
+// 厚いプール同士は許容する価格差を厳しく制限する
+// (薄いプール側が絡む場合は適用しない)。
+const DEEP_POOL_LIQUIDITY_USD = 500000;
+const DEEP_POOL_MAX_GAP_PCT = 1;
+
+// 過去(修正前)に「同じDEX名同士」「両プール厚いのに大きな価格差」の
+// 誤ったペアが記録済みの場合があるため、読み込み時にも同じ基準で弾く。
+// 新規記録だけでなく、既存ログの累積純利益にも過去の異常値が
+// 混ざらないようにするため。
 function dexLoadLog() {
   try {
     if (fs.existsSync(DEX_LOG_FILE)) {
       const entries = JSON.parse(fs.readFileSync(DEX_LOG_FILE, "utf8"));
-      return entries.filter((e) => e.cheapDex !== e.expensiveDex);
+      return entries.filter((e) => {
+        if (e.cheapDex === e.expensiveDex) return false;
+        const bothDeep = (e.cheapPoolLiquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD
+          && (e.expensivePoolLiquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD;
+        if (bothDeep && Math.abs(e.priceDiffPercent) > DEEP_POOL_MAX_GAP_PCT) return false;
+        return true;
+      });
     }
   } catch (e) {
     /* 読み込み失敗時は空ログから再開 */
@@ -290,6 +306,17 @@ async function dexWatchOnePair(candidate) {
 
   if (Math.abs(result.priceDiffPercent) > 20) {
     console.warn(`[DEX] 異常な価格差を検出、データ不備として除外 (${candidate.symbol} / ${candidate.chain}): ${result.priceDiffPercent.toFixed(1)}%`);
+    return null;
+  }
+
+  // 両プールとも流動性が厚い($500,000以上)のに1%を超える価格差が
+  // 残っているのは、本物の機会というよりデータ取得時のズレや
+  // プール種別の誤判定である可能性が高い(厚いプール同士は他のbotが
+  // 常時監視しているため)。
+  const bothPoolsDeep = (cheapPool.liquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD
+    && (expensivePool.liquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD;
+  if (bothPoolsDeep && Math.abs(result.priceDiffPercent) > DEEP_POOL_MAX_GAP_PCT) {
+    console.warn(`[DEX] 両プールとも流動性十分($${Math.round(cheapPool.liquidityUsd).toLocaleString()} / $${Math.round(expensivePool.liquidityUsd).toLocaleString()})なのに価格差${result.priceDiffPercent.toFixed(2)}%は不自然、データ不備として除外 (${candidate.symbol} / ${candidate.chain})`);
     return null;
   }
 
@@ -657,7 +684,9 @@ function renderAboutPage() {
     サーバー内の永続ディスク(/data)に保存、最大2000件まで(超えた分は古い順に削除)。<br>
     再デプロイしてもデータは消えません。<br>
     ダッシュボードの記録件数・黒字件数・累積純利益は、この保存済み全件(最大2000件)を集計したものです。<br>
-    同じDEX名同士(例:aerodrome→aerodrome)の組み合わせは、AerodromeやVelodrome系にある「Stable」「Volatile」という異なる計算式のプールを取り違えている可能性があるため、除外しています(過去に保存されたデータも読み込み時に除外されます)。
+    以下の場合はデータ不備・異常値として除外しています(過去に保存されたデータも読み込み時に除外されます):<br>
+    ・同じDEX名同士(Stable/Volatileプールの取り違えの可能性)<br>
+    ・両プールとも流動性が$500,000以上あるのに価格差が1%を超える場合(WETH-USDC on Baseで実際に2回確認済み。PancakeSwap等のV3プールが除外の網をすり抜けた場合の保険にもなっている)
   </div>
 </div>
 
