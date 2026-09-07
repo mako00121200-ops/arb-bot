@@ -18,6 +18,8 @@ async function dexFetchWithTimeout(url, timeoutMs = DEX_FETCH_TIMEOUT_MS) {
 // 1回の取引の上限額(USD)。理論上の最適額がこれより小さければそのまま
 // 使い(過剰投入で非効率になるのを防ぐ)、上限を超える場合だけこの額で
 // キャップする(資金不足で負けが続かないようにするため)。
+// 現状は自動売買を実装していないため、この値はシミュレーション上の
+// 想定としてのみ使われている。
 const MAX_TRADE_USD = parseFloat(process.env.MAX_TRADE_USD || "300");
 
 function dexGetAmountOut(amountIn, reserveIn, reserveOut, feeRetain) {
@@ -142,17 +144,10 @@ function dexNormalizeChain(chain) {
   return map[(chain || "").toLowerCase()] || (chain || "").toLowerCase();
 }
 
-// チェーンごとの想定ガス代(USD)。2026年時点の実測レンジを調査して設定:
-//  - Base/Arbitrum/Optimism: L2群で$0.01〜0.40程度の最安クラス
-//  - Polygon: 以前より相対的に値上がりしており、BSCと同格の$0.05〜0.50帯
-//    (旧設定$0.02は低すぎたため引き上げ)
-//  - BSC: $0.05〜0.50
-//  - Avalanche: $0.01〜0.10
-//  - Flare: SparkDEX/BlazeSwapは実在の監査済みDEXだが、ネットワーク自体は
-//    新しく小さい。ガス代自体は20倍値上げ提案後でも「1セント未満」との
-//    記載があり、他チェーンよりむしろ安い可能性が高い
-//  - イーサリアムL1は一桁以上高いため、一律の値を使うと「小さな価格差」を
-//    誤って黒字判定してしまう
+// チェーンごとの想定ガス代(USD)。イーサリアムL1はL2群より一桁以上高いため、
+// 一律の値を使うと「小さな価格差」を誤って黒字判定してしまう。
+// bsc/binance/bnbは、DeFiLlamaがどの表記を使っているか未確定なため
+// 念のため全パターンを登録している。
 const CHAIN_GAS_COST_USD = {
   base: 0.05,
   arbitrum: 0.10,
@@ -179,14 +174,39 @@ function getGasCostForChain(chain) {
 const DEEP_POOL_LIQUIDITY_USD = 500000;
 const DEEP_POOL_MAX_GAP_PCT = 1;
 
-// 過去(修正前)に「同じDEX名同士」「両プール厚いのに大きな価格差」の
-// 誤ったペアが記録済みの場合があるため、読み込み時にも同じ基準で弾く。
+// 取引がほぼ枯れている(=事実上稼働停止している)プールを除外する基準。
+// ZipSwapの実例(24時間の取引0件・出来高$13.7)で確認済み:
+// こういうプールは古い・更新されない価格を持ったまま残ってしまい、
+// 見せかけの「歪み」を生む。
+const DEAD_POOL_MIN_VOLUME_USD = 50;
+const DEAD_POOL_MIN_TXNS_24H = 3;
+function isDeadPool(pair) {
+  const volume24h = pair.volume?.h24 ?? 0;
+  const txns24h = (pair.txns?.h24?.buys ?? 0) + (pair.txns?.h24?.sells ?? 0);
+  return volume24h < DEAD_POOL_MIN_VOLUME_USD || txns24h < DEAD_POOL_MIN_TXNS_24H;
+}
+
+// 実際に調査して「見せかけの歪み」と確定したペア/DEXの組み合わせ。
+// USDC-USDBC: USDbCは廃止進行中のトークンで、実勢は$1.00でほぼ固定と
+// 確認済み(複数の主要プールで乖離0.01%未満)。
+// zipswap: 直近24時間の取引が実質0件、事実上稼働停止と確認済み。
+function isKnownFalsePositiveEntry(e) {
+  const label = (e.pairLabel || "").toUpperCase();
+  if (label.includes("USDC-USDBC") || label.includes("USDBC-USDC")) return true;
+  if (e.cheapDex === "zipswap" || e.expensiveDex === "zipswap") return true;
+  return false;
+}
+
+// 過去(修正前)に「同じDEX名同士」「両プール厚いのに大きな価格差」
+// 「実際に見せかけと確認できたペア」の誤ったデータが記録済みの場合が
+// あるため、読み込み時にも同じ基準で弾く。
 function dexLoadLog() {
   try {
     if (fs.existsSync(DEX_LOG_FILE)) {
       const entries = JSON.parse(fs.readFileSync(DEX_LOG_FILE, "utf8"));
       return entries.filter((e) => {
         if (e.cheapDex === e.expensiveDex) return false;
+        if (isKnownFalsePositiveEntry(e)) return false;
         const bothDeep = (e.cheapPoolLiquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD
           && (e.expensivePoolLiquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD;
         if (bothDeep && Math.abs(e.priceDiffPercent) > DEEP_POOL_MAX_GAP_PCT) return false;
@@ -208,11 +228,12 @@ function dexSaveLog(entries) {
   }
 }
 
-// 観測ログは容量の都合で直近2000件までしか保持できないため、
-// そこから「記録件数・黒字件数・累積純利益」を毎回計算すると、
-// 古い黒字記録が押し出されるたびに数字が減って見えてしまう。
-// これらは観測ログとは別に、上限なく増え続ける専用ファイルで
-// 管理する(初回だけ、既存の観測ログから初期値を引き継ぐ)。
+// 記録件数・黒字件数・累積純利益は、観測ログの2000件上限とは独立した
+// 専用ファイルで管理する(古い記録が押し出されても数字が減らないため)。
+// 注記: この累積値は新規記録が入るたびに加算していく方式のため、
+// 今回のフィルター追加以前に記録された「見せかけの歪み」分は、
+// 過去に既に加算されてしまっている場合、自動では遡って引かれない。
+// 今後は新しい正しいデータの割合が増えるにつれて薄まっていく。
 function dexLoadStats() {
   try {
     if (fs.existsSync(DEX_STATS_FILE)) return JSON.parse(fs.readFileSync(DEX_STATS_FILE, "utf8"));
@@ -301,6 +322,13 @@ function isConcentratedLiquidity(pair) {
 function dexToPoolShape(pair, targetTokenAddress) {
   if (isConcentratedLiquidity(pair)) {
     console.log(`[DEX診断] ${pair.dexId}: 集中流動性型(V3方式)のため除外(labels=${JSON.stringify(pair.labels)}) - 今の計算式は通用しないため`);
+    return null;
+  }
+
+  if (isDeadPool(pair)) {
+    const volume24h = pair.volume?.h24 ?? 0;
+    const txns24h = (pair.txns?.h24?.buys ?? 0) + (pair.txns?.h24?.sells ?? 0);
+    console.log(`[DEX診断] ${pair.dexId}: 取引がほぼ枯れているため除外(24時間出来高=$${volume24h.toFixed(2)}, 取引件数=${txns24h}件) - ZipSwap等で実際に確認された「活動停止プール」の誤検知パターン`);
     return null;
   }
 
@@ -775,7 +803,9 @@ function renderAboutPage() {
     再デプロイしてもデータは消えません。<br>
     以下の場合はデータ不備・異常値として除外しています(過去に保存されたデータも読み込み時に除外されます):<br>
     ・同じDEX名同士(Stable/Volatileプールの取り違えの可能性)<br>
-    ・両プールとも流動性が$500,000以上あるのに価格差が1%を超える場合(WETH-USDC on Baseで実際に2回確認済み。PancakeSwap等のV3プールが除外の網をすり抜けた場合の保険にもなっている)
+    ・両プールとも流動性が$500,000以上あるのに価格差が1%を超える場合<br>
+    ・24時間の出来高が$50未満、または取引件数が3件未満(=事実上稼働停止しているDEXの誤検知)<br>
+    ・調査により「見せかけの歪み」と確定したUSDC-USDBC・ZipSwap関連
   </div>
 </div>
 
