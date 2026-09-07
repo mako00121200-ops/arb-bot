@@ -15,10 +15,22 @@ async function dexFetchWithTimeout(url, timeoutMs = DEX_FETCH_TIMEOUT_MS) {
   }
 }
 
+// 1回の取引の上限額(USD)。理論上の最適額がこれより小さければそのまま
+// 使い(過剰投入で非効率になるのを防ぐ)、上限を超える場合だけこの額で
+// キャップする(資金不足で負けが続かないようにするため)。
+const MAX_TRADE_USD = parseFloat(process.env.MAX_TRADE_USD || "300");
+
 function dexGetAmountOut(amountIn, reserveIn, reserveOut, feeRetain) {
   if (amountIn <= 0) return 0;
   const amountInWithFee = amountIn * feeRetain;
   return (reserveOut * amountInWithFee) / (reserveIn + amountInWithFee);
+}
+
+// 任意の投入量(Yトークン建て)でのプロフィットを計算する共通関数。
+function dexSimulateProfitForAmount(pool1, pool2, amountIn) {
+  const xOut = dexGetAmountOut(amountIn, pool1.reserveY, pool1.reserveX, 1 - pool1.fee);
+  const yOut = dexGetAmountOut(xOut, pool2.reserveX, pool2.reserveY, 1 - pool2.fee);
+  return yOut - amountIn;
 }
 
 function dexComputeOptimalArbitrage(pool1, pool2) {
@@ -45,18 +57,12 @@ function dexComputeOptimalArbitrage(pool1, pool2) {
     return { amountIn: 0, grossProfit: 0, profitable: false };
   }
 
-  const simulateProfit = (t) => {
-    const xOut = dexGetAmountOut(t, a, A, g1);
-    const yOut = dexGetAmountOut(xOut, X2, Y2, g2);
-    return yOut - t;
-  };
-
   let bestT = theoreticalAmountIn;
-  let bestProfit = simulateProfit(theoreticalAmountIn);
+  let bestProfit = dexSimulateProfitForAmount(pool1, pool2, theoreticalAmountIn);
 
   for (let mult = 0.5; mult <= 1.5; mult += 0.01) {
     const t = theoreticalAmountIn * mult;
-    const p = simulateProfit(t);
+    const p = dexSimulateProfitForAmount(pool1, pool2, t);
     if (p > bestProfit) {
       bestProfit = p;
       bestT = t;
@@ -66,30 +72,47 @@ function dexComputeOptimalArbitrage(pool1, pool2) {
   return { amountIn: bestT, grossProfit: bestProfit, profitable: bestProfit > 0 };
 }
 
-function dexEvaluateOpportunity({ cheapPool, expensivePool, gasCostInY, slippageBuffer = 0, pairLabel = "" }) {
+// cheapPool.priceUsdPerY を使って上限額($300)をYトークン建てに換算し、
+// 「理論上の最適額」と「上限額」の小さい方を実際の投入量として使う。
+function dexEvaluateOpportunity({ cheapPool, expensivePool, gasCostUsd, maxTradeAmountUsd, slippageBuffer = 0, pairLabel = "" }) {
   const priceCheap = cheapPool.reserveY / cheapPool.reserveX;
   const priceExpensive = expensivePool.reserveY / expensivePool.reserveX;
+  const priceDiffPercent = ((priceExpensive - priceCheap) / priceCheap) * 100;
 
-  const result = dexComputeOptimalArbitrage(cheapPool, expensivePool);
-  const grossProfit = result.grossProfit;
-  const slippageCost = grossProfit * slippageBuffer;
-  const netProfit = grossProfit - gasCostInY - slippageCost;
+  const priceUsdPerY = cheapPool.priceUsdPerY;
+  const maxTradeAmountIn = maxTradeAmountUsd / priceUsdPerY;
+  const gasCostInY = gasCostUsd / priceUsdPerY;
+
+  const optimalResult = dexComputeOptimalArbitrage(cheapPool, expensivePool);
+
+  // 実際に使う投入量: 理論上の最適額と上限額の小さい方。
+  const actualTradeAmountIn = Math.min(optimalResult.amountIn, maxTradeAmountIn);
+  const cappedByBudget = optimalResult.amountIn > maxTradeAmountIn;
+
+  const actualGrossProfitY = dexSimulateProfitForAmount(cheapPool, expensivePool, actualTradeAmountIn);
+  const actualSlippageCostY = actualGrossProfitY * slippageBuffer;
+  const actualNetProfitY = actualGrossProfitY - gasCostInY - actualSlippageCostY;
 
   return {
     timestamp: new Date().toISOString(),
     pairLabel,
-    priceDiffPercent: ((priceExpensive - priceCheap) / priceCheap) * 100,
-    optimalAmountIn: result.amountIn,
-    grossProfit,
-    gasCostInY,
-    slippageCost,
-    netProfit,
-    profitable: netProfit > 0,
+    priceDiffPercent,
+    tradeAmountUsd: actualTradeAmountIn * priceUsdPerY,
+    tradeAmountIn: actualTradeAmountIn,
+    grossProfit: actualGrossProfitY * priceUsdPerY,
+    gasCostInY: gasCostUsd,
+    slippageCost: actualSlippageCostY * priceUsdPerY,
+    netProfit: actualNetProfitY * priceUsdPerY,
+    profitable: actualNetProfitY > 0,
+    optimalAmountIn: optimalResult.amountIn,
+    optimalGrossProfitUsd: optimalResult.grossProfit * priceUsdPerY,
+    cappedByBudget,
   };
 }
 
 const DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/latest/dex/tokens/";
 const DEX_LOG_FILE = process.env.WATCHER_LOG_FILE || "/tmp/dex-arb-observations.json";
+const DEX_STATS_FILE = process.env.STATS_FILE || "/tmp/dex-arb-stats.json";
 
 const DEX_DEFAULT_FEE_BY_DEX = {
   uniswap: 0.003,
@@ -150,8 +173,6 @@ const DEEP_POOL_MAX_GAP_PCT = 1;
 
 // 過去(修正前)に「同じDEX名同士」「両プール厚いのに大きな価格差」の
 // 誤ったペアが記録済みの場合があるため、読み込み時にも同じ基準で弾く。
-// 新規記録だけでなく、既存ログの累積純利益にも過去の異常値が
-// 混ざらないようにするため。
 function dexLoadLog() {
   try {
     if (fs.existsSync(DEX_LOG_FILE)) {
@@ -177,6 +198,42 @@ function dexSaveLog(entries) {
   } catch (e) {
     console.warn("観測ログの保存に失敗:", e.message);
   }
+}
+
+// 観測ログは容量の都合で直近2000件までしか保持できないため、
+// そこから「記録件数・黒字件数・累積純利益」を毎回計算すると、
+// 古い黒字記録が押し出されるたびに数字が減って見えてしまう。
+// これらは観測ログとは別に、上限なく増え続ける専用ファイルで
+// 管理する(初回だけ、既存の観測ログから初期値を引き継ぐ)。
+function dexLoadStats() {
+  try {
+    if (fs.existsSync(DEX_STATS_FILE)) return JSON.parse(fs.readFileSync(DEX_STATS_FILE, "utf8"));
+  } catch (e) {}
+  const existing = dexLoadLog();
+  const profitable = existing.filter((r) => r.profitable);
+  const seeded = {
+    totalObserved: existing.length,
+    totalProfitableCount: profitable.length,
+    cumulativeProfit: profitable.reduce((s, r) => s + r.netProfit, 0),
+  };
+  dexSaveStats(seeded);
+  return seeded;
+}
+function dexSaveStats(stats) {
+  try {
+    fs.writeFileSync(DEX_STATS_FILE, JSON.stringify(stats));
+  } catch (e) {
+    console.warn("累積統計の保存に失敗:", e.message);
+  }
+}
+function dexRecordStats(observed) {
+  const stats = dexLoadStats();
+  stats.totalObserved = (stats.totalObserved || 0) + 1;
+  if (observed.profitable) {
+    stats.totalProfitableCount = (stats.totalProfitableCount || 0) + 1;
+    stats.cumulativeProfit = (stats.cumulativeProfit || 0) + observed.netProfit;
+  }
+  dexSaveStats(stats);
 }
 
 // tokenAだけで検索すると、人気トークン(WETH等)は上位30件がUSDC等の
@@ -259,6 +316,16 @@ function dexToPoolShape(pair, targetTokenAddress) {
   const reserveX = baseIsTarget ? liqBase : liqQuote;
   const reserveY = baseIsTarget ? liqQuote : liqBase;
 
+  // Yトークン(取引の投入・利益の建値通貨)のUSD価格を、DexScreenerの
+  // priceUsd(base側のUSD価格)とpriceNative(baseがquote何枚分か)から
+  // 逆算する。上限$300をYトークン建てに正しく換算するために必須。
+  const basePriceUsd = parseFloat(pair.priceUsd);
+  let priceUsdPerY = null;
+  if (isFinite(basePriceUsd) && basePriceUsd > 0) {
+    const quotePriceUsd = basePriceUsd / priceNative;
+    priceUsdPerY = baseIsTarget ? quotePriceUsd : basePriceUsd;
+  }
+
   return {
     dexId: pair.dexId,
     pairAddress: pair.pairAddress,
@@ -267,6 +334,7 @@ function dexToPoolShape(pair, targetTokenAddress) {
     fee: dexGetFeeForDex(pair.dexId),
     priceUsd: pair.priceUsd,
     liquidityUsd: (pair.liquidity?.usd ?? null),
+    priceUsdPerY,
   };
 }
 
@@ -296,10 +364,16 @@ async function dexWatchOnePair(candidate) {
   const priceB = poolB.reserveY / poolB.reserveX;
   const [cheapPool, expensivePool] = priceA < priceB ? [poolA, poolB] : [poolB, poolA];
 
+  if (!cheapPool.priceUsdPerY || !isFinite(cheapPool.priceUsdPerY) || cheapPool.priceUsdPerY <= 0) {
+    console.log(`[DEX診断] ${candidate.symbol} on ${candidate.chain}: USD換算価格が取得できないため、上限$${MAX_TRADE_USD}の計算ができず除外`);
+    return null;
+  }
+
   const result = dexEvaluateOpportunity({
     cheapPool,
     expensivePool,
-    gasCostInY: gasCostUsd,
+    gasCostUsd,
+    maxTradeAmountUsd: MAX_TRADE_USD,
     slippageBuffer: 0.002,
     pairLabel: `${candidate.symbol} on ${candidate.chain} (${cheapPool.dexId} -> ${expensivePool.dexId})`,
   });
@@ -432,6 +506,7 @@ async function handleOnchainSync(chainName, poolAddress, reserve0, reserve1, rec
       const log = dexLoadLog();
       log.push({ ...observed, viaOnchainEvent: true, reactionLatencyMs: latencyMs });
       dexSaveLog(log);
+      dexRecordStats(observed);
       console.log(`[オンチェーン反応] ${observed.pairLabel}: Sync検知から${latencyMs}ms後に再評価完了(ズレ${observed.priceDiffPercent.toFixed(2)}%、純利益${observed.netProfit>=0?'+':''}$${observed.netProfit.toFixed(2)})`);
     }
   } catch (e) {
@@ -509,6 +584,7 @@ async function runWatchCycle({ topN = 8 } = {}) {
       if (observed) {
         results.push(observed);
         log.push(observed);
+        dexRecordStats(observed);
         if (Math.abs(observed.priceDiffPercent) >= PERSISTENCE_TRIGGER_THRESHOLD_PCT) {
           trackPersistence(candidate, observed);
         }
@@ -557,7 +633,10 @@ async function dexWatchOnce() {
         const liq = [r.cheapPoolLiquidityUsd, r.expensivePoolLiquidityUsd]
           .map((v) => v !== null && v !== undefined ? `$${Math.round(v).toLocaleString()}` : "不明")
           .join(" / ");
-        console.log(`[DEX] ${r.pairLabel}: 純利益 +$${r.netProfit.toFixed(2)}(価格差${r.priceDiffPercent.toFixed(2)}%、最適投入量=${r.optimalAmountIn.toFixed(4)}、両プール流動性=${liq}）`);
+        const cappedNote = r.cappedByBudget
+          ? `上限$${MAX_TRADE_USD}でキャップ、理論上の最適額は${r.optimalAmountIn.toFixed(4)}`
+          : "理論上の最適額のまま";
+        console.log(`[DEX] ${r.pairLabel}: 純利益 +$${r.netProfit.toFixed(2)}(価格差${r.priceDiffPercent.toFixed(2)}%、投入額$${r.tradeAmountUsd.toFixed(2)}[${cappedNote}]、両プール流動性=${liq}）`);
       }
     } else {
       console.log(`[DEX] 観測${result.checked}件・記録${result.logged}件・黒字0件`);
@@ -587,12 +666,10 @@ a{color:#6fae62;}
 `;
 
 function renderPage() {
-  // 累積系の集計(記録件数・黒字件数・累積純利益)は、直近だけに絞ると
-  // 古い黒字記録が集計から漏れて数字が縮んで見える。保存済みの全件
-  // (最大2000件)を対象に集計する。
-  const dexObservations = dexLoadLog();
-  const dexProfitableAll = dexObservations.filter((r) => r.profitable);
-  const dexCumulativeProfit = dexProfitableAll.reduce((s, r) => s + r.netProfit, 0);
+  // 記録件数・黒字件数・累積純利益は、観測ログの2000件上限とは
+  // 独立した専用の統計ファイルから読む(古い記録が押し出されても
+  // 減らないようにするため)。
+  const dexStats = dexLoadStats();
   const persistenceSummary = getPersistenceSummary();
   const onchainLatencyStats = getOnchainLatencyStats();
 
@@ -607,21 +684,21 @@ function renderPage() {
 <meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="refresh" content="30">
 <title>DEXアービトラージ観測所</title><style>${PAGE_STYLE}</style></head><body>
 <h1>🔍 DEXアービトラージ観測所</h1>
-<div class="sub">紙上取引のみ(実際の注文は出しません) / DEX観測${dexWatchCount}回</div>
+<div class="sub">紙上取引のみ(実際の注文は出しません) / DEX観測${dexWatchCount}回 / 1回の取引額は理論上の最適額(上限$${MAX_TRADE_USD})</div>
 
 <div class="card">
   <h2>🔍 DEXアービトラージ観測(Base等)</h2>
   <div class="stat">
-    <div><div class="v">${dexObservations.length}</div><div class="l">記録件数</div></div>
-    <div><div class="v" style="color:${dexProfitableAll.length>0?'#2ecc71':'#888'};">${dexProfitableAll.length}</div><div class="l">黒字だった件数</div></div>
-    <div><div class="v" style="color:${dexCumulativeProfit>=0?'#2ecc71':'#e74c3c'};">${dexCumulativeProfit>=0?'+':''}$${dexCumulativeProfit.toFixed(2)}</div><div class="l">累積純利益(黒字分の合計)</div></div>
+    <div><div class="v">${dexStats.totalObserved}</div><div class="l">記録件数</div></div>
+    <div><div class="v" style="color:${dexStats.totalProfitableCount>0?'#2ecc71':'#888'};">${dexStats.totalProfitableCount}</div><div class="l">黒字だった件数</div></div>
+    <div><div class="v" style="color:${dexStats.cumulativeProfit>=0?'#2ecc71':'#e74c3c'};">${dexStats.cumulativeProfit>=0?'+':''}$${dexStats.cumulativeProfit.toFixed(2)}</div><div class="l">累積純利益(黒字分の合計)</div></div>
     <div><div class="v">${lastDexWatchAt ? new Date(lastDexWatchAt).toLocaleTimeString('ja-JP') : '-'}</div><div class="l">最終観測時刻</div></div>
   </div>
   <table><thead><tr><th>#</th><th>ペア</th><th style="text-align:right;">価格差</th><th style="text-align:right;">純利益</th></tr></thead>
   <tbody>${dexRows}</tbody></table>
   <div class="note">
-    prospector.jsが選んだ候補ペアを、DexScreenerのデータで観測 → ガス代・手数料込みの純利益を計算して記録。<br>
-    記録件数・黒字件数・累積純利益は保存済みの全件(最大2000件)集計です。<br>
+    prospector.jsが選んだ候補ペアを、DexScreenerのデータで観測 → 理論上の最適投入額(上限$${MAX_TRADE_USD})で取引した想定で、ガス代・手数料込みの純利益を計算して記録。<br>
+    記録件数・黒字件数・累積純利益は上限なく増え続ける累計値です(観測ログ本体は容量の都合で直近2000件のみ保持)。<br>
     実際の注文は出していません(紙上観測のみ)。${lastDexError ? `<br><span style="color:#e74c3c;">エラー: ${lastDexError}</span>` : ''}
   </div>
 </div>
@@ -673,21 +750,21 @@ function renderAboutPage() {
   <h2>② DEX観測ログ(3分ごと)</h2>
   <div class="note">
     キャッシュした候補を8件ずつ順番に(ローテーションしながら)DexScreenerで価格チェックします。<br>
-    2つのDEXの価格差から、ガス代・取引手数料・スリッページを差し引いた「純利益」を計算し、以下を記録します:
+    「理論上いちばん利益が出る投入額」と「上限$${MAX_TRADE_USD}」の小さい方を実際の投入額として使い、ガス代・取引手数料・スリッページを差し引いた「純利益」を計算して、以下を記録します:
   </div>
   <table><thead><tr><th>項目</th><th>内容</th></tr></thead><tbody>
     <tr><td>日時</td><td>観測した時刻</td></tr>
     <tr><td>ペア・チェーン</td><td>例:USDC-AERO on Base</td></tr>
     <tr><td>DEX(安い方/高い方)</td><td>例:aerodrome → uniswap</td></tr>
     <tr><td>価格差(%)</td><td>2つのDEX間のズレ</td></tr>
-    <tr><td>最適投入量</td><td>理論上もっとも利益が出る取引サイズ</td></tr>
-    <tr><td>純利益($)</td><td>ガス代・手数料・スリッページを引いた後の金額</td></tr>
+    <tr><td>投入額($)</td><td>理論上の最適額(上限$${MAX_TRADE_USD}でキャップ)</td></tr>
+    <tr><td>純利益($)</td><td>投入額をもとに、ガス代・手数料・スリッページを引いた後の金額</td></tr>
     <tr><td>両プールの流動性($)</td><td>取引の実現性を判断する材料</td></tr>
   </tbody></table>
   <div class="note">
-    サーバー内の永続ディスク(/data)に保存、最大2000件まで(超えた分は古い順に削除)。<br>
+    観測1件ごとの詳細は永続ディスク(/data)に保存、最大2000件まで(超えた分は古い順に削除)。<br>
+    ダッシュボードの記録件数・黒字件数・累積純利益は、この2000件上限とは別に、上限なく増え続ける専用の集計ファイルで管理しています(古い記録が押し出されても数字が減りません)。<br>
     再デプロイしてもデータは消えません。<br>
-    ダッシュボードの記録件数・黒字件数・累積純利益は、この保存済み全件(最大2000件)を集計したものです。<br>
     以下の場合はデータ不備・異常値として除外しています(過去に保存されたデータも読み込み時に除外されます):<br>
     ・同じDEX名同士(Stable/Volatileプールの取り違えの可能性)<br>
     ・両プールとも流動性が$500,000以上あるのに価格差が1%を超える場合(WETH-USDC on Baseで実際に2回確認済み。PancakeSwap等のV3プールが除外の網をすり抜けた場合の保険にもなっている)
