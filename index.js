@@ -458,7 +458,11 @@ async function dexGetCandidates(topN) {
     dexProspectRefreshing = true;
     try {
       console.log("[DEX] 候補ペアを再選定中(DeFiLlama全件取得。数十秒かかることがあります)...");
-      const prospect = await runProspect({ minTvlUSD: 20000, topN: 30 });
+      // TVL下限を$20,000→$5,000に、キャッシュ件数を30→60に拡大。
+      // 実測で見つかった「薄いプール vs 厚いプール」の当たりパターン
+      // (例: EURC-USDC on Baseの片側$8,910)は、この足切りラインの
+      // すぐ近くにいたため、取りこぼしを減らす狙い。
+      const prospect = await runProspect({ minTvlUSD: 5000, topN: 60 });
       dexCachedCandidates = prospect.topPairs;
       dexLastProspectAt = now;
       dexCandidateRotationOffset = 0;
@@ -660,7 +664,7 @@ function renderAboutPage() {
   <div class="note">
     DeFiLlamaから全DEXプールのデータを取得し、「同じトークンペアが複数のDEXに存在する組み合わせ」を洗い出します。<br>
     Ethereumはガス代が確実に利益を上回るため除外しています。それ以外の全チェーン(Base, Arbitrum, Optimism, Polygon, Avalanche, BSC等)が対象です。<br>
-    流動性・出来高の少なさからスコアリングして上位30件をキャッシュします(prospector.js)。<br>
+    流動性・出来高の少なさからスコアリングして上位60件をキャッシュします(prospector.js)。<br>
     このデータ自体はファイルには保存せず、メモリ上に1時間だけ保持します。
   </div>
 </div>
