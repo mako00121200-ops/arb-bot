@@ -175,9 +175,7 @@ const DEEP_POOL_LIQUIDITY_USD = 500000;
 const DEEP_POOL_MAX_GAP_PCT = 1;
 
 // 取引がほぼ枯れている(=事実上稼働停止している)プールを除外する基準。
-// ZipSwapの実例(24時間の取引0件・出来高$13.7)で確認済み:
-// こういうプールは古い・更新されない価格を持ったまま残ってしまい、
-// 見せかけの「歪み」を生む。
+// ZipSwapの実例(24時間の取引0件・出来高$13.7)で確認済み。
 const DEAD_POOL_MIN_VOLUME_USD = 50;
 const DEAD_POOL_MIN_TXNS_24H = 3;
 function isDeadPool(pair) {
@@ -187,13 +185,16 @@ function isDeadPool(pair) {
 }
 
 // 実際に調査して「見せかけの歪み」と確定したペア/DEXの組み合わせ。
-// USDC-USDBC: USDbCは廃止進行中のトークンで、実勢は$1.00でほぼ固定と
-// 確認済み(複数の主要プールで乖離0.01%未満)。
-// zipswap: 直近24時間の取引が実質0件、事実上稼働停止と確認済み。
-function isKnownFalsePositiveEntry(e) {
-  const label = (e.pairLabel || "").toUpperCase();
-  if (label.includes("USDC-USDBC") || label.includes("USDBC-USDC")) return true;
-  if (e.cheapDex === "zipswap" || e.expensiveDex === "zipswap") return true;
+// USDbC(Base)・USDC.e(Avalanche)は、どちらも実勢が正規USDCとほぼ
+// $1.00で一致すると確認済み(USDC.eは実際$0.99549で乖離0.45%程度)。
+// コントラクトアドレスでの厳密な判定も検討したが、信頼できる完全な
+// アドレスを確認できなかったため、実際のログで動作確認済みの
+// シンボル名判定を採用している。zipswapは実質稼働停止と確認済み。
+function isKnownFalsePositive({ symbol, cheapDexId, expensiveDexId }) {
+  const upperSymbol = (symbol || "").toUpperCase();
+  if (upperSymbol.includes("USDBC")) return true;
+  if (upperSymbol.includes("USDC.E") || upperSymbol.includes("USDCE")) return true;
+  if (cheapDexId === "zipswap" || expensiveDexId === "zipswap") return true;
   return false;
 }
 
@@ -206,7 +207,7 @@ function dexLoadLog() {
       const entries = JSON.parse(fs.readFileSync(DEX_LOG_FILE, "utf8"));
       return entries.filter((e) => {
         if (e.cheapDex === e.expensiveDex) return false;
-        if (isKnownFalsePositiveEntry(e)) return false;
+        if (isKnownFalsePositive({ symbol: e.pairLabel, cheapDexId: e.cheapDex, expensiveDexId: e.expensiveDex })) return false;
         const bothDeep = (e.cheapPoolLiquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD
           && (e.expensivePoolLiquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD;
         if (bothDeep && Math.abs(e.priceDiffPercent) > DEEP_POOL_MAX_GAP_PCT) return false;
@@ -230,10 +231,6 @@ function dexSaveLog(entries) {
 
 // 記録件数・黒字件数・累積純利益は、観測ログの2000件上限とは独立した
 // 専用ファイルで管理する(古い記録が押し出されても数字が減らないため)。
-// 注記: この累積値は新規記録が入るたびに加算していく方式のため、
-// 今回のフィルター追加以前に記録された「見せかけの歪み」分は、
-// 過去に既に加算されてしまっている場合、自動では遡って引かれない。
-// 今後は新しい正しいデータの割合が増えるにつれて薄まっていく。
 function dexLoadStats() {
   try {
     if (fs.existsSync(DEX_STATS_FILE)) return JSON.parse(fs.readFileSync(DEX_STATS_FILE, "utf8"));
@@ -393,6 +390,13 @@ async function dexWatchOnePair(candidate) {
   // 安全のため除外する。
   if (poolA.dexId === poolB.dexId) {
     console.log(`[DEX診断] ${candidate.symbol} on ${candidate.chain}: 同じDEX名同士(${poolA.dexId})のため除外(Stable/Volatileプールの取り違えの可能性 - 今の計算式では区別できないため)`);
+    return null;
+  }
+
+  // 調査により「見せかけの歪み」と確定済みのペア/DEXは、観測の
+  // 時点で弾く(過去ログの読み込み時だけでなく、新規記録もここで防ぐ)。
+  if (isKnownFalsePositive({ symbol: candidate.symbol, cheapDexId: poolA.dexId, expensiveDexId: poolB.dexId })) {
+    console.log(`[DEX診断] ${candidate.symbol} on ${candidate.chain}: 調査により「見せかけの歪み」と確定済みのため除外(USDbC/USDC.e/ZipSwap)`);
     return null;
   }
 
@@ -570,9 +574,6 @@ async function dexGetCandidates(topN) {
     try {
       console.log("[DEX] 候補ペアを再選定中(DeFiLlama全件取得。数十秒かかることがあります)...");
       // TVL下限を$20,000→$5,000に、キャッシュ件数を30→60に拡大。
-      // 実測で見つかった「薄いプール vs 厚いプール」の当たりパターン
-      // (例: EURC-USDC on Baseの片側$8,910)は、この足切りラインの
-      // すぐ近くにいたため、取りこぼしを減らす狙い。
       const prospect = await runProspect({ minTvlUSD: 5000, topN: 60 });
       dexCachedCandidates = prospect.topPairs;
       dexLastProspectAt = now;
@@ -702,9 +703,6 @@ a{color:#6fae62;}
 `;
 
 function renderPage() {
-  // 記録件数・黒字件数・累積純利益は、観測ログの2000件上限とは
-  // 独立した専用の統計ファイルから読む(古い記録が押し出されても
-  // 減らないようにするため)。
   const dexStats = dexLoadStats();
   const persistenceSummary = getPersistenceSummary();
   const onchainLatencyStats = getOnchainLatencyStats();
@@ -801,11 +799,11 @@ function renderAboutPage() {
     観測1件ごとの詳細は永続ディスク(/data)に保存、最大2000件まで(超えた分は古い順に削除)。<br>
     ダッシュボードの記録件数・黒字件数・累積純利益は、この2000件上限とは別に、上限なく増え続ける専用の集計ファイルで管理しています(古い記録が押し出されても数字が減りません)。<br>
     再デプロイしてもデータは消えません。<br>
-    以下の場合はデータ不備・異常値として除外しています(過去に保存されたデータも読み込み時に除外されます):<br>
+    以下の場合はデータ不備・異常値として除外しています(観測の時点、および過去に保存されたデータの読み込み時点の両方で適用):<br>
     ・同じDEX名同士(Stable/Volatileプールの取り違えの可能性)<br>
     ・両プールとも流動性が$500,000以上あるのに価格差が1%を超える場合<br>
     ・24時間の出来高が$50未満、または取引件数が3件未満(=事実上稼働停止しているDEXの誤検知)<br>
-    ・調査により「見せかけの歪み」と確定したUSDC-USDBC・ZipSwap関連
+    ・調査により「見せかけの歪み」と確定したUSDbC・USDC.e・ZipSwap関連
   </div>
 </div>
 
