@@ -1,10 +1,15 @@
 {
-  "name": "prediction-market-observer",
+  "name": "dex-arb-bot",
   "version": "1.0.0",
-  "description": "Polymarketの2つの歪み(TWAPオラクル観測・論理矛盾)を紙上取引で検証する観測所",
+  "description": "DEXアービトラージ観測・実行bot(Base/Polygon/Optimism/Avalanche/Flare等)",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
+  },
+  "dependencies": {
+    "ethers": "^6.13.0",
+    "solc": "^0.8.24",
+    "@aave-dao/aave-address-book": "^4.8.0"
   }
 }
