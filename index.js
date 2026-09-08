@@ -2,6 +2,7 @@ import http from "http";
 import fs from "fs";
 import { runProspect } from "./prospector.js";
 import { startOnchainFeeds, updatePoolSubscriptions } from "./dex-onchain-realtime.js";
+import { runTestnetDeployCheck } from "./scripts/testnet-deploy-check.js";
 
 const DEX_FETCH_TIMEOUT_MS = 20000;
 
@@ -599,7 +600,6 @@ async function dexGetCandidates(topN) {
     dexProspectRefreshing = true;
     try {
       console.log("[DEX] 候補ペアを再選定中(DeFiLlama全件取得。数十秒かかることがあります)...");
-      // TVL下限を$20,000→$5,000に、キャッシュ件数を30→60に拡大。
       const prospect = await runProspect({ minTvlUSD: 5000, topN: 60 });
       dexCachedCandidates = prospect.topPairs;
       dexLastProspectAt = now;
@@ -615,9 +615,6 @@ async function dexGetCandidates(topN) {
   const total = dexCachedCandidates.length;
   if (total === 0) return [];
 
-  // 毎回同じ上位N件だけを見るのではなく、キャッシュ済みの全候補を
-  // 順番にローテーションして観測する。こうすることでDeFiLlamaへの
-  // 追加リクエストなしに、1時間待たず短時間で全候補を一巡できる。
   const batchSize = Math.min(topN, total);
   const start = dexCandidateRotationOffset % total;
   const selected = [];
@@ -897,6 +894,16 @@ function startServer() {
 async function main() {
   console.log("=== DEXアービトラージ観測所 起動 ===");
   startServer();
+
+  // テストネット検証(RUN_TESTNET_DEPLOY_CHECK=trueの時だけ、起動時に1回実行)。
+  // 観測本体の動作には影響させないよう、エラーが出てもcatchして続行する。
+  if (process.env.RUN_TESTNET_DEPLOY_CHECK === "true") {
+    try {
+      await runTestnetDeployCheck();
+    } catch (e) {
+      console.error("[テストネット検証] 失敗:", e.message);
+    }
+  }
 
   dexWatchOnce();
   setInterval(dexWatchOnce, DEX_WATCH_INTERVAL_SEC * 1000);
