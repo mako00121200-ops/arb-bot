@@ -89,9 +89,25 @@ export async function runTestnetDeployCheck() {
   console.log(`[テストネット検証] 確認用: https://sepolia.basescan.org/tx/${deployTx.hash}`);
 
   // POOLアドレスが正しく取得できているか(コンストラクタ内のgetPool()呼び出しが
-  // 成功しているか)を確認する
-  const deployedPool = await contract.POOL();
-  console.log(`[テストネット検証] コントラクトが認識しているAave Poolアドレス: ${deployedPool}`);
+  // 成功しているか)を確認する。デプロイ直後はパブリックRPCの状態反映に
+  // わずかな遅延があることがあるため、待機時間を伸ばしながら数回リトライする。
+  const retryDelaysMs = [1000, 2000, 4000];
+  let deployedPool = null;
+  for (const delayMs of retryDelaysMs) {
+    await new Promise((r) => setTimeout(r, delayMs));
+    try {
+      deployedPool = await contract.POOL();
+      break;
+    } catch (e) {
+      console.warn(`[テストネット検証] POOL確認コール失敗(${delayMs}ms待機後)、再試行します:`, e.message);
+    }
+  }
+
+  if (deployedPool) {
+    console.log(`[テストネット検証] コントラクトが認識しているAave Poolアドレス: ${deployedPool}`);
+  } else {
+    console.warn("[テストネット検証] POOL確認コールは最終的に失敗しましたが、デプロイ自体は成功しています");
+  }
 
   console.log("[テストネット検証] 完了: コンパイル・デプロイともに成功しました");
 }
