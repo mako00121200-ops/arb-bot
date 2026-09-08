@@ -115,6 +115,7 @@ function dexEvaluateOpportunity({ cheapPool, expensivePool, gasCostUsd, maxTrade
 const DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/latest/dex/tokens/";
 const DEX_LOG_FILE = process.env.WATCHER_LOG_FILE || "/tmp/dex-arb-observations.json";
 const DEX_STATS_FILE = process.env.STATS_FILE || "/tmp/dex-arb-stats.json";
+const KNOWN_DEX_FILE = process.env.KNOWN_DEX_FILE || "/tmp/dex-known-list.json";
 
 const DEX_DEFAULT_FEE_BY_DEX = {
   uniswap: 0.003,
@@ -185,17 +186,39 @@ function isDeadPool(pair) {
 }
 
 // 実際に調査して「見せかけの歪み」と確定したペア/DEXの組み合わせ。
-// USDbC(Base)・USDC.e(Avalanche)は、どちらも実勢が正規USDCとほぼ
-// $1.00で一致すると確認済み(USDC.eは実際$0.99549で乖離0.45%程度)。
-// コントラクトアドレスでの厳密な判定も検討したが、信頼できる完全な
-// アドレスを確認できなかったため、実際のログで動作確認済みの
-// シンボル名判定を採用している。zipswapは実質稼働停止と確認済み。
 function isKnownFalsePositive({ symbol, cheapDexId, expensiveDexId }) {
   const upperSymbol = (symbol || "").toUpperCase();
   if (upperSymbol.includes("USDBC")) return true;
   if (upperSymbol.includes("USDC.E") || upperSymbol.includes("USDCE")) return true;
   if (cheapDexId === "zipswap" || expensiveDexId === "zipswap") return true;
   return false;
+}
+
+// 「初めて見るDEX」をチェーン別に記録しておく仕組み。定期メンテナンス
+// 時にこの一覧を見れば、SparkDEX・BlazeSwap・ZipSwap・QuickSwap(Base)の
+// 時のように、いちいちログを掘らなくても「今回新しく増えたDEX」が
+// ひと目で分かる(実在確認・信頼性調査の対象リストになる)。
+function dexLoadKnownDexes() {
+  try {
+    if (fs.existsSync(KNOWN_DEX_FILE)) return JSON.parse(fs.readFileSync(KNOWN_DEX_FILE, "utf8"));
+  } catch (e) {}
+  return {};
+}
+function dexSaveKnownDexes(known) {
+  try {
+    fs.writeFileSync(KNOWN_DEX_FILE, JSON.stringify(known));
+  } catch (e) {
+    console.warn("既知DEX一覧の保存に失敗:", e.message);
+  }
+}
+function checkAndRecordNewDex(dexId, chain) {
+  if (!dexId) return;
+  const key = `${chain}::${dexId}`;
+  const known = dexLoadKnownDexes();
+  if (known[key]) return;
+  known[key] = new Date().toISOString();
+  dexSaveKnownDexes(known);
+  console.log(`[DEX診断] 新しいDEXを初めて検出: "${dexId}" on ${chain} — 実在確認・信頼性の調査を推奨`);
 }
 
 // 過去(修正前)に「同じDEX名同士」「両プール厚いのに大きな価格差」
@@ -316,7 +339,10 @@ function isConcentratedLiquidity(pair) {
   return false;
 }
 
-function dexToPoolShape(pair, targetTokenAddress) {
+function dexToPoolShape(pair, targetTokenAddress, chain) {
+  // どんな理由で後段が除外しても、「このDEXの存在自体」は必ず記録する。
+  checkAndRecordNewDex(pair.dexId, chain);
+
   if (isConcentratedLiquidity(pair)) {
     console.log(`[DEX診断] ${pair.dexId}: 集中流動性型(V3方式)のため除外(labels=${JSON.stringify(pair.labels)}) - 今の計算式は通用しないため`);
     return null;
@@ -376,7 +402,7 @@ async function dexWatchOnePair(candidate) {
   const rawPairs = await dexFetchPairsForToken(candidate.tokenA, candidate.chain, candidate.tokenB);
 
   const pools = rawPairs
-    .map((p) => dexToPoolShape(p, candidate.tokenA))
+    .map((p) => dexToPoolShape(p, candidate.tokenA, candidate.chain))
     .filter(Boolean)
     .sort((a, b) => b.reserveX + b.reserveY - (a.reserveX + a.reserveY));
 
@@ -763,6 +789,24 @@ ${onchainLatencyStats ? `<div class="card">
 </body></html>`;
 }
 
+function renderNewDexSection() {
+  const known = dexLoadKnownDexes();
+  const entries = Object.entries(known).sort((a, b) => new Date(b[1]) - new Date(a[1]));
+  if (entries.length === 0) return '';
+  const rows = entries.slice(0, 20).map(([key, firstSeen]) => {
+    const [chain, dexId] = key.split("::");
+    return `<tr><td>${dexId}</td><td>${chain}</td><td>${new Date(firstSeen).toLocaleDateString('ja-JP')}</td></tr>`;
+  }).join('');
+  return `<div class="card">
+    <h2>🆕 これまでに検出したDEX(直近${Math.min(entries.length, 20)}件、新しい順)</h2>
+    <table><thead><tr><th>DEX名</th><th>チェーン</th><th>初検出日</th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="note">
+      全${entries.length}件のDEXを検出済み。定期メンテナンス時は、直近に増えたものを優先的に「実在するか」「信頼できるか」調査してください。<br>
+      (SparkDEX・BlazeSwap・QuickSwap on Base・ZipSwapは、この方式で見つかり調査済みです)
+    </div>
+  </div>`;
+}
+
 function renderAboutPage() {
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -806,6 +850,8 @@ function renderAboutPage() {
     ・調査により「見せかけの歪み」と確定したUSDbC・USDC.e・ZipSwap関連
   </div>
 </div>
+
+${renderNewDexSection()}
 
 <div class="card">
   <h2>③ 持続性の追跡</h2>
