@@ -14,6 +14,7 @@ import { ethers } from "ethers";
 import { getRouterAddress } from "../router-addresses.js";
 import { getChainConfig } from "../chain-config.js";
 import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
+import { recordRealExecution } from "./real-execution-log.js";
 
 const ERC20_DECIMALS_ABI = ["function decimals() view returns (uint8)"];
 const PAIR_ABI = [
@@ -22,6 +23,7 @@ const PAIR_ABI = [
 ];
 const CONTRACT_ABI = [
   "function executeArb(address asset, uint256 amount, (address routerCheap, address routerExpensive, address tokenX, address tokenY, uint256 minAmountOutStep1, uint256 minAmountOutStep2) params) external",
+  "event ArbExecuted(address indexed tokenY, uint256 amountBorrowed, uint256 profit)",
 ];
 
 const DEX_FEE_BPS_BY_ID = {
@@ -178,6 +180,46 @@ export async function maybeExecuteArb(observed) {
     console.log(`[実行] トランザクション送信: ${tx.hash}`);
     const receipt = await tx.wait();
     console.log(`[実行] 完了: ブロック${receipt.blockNumber}, ガス使用量=${receipt.gasUsed.toString()}`);
+
+    // コントラクトが発したArbExecutedイベントから、実際に確定した利益を
+    // 直接読み取る(私たちの事前予測ではなく、オンチェーンの確定値)。
+    let actualProfitTokens = null;
+    try {
+      for (const log of receipt.logs) {
+        try {
+          const parsed = contract.interface.parseLog({ topics: log.topics, data: log.data });
+          if (parsed && parsed.name === "ArbExecuted") {
+            actualProfitTokens = parseFloat(ethers.formatUnits(parsed.args.profit, decimalsY));
+            break;
+          }
+        } catch (inner) { /* このログは別のイベント */ }
+      }
+    } catch (e) {
+      console.warn("[実行] 利益イベントの読み取りに失敗:", e.message);
+    }
+
+    // Yトークン建ての利益を、観測時点のUSD換算レートでドルに直す。
+    const priceUsdPerUnit = observed.tradeAmountUsd / observed.tradeAmountIn;
+    const actualProfitUsd = actualProfitTokens !== null ? actualProfitTokens * priceUsdPerUnit : null;
+    const gasCostUsd = null; // ネイティブトークンのUSD価格が必要なため、現時点では未算出
+
+    if (actualProfitUsd !== null) {
+      console.log(`[実行] 実際に確定した利益: +$${actualProfitUsd.toFixed(4)}(${actualProfitTokens} トークン)`);
+    }
+
+    recordRealExecution({
+      timestamp: new Date().toISOString(),
+      pairLabel: observed.pairLabel,
+      chain: observed.chain,
+      txHash: tx.hash,
+      explorerUrl: chainConfig.explorerTxUrl(tx.hash),
+      tradeAmountUsd: Math.min(observed.tradeAmountUsd, tradeCapUsd),
+      predictedProfitUsd: observed.netProfit,
+      actualProfitUsd,
+      gasUsed: receipt.gasUsed.toString(),
+      gasCostUsd,
+    });
+
     recordExecutionSuccess();
   } catch (e) {
     console.error("[実行] 失敗:", e.message);
