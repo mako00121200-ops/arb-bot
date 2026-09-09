@@ -61,10 +61,12 @@ async function getTokenDecimals(tokenAddress, provider) {
 
 // 実行直前に、プールの現在の準備量を直接読み直す(観測データは
 // 最大3分前のスナップショットのため、実行直前の再確認として必須)。
-// ethers.getAddress()でアドレス形式を正規化してから使う
-// (DexScreenerが返す大文字小文字の形式によっては、正規化しないと
-// ethersがアドレスではなくENSドメイン名と誤解してエラーになるため)。
+// Uniswap V4等、通常の20バイトアドレスを持たない方式のプールを
+// 事前に弾く(minAmountOutStep1/2参照)。
 async function getFreshReserves(pairAddress, tokenXAddress, provider) {
+  if (!ethers.isAddress(pairAddress)) {
+    throw new Error(`プールアドレスの形式が不正(標準的な20バイトアドレスではない): ${pairAddress}`);
+  }
   const normalizedPairAddress = ethers.getAddress(pairAddress);
   const normalizedTokenX = ethers.getAddress(tokenXAddress);
   const pair = new ethers.Contract(normalizedPairAddress, PAIR_ABI, provider);
