@@ -4,10 +4,16 @@
 // 送信する(またはDRY_RUNならログに記録するだけの)ロジック。
 // chain-config.jsに登録済み・ルーター確認済みDEXの組み合わせのみを
 // 対象とする(仕様書3.1〜3.2節に対応)。
+//
+// 実際に送信する金額は、段階的取引上限(scripts/trade-cap.js)で
+// さらに絞られる。フラッシュローンなので「借りる金額自体」に
+// リスクは無いが、まだ実績のないロジックをいきなり大きな金額で
+// 動かすリスクを避けるため。
 
 import { ethers } from "ethers";
 import { getRouterAddress } from "../router-addresses.js";
 import { getChainConfig } from "../chain-config.js";
+import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
 
 const ERC20_DECIMALS_ABI = ["function decimals() view returns (uint8)"];
 const PAIR_ABI = [
@@ -18,7 +24,6 @@ const CONTRACT_ABI = [
   "function executeArb(address asset, uint256 amount, (address routerCheap, address routerExpensive, address tokenX, address tokenY, uint256 minAmountOutStep1, uint256 minAmountOutStep2) params) external",
 ];
 
-// index.jsのDEX_DEFAULT_FEE_BY_DEXと揃えた、確認済みDEXの手数料(bps)。
 const DEX_FEE_BPS_BY_ID = {
   aerodrome: 5,
   uniswap: 30,
@@ -30,7 +35,6 @@ function getFeeBpsForDex(dexId) {
   return DEX_FEE_BPS_BY_ID[(dexId || "").toLowerCase()] ?? 30;
 }
 
-// Uniswap V2形式の定数積AMM計算をBigIntで行う(オンチェーンと同じ精度)。
 function getAmountOutBigInt(amountIn, reserveIn, reserveOut, feeBps) {
   const feeRetainNumerator = 10000n - BigInt(feeBps);
   const amountInWithFee = amountIn * feeRetainNumerator;
@@ -39,7 +43,6 @@ function getAmountOutBigInt(amountIn, reserveIn, reserveOut, feeBps) {
   return denominator === 0n ? 0n : numerator / denominator;
 }
 
-// チェーンごとにprovider接続を使い回す。
 const providerCache = new Map();
 function getProviderForChain(rpcUrl) {
   if (!providerCache.has(rpcUrl)) {
@@ -48,10 +51,6 @@ function getProviderForChain(rpcUrl) {
   return providerCache.get(rpcUrl);
 }
 
-// トークンごとの桁数(decimals)は、外部サイトの情報に頼らず、
-// ブロックチェーン自身に直接問い合わせて確認する(確実性のため)。
-// 複数チェーンで同じトークンアドレスが別物のことがあるため、
-// チェーン名も含めてキャッシュする。
 const decimalsCache = new Map();
 async function getTokenDecimals(tokenAddress, provider, chain) {
   const normalizedAddress = ethers.getAddress(tokenAddress);
@@ -63,10 +62,6 @@ async function getTokenDecimals(tokenAddress, provider, chain) {
   return decimals;
 }
 
-// 実行直前に、プールの現在の準備量を直接読み直す(観測データは
-// 最大3分前のスナップショットのため、実行直前の再確認として必須)。
-// Uniswap V4等、通常の20バイトアドレスを持たない方式のプールを
-// 事前に弾く。
 async function getFreshReserves(pairAddress, tokenXAddress, provider) {
   if (!ethers.isAddress(pairAddress)) {
     throw new Error(`プールアドレスの形式が不正(標準的な20バイトアドレスではない): ${pairAddress}`);
@@ -82,13 +77,12 @@ async function getFreshReserves(pairAddress, tokenXAddress, provider) {
   };
 }
 
-const SLIPPAGE_TOLERANCE_BPS = 100n; // 1%の余裕
+const SLIPPAGE_TOLERANCE_BPS = 100n;
 
-// observed: dexWatchOnePairが返す観測結果オブジェクト(profitable===trueのもの)
 export async function maybeExecuteArb(observed) {
   const chainConfig = getChainConfig(observed.chain);
   if (!chainConfig) {
-    return; // chain-config.jsに未登録のチェーンは対象外。
+    return;
   }
 
   const routerCheap = getRouterAddress(observed.chain, observed.cheapDex);
@@ -114,8 +108,14 @@ export async function maybeExecuteArb(observed) {
     return;
   }
 
-  // tradeAmountInはJSの浮動小数点数のため、精度を保つよう文字列経由でBigIntへ変換する。
-  const amountInStr = observed.tradeAmountIn.toFixed(Math.min(decimalsY, 18));
+  const tradeCapUsd = getCurrentTradeCapUsd();
+  let effectiveTradeAmountIn = observed.tradeAmountIn;
+  if (observed.tradeAmountUsd > tradeCapUsd) {
+    const priceUsdPerUnit = observed.tradeAmountUsd / observed.tradeAmountIn;
+    effectiveTradeAmountIn = tradeCapUsd / priceUsdPerUnit;
+  }
+
+  const amountInStr = effectiveTradeAmountIn.toFixed(Math.min(decimalsY, 18));
   let amountIn;
   try {
     amountIn = ethers.parseUnits(amountInStr, decimalsY);
@@ -124,9 +124,6 @@ export async function maybeExecuteArb(observed) {
     return;
   }
 
-  // 実行直前にプールの現在の状態を直接読み直し、そこから期待される
-  // 受取量を計算する。観測時点(最大3分前)からズレていないかの
-  // 再確認も兼ねる。
   let minAmountOutStep1, minAmountOutStep2;
   try {
     const [cheapReserves, expensiveReserves] = await Promise.all([
@@ -152,9 +149,9 @@ export async function maybeExecuteArb(observed) {
     return;
   }
 
-  const dryRun = process.env.DRY_RUN !== "false"; // 明示的にfalseにしない限り常に安全側
+  const dryRun = process.env.DRY_RUN !== "false";
 
-  console.log(`[実行判定] ${observed.pairLabel}: 投入額=${amountInStr}(${decimalsY}桁) 想定純利益=+$${observed.netProfit.toFixed(2)} minAmountOutStep1=${minAmountOutStep1} minAmountOutStep2=${minAmountOutStep2} DRY_RUN=${dryRun}`);
+  console.log(`[実行判定] ${observed.pairLabel}: 投入額=${amountInStr}(${decimalsY}桁、取引上限$${tradeCapUsd}適用後) 想定純利益=+$${observed.netProfit.toFixed(2)} minAmountOutStep1=${minAmountOutStep1} minAmountOutStep2=${minAmountOutStep2} DRY_RUN=${dryRun}`);
 
   if (dryRun) {
     console.log(`[実行判定] DRY_RUNのため送信はスキップします(routerCheap=${routerCheap}, routerExpensive=${routerExpensive})`);
@@ -181,6 +178,7 @@ export async function maybeExecuteArb(observed) {
     console.log(`[実行] トランザクション送信: ${tx.hash}`);
     const receipt = await tx.wait();
     console.log(`[実行] 完了: ブロック${receipt.blockNumber}, ガス使用量=${receipt.gasUsed.toString()}`);
+    recordExecutionSuccess();
   } catch (e) {
     console.error("[実行] 失敗:", e.message);
   }
