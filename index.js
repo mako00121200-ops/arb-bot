@@ -18,9 +18,6 @@ async function dexFetchWithTimeout(url, timeoutMs = DEX_FETCH_TIMEOUT_MS) {
   }
 }
 
-// 1回の取引の上限額(USD)。理論上の最適額がこれより小さければそのまま
-// 使い(過剰投入で非効率になるのを防ぐ)、上限を超える場合だけこの額で
-// キャップする(資金不足で負けが続かないようにするため)。
 const MAX_TRADE_USD = parseFloat(process.env.MAX_TRADE_USD || "300");
 
 function dexGetAmountOut(amountIn, reserveIn, reserveOut, feeRetain) {
@@ -29,7 +26,6 @@ function dexGetAmountOut(amountIn, reserveIn, reserveOut, feeRetain) {
   return (reserveOut * amountInWithFee) / (reserveIn + amountInWithFee);
 }
 
-// 任意の投入量(Yトークン建て)でのプロフィットを計算する共通関数。
 function dexSimulateProfitForAmount(pool1, pool2, amountIn) {
   const xOut = dexGetAmountOut(amountIn, pool1.reserveY, pool1.reserveX, 1 - pool1.fee);
   const yOut = dexGetAmountOut(xOut, pool2.reserveX, pool2.reserveY, 1 - pool2.fee);
@@ -75,8 +71,6 @@ function dexComputeOptimalArbitrage(pool1, pool2) {
   return { amountIn: bestT, grossProfit: bestProfit, profitable: bestProfit > 0 };
 }
 
-// cheapPool.priceUsdPerY を使って上限額($300)をYトークン建てに換算し、
-// 「理論上の最適額」と「上限額」の小さい方を実際の投入量として使う。
 function dexEvaluateOpportunity({ cheapPool, expensivePool, gasCostUsd, maxTradeAmountUsd, slippageBuffer = 0, pairLabel = "" }) {
   const priceCheap = cheapPool.reserveY / cheapPool.reserveX;
   const priceExpensive = expensivePool.reserveY / expensivePool.reserveX;
@@ -802,7 +796,7 @@ function renderAboutPage() {
   <h2>② DEX観測ログ(3分ごと)</h2>
   <div class="note">
     キャッシュした候補を8件ずつ順番に(ローテーションしながら)DexScreenerで価格チェックします。<br>
-    黒字判定された案件は、実行判定ロジック(scripts/execute-arb.js)に渡されます。現状はBase・ルーター確認済みDEXの組み合わせのみが対象で、DRY_RUNの間は実際の送信を行わずログ記録のみ行います。
+    黒字判定された案件は、実行判定ロジック(scripts/execute-arb.js)に渡されます。現状はchain-config.jsに登録済み・ルーター確認済みDEXの組み合わせのみが対象で、DRY_RUNの間は実際の送信を行わずログ記録のみ行います。
   </div>
 </div>
 
@@ -856,9 +850,12 @@ async function main() {
       console.error("[テストネット検証] 失敗:", e.message);
     }
   }
-  if (process.env.RUN_MAINNET_DEPLOY === "true") {
+  // RUN_MAINNET_DEPLOYには、デプロイしたいチェーン名(base/polygon/optimism/avalanche)
+  // を設定する。未設定・"false"の場合は何もしない。
+  const deployTarget = process.env.RUN_MAINNET_DEPLOY;
+  if (deployTarget && deployTarget !== "false") {
     try {
-      await runMainnetDeploy();
+      await runMainnetDeploy(deployTarget);
     } catch (e) {
       console.error("[本番デプロイ] 失敗:", e.message);
     }
