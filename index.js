@@ -19,10 +19,12 @@ async function dexFetchWithTimeout(url, timeoutMs = DEX_FETCH_TIMEOUT_MS) {
 }
 
 const MAX_TRADE_USD = parseFloat(process.env.MAX_TRADE_USD || "300");
-
-// Aave V3のフラッシュローン手数料(標準0.05%)。取引資金がフラッシュローン
-// 由来のため、これを差し引かないと純利益を実際より多く見積もってしまう。
 const AAVE_FLASHLOAN_FEE_RATE = 0.0005;
+
+// 極端に時価総額の小さいトークン(超小型ミームコイン等)を除外する。
+// NPC(時価総額$7,480)のような、詐欺・急激な価格操作リスクが高い
+// トークンが紛れ込むのを防ぐため。$100,000未満を目安とする。
+const MIN_MARKET_CAP_USD = 100000;
 
 function dexGetAmountOut(amountIn, reserveIn, reserveOut, feeRetain) {
   if (amountIn <= 0) return 0;
@@ -333,6 +335,12 @@ function dexToPoolShape(pair, targetTokenAddress, chain) {
     const volume24h = pair.volume?.h24 ?? 0;
     const txns24h = (pair.txns?.h24?.buys ?? 0) + (pair.txns?.h24?.sells ?? 0);
     console.log(`[DEX診断] ${pair.dexId}: 取引がほぼ枯れているため除外(24時間出来高=$${volume24h.toFixed(2)}, 取引件数=${txns24h}件) - ZipSwap等で実際に確認された「活動停止プール」の誤検知パターン`);
+    return null;
+  }
+
+  const marketCap = pair.marketCap ?? pair.fdv;
+  if (marketCap != null && marketCap < MIN_MARKET_CAP_USD) {
+    console.log(`[DEX診断] ${pair.dexId}: 時価総額$${Math.round(marketCap).toLocaleString()}が小さすぎるため除外(NPC等の超小型ミームコイン対策、基準$${MIN_MARKET_CAP_USD.toLocaleString()})`);
     return null;
   }
 
@@ -805,7 +813,8 @@ function renderAboutPage() {
   <div class="note">
     キャッシュした候補を8件ずつ順番に(ローテーションしながら)DexScreenerで価格チェックします。<br>
     純利益には、DEXの取引手数料・ガス代・Aaveのフラッシュローン手数料(0.05%)・スリッページの見積もりを差し引いています。<br>
-    黒字判定された案件は、実行判定ロジック(scripts/execute-arb.js)に渡されます。現状はchain-config.jsに登録済み・ルーター確認済みDEXの組み合わせのみが対象で、DRY_RUNの間は実際の送信を行わずログ記録のみ行います。
+    時価総額が$100,000未満の超小型トークンは、詐欺・急激な価格操作のリスクが高いため除外しています。<br>
+    黒字判定された案件は、実行判定ロジック(scripts/execute-arb.js)に渡されます。現状はchain-config.jsに登録済み・ルーター確認済みDEXの組み合わせのみが対象で、DRY_RUNの間は実際の送信を行わずログ記録のみ行います。実際に送信する金額は、段階的取引上限(scripts/trade-cap.js)でさらに絞られます。
   </div>
 </div>
 
