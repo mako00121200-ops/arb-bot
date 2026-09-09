@@ -7,8 +7,10 @@
 //
 // 各アドレスの確認方法(2026年9月時点):
 // - Base/Aerodrome: 実際のトランザクション例付きの技術記事で確認
-// - Base/Uniswap V2: docs.base.org公式ドキュメント + Uniswap公式ガバナンス
-//   フォーラムの2つの独立した情報源で一致を確認
+// - Base・Arbitrum・Avalanche/Uniswap V2: Uniswap公式ドキュメントの
+//   複数チェーン対応表で確認(3チェーンとも同一アドレス)
+// - Optimism/Uniswap V2、Polygon/Uniswap V2: 同じくUniswap公式
+//   ドキュメントの複数チェーン対応表で確認(チェーンごとに別アドレス)
 // - Polygon/QuickSwap: QuickSwap公式GitHubリポジトリ + 実際の取引データで確認
 // - Optimism/Velodrome: Velodrome公式GitHubリポジトリ(Optimistic Etherscan
 //   リンク付き)で確認
@@ -22,12 +24,18 @@ export const ROUTER_ADDRESSES = {
   },
   polygon: {
     quickswap: "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff",
+    uniswap: "0xedf6066a2b290C185783862C7F4776A2C8077AD1",
   },
   optimism: {
     velodrome: "0xa062aE8A9c5e11aaA026fc2670B0D65cCc8B2858",
+    uniswap: "0x4A7b5Da61326A6379179b40d00F57E5bbDC962c2",
   },
   avalanche: {
     traderjoe: "0x60ae616a2155ee3d9a68541ba4544862310933d4",
+    uniswap: "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24",
+  },
+  arbitrum: {
+    uniswap: "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24",
   },
 };
 
