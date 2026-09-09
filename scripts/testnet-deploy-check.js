@@ -3,51 +3,10 @@
 // 6節の未確定事項⑥(テストネットでのコントラクト動作検証)に対応するスクリプト。
 // RUN_TESTNET_DEPLOY_CHECK=true が設定されている場合のみ、起動時に1回だけ実行される
 // (index.js側のフックから呼び出される)。
-//
-// 現時点で確認するのは「コンパイルが通るか」「Base Sepoliaへ実際にデプロイできるか」
-// 「デプロイの実際のガス代はいくらか」の3点。DEXルーターを使った実際のアービトラージ
-// 実行テスト(トークン・プールの準備が別途必要)は、次の段階で扱う。
 
-import fs from "fs";
-import { fileURLToPath } from "url";
-import path from "path";
-import solc from "solc";
 import { ethers } from "ethers";
 import { AaveV3BaseSepolia } from "@aave-dao/aave-address-book";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-function compileContract() {
-  const contractPath = path.join(__dirname, "..", "contracts", "DexArbFlashLoan.sol");
-  const source = fs.readFileSync(contractPath, "utf8");
-
-  const input = {
-    language: "Solidity",
-    sources: {
-      "DexArbFlashLoan.sol": { content: source },
-    },
-    settings: {
-      optimizer: { enabled: true, runs: 200 },
-      outputSelection: {
-        "*": { "*": ["abi", "evm.bytecode.object"] },
-      },
-    },
-  };
-
-  const output = JSON.parse(solc.compile(JSON.stringify(input)));
-
-  const errors = (output.errors || []).filter((e) => e.severity === "error");
-  if (errors.length > 0) {
-    console.error("[テストネット検証] コンパイルエラー:");
-    for (const e of errors) console.error(e.formattedMessage);
-    throw new Error("コンパイル失敗");
-  }
-  const warnings = (output.errors || []).filter((e) => e.severity === "warning");
-  for (const w of warnings) console.warn("[テストネット検証] コンパイル警告:", w.formattedMessage);
-
-  const compiled = output.contracts["DexArbFlashLoan.sol"]["DexArbFlashLoan"];
-  return { abi: compiled.abi, bytecode: "0x" + compiled.evm.bytecode.object };
-}
+import { compileContract } from "./compile-contract.js";
 
 export async function runTestnetDeployCheck() {
   console.log("[テストネット検証] 開始: Base Sepoliaへのデプロイ確認");
