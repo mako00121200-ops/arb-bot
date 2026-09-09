@@ -20,6 +20,10 @@ async function dexFetchWithTimeout(url, timeoutMs = DEX_FETCH_TIMEOUT_MS) {
 
 const MAX_TRADE_USD = parseFloat(process.env.MAX_TRADE_USD || "300");
 
+// Aave V3のフラッシュローン手数料(標準0.05%)。取引資金がフラッシュローン
+// 由来のため、これを差し引かないと純利益を実際より多く見積もってしまう。
+const AAVE_FLASHLOAN_FEE_RATE = 0.0005;
+
 function dexGetAmountOut(amountIn, reserveIn, reserveOut, feeRetain) {
   if (amountIn <= 0) return 0;
   const amountInWithFee = amountIn * feeRetain;
@@ -87,7 +91,8 @@ function dexEvaluateOpportunity({ cheapPool, expensivePool, gasCostUsd, maxTrade
 
   const actualGrossProfitY = dexSimulateProfitForAmount(cheapPool, expensivePool, actualTradeAmountIn);
   const actualSlippageCostY = actualGrossProfitY * slippageBuffer;
-  const actualNetProfitY = actualGrossProfitY - gasCostInY - actualSlippageCostY;
+  const aaveFeeInY = actualTradeAmountIn * AAVE_FLASHLOAN_FEE_RATE;
+  const actualNetProfitY = actualGrossProfitY - gasCostInY - actualSlippageCostY - aaveFeeInY;
 
   return {
     timestamp: new Date().toISOString(),
@@ -98,6 +103,7 @@ function dexEvaluateOpportunity({ cheapPool, expensivePool, gasCostUsd, maxTrade
     grossProfit: actualGrossProfitY * priceUsdPerY,
     gasCostInY: gasCostUsd,
     slippageCost: actualSlippageCostY * priceUsdPerY,
+    aaveFeeCost: aaveFeeInY * priceUsdPerY,
     netProfit: actualNetProfitY * priceUsdPerY,
     profitable: actualNetProfitY > 0,
     optimalAmountIn: optimalResult.amountIn,
@@ -176,6 +182,8 @@ function isKnownFalsePositive({ symbol, cheapDexId, expensiveDexId, chain }) {
   if ((cheapDexId || "").includes("sparkdex") || (expensiveDexId || "").includes("sparkdex")) return true;
 
   if ((cheapDexId || "").includes("traderjoe-v2") || (expensiveDexId || "").includes("traderjoe-v2")) return true;
+
+  if (lowerChain === "base" && (cheapDexId === "quickswap" || expensiveDexId === "quickswap")) return true;
 
   return false;
 }
@@ -386,7 +394,7 @@ async function dexWatchOnePair(candidate) {
   }
 
   if (isKnownFalsePositive({ symbol: candidate.symbol, cheapDexId: poolA.dexId, expensiveDexId: poolB.dexId, chain: candidate.chain })) {
-    console.log(`[DEX診断] ${candidate.symbol} on ${candidate.chain}: 調査により「見せかけの歪み」と確定済みのため除外(USDbC/USDC.e/ZipSwap/PancakeSwap-Arbitrum/SparkDEX/TraderJoeV2)`);
+    console.log(`[DEX診断] ${candidate.symbol} on ${candidate.chain}: 調査により「見せかけの歪み」と確定済みのため除外(USDbC/USDC.e/ZipSwap/PancakeSwap-Arbitrum/SparkDEX/TraderJoeV2/QuickSwap-Base)`);
     return null;
   }
 
@@ -727,7 +735,7 @@ function renderPage() {
   <table><thead><tr><th>#</th><th>ペア</th><th style="text-align:right;">価格差</th><th style="text-align:right;">純利益</th></tr></thead>
   <tbody>${dexRows}</tbody></table>
   <div class="note">
-    prospector.jsが選んだ候補ペアを、DexScreenerのデータで観測 → 理論上の最適投入額(上限$${MAX_TRADE_USD})で取引した想定で、ガス代・手数料込みの純利益を計算して記録。<br>
+    prospector.jsが選んだ候補ペアを、DexScreenerのデータで観測 → 理論上の最適投入額(上限$${MAX_TRADE_USD})で取引した想定で、ガス代・手数料(DEX取引手数料+Aaveフラッシュローン手数料0.05%)込みの純利益を計算して記録。<br>
     記録件数・黒字件数・累積純利益は上限なく増え続ける累計値です(観測ログ本体は容量の都合で直近2000件のみ保持)。<br>
     実際の注文は出していません(紙上観測のみ)。${lastDexError ? `<br><span style="color:#e74c3c;">エラー: ${lastDexError}</span>` : ''}
   </div>
@@ -796,6 +804,7 @@ function renderAboutPage() {
   <h2>② DEX観測ログ(3分ごと)</h2>
   <div class="note">
     キャッシュした候補を8件ずつ順番に(ローテーションしながら)DexScreenerで価格チェックします。<br>
+    純利益には、DEXの取引手数料・ガス代・Aaveのフラッシュローン手数料(0.05%)・スリッページの見積もりを差し引いています。<br>
     黒字判定された案件は、実行判定ロジック(scripts/execute-arb.js)に渡されます。現状はchain-config.jsに登録済み・ルーター確認済みDEXの組み合わせのみが対象で、DRY_RUNの間は実際の送信を行わずログ記録のみ行います。
   </div>
 </div>
@@ -850,8 +859,6 @@ async function main() {
       console.error("[テストネット検証] 失敗:", e.message);
     }
   }
-  // RUN_MAINNET_DEPLOYには、デプロイしたいチェーン名(base/polygon/optimism/avalanche)
-  // を設定する。未設定・"false"の場合は何もしない。
   const deployTarget = process.env.RUN_MAINNET_DEPLOY;
   if (deployTarget && deployTarget !== "false") {
     try {
