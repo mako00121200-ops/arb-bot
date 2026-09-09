@@ -14,7 +14,7 @@ export const CHAIN_CONFIG = {
     explorerTxUrl: (hash) => `https://basescan.org/tx/${hash}`,
   },
   polygon: {
-    rpcUrl: "https://polygon-rpc.com",
+    rpcUrl: "https://polygon.llamarpc.com",
     aavePoolAddressesProvider: AaveV3Polygon.POOL_ADDRESSES_PROVIDER,
     contractAddressEnvVar: "MAINNET_CONTRACT_ADDRESS_POLYGON",
     explorerTxUrl: (hash) => `https://polygonscan.com/tx/${hash}`,
