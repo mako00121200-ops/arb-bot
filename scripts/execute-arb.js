@@ -2,11 +2,12 @@
 //
 // 観測システムが黒字と判定した案件を、実際にコントラクトのexecuteArbへ
 // 送信する(またはDRY_RUNならログに記録するだけの)ロジック。
-// 現時点ではBase・ルーター確認済みDEXの組み合わせのみを対象とする
-// (仕様書3.1〜3.2節に対応)。
+// chain-config.jsに登録済み・ルーター確認済みDEXの組み合わせのみを
+// 対象とする(仕様書3.1〜3.2節に対応)。
 
 import { ethers } from "ethers";
 import { getRouterAddress } from "../router-addresses.js";
+import { getChainConfig } from "../chain-config.js";
 
 const ERC20_DECIMALS_ABI = ["function decimals() view returns (uint8)"];
 const PAIR_ABI = [
@@ -38,20 +39,23 @@ function getAmountOutBigInt(amountIn, reserveIn, reserveOut, feeBps) {
   return denominator === 0n ? 0n : numerator / denominator;
 }
 
-let cachedProvider = null;
-function getProvider() {
-  if (!cachedProvider) {
-    cachedProvider = new ethers.JsonRpcProvider("https://mainnet.base.org");
+// チェーンごとにprovider接続を使い回す。
+const providerCache = new Map();
+function getProviderForChain(rpcUrl) {
+  if (!providerCache.has(rpcUrl)) {
+    providerCache.set(rpcUrl, new ethers.JsonRpcProvider(rpcUrl));
   }
-  return cachedProvider;
+  return providerCache.get(rpcUrl);
 }
 
 // トークンごとの桁数(decimals)は、外部サイトの情報に頼らず、
 // ブロックチェーン自身に直接問い合わせて確認する(確実性のため)。
+// 複数チェーンで同じトークンアドレスが別物のことがあるため、
+// チェーン名も含めてキャッシュする。
 const decimalsCache = new Map();
-async function getTokenDecimals(tokenAddress, provider) {
+async function getTokenDecimals(tokenAddress, provider, chain) {
   const normalizedAddress = ethers.getAddress(tokenAddress);
-  const key = normalizedAddress.toLowerCase();
+  const key = `${chain}:${normalizedAddress.toLowerCase()}`;
   if (decimalsCache.has(key)) return decimalsCache.get(key);
   const contract = new ethers.Contract(normalizedAddress, ERC20_DECIMALS_ABI, provider);
   const decimals = Number(await contract.decimals());
@@ -62,7 +66,7 @@ async function getTokenDecimals(tokenAddress, provider) {
 // 実行直前に、プールの現在の準備量を直接読み直す(観測データは
 // 最大3分前のスナップショットのため、実行直前の再確認として必須)。
 // Uniswap V4等、通常の20バイトアドレスを持たない方式のプールを
-// 事前に弾く(minAmountOutStep1/2参照)。
+// 事前に弾く。
 async function getFreshReserves(pairAddress, tokenXAddress, provider) {
   if (!ethers.isAddress(pairAddress)) {
     throw new Error(`プールアドレスの形式が不正(標準的な20バイトアドレスではない): ${pairAddress}`);
@@ -82,8 +86,9 @@ const SLIPPAGE_TOLERANCE_BPS = 100n; // 1%の余裕
 
 // observed: dexWatchOnePairが返す観測結果オブジェクト(profitable===trueのもの)
 export async function maybeExecuteArb(observed) {
-  if ((observed.chain || "").toLowerCase() !== "base") {
-    return; // 現時点ではBaseのみ対応。他チェーンはコントラクト未デプロイ。
+  const chainConfig = getChainConfig(observed.chain);
+  if (!chainConfig) {
+    return; // chain-config.jsに未登録のチェーンは対象外。
   }
 
   const routerCheap = getRouterAddress(observed.chain, observed.cheapDex);
@@ -93,17 +98,17 @@ export async function maybeExecuteArb(observed) {
     return;
   }
 
-  const contractAddress = process.env.MAINNET_CONTRACT_ADDRESS;
+  const contractAddress = process.env[chainConfig.contractAddressEnvVar];
   if (!contractAddress) {
-    console.warn("[実行判定] MAINNET_CONTRACT_ADDRESSが未設定のため見送り");
+    console.warn(`[実行判定] ${chainConfig.contractAddressEnvVar}が未設定のため見送り`);
     return;
   }
 
-  const provider = getProvider();
+  const provider = getProviderForChain(chainConfig.rpcUrl);
 
   let decimalsY;
   try {
-    decimalsY = await getTokenDecimals(observed.tokenB, provider);
+    decimalsY = await getTokenDecimals(observed.tokenB, provider, observed.chain);
   } catch (e) {
     console.warn(`[実行判定] ${observed.pairLabel}: トークンのdecimals取得に失敗、見送り:`, e.message);
     return;
