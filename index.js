@@ -4,6 +4,7 @@ import { runProspect } from "./prospector.js";
 import { startOnchainFeeds, updatePoolSubscriptions } from "./dex-onchain-realtime.js";
 import { runTestnetDeployCheck } from "./scripts/testnet-deploy-check.js";
 import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
+import { maybeExecuteArb } from "./scripts/execute-arb.js";
 
 const DEX_FETCH_TIMEOUT_MS = 20000;
 
@@ -20,8 +21,6 @@ async function dexFetchWithTimeout(url, timeoutMs = DEX_FETCH_TIMEOUT_MS) {
 // 1回の取引の上限額(USD)。理論上の最適額がこれより小さければそのまま
 // 使い(過剰投入で非効率になるのを防ぐ)、上限を超える場合だけこの額で
 // キャップする(資金不足で負けが続かないようにするため)。
-// 現状は自動売買を実装していないため、この値はシミュレーション上の
-// 想定としてのみ使われている。
 const MAX_TRADE_USD = parseFloat(process.env.MAX_TRADE_USD || "300");
 
 function dexGetAmountOut(amountIn, reserveIn, reserveOut, feeRetain) {
@@ -89,7 +88,6 @@ function dexEvaluateOpportunity({ cheapPool, expensivePool, gasCostUsd, maxTrade
 
   const optimalResult = dexComputeOptimalArbitrage(cheapPool, expensivePool);
 
-  // 実際に使う投入量: 理論上の最適額と上限額の小さい方。
   const actualTradeAmountIn = Math.min(optimalResult.amountIn, maxTradeAmountIn);
   const cappedByBudget = optimalResult.amountIn > maxTradeAmountIn;
 
@@ -133,9 +131,6 @@ function dexGetFeeForDex(dexId) {
   return DEX_DEFAULT_FEE_BY_DEX[(dexId || "").toLowerCase()] ?? DEX_DEFAULT_FEE_BY_DEX.default;
 }
 
-// DeFiLlamaとDexScreenerでチェーンの表記が一致しない場合がある。
-// 特にOptimismはDeFiLlamaが"OP Mainnet"、DexScreenerが"optimism"と
-// 表記しており、変換しないと候補が常に0件になってしまっていた。
 function dexNormalizeChain(chain) {
   const map = {
     base: "base",
@@ -147,10 +142,6 @@ function dexNormalizeChain(chain) {
   return map[(chain || "").toLowerCase()] || (chain || "").toLowerCase();
 }
 
-// チェーンごとの想定ガス代(USD)。イーサリアムL1はL2群より一桁以上高いため、
-// 一律の値を使うと「小さな価格差」を誤って黒字判定してしまう。
-// bsc/binance/bnbは、DeFiLlamaがどの表記を使っているか未確定なため
-// 念のため全パターンを登録している。
 const CHAIN_GAS_COST_USD = {
   base: 0.05,
   arbitrum: 0.10,
@@ -168,17 +159,9 @@ function getGasCostForChain(chain) {
   return CHAIN_GAS_COST_USD[key] ?? 0.25;
 }
 
-// 両プールとも流動性が厚い(=プロのbotが常時監視している)のに
-// 大きな価格差が残っている場合、本物の機会ではなくデータ取得時の
-// ズレ・プール種別の誤判定である可能性が高い(WETH-USDC on Base で
-// 2回実際に確認済み: PancakeSwap V3プールが除外の網をすり抜けていた)。
-// 厚いプール同士は許容する価格差を厳しく制限する
-// (薄いプール側が絡む場合は適用しない)。
 const DEEP_POOL_LIQUIDITY_USD = 500000;
 const DEEP_POOL_MAX_GAP_PCT = 1;
 
-// 取引がほぼ枯れている(=事実上稼働停止している)プールを除外する基準。
-// ZipSwapの実例(24時間の取引0件・出来高$13.7)で確認済み。
 const DEAD_POOL_MIN_VOLUME_USD = 50;
 const DEAD_POOL_MIN_TXNS_24H = 3;
 function isDeadPool(pair) {
@@ -187,33 +170,22 @@ function isDeadPool(pair) {
   return volume24h < DEAD_POOL_MIN_VOLUME_USD || txns24h < DEAD_POOL_MIN_TXNS_24H;
 }
 
-// 実際に調査して「見せかけの歪み」と確定したペア/DEXの組み合わせ。
 function isKnownFalsePositive({ symbol, cheapDexId, expensiveDexId, chain }) {
   const upperSymbol = (symbol || "").toUpperCase();
   if (upperSymbol.includes("USDBC")) return true;
   if (upperSymbol.includes("USDC.E") || upperSymbol.includes("USDCE")) return true;
   if (cheapDexId === "zipswap" || expensiveDexId === "zipswap") return true;
 
-  // PancakeSwapはArbitrum版のみ、取扱ペア1件・24時間出来高$62程度で
-  // 事実上活動停止と確認済み(他チェーンのPancakeSwapは対象外)。
   const lowerChain = dexNormalizeChain(chain);
   if (lowerChain === "arbitrum" && (cheapDexId === "pancakeswap" || expensiveDexId === "pancakeswap")) return true;
 
-  // SparkDEX V2はFlareで24時間出来高$0(DefiLlamaで確認済み)、
-  // 事実上活動停止。
   if ((cheapDexId || "").includes("sparkdex") || (expensiveDexId || "").includes("sparkdex")) return true;
 
-  // TraderJoe V2(Liquidity Book)は離散的な価格帯モデルで、
-  // 私たちの計算式(x*y=k)が通用しない。V1のみ対応するための予防策。
   if ((cheapDexId || "").includes("traderjoe-v2") || (expensiveDexId || "").includes("traderjoe-v2")) return true;
 
   return false;
 }
 
-// 「初めて見るDEX」をチェーン別に記録しておく仕組み。定期メンテナンス
-// 時にこの一覧を見れば、SparkDEX・BlazeSwap・ZipSwap・QuickSwap(Base)の
-// 時のように、いちいちログを掘らなくても「今回新しく増えたDEX」が
-// ひと目で分かる(実在確認・信頼性調査の対象リストになる)。
 function dexLoadKnownDexes() {
   try {
     if (fs.existsSync(KNOWN_DEX_FILE)) return JSON.parse(fs.readFileSync(KNOWN_DEX_FILE, "utf8"));
@@ -237,9 +209,6 @@ function checkAndRecordNewDex(dexId, chain) {
   console.log(`[DEX診断] 新しいDEXを初めて検出: "${dexId}" on ${chain} — 実在確認・信頼性の調査を推奨`);
 }
 
-// 過去(修正前)に「同じDEX名同士」「両プール厚いのに大きな価格差」
-// 「実際に見せかけと確認できたペア」の誤ったデータが記録済みの場合が
-// あるため、読み込み時にも同じ基準で弾く。
 function dexLoadLog() {
   try {
     if (fs.existsSync(DEX_LOG_FILE)) {
@@ -268,8 +237,6 @@ function dexSaveLog(entries) {
   }
 }
 
-// 記録件数・黒字件数・累積純利益は、観測ログの2000件上限とは独立した
-// 専用ファイルで管理する(古い記録が押し出されても数字が減らないため)。
 function dexLoadStats() {
   try {
     if (fs.existsSync(DEX_STATS_FILE)) return JSON.parse(fs.readFileSync(DEX_STATS_FILE, "utf8"));
@@ -301,9 +268,6 @@ function dexRecordStats(observed) {
   dexSaveStats(stats);
 }
 
-// tokenAだけで検索すると、人気トークン(WETH等)は上位30件がUSDC等の
-// 出来高最大ペアで埋まり、本命のペアが枠外に押し出されることがある。
-// tokenA・tokenB両方で検索して結果を合成することで、この取りこぼしを防ぐ。
 async function dexFetchPairsForToken(tokenAddress, chain, otherTokenAddress) {
   const targetChain = dexNormalizeChain(chain);
   const target = tokenAddress.toLowerCase();
@@ -356,7 +320,6 @@ function isConcentratedLiquidity(pair) {
 }
 
 function dexToPoolShape(pair, targetTokenAddress, chain) {
-  // どんな理由で後段が除外しても、「このDEXの存在自体」は必ず記録する。
   checkAndRecordNewDex(pair.dexId, chain);
 
   if (isConcentratedLiquidity(pair)) {
@@ -391,9 +354,6 @@ function dexToPoolShape(pair, targetTokenAddress, chain) {
   const reserveX = baseIsTarget ? liqBase : liqQuote;
   const reserveY = baseIsTarget ? liqQuote : liqBase;
 
-  // Yトークン(取引の投入・利益の建値通貨)のUSD価格を、DexScreenerの
-  // priceUsd(base側のUSD価格)とpriceNative(baseがquote何枚分か)から
-  // 逆算する。上限$300をYトークン建てに正しく換算するために必須。
   const basePriceUsd = parseFloat(pair.priceUsd);
   let priceUsdPerY = null;
   if (isFinite(basePriceUsd) && basePriceUsd > 0) {
@@ -426,17 +386,11 @@ async function dexWatchOnePair(candidate) {
 
   const [poolA, poolB] = pools;
 
-  // 同じDEX名同士(例: aerodrome vs aerodrome)は、AerodromeやVelodrome系に
-  // ある「Volatile」「Stable」という異なる計算式のプールを取り違えている
-  // 可能性が高い。今のコードはVolatile(x*y=k)しか対応していないため、
-  // 安全のため除外する。
   if (poolA.dexId === poolB.dexId) {
     console.log(`[DEX診断] ${candidate.symbol} on ${candidate.chain}: 同じDEX名同士(${poolA.dexId})のため除外(Stable/Volatileプールの取り違えの可能性 - 今の計算式では区別できないため)`);
     return null;
   }
 
-  // 調査により「見せかけの歪み」と確定済みのペア/DEXは、観測の
-  // 時点で弾く(過去ログの読み込み時だけでなく、新規記録もここで防ぐ)。
   if (isKnownFalsePositive({ symbol: candidate.symbol, cheapDexId: poolA.dexId, expensiveDexId: poolB.dexId, chain: candidate.chain })) {
     console.log(`[DEX診断] ${candidate.symbol} on ${candidate.chain}: 調査により「見せかけの歪み」と確定済みのため除外(USDbC/USDC.e/ZipSwap/PancakeSwap-Arbitrum/SparkDEX/TraderJoeV2)`);
     return null;
@@ -465,10 +419,6 @@ async function dexWatchOnePair(candidate) {
     return null;
   }
 
-  // 両プールとも流動性が厚い($500,000以上)のに1%を超える価格差が
-  // 残っているのは、本物の機会というよりデータ取得時のズレや
-  // プール種別の誤判定である可能性が高い(厚いプール同士は他のbotが
-  // 常時監視しているため)。
   const bothPoolsDeep = (cheapPool.liquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD
     && (expensivePool.liquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD;
   if (bothPoolsDeep && Math.abs(result.priceDiffPercent) > DEEP_POOL_MAX_GAP_PCT) {
@@ -590,6 +540,13 @@ async function handleOnchainSync(chainName, poolAddress, reserve0, reserve1, rec
       dexSaveLog(log);
       dexRecordStats(observed);
       console.log(`[オンチェーン反応] ${observed.pairLabel}: Sync検知から${latencyMs}ms後に再評価完了(ズレ${observed.priceDiffPercent.toFixed(2)}%、純利益${observed.netProfit>=0?'+':''}$${observed.netProfit.toFixed(2)})`);
+      if (observed.profitable) {
+        try {
+          await maybeExecuteArb(observed);
+        } catch (e) {
+          console.warn(`[実行判定] ${observed.pairLabel}: エラー:`, e.message);
+        }
+      }
     }
   } catch (e) {
     console.warn(`[オンチェーン反応] 再評価失敗:`, e.message);
@@ -667,6 +624,13 @@ async function runWatchCycle({ topN = 8 } = {}) {
           poolAddressToCandidate.set(observed.cheapPoolAddress, { candidate });
           poolAddressToCandidate.set(observed.expensivePoolAddress, { candidate });
           updatePoolSubscriptions(candidate.chain, [observed.cheapPoolAddress, observed.expensivePoolAddress]);
+        }
+        if (observed.profitable) {
+          try {
+            await maybeExecuteArb(observed);
+          } catch (e) {
+            console.warn(`[実行判定] ${observed.pairLabel}: エラー:`, e.message);
+          }
         }
       }
     } catch (e) {
@@ -813,8 +777,7 @@ function renderNewDexSection() {
     <h2>🆕 これまでに検出したDEX(直近${Math.min(entries.length, 20)}件、新しい順)</h2>
     <table><thead><tr><th>DEX名</th><th>チェーン</th><th>初検出日</th></tr></thead><tbody>${rows}</tbody></table>
     <div class="note">
-      全${entries.length}件のDEXを検出済み。定期メンテナンス時は、直近に増えたものを優先的に「実在するか」「信頼できるか」調査してください。<br>
-      (SparkDEX・BlazeSwap・QuickSwap on Base・ZipSwapは、この方式で見つかり調査済みです)
+      全${entries.length}件のDEXを検出済み。定期メンテナンス時は、直近に増えたものを優先的に「実在するか」「信頼できるか」調査してください。
     </div>
   </div>`;
 }
@@ -830,9 +793,8 @@ function renderAboutPage() {
   <h2>① 候補ペアの選定(1時間ごと)</h2>
   <div class="note">
     DeFiLlamaから全DEXプールのデータを取得し、「同じトークンペアが複数のDEXに存在する組み合わせ」を洗い出します。<br>
-    Ethereumはガス代が確実に利益を上回るため除外しています。それ以外の全チェーン(Base, Arbitrum, Optimism, Polygon, Avalanche, BSC, Flare等)が対象です。<br>
-    流動性・出来高の少なさからスコアリングして上位60件をキャッシュします(prospector.js)。<br>
-    このデータ自体はファイルには保存せず、メモリ上に1時間だけ保持します。
+    Ethereumはガス代が確実に利益を上回るため除外しています。それ以外の全チェーンが対象です。<br>
+    流動性・出来高の少なさからスコアリングして上位60件をキャッシュします(prospector.js)。
   </div>
 </div>
 
@@ -840,26 +802,7 @@ function renderAboutPage() {
   <h2>② DEX観測ログ(3分ごと)</h2>
   <div class="note">
     キャッシュした候補を8件ずつ順番に(ローテーションしながら)DexScreenerで価格チェックします。<br>
-    「理論上いちばん利益が出る投入額」と「上限$${MAX_TRADE_USD}」の小さい方を実際の投入額として使い、ガス代・取引手数料・スリッページを差し引いた「純利益」を計算して、以下を記録します:
-  </div>
-  <table><thead><tr><th>項目</th><th>内容</th></tr></thead><tbody>
-    <tr><td>日時</td><td>観測した時刻</td></tr>
-    <tr><td>ペア・チェーン</td><td>例:USDC-AERO on Base</td></tr>
-    <tr><td>DEX(安い方/高い方)</td><td>例:aerodrome → uniswap</td></tr>
-    <tr><td>価格差(%)</td><td>2つのDEX間のズレ</td></tr>
-    <tr><td>投入額($)</td><td>理論上の最適額(上限$${MAX_TRADE_USD}でキャップ)</td></tr>
-    <tr><td>純利益($)</td><td>投入額をもとに、ガス代・手数料・スリッページを引いた後の金額</td></tr>
-    <tr><td>両プールの流動性($)</td><td>取引の実現性を判断する材料</td></tr>
-  </tbody></table>
-  <div class="note">
-    観測1件ごとの詳細は永続ディスク(/data)に保存、最大2000件まで(超えた分は古い順に削除)。<br>
-    ダッシュボードの記録件数・黒字件数・累積純利益は、この2000件上限とは別に、上限なく増え続ける専用の集計ファイルで管理しています(古い記録が押し出されても数字が減りません)。<br>
-    再デプロイしてもデータは消えません。<br>
-    以下の場合はデータ不備・異常値として除外しています(観測の時点、および過去に保存されたデータの読み込み時点の両方で適用):<br>
-    ・同じDEX名同士(Stable/Volatileプールの取り違えの可能性)<br>
-    ・両プールとも流動性が$500,000以上あるのに価格差が1%を超える場合<br>
-    ・24時間の出来高が$50未満、または取引件数が3件未満(=事実上稼働停止しているDEXの誤検知)<br>
-    ・調査により「見せかけの歪み」と確定したUSDbC・USDC.e・ZipSwap・PancakeSwap(Arbitrum版)・SparkDEX・TraderJoe V2関連
+    黒字判定された案件は、実行判定ロジック(scripts/execute-arb.js)に渡されます。現状はBase・ルーター確認済みDEXの組み合わせのみが対象で、DRY_RUNの間は実際の送信を行わずログ記録のみ行います。
   </div>
 </div>
 
@@ -868,25 +811,21 @@ ${renderNewDexSection()}
 <div class="card">
   <h2>③ 持続性の追跡</h2>
   <div class="note">
-    価格差が一定以上(0.1%)見つかった時だけ、5秒後・15秒後・30秒後・60秒後に同じペアを再チェックし、「まだ残っていたか」を記録します。<br>
-    他のbotにどれくらいの速さで価格差を埋められているかを見るためのデータです。<br>
-    最大500件まで、同じく/dataに保存されます。
+    価格差が一定以上(0.1%)見つかった時だけ、5秒後・15秒後・30秒後・60秒後に同じペアを再チェックし、「まだ残っていたか」を記録します。
   </div>
 </div>
 
 <div class="card">
   <h2>④ オンチェーン反応速度</h2>
   <div class="note">
-    Base(BASE_WSS_URLを設定している場合のみ)のSyncイベントをリアルタイムで購読し、検知から再評価完了までの時間を計測します。<br>
-    このデータはファイルに保存せず、直近200件だけメモリ上に保持します(再起動で消えます)。
+    Base(BASE_WSS_URLを設定している場合のみ)のSyncイベントをリアルタイムで購読し、検知から再評価完了までの時間を計測します。
   </div>
 </div>
 
 <div class="card">
   <h2>⑤ このサイトがやっていないこと</h2>
   <div class="note">
-    実際の売買注文は一切出していません。全て「もし取引していたら」の紙上シミュレーションです。<br>
-    ウォレットの秘密鍵や資金にアクセスすることもありません。
+    DRY_RUNの間は、実際の売買注文は一切出していません。全て「もし取引していたら」の紙上シミュレーションです。
   </div>
 </div>
 
@@ -910,9 +849,6 @@ async function main() {
   console.log("=== DEXアービトラージ観測所 起動 ===");
   startServer();
 
-  // テストネット検証・本番デプロイは、対応する環境変数がtrueの時だけ
-  // 起動時に1回実行される。観測本体の動作には影響させないよう、
-  // エラーが出てもcatchして続行する。
   if (process.env.RUN_TESTNET_DEPLOY_CHECK === "true") {
     try {
       await runTestnetDeployCheck();
