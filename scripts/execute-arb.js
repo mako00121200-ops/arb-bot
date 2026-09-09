@@ -50,9 +50,10 @@ function getProvider() {
 // ブロックチェーン自身に直接問い合わせて確認する(確実性のため)。
 const decimalsCache = new Map();
 async function getTokenDecimals(tokenAddress, provider) {
-  const key = tokenAddress.toLowerCase();
+  const normalizedAddress = ethers.getAddress(tokenAddress);
+  const key = normalizedAddress.toLowerCase();
   if (decimalsCache.has(key)) return decimalsCache.get(key);
-  const contract = new ethers.Contract(tokenAddress, ERC20_DECIMALS_ABI, provider);
+  const contract = new ethers.Contract(normalizedAddress, ERC20_DECIMALS_ABI, provider);
   const decimals = Number(await contract.decimals());
   decimalsCache.set(key, decimals);
   return decimals;
@@ -60,10 +61,15 @@ async function getTokenDecimals(tokenAddress, provider) {
 
 // 実行直前に、プールの現在の準備量を直接読み直す(観測データは
 // 最大3分前のスナップショットのため、実行直前の再確認として必須)。
+// ethers.getAddress()でアドレス形式を正規化してから使う
+// (DexScreenerが返す大文字小文字の形式によっては、正規化しないと
+// ethersがアドレスではなくENSドメイン名と誤解してエラーになるため)。
 async function getFreshReserves(pairAddress, tokenXAddress, provider) {
-  const pair = new ethers.Contract(pairAddress, PAIR_ABI, provider);
+  const normalizedPairAddress = ethers.getAddress(pairAddress);
+  const normalizedTokenX = ethers.getAddress(tokenXAddress);
+  const pair = new ethers.Contract(normalizedPairAddress, PAIR_ABI, provider);
   const [reserves, token0] = await Promise.all([pair.getReserves(), pair.token0()]);
-  const isToken0X = token0.toLowerCase() === tokenXAddress.toLowerCase();
+  const isToken0X = token0.toLowerCase() === normalizedTokenX.toLowerCase();
   return {
     reserveX: isToken0X ? reserves[0] : reserves[1],
     reserveY: isToken0X ? reserves[1] : reserves[0],
