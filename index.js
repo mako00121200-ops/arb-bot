@@ -3,6 +3,7 @@ import fs from "fs";
 import { runProspect } from "./prospector.js";
 import { startOnchainFeeds, updatePoolSubscriptions } from "./dex-onchain-realtime.js";
 import { runTestnetDeployCheck } from "./scripts/testnet-deploy-check.js";
+import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
 
 const DEX_FETCH_TIMEOUT_MS = 20000;
 
@@ -895,13 +896,21 @@ async function main() {
   console.log("=== DEXアービトラージ観測所 起動 ===");
   startServer();
 
-  // テストネット検証(RUN_TESTNET_DEPLOY_CHECK=trueの時だけ、起動時に1回実行)。
-  // 観測本体の動作には影響させないよう、エラーが出てもcatchして続行する。
+  // テストネット検証・本番デプロイは、対応する環境変数がtrueの時だけ
+  // 起動時に1回実行される。観測本体の動作には影響させないよう、
+  // エラーが出てもcatchして続行する。
   if (process.env.RUN_TESTNET_DEPLOY_CHECK === "true") {
     try {
       await runTestnetDeployCheck();
     } catch (e) {
       console.error("[テストネット検証] 失敗:", e.message);
+    }
+  }
+  if (process.env.RUN_MAINNET_DEPLOY === "true") {
+    try {
+      await runMainnetDeploy();
+    } catch (e) {
+      console.error("[本番デプロイ] 失敗:", e.message);
     }
   }
 
