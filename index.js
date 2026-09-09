@@ -5,6 +5,8 @@ import { startOnchainFeeds, updatePoolSubscriptions } from "./dex-onchain-realti
 import { runTestnetDeployCheck } from "./scripts/testnet-deploy-check.js";
 import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
 import { maybeExecuteArb } from "./scripts/execute-arb.js";
+import { getRealExecutionStats } from "./scripts/real-execution-log.js";
+import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
 
 const DEX_FETCH_TIMEOUT_MS = 20000;
 
@@ -20,10 +22,6 @@ async function dexFetchWithTimeout(url, timeoutMs = DEX_FETCH_TIMEOUT_MS) {
 
 const MAX_TRADE_USD = parseFloat(process.env.MAX_TRADE_USD || "300");
 const AAVE_FLASHLOAN_FEE_RATE = 0.0005;
-
-// 極端に時価総額の小さいトークン(超小型ミームコイン等)を除外する。
-// NPC(時価総額$7,480)のような、詐欺・急激な価格操作リスクが高い
-// トークンが紛れ込むのを防ぐため。$100,000未満を目安とする。
 const MIN_MARKET_CAP_USD = 100000;
 
 function dexGetAmountOut(amountIn, reserveIn, reserveOut, feeRetain) {
@@ -402,7 +400,7 @@ async function dexWatchOnePair(candidate) {
   }
 
   if (isKnownFalsePositive({ symbol: candidate.symbol, cheapDexId: poolA.dexId, expensiveDexId: poolB.dexId, chain: candidate.chain })) {
-    console.log(`[DEX診断] ${candidate.symbol} on ${candidate.chain}: 調査により「見せかけの歪み」と確定済みのため除外(USDbC/USDC.e/ZipSwap/PancakeSwap-Arbitrum/SparkDEX/TraderJoeV2/QuickSwap-Base)`);
+    console.log(`[DEX診断] ${candidate.symbol} on ${candidate.chain}: 調査により「見せかけの歪み」と確定済みのため除外`);
     return null;
   }
 
@@ -411,7 +409,7 @@ async function dexWatchOnePair(candidate) {
   const [cheapPool, expensivePool] = priceA < priceB ? [poolA, poolB] : [poolB, poolA];
 
   if (!cheapPool.priceUsdPerY || !isFinite(cheapPool.priceUsdPerY) || cheapPool.priceUsdPerY <= 0) {
-    console.log(`[DEX診断] ${candidate.symbol} on ${candidate.chain}: USD換算価格が取得できないため、上限$${MAX_TRADE_USD}の計算ができず除外`);
+    console.log(`[DEX診断] ${candidate.symbol} on ${candidate.chain}: USD換算価格が取得できないため除外`);
     return null;
   }
 
@@ -432,7 +430,7 @@ async function dexWatchOnePair(candidate) {
   const bothPoolsDeep = (cheapPool.liquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD
     && (expensivePool.liquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD;
   if (bothPoolsDeep && Math.abs(result.priceDiffPercent) > DEEP_POOL_MAX_GAP_PCT) {
-    console.warn(`[DEX] 両プールとも流動性十分($${Math.round(cheapPool.liquidityUsd).toLocaleString()} / $${Math.round(expensivePool.liquidityUsd).toLocaleString()})なのに価格差${result.priceDiffPercent.toFixed(2)}%は不自然、データ不備として除外 (${candidate.symbol} / ${candidate.chain})`);
+    console.warn(`[DEX] 両プールとも流動性十分($${Math.round(cheapPool.liquidityUsd).toLocaleString()} / $${Math.round(expensivePool.liquidityUsd).toLocaleString()})なのに価格差${result.priceDiffPercent.toFixed(2)}%は不自然、データ不備として除外`);
     return null;
   }
 
@@ -481,7 +479,7 @@ function trackPersistence(candidate, initialResult) {
     followUps: [],
   };
 
-  console.log(`[DEX持続性] 追跡開始: ${initialResult.pairLabel}(初回ズレ${initialResult.priceDiffPercent.toFixed(2)}%) → 5/15/30/60秒後に再チェックします`);
+  console.log(`[DEX持続性] 追跡開始: ${initialResult.pairLabel}(初回ズレ${initialResult.priceDiffPercent.toFixed(2)}%)`);
 
   for (const delaySec of PERSISTENCE_CHECK_DELAYS_SEC) {
     setTimeout(async () => {
@@ -581,14 +579,14 @@ async function dexGetCandidates(topN) {
   if (needsRefresh && !dexProspectRefreshing) {
     dexProspectRefreshing = true;
     try {
-      console.log("[DEX] 候補ペアを再選定中(DeFiLlama全件取得。数十秒かかることがあります)...");
+      console.log("[DEX] 候補ペアを再選定中...");
       const prospect = await runProspect({ minTvlUSD: 5000, topN: 60 });
       dexCachedCandidates = prospect.topPairs;
       dexLastProspectAt = now;
       dexCandidateRotationOffset = 0;
       console.log(`[DEX] 候補ペア再選定完了: ${dexCachedCandidates.length}件`);
     } catch (e) {
-      console.error("[DEX] 候補ペア選定に失敗(前回のキャッシュを使い続けます):", e.message);
+      console.error("[DEX] 候補ペア選定に失敗:", e.message);
     } finally {
       dexProspectRefreshing = false;
     }
@@ -613,7 +611,7 @@ async function runWatchCycle({ topN = 8 } = {}) {
   const candidates = await dexGetCandidates(topN);
 
   if (candidates.length === 0) {
-    console.log("[DEX] 候補ペアがまだありません(初回の選定待ち、または失敗)");
+    console.log("[DEX] 候補ペアがまだありません");
     return { scannedAt: new Date().toISOString(), checked: 0, logged: 0, results: [] };
   }
 
@@ -682,10 +680,7 @@ async function dexWatchOnce() {
         const liq = [r.cheapPoolLiquidityUsd, r.expensivePoolLiquidityUsd]
           .map((v) => v !== null && v !== undefined ? `$${Math.round(v).toLocaleString()}` : "不明")
           .join(" / ");
-        const cappedNote = r.cappedByBudget
-          ? `上限$${MAX_TRADE_USD}でキャップ、理論上の最適額は${r.optimalAmountIn.toFixed(4)}`
-          : "理論上の最適額のまま";
-        console.log(`[DEX] ${r.pairLabel}: 純利益 +$${r.netProfit.toFixed(2)}(価格差${r.priceDiffPercent.toFixed(2)}%、投入額$${r.tradeAmountUsd.toFixed(2)}[${cappedNote}]、両プール流動性=${liq}）`);
+        console.log(`[DEX] ${r.pairLabel}: 純利益 +$${r.netProfit.toFixed(2)}(価格差${r.priceDiffPercent.toFixed(2)}%、投入額$${r.tradeAmountUsd.toFixed(2)}、両プール流動性=${liq}）`);
       }
     } else {
       console.log(`[DEX] 観測${result.checked}件・記録${result.logged}件・黒字0件`);
@@ -703,6 +698,7 @@ body{font-family:-apple-system,sans-serif;background:#0d100c;color:#e8e6d8;margi
 h1{font-size:17px;margin:0 0 4px;} h2{font-size:13px;margin:0 0 10px;font-weight:600;}
 .sub{color:#888;font-size:11px;margin-bottom:16px;}
 .card{background:#14180f;border:1px solid #2a331d;border-radius:8px;padding:13px;margin-bottom:13px;}
+.card.real{border-color:#2ecc71;}
 table{width:100%;border-collapse:collapse;font-size:11px;}
 th{text-align:left;color:#888;font-weight:500;font-size:9.5px;padding:5px 3px;border-bottom:1px solid #2a331d;}
 td{padding:6px 3px;border-bottom:1px solid #1c1c1c;}
@@ -714,6 +710,41 @@ a{color:#6fae62;}
 .footerlink{margin-top:18px;font-size:11px;}
 `;
 
+function renderRealExecutionSection() {
+  const real = getRealExecutionStats();
+  const cap = getCurrentTradeCapUsd();
+  const successes = getSuccessCount();
+  const isLive = process.env.DRY_RUN === "false";
+
+  const rows = real.recent.map((e, i) => {
+    const actual = e.actualProfitUsd !== null && e.actualProfitUsd !== undefined
+      ? `${e.actualProfitUsd >= 0 ? '+' : ''}$${e.actualProfitUsd.toFixed(4)}` : '取得できず';
+    return `<tr><td>${new Date(e.timestamp).toLocaleString('ja-JP')}</td>
+    <td style="font-size:9px;">${e.pairLabel}</td>
+    <td style="text-align:right;">$${e.tradeAmountUsd.toFixed(2)}</td>
+    <td style="text-align:right;color:#2ecc71;font-weight:600;">${actual}</td>
+    <td><a href="${e.explorerUrl}" target="_blank">確認</a></td></tr>`;
+  }).join('') || `<tr><td colspan="5" style="color:#888;">まだ実際の取引はありません</td></tr>`;
+
+  return `<div class="card real">
+    <h2>💰 実際の取引結果(本物のお金)</h2>
+    <div class="stat">
+      <div><div class="v">${real.count}</div><div class="l">実行回数</div></div>
+      <div><div class="v" style="color:${real.totalProfitUsd>=0?'#2ecc71':'#e74c3c'};">${real.totalProfitUsd>=0?'+':''}$${real.totalProfitUsd.toFixed(4)}</div><div class="l">実際の累積利益</div></div>
+      <div><div class="v">$${cap}</div><div class="l">現在の取引上限</div></div>
+      <div><div class="v" style="color:${isLive?'#2ecc71':'#888'};">${isLive ? '稼働中' : '停止中'}</div><div class="l">自動売買</div></div>
+    </div>
+    <table><thead><tr><th>日時</th><th>ペア</th><th style="text-align:right;">投入額</th><th style="text-align:right;">実際の利益</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table>
+    <div class="note">
+      <strong>これが本当のお金の結果です。</strong>下の観測データ(紙上シミュレーション)とは完全に別物です。<br>
+      利益額は、コントラクトがブロックチェーン上に記録した確定値をそのまま読み取っています(事前の予測値ではありません)。<br>
+      取引上限は成功実績に応じて自動的に引き上がります(成功${successes}回、$50→$200→$500→$1000→$2000)。<br>
+      利益はコントラクト内に蓄積されます(ウォレット残高には反映されません)。「確認」リンクから実際の取引記録が見られます。
+    </div>
+  </div>`;
+}
+
 function renderPage() {
   const dexStats = dexLoadStats();
   const persistenceSummary = getPersistenceSummary();
@@ -724,40 +755,38 @@ function renderPage() {
     return `<tr><td>${i+1}</td><td style="font-size:9px;">${r.pairLabel}</td>
     <td style="text-align:right;">${r.priceDiffPercent.toFixed(2)}%</td>
     <td style="text-align:right;color:${color};font-weight:600;">${r.netProfit>=0?'+':''}$${r.netProfit.toFixed(2)}</td></tr>`;
-  }).join("") || `<tr><td colspan="4" style="color:#888;">観測データがまだありません(次のサイクルを待機中)</td></tr>`;
+  }).join("") || `<tr><td colspan="4" style="color:#888;">観測データがまだありません</td></tr>`;
 
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="refresh" content="30">
 <title>DEXアービトラージ観測所</title><style>${PAGE_STYLE}</style></head><body>
 <h1>🔍 DEXアービトラージ観測所</h1>
-<div class="sub">紙上取引のみ(実際の注文は出しません) / DEX観測${dexWatchCount}回 / 1回の取引額は理論上の最適額(上限$${MAX_TRADE_USD})</div>
+<div class="sub">DEX観測${dexWatchCount}回 / 観測上限$${MAX_TRADE_USD}</div>
+
+${renderRealExecutionSection()}
 
 <div class="card">
-  <h2>🔍 DEXアービトラージ観測(Base等)</h2>
+  <h2>🔍 観測データ(紙上シミュレーション)</h2>
   <div class="stat">
     <div><div class="v">${dexStats.totalObserved}</div><div class="l">記録件数</div></div>
     <div><div class="v" style="color:${dexStats.totalProfitableCount>0?'#2ecc71':'#888'};">${dexStats.totalProfitableCount}</div><div class="l">黒字だった件数</div></div>
-    <div><div class="v" style="color:${dexStats.cumulativeProfit>=0?'#2ecc71':'#e74c3c'};">${dexStats.cumulativeProfit>=0?'+':''}$${dexStats.cumulativeProfit.toFixed(2)}</div><div class="l">累積純利益(黒字分の合計)</div></div>
+    <div><div class="v" style="color:${dexStats.cumulativeProfit>=0?'#2ecc71':'#e74c3c'};">${dexStats.cumulativeProfit>=0?'+':''}$${dexStats.cumulativeProfit.toFixed(2)}</div><div class="l">理論上の累積利益</div></div>
     <div><div class="v">${lastDexWatchAt ? new Date(lastDexWatchAt).toLocaleTimeString('ja-JP') : '-'}</div><div class="l">最終観測時刻</div></div>
   </div>
   <table><thead><tr><th>#</th><th>ペア</th><th style="text-align:right;">価格差</th><th style="text-align:right;">純利益</th></tr></thead>
   <tbody>${dexRows}</tbody></table>
   <div class="note">
-    prospector.jsが選んだ候補ペアを、DexScreenerのデータで観測 → 理論上の最適投入額(上限$${MAX_TRADE_USD})で取引した想定で、ガス代・手数料(DEX取引手数料+Aaveフラッシュローン手数料0.05%)込みの純利益を計算して記録。<br>
-    記録件数・黒字件数・累積純利益は上限なく増え続ける累計値です(観測ログ本体は容量の都合で直近2000件のみ保持)。<br>
-    実際の注文は出していません(紙上観測のみ)。${lastDexError ? `<br><span style="color:#e74c3c;">エラー: ${lastDexError}</span>` : ''}
+    <strong>これは「もし取引していたら」の理論値です。</strong>実際に実行できる案件は、ルーター確認済みDEX・対応チェーンに限られるため、この数字より少なくなります。<br>
+    ガス代・DEX手数料・Aaveのフラッシュローン手数料(0.05%)・スリッページを差し引いて計算しています。${lastDexError ? `<br><span style="color:#e74c3c;">エラー: ${lastDexError}</span>` : ''}
   </div>
 </div>
 
 ${persistenceSummary ? `<div class="card">
-  <h2>⏱️ 歪みの持続性(最重要データ)</h2>
+  <h2>⏱️ 歪みの持続性</h2>
   <table><thead><tr><th>経過時間</th><th style="text-align:right;">追跡件数</th><th style="text-align:right;">まだ残っていた割合</th></tr></thead>
   <tbody>${persistenceSummary.byDelay.map(d => `<tr><td>${d.delaySec}秒後</td><td style="text-align:right;">${d.total}</td>
     <td style="text-align:right;color:${d.survivalRate!==null && d.survivalRate>50?'#2ecc71':'#e74c3c'};">${d.survivalRate!==null ? d.survivalRate.toFixed(0)+'%' : '-'}</td></tr>`).join('')}</tbody></table>
-  <div class="note">
-    検知した歪みが、その後も残っていたかを実測(追跡件数${persistenceSummary.trackedCount}件)。<br>
-    60秒後の残存率が低ければ、今の3分間隔の観測では間に合わない証拠。高ければ、この間隔でも十分捕まえられる可能性がある。
-  </div>
+  <div class="note">検知した歪みが、その後も残っていたかを実測(追跡件数${persistenceSummary.trackedCount}件)。</div>
 </div>` : ''}
 
 ${onchainLatencyStats ? `<div class="card">
@@ -768,7 +797,7 @@ ${onchainLatencyStats ? `<div class="card">
     <div><div class="v">${onchainLatencyStats.minMs.toFixed(0)}ms</div><div class="l">最速</div></div>
     <div><div class="v">${onchainLatencyStats.maxMs.toFixed(0)}ms</div><div class="l">最遅</div></div>
   </div>
-  <div class="note">Syncイベントを検知してから、再評価が完了するまでの実測時間。3分間隔のポーリングと比べ、どれだけ速く反応できているかの指標。</div>
+  <div class="note">Syncイベント検知から再評価完了までの実測時間。</div>
 </div>` : ''}
 
 <div class="footerlink"><a href="/about">→ このサイトが集めているデータについて</a></div>
@@ -786,9 +815,7 @@ function renderNewDexSection() {
   return `<div class="card">
     <h2>🆕 これまでに検出したDEX(直近${Math.min(entries.length, 20)}件、新しい順)</h2>
     <table><thead><tr><th>DEX名</th><th>チェーン</th><th>初検出日</th></tr></thead><tbody>${rows}</tbody></table>
-    <div class="note">
-      全${entries.length}件のDEXを検出済み。定期メンテナンス時は、直近に増えたものを優先的に「実在するか」「信頼できるか」調査してください。
-    </div>
+    <div class="note">全${entries.length}件のDEXを検出済み。直近に増えたものを優先的に信頼性を調査してください。</div>
   </div>`;
 }
 
@@ -803,41 +830,42 @@ function renderAboutPage() {
   <h2>① 候補ペアの選定(1時間ごと)</h2>
   <div class="note">
     DeFiLlamaから全DEXプールのデータを取得し、「同じトークンペアが複数のDEXに存在する組み合わせ」を洗い出します。<br>
-    Ethereumはガス代が確実に利益を上回るため除外しています。それ以外の全チェーンが対象です。<br>
-    流動性・出来高の少なさからスコアリングして上位60件をキャッシュします(prospector.js)。
+    Ethereumはガス代が確実に利益を上回るため除外しています。流動性・出来高の少なさからスコアリングして上位60件をキャッシュします。
   </div>
 </div>
 
 <div class="card">
   <h2>② DEX観測ログ(3分ごと)</h2>
   <div class="note">
-    キャッシュした候補を8件ずつ順番に(ローテーションしながら)DexScreenerで価格チェックします。<br>
+    キャッシュした候補を8件ずつDexScreenerで価格チェックします。<br>
     純利益には、DEXの取引手数料・ガス代・Aaveのフラッシュローン手数料(0.05%)・スリッページの見積もりを差し引いています。<br>
-    時価総額が$100,000未満の超小型トークンは、詐欺・急激な価格操作のリスクが高いため除外しています。<br>
-    黒字判定された案件は、実行判定ロジック(scripts/execute-arb.js)に渡されます。現状はchain-config.jsに登録済み・ルーター確認済みDEXの組み合わせのみが対象で、DRY_RUNの間は実際の送信を行わずログ記録のみ行います。実際に送信する金額は、段階的取引上限(scripts/trade-cap.js)でさらに絞られます。
+    時価総額が$100,000未満の超小型トークンは、詐欺・急激な価格操作のリスクが高いため除外しています。
+  </div>
+</div>
+
+<div class="card">
+  <h2>③ 実際の自動売買</h2>
+  <div class="note">
+    黒字判定された案件のうち、対応チェーン(Base/Polygon/Optimism/Avalanche)かつルーター確認済みDEXの組み合わせだけが実行対象です。<br>
+    実行直前にプールの状態を再確認し、利益が消えていれば見送ります。スリッページ保護(1%)も設定します。<br>
+    Aaveのフラッシュローンを使うため、取引資金は借りたもので、利益が出なければ取引全体が自動的に無かったことになります(実害はガス代のみ)。<br>
+    実際に送信する金額は、成功実績に応じて段階的に引き上がります($50→$200→$500→$1000→$2000)。
   </div>
 </div>
 
 ${renderNewDexSection()}
 
 <div class="card">
-  <h2>③ 持続性の追跡</h2>
+  <h2>④ 持続性の追跡</h2>
   <div class="note">
-    価格差が一定以上(0.1%)見つかった時だけ、5秒後・15秒後・30秒後・60秒後に同じペアを再チェックし、「まだ残っていたか」を記録します。
+    価格差が0.1%以上見つかった時だけ、5秒後・15秒後・30秒後・60秒後に再チェックし、「まだ残っていたか」を記録します。
   </div>
 </div>
 
 <div class="card">
-  <h2>④ オンチェーン反応速度</h2>
+  <h2>⑤ オンチェーン反応速度</h2>
   <div class="note">
-    Base(BASE_WSS_URLを設定している場合のみ)のSyncイベントをリアルタイムで購読し、検知から再評価完了までの時間を計測します。
-  </div>
-</div>
-
-<div class="card">
-  <h2>⑤ このサイトがやっていないこと</h2>
-  <div class="note">
-    DRY_RUNの間は、実際の売買注文は一切出していません。全て「もし取引していたら」の紙上シミュレーションです。
+    BaseのSyncイベントをリアルタイムで購読し、検知から再評価完了までの時間を計測します。
   </div>
 </div>
 
