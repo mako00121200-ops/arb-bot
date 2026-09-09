@@ -188,11 +188,25 @@ function isDeadPool(pair) {
 }
 
 // 実際に調査して「見せかけの歪み」と確定したペア/DEXの組み合わせ。
-function isKnownFalsePositive({ symbol, cheapDexId, expensiveDexId }) {
+function isKnownFalsePositive({ symbol, cheapDexId, expensiveDexId, chain }) {
   const upperSymbol = (symbol || "").toUpperCase();
   if (upperSymbol.includes("USDBC")) return true;
   if (upperSymbol.includes("USDC.E") || upperSymbol.includes("USDCE")) return true;
   if (cheapDexId === "zipswap" || expensiveDexId === "zipswap") return true;
+
+  // PancakeSwapはArbitrum版のみ、取扱ペア1件・24時間出来高$62程度で
+  // 事実上活動停止と確認済み(他チェーンのPancakeSwapは対象外)。
+  const lowerChain = dexNormalizeChain(chain);
+  if (lowerChain === "arbitrum" && (cheapDexId === "pancakeswap" || expensiveDexId === "pancakeswap")) return true;
+
+  // SparkDEX V2はFlareで24時間出来高$0(DefiLlamaで確認済み)、
+  // 事実上活動停止。
+  if ((cheapDexId || "").includes("sparkdex") || (expensiveDexId || "").includes("sparkdex")) return true;
+
+  // TraderJoe V2(Liquidity Book)は離散的な価格帯モデルで、
+  // 私たちの計算式(x*y=k)が通用しない。V1のみ対応するための予防策。
+  if ((cheapDexId || "").includes("traderjoe-v2") || (expensiveDexId || "").includes("traderjoe-v2")) return true;
+
   return false;
 }
 
@@ -232,7 +246,7 @@ function dexLoadLog() {
       const entries = JSON.parse(fs.readFileSync(DEX_LOG_FILE, "utf8"));
       return entries.filter((e) => {
         if (e.cheapDex === e.expensiveDex) return false;
-        if (isKnownFalsePositive({ symbol: e.pairLabel, cheapDexId: e.cheapDex, expensiveDexId: e.expensiveDex })) return false;
+        if (isKnownFalsePositive({ symbol: e.pairLabel, cheapDexId: e.cheapDex, expensiveDexId: e.expensiveDex, chain: e.chain })) return false;
         const bothDeep = (e.cheapPoolLiquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD
           && (e.expensivePoolLiquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD;
         if (bothDeep && Math.abs(e.priceDiffPercent) > DEEP_POOL_MAX_GAP_PCT) return false;
@@ -423,8 +437,8 @@ async function dexWatchOnePair(candidate) {
 
   // 調査により「見せかけの歪み」と確定済みのペア/DEXは、観測の
   // 時点で弾く(過去ログの読み込み時だけでなく、新規記録もここで防ぐ)。
-  if (isKnownFalsePositive({ symbol: candidate.symbol, cheapDexId: poolA.dexId, expensiveDexId: poolB.dexId })) {
-    console.log(`[DEX診断] ${candidate.symbol} on ${candidate.chain}: 調査により「見せかけの歪み」と確定済みのため除外(USDbC/USDC.e/ZipSwap)`);
+  if (isKnownFalsePositive({ symbol: candidate.symbol, cheapDexId: poolA.dexId, expensiveDexId: poolB.dexId, chain: candidate.chain })) {
+    console.log(`[DEX診断] ${candidate.symbol} on ${candidate.chain}: 調査により「見せかけの歪み」と確定済みのため除外(USDbC/USDC.e/ZipSwap/PancakeSwap-Arbitrum/SparkDEX/TraderJoeV2)`);
     return null;
   }
 
@@ -845,7 +859,7 @@ function renderAboutPage() {
     ・同じDEX名同士(Stable/Volatileプールの取り違えの可能性)<br>
     ・両プールとも流動性が$500,000以上あるのに価格差が1%を超える場合<br>
     ・24時間の出来高が$50未満、または取引件数が3件未満(=事実上稼働停止しているDEXの誤検知)<br>
-    ・調査により「見せかけの歪み」と確定したUSDbC・USDC.e・ZipSwap関連
+    ・調査により「見せかけの歪み」と確定したUSDbC・USDC.e・ZipSwap・PancakeSwap(Arbitrum版)・SparkDEX・TraderJoe V2関連
   </div>
 </div>
 
