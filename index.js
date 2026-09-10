@@ -14,6 +14,7 @@ import {
   getVerifiedPairsByChain, findVerifiedPairByPool, getVerifiedPairCount,
 } from "./scripts/verified-pairs.js";
 import { readVerifiedPairPools } from "./scripts/multicall-reserves.js";
+import { shouldSkipChain, recordChainSuccess, recordChainFailure, getThrottleStatus } from "./scripts/chain-throttle.js";
 
 const DEX_FETCH_TIMEOUT_MS = 20000;
 
@@ -267,7 +268,6 @@ function buildPoolFromDexScreener(prefiltered, targetTokenAddress) {
   };
 }
 
-// プール一覧から「安い/高い」を決めて評価する共通処理(定期観測・高速観測の両方で使う)。
 function evaluatePools({ pools, symbol, chain, tokenA, tokenB, reserveSource }) {
   pools.sort((a, b) => b.reserveX + b.reserveY - (a.reserveX + a.reserveY));
   if (pools.length < 2) return null;
@@ -300,7 +300,6 @@ function evaluatePools({ pools, symbol, chain, tokenA, tokenB, reserveSource }) 
   };
 }
 
-// 定期観測(DexScreenerで発掘 → オンチェーンで確認 → 実行可能ペアとして登録)。
 async function dexWatchOnePair(candidate) {
   const rawPairs = await dexFetchPairsForToken(candidate.tokenA, candidate.chain, candidate.tokenB);
   const prefiltered = rawPairs.map((p) => dexPrefilterPair(p, candidate.chain)).filter(Boolean);
@@ -323,17 +322,16 @@ async function dexWatchOnePair(candidate) {
         const built = await buildPoolFromOnchain(p, candidate.tokenA, normalizedChain, decimalsX, decimalsY);
         if (built) pools.push(built);
       }
-      // 「読めた かつ ルーター確認済み」のプールが2つ以上なら、実行可能ペアとして登録。
       const executablePools = pools.filter((p) => getRouterInfo(normalizedChain, p.dexId));
       if (executablePools.length >= 2) {
-        const priceUsdPerY = executablePools[0].priceUsdPerY;
         const isNew = recordVerifiedPair({
           chain: normalizedChain, symbol: candidate.symbol,
-          tokenA: candidate.tokenA, tokenB: candidate.tokenB, decimalsX, decimalsY, priceUsdPerY,
+          tokenA: candidate.tokenA, tokenB: candidate.tokenB, decimalsX, decimalsY,
+          priceUsdPerY: executablePools[0].priceUsdPerY,
           pools: executablePools.map((p) => ({ address: p.pairAddress, dexId: p.dexId })),
         });
         updatePoolSubscriptions(normalizedChain, executablePools.map((p) => p.pairAddress));
-        if (isNew) fastPoolIndexDirty = true;
+        if (isNew) console.log(`[実行可能ペア] ${candidate.symbol} on ${normalizedChain} を追加(合計${getVerifiedPairCount()}件)`);
       }
     }
   } else {
@@ -347,22 +345,21 @@ async function dexWatchOnePair(candidate) {
   });
 }
 
-// ===== 高速観測(実行可能ペアだけをMulticallで一括読み・十数秒間隔) =====
-const FAST_WATCH_INTERVAL_SEC = parseInt(process.env.FAST_WATCH_INTERVAL_SEC || "15", 10);
+// ===== 高速観測 =====
+// Multicallで1ペア1回のRPC呼び出しに抑えているため、5秒間隔でも
+// Chainstack無料枠(毎秒25回)に十分収まる。
+const FAST_WATCH_INTERVAL_SEC = parseInt(process.env.FAST_WATCH_INTERVAL_SEC || "5", 10);
 let fastWatchRunning = false;
 let fastWatchCount = 0;
 let fastWatchLastAt = null;
-let fastWatchLastPairs = 0;
-let fastPoolIndexDirty = true;
 const executingPairs = new Set();
 
-// 実行可能ペアの評価と実行を1つにまとめる。定期観測・高速観測・Sync受信の3経路が共用する。
 async function evaluateAndMaybeExecute(observed, source) {
   if (!observed) return;
   const key = `${observed.chain}::${observed.tokenA}::${observed.tokenB}`.toLowerCase();
   dexRecordStats(observed);
   if (!observed.profitable) return;
-  if (executingPairs.has(key)) return; // 別経路で同じペアを実行中なら二重送信しない
+  if (executingPairs.has(key)) return;
   executingPairs.add(key);
   try {
     console.log(`[${source}] ${observed.pairLabel}: 純利益 +$${observed.netProfit.toFixed(2)}(価格差${observed.priceDiffPercent.toFixed(2)}%、投入額$${observed.tradeAmountUsd.toFixed(2)}）`);
@@ -375,19 +372,19 @@ async function evaluateAndMaybeExecute(observed, source) {
   }
 }
 
+// 戻り値: 評価結果 / null(黒字でない等) / undefined(読み取り自体に失敗)
 async function evaluateVerifiedPair(pair, source) {
   let pools;
   try {
     pools = await readVerifiedPairPools(pair);
   } catch (e) {
-    console.warn(`[高速観測] ${pair.symbol} on ${pair.chain}: 読み取り失敗:`, e.message.slice(0, 80));
-    return null;
+    return undefined;
   }
-  // 読めなくなったプールは一覧から外す(V3化・廃止など)。
   const readable = new Set(pools.map((p) => p.pairAddress.toLowerCase()));
   for (const p of pair.pools) {
     if (!readable.has(p.address.toLowerCase())) removePoolFromVerifiedPairs(pair.chain, p.address);
   }
+  if (pools.length === 0) return undefined;
   if (pools.length < 2 || !pair.priceUsdPerY) return null;
 
   const shaped = pools.map((p) => ({
@@ -406,17 +403,20 @@ async function fastWatchOnce() {
   if (fastWatchRunning) return;
   fastWatchRunning = true;
   try {
-    const byChain = getVerifiedPairsByChain();
-    let total = 0;
-    for (const [chain, pairs] of Object.entries(byChain)) {
+    for (const [chain, pairs] of Object.entries(getVerifiedPairsByChain())) {
+      // 公開RPCが制限に当たっているチェーンは、そのチェーンだけ休む。
+      // Base(自前ノード)の速度を巻き添えで落とさないため。
+      if (shouldSkipChain(chain)) continue;
+      let anyFailed = false;
       for (const pair of pairs) {
-        total++;
-        await evaluateVerifiedPair(pair, "高速観測");
+        const result = await evaluateVerifiedPair(pair, "高速観測");
+        if (result === undefined) anyFailed = true;
       }
+      if (anyFailed) recordChainFailure(chain, "プール読み取りに失敗");
+      else recordChainSuccess(chain);
     }
     fastWatchCount++;
     fastWatchLastAt = new Date().toISOString();
-    fastWatchLastPairs = total;
   } catch (e) {
     console.error("[高速観測] エラー:", e.message);
   } finally {
@@ -432,7 +432,6 @@ async function handleOnchainSync(chainName, poolAddress, reserve0, reserve1, rec
   const pair = findVerifiedPairByPool(chainName, poolAddress);
   if (!pair) return;
   try {
-    // DexScreenerを経由せず、そのペアのプールだけをMulticallで読んで即座に判定する。
     const observed = await evaluateVerifiedPair(pair, "Sync反応");
     const latencyMs = Date.now() - receivedAt;
     onchainReactionCount++;
@@ -573,11 +572,16 @@ function renderRealExecutionSection() {
 
 function renderFastWatchSection() {
   const pairs = getVerifiedPairs();
+  const throttle = getThrottleStatus();
   const byChain = {};
   for (const p of pairs) byChain[p.chain] = (byChain[p.chain] || 0) + 1;
-  const chainList = Object.entries(byChain).map(([c, n]) => `${c}:${n}`).join(' / ') || 'なし';
+  const chainList = Object.entries(byChain).map(([c, n]) => {
+    const t = throttle[c];
+    const status = t && t.pausedForSec > 0 ? `<span style="color:#e74c3c;">(${t.pausedForSec}秒休止中)</span>` : '';
+    return `${c}:${n}${status}`;
+  }).join(' / ') || 'なし';
   const rows = pairs.slice(0, 20).map((p) => `<tr><td style="font-size:9px;">${p.symbol}</td><td>${p.chain}</td>
-    <td>${p.pools.map((x) => x.dexId).join(', ')}</td></tr>`).join('') || `<tr><td colspan="3" style="color:#888;">まだ登録されていません(定期観測で確認でき次第、自動的に追加されます)</td></tr>`;
+    <td style="font-size:9px;">${p.pools.map((x) => x.dexId).join(', ')}</td></tr>`).join('') || `<tr><td colspan="3" style="color:#888;">まだ登録されていません(定期観測で確認でき次第、自動追加されます)</td></tr>`;
   return `<div class="card"><h2>⚡ 高速観測(実行可能ペア)</h2>
     <div class="stat">
       <div><div class="v">${pairs.length}</div><div class="l">実行可能ペア</div></div>
@@ -586,7 +590,8 @@ function renderFastWatchSection() {
       <div><div class="v">${fastWatchLastAt ? new Date(fastWatchLastAt).toLocaleTimeString('ja-JP') : '-'}</div><div class="l">最終観測</div></div>
     </div>
     <table><thead><tr><th>ペア</th><th>チェーン</th><th>DEX</th></tr></thead><tbody>${rows}</tbody></table>
-    <div class="note">「準備量をチェーンから読めた かつ ルーター確認済み」のプールが2つ以上あるペアだけを、Multicallで一括読み取り。DexScreenerを経由しないため${FAST_WATCH_INTERVAL_SEC}秒間隔で全件を観測できます。内訳: ${chainList}</div></div>`;
+    <div class="note">「準備量を読めた かつ ルーター確認済み」のプールが2つ以上あるペアを、Multicallで一括読み取り(1ペア1回のRPC呼び出し)。DexScreenerを経由しないため${FAST_WATCH_INTERVAL_SEC}秒間隔で全件を観測できます。<br>
+    公開RPCが不安定なチェーンは、そのチェーンだけ自動的に休止し、Base(自前ノード)の速度は落としません。内訳: ${chainList}</div></div>`;
 }
 
 function renderPage() {
@@ -616,7 +621,7 @@ ${renderFastWatchSection()}
 ${lat ? `<div class="card"><h2>⚡ Sync反応速度</h2>
   <div class="stat"><div><div class="v">${lat.count}</div><div class="l">反応回数</div></div><div><div class="v">${lat.medianMs}ms</div><div class="l">中央値</div></div>
   <div><div class="v">${lat.minMs}ms</div><div class="l">最速</div></div><div><div class="v">${lat.maxMs}ms</div><div class="l">最遅</div></div></div>
-  <div class="note">取引が起きた瞬間の通知(Sync)を受けてから、判定完了までの実測時間。DexScreenerを経由しない高速経路。</div></div>` : ''}
+  <div class="note">取引が起きた瞬間の通知(Sync)を受けてから、判定完了までの実測時間(Baseのみ)。</div></div>` : ''}
 <div class="footerlink"><a href="/about">→ このサイトが集めているデータについて</a></div>
 </body></html>`;
 }
@@ -626,8 +631,8 @@ function renderAboutPage() {
 <title>収集データについて</title><style>${PAGE_STYLE}</style></head><body>
 <h1>📊 このサイトが集めているデータ</h1>
 <div class="card"><h2>① 発掘(定期観測、3分ごと)</h2><div class="note">DeFiLlamaの候補60件を8件ずつ、DexScreenerでプールを探し、対応4チェーンではチェーンから直接準備量を読みます。「読めた かつ ルーター確認済み」のプールが2つ以上あるペアを「実行可能ペア」として登録します。</div></div>
-<div class="card"><h2>② 高速観測(${FAST_WATCH_INTERVAL_SEC}秒ごと)</h2><div class="note">実行可能ペアだけを対象に、Multicall3で全プールを一括読み取り(1ペア1回のRPC呼び出し)。DexScreenerを経由しないため、レート制限を気にせず頻繁に観測できます。</div></div>
-<div class="card"><h2>③ Sync反応(即時)</h2><div class="note">Baseでは実行可能ペアのプールでの取引を即座に検知し、そのペアだけを読み直して判定します。検知から判定まで1秒未満を目標としています。</div></div>
+<div class="card"><h2>② 高速観測(${FAST_WATCH_INTERVAL_SEC}秒ごと)</h2><div class="note">実行可能ペアだけを対象に、Multicall3で全プールを一括読み取り(1ペア1回のRPC呼び出し)。DexScreenerを経由しないため、レート制限を気にせず頻繁に観測できます。読み取りが3回連続で失敗したチェーンは、そのチェーンだけ一時的に休止します。</div></div>
+<div class="card"><h2>③ Sync反応(即時、Baseのみ)</h2><div class="note">実行可能ペアのプールでの取引を即座に検知し、そのペアだけを読み直して判定します。他チェーンは②の${FAST_WATCH_INTERVAL_SEC}秒間隔で代替しており、追加費用なしでほぼ同等の反応速度を確保しています。</div></div>
 <div class="card"><h2>④ 実行</h2><div class="note">黒字判定された案件は、実行直前にプール自身のgetAmountOutで最低受取量を確定し、フラッシュローンで実行します。利益が出なければ取引全体が無効化されます(実害はガス代のみ)。3つの観測経路が同じペアを同時に実行しないよう排他制御しています。</div></div>
 <div class="footerlink"><a href="/">← 観測所トップに戻る</a></div></body></html>`;
 }
@@ -654,11 +659,10 @@ async function main() {
 
   startOnchainFeeds(handleOnchainSync);
 
-  // 起動時に、登録済みの実行可能ペアのプールを全てSync購読する。
   for (const [chain, pairs] of Object.entries(getVerifiedPairsByChain())) {
     updatePoolSubscriptions(chain, pairs.flatMap((p) => p.pools.map((x) => x.address)));
   }
-  console.log(`[起動] 実行可能ペア${getVerifiedPairCount()}件を読み込み`);
+  console.log(`[起動] 実行可能ペア${getVerifiedPairCount()}件を読み込み / 高速観測${FAST_WATCH_INTERVAL_SEC}秒間隔`);
 
   dexWatchOnce();
   setInterval(dexWatchOnce, DEX_WATCH_INTERVAL_SEC * 1000);
