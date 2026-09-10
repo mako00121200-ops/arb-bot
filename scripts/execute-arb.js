@@ -9,12 +9,17 @@
 // さらに絞られる。フラッシュローンなので「借りる金額自体」に
 // リスクは無いが、まだ実績のないロジックをいきなり大きな金額で
 // 動かすリスクを避けるため。
+//
+// 一度「使えない」と判明したプール(V4形式のアドレス、getReserves
+// 呼び出しに応答しないプール等)は、scripts/incompatible-pools.jsに
+// 記録し、以降は最初からスキップする。
 
 import { ethers } from "ethers";
 import { getRouterAddress } from "../router-addresses.js";
 import { getChainConfig } from "../chain-config.js";
 import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
 import { recordRealExecution } from "./real-execution-log.js";
+import { isKnownIncompatiblePool, recordIncompatiblePool } from "./incompatible-pools.js";
 
 const ERC20_DECIMALS_ABI = ["function decimals() view returns (uint8)"];
 const PAIR_ABI = [
@@ -94,6 +99,13 @@ export async function maybeExecuteArb(observed) {
     return;
   }
 
+  const cheapKnownBad = isKnownIncompatiblePool(observed.chain, observed.cheapPoolAddress);
+  const expensiveKnownBad = isKnownIncompatiblePool(observed.chain, observed.expensivePoolAddress);
+  if (cheapKnownBad || expensiveKnownBad) {
+    console.log(`[実行判定] ${observed.pairLabel}: 既知の非対応プールのため見送り(${(cheapKnownBad || expensiveKnownBad).reason})`);
+    return;
+  }
+
   const contractAddress = process.env[chainConfig.contractAddressEnvVar];
   if (!contractAddress) {
     console.warn(`[実行判定] ${chainConfig.contractAddressEnvVar}が未設定のため見送り`);
@@ -126,13 +138,24 @@ export async function maybeExecuteArb(observed) {
     return;
   }
 
+  let cheapReserves, expensiveReserves;
+  try {
+    cheapReserves = await getFreshReserves(observed.cheapPoolAddress, observed.tokenA, provider);
+  } catch (e) {
+    recordIncompatiblePool(observed.chain, observed.cheapPoolAddress, e.message);
+    console.warn(`[実行判定] ${observed.pairLabel}: 安い方のプール状態の再確認に失敗、見送り:`, e.message);
+    return;
+  }
+  try {
+    expensiveReserves = await getFreshReserves(observed.expensivePoolAddress, observed.tokenA, provider);
+  } catch (e) {
+    recordIncompatiblePool(observed.chain, observed.expensivePoolAddress, e.message);
+    console.warn(`[実行判定] ${observed.pairLabel}: 高い方のプール状態の再確認に失敗、見送り:`, e.message);
+    return;
+  }
+
   let minAmountOutStep1, minAmountOutStep2;
   try {
-    const [cheapReserves, expensiveReserves] = await Promise.all([
-      getFreshReserves(observed.cheapPoolAddress, observed.tokenA, provider),
-      getFreshReserves(observed.expensivePoolAddress, observed.tokenA, provider),
-    ]);
-
     const feeBpsCheap = getFeeBpsForDex(observed.cheapDex);
     const feeBpsExpensive = getFeeBpsForDex(observed.expensiveDex);
 
@@ -147,7 +170,7 @@ export async function maybeExecuteArb(observed) {
     minAmountOutStep1 = (xOutExpected * (10000n - SLIPPAGE_TOLERANCE_BPS)) / 10000n;
     minAmountOutStep2 = (yOutExpected * (10000n - SLIPPAGE_TOLERANCE_BPS)) / 10000n;
   } catch (e) {
-    console.warn(`[実行判定] ${observed.pairLabel}: プール状態の再確認に失敗、見送り:`, e.message);
+    console.warn(`[実行判定] ${observed.pairLabel}: 利益の再計算に失敗、見送り:`, e.message);
     return;
   }
 
@@ -181,8 +204,6 @@ export async function maybeExecuteArb(observed) {
     const receipt = await tx.wait();
     console.log(`[実行] 完了: ブロック${receipt.blockNumber}, ガス使用量=${receipt.gasUsed.toString()}`);
 
-    // コントラクトが発したArbExecutedイベントから、実際に確定した利益を
-    // 直接読み取る(私たちの事前予測ではなく、オンチェーンの確定値)。
     let actualProfitTokens = null;
     try {
       for (const log of receipt.logs) {
@@ -198,10 +219,8 @@ export async function maybeExecuteArb(observed) {
       console.warn("[実行] 利益イベントの読み取りに失敗:", e.message);
     }
 
-    // Yトークン建ての利益を、観測時点のUSD換算レートでドルに直す。
     const priceUsdPerUnit = observed.tradeAmountUsd / observed.tradeAmountIn;
     const actualProfitUsd = actualProfitTokens !== null ? actualProfitTokens * priceUsdPerUnit : null;
-    const gasCostUsd = null; // ネイティブトークンのUSD価格が必要なため、現時点では未算出
 
     if (actualProfitUsd !== null) {
       console.log(`[実行] 実際に確定した利益: +$${actualProfitUsd.toFixed(4)}(${actualProfitTokens} トークン)`);
@@ -217,7 +236,7 @@ export async function maybeExecuteArb(observed) {
       predictedProfitUsd: observed.netProfit,
       actualProfitUsd,
       gasUsed: receipt.gasUsed.toString(),
-      gasCostUsd,
+      gasCostUsd: null,
     });
 
     recordExecutionSuccess();
