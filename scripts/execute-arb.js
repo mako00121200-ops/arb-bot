@@ -2,11 +2,12 @@
 //
 // 観測システムが黒字と判定した案件を、実際にコントラクトのexecuteArbへ
 // 送信する(またはDRY_RUNならログに記録するだけの)ロジック。
-// chain-config.jsに登録済み・ルーター確認済みDEXの組み合わせのみが対象。
 //
-// ルーターの呼び出し形式(Uniswap V2形式 / Solidly形式)は
-// router-addresses.js の kind を見てコントラクトへ明示的に渡す。
-// RPCへの接続は onchain-reserves.js の複数RPC対応の仕組みを共用する。
+// [重要] 最低受取量(minAmountOut)は、こちらで手数料を推測して計算する
+// のではなく、プール自身が持つ getAmountOut(amountIn, tokenIn) を呼んで
+// 求める。プールが自分の手数料・計算式(volatile/stable)で答えるため、
+// 推測による誤差がなくなる。Uniswap V2形式のプールにもこの関数が無い
+// ものがあるため、その場合だけ準備量から自前で計算する。
 
 import { ethers } from "ethers";
 import { getRouterInfo, ROUTER_KIND_ENUM } from "../router-addresses.js";
@@ -21,7 +22,10 @@ const CONTRACT_ABI = [
   "event ArbExecuted(address indexed tokenY, uint256 amountBorrowed, uint256 profit)",
 ];
 
-function getAmountOutBigInt(amountIn, reserveIn, reserveOut, feeBps) {
+// Solidly系プールが持つ、そのプール自身の計算式で結果を返す関数。
+const POOL_QUOTE_ABI = ["function getAmountOut(uint256 amountIn, address tokenIn) view returns (uint256)"];
+
+function getAmountOutFallback(amountIn, reserveIn, reserveOut, feeBps) {
   const feeRetainNumerator = 10000n - BigInt(feeBps);
   const amountInWithFee = amountIn * feeRetainNumerator;
   const numerator = amountInWithFee * reserveOut;
@@ -29,10 +33,24 @@ function getAmountOutBigInt(amountIn, reserveIn, reserveOut, feeBps) {
   return denominator === 0n ? 0n : numerator / denominator;
 }
 
+// まずプール自身に聞き、答えられなければ準備量から自前で計算する。
+async function quoteAmountOut({
+  provider, poolAddress, amountIn, tokenInAddress, reserveIn, reserveOut, feeBps,
+}) {
+  try {
+    const pool = new ethers.Contract(ethers.getAddress(poolAddress), POOL_QUOTE_ABI, provider);
+    const out = await pool.getAmountOut(amountIn, ethers.getAddress(tokenInAddress));
+    if (out > 0n) return { amountOut: out, source: "pool" };
+  } catch (e) { /* この形式のプールではない */ }
+
+  return {
+    amountOut: getAmountOutFallback(amountIn, reserveIn, reserveOut, feeBps),
+    source: "calculated",
+  };
+}
+
 const SLIPPAGE_TOLERANCE_BPS = 100n;
 
-// index.jsのdexNormalizeChainと同じ変換。DeFiLlamaが "OP Mainnet" のような
-// 表記を使うため、chain-config.jsのキーに合わせる必要がある。
 function normalizeChain(chain) {
   const map = {
     base: "base",
@@ -96,7 +114,7 @@ export async function maybeExecuteArb(observed) {
     return;
   }
 
-  // 実行直前にプールの現在の状態を読み直す(観測時点から動いていないかの再確認)。
+  // 実行直前にプールの現在の状態を読み直す。
   let cheapReserves, expensiveReserves;
   try {
     cheapReserves = await fetchOnchainReserves({
@@ -117,27 +135,51 @@ export async function maybeExecuteArb(observed) {
     return;
   }
 
-  // 最低受取量の計算はコントラクトへ渡す生の整数で行う必要があるため、
-  // 小数で受け取った準備量を最小単位に戻す。
-  const reserveCheapX = ethers.parseUnits(cheapReserves.reserveX.toFixed(Math.min(decimalsX, 18)), decimalsX);
-  const reserveCheapY = ethers.parseUnits(cheapReserves.reserveY.toFixed(Math.min(decimalsY, 18)), decimalsY);
-  const reserveExpX = ethers.parseUnits(expensiveReserves.reserveX.toFixed(Math.min(decimalsX, 18)), decimalsX);
-  const reserveExpY = ethers.parseUnits(expensiveReserves.reserveY.toFixed(Math.min(decimalsY, 18)), decimalsY);
+  const provider = getProviderForChain(chain);
 
-  const xOutExpected = getAmountOutBigInt(amountIn, reserveCheapY, reserveCheapX, infoCheap.feeBps);
-  const yOutExpected = getAmountOutBigInt(xOutExpected, reserveExpX, reserveExpY, infoExpensive.feeBps);
+  // ステップ1: 安いプールで tokenY → tokenX
+  const step1 = await quoteAmountOut({
+    provider,
+    poolAddress: observed.cheapPoolAddress,
+    amountIn,
+    tokenInAddress: observed.tokenB,
+    reserveIn: cheapReserves.rawY,
+    reserveOut: cheapReserves.rawX,
+    feeBps: infoCheap.feeBps,
+  });
 
-  if (yOutExpected <= amountIn) {
+  if (step1.amountOut <= 0n) {
+    console.log(`[実行判定] ${observed.pairLabel}: 1回目のスワップ見積もりが0のため見送り`);
+    return;
+  }
+
+  // ステップ2: 高いプールで tokenX → tokenY
+  const step2 = await quoteAmountOut({
+    provider,
+    poolAddress: observed.expensivePoolAddress,
+    amountIn: step1.amountOut,
+    tokenInAddress: observed.tokenA,
+    reserveIn: expensiveReserves.rawX,
+    reserveOut: expensiveReserves.rawY,
+    feeBps: infoExpensive.feeBps,
+  });
+
+  if (step2.amountOut <= amountIn) {
     console.log(`[実行判定] ${observed.pairLabel}: 実行直前の再計算で利益が消えていたため見送り`);
     return;
   }
 
-  const minAmountOutStep1 = (xOutExpected * (10000n - SLIPPAGE_TOLERANCE_BPS)) / 10000n;
-  const minAmountOutStep2 = (yOutExpected * (10000n - SLIPPAGE_TOLERANCE_BPS)) / 10000n;
+  const minAmountOutStep1 = (step1.amountOut * (10000n - SLIPPAGE_TOLERANCE_BPS)) / 10000n;
+  const minAmountOutStep2 = (step2.amountOut * (10000n - SLIPPAGE_TOLERANCE_BPS)) / 10000n;
+
+  // 実行直前の正確な見積もりでの粗利(トークン建て)。
+  const grossProfitTokens = parseFloat(ethers.formatUnits(step2.amountOut - amountIn, decimalsY));
+  const priceUsdPerUnit = observed.tradeAmountUsd / observed.tradeAmountIn;
+  const grossProfitUsd = grossProfitTokens * priceUsdPerUnit;
 
   const dryRun = process.env.DRY_RUN !== "false";
 
-  console.log(`[実行判定] ${observed.pairLabel}: 投入額=${amountInStr}(取引上限$${tradeCapUsd}適用後) 想定純利益=+$${observed.netProfit.toFixed(2)} 形式=${infoCheap.kind}→${infoExpensive.kind} DRY_RUN=${dryRun}`);
+  console.log(`[実行判定] ${observed.pairLabel}: 投入額=${amountInStr}(上限$${tradeCapUsd}) 実行直前の粗利=+$${grossProfitUsd.toFixed(4)} 見積もり元=${step1.source}/${step2.source} プール形式=${cheapReserves.poolFormat}/${expensiveReserves.poolFormat} DRY_RUN=${dryRun}`);
 
   if (dryRun) {
     console.log(`[実行判定] DRY_RUNのため送信はスキップします`);
@@ -150,7 +192,6 @@ export async function maybeExecuteArb(observed) {
     return;
   }
 
-  const provider = getProviderForChain(chain);
   const wallet = new ethers.Wallet(privateKey, provider);
   const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, wallet);
 
@@ -180,7 +221,6 @@ export async function maybeExecuteArb(observed) {
       } catch (inner) { /* このログは別のイベント */ }
     }
 
-    const priceUsdPerUnit = observed.tradeAmountUsd / observed.tradeAmountIn;
     const actualProfitUsd = actualProfitTokens !== null ? actualProfitTokens * priceUsdPerUnit : null;
 
     if (actualProfitUsd !== null) {
