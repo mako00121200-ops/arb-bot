@@ -2,22 +2,33 @@
 //
 // 対応チェーンごとの設定を一元管理する。
 //
-// rpcUrls は候補の配列。公開RPCは予告なく利用上限・403・障害に当たるため
-// (polygon-rpc.com・llamarpc・ankr・1rpc.io が順に使えなくなった実績あり)、
-// 1つに依存しない。切り替えは scripts/onchain-reserves.js が行い、
-// エラーが続いたRPCを自動的に次の候補へ回す。
+// [RPCの割り当て方針]
+// Chainstackの無料枠はノード1つ。そこで「無料の代替が存在しないチェーン」に
+// 優先して割り当てる:
+//   Base    … 公式 mainnet.base.org が安定稼働。無料で十分。
+//   Polygon … 公式は401、1rpc.ioは利用上限。無料の選択肢が尽きたため
+//             Chainstackを割り当てる(POLYGON_RPC_URL 環境変数で指定)。
 //
-// 注意: 未確認のURLを候補に入れると、存在しないホストへの接続リトライで
-// ログが埋まる。ここには実在を確認できたものだけを置く。
+// rpcUrls は候補の配列。一定回数連続で失敗したら次の候補へ自動切替する
+// (scripts/onchain-reserves.js)。未確認のURLは入れない(存在しない
+// ホストへのリトライでログが埋まるため)。
 
 import { AaveV3Base, AaveV3Polygon, AaveV3Optimism, AaveV3Avalanche } from "@aave-dao/aave-address-book";
+
+// Chainstackの新しいPolygonノードは環境変数で渡す。
+// 未設定の間は公開RPCのみで動作する(設定後に自動的に最優先で使われる)。
+const POLYGON_RPCS = [
+  process.env.POLYGON_RPC_URL,
+  "https://polygon-rpc.com",
+  "https://1rpc.io/matic",
+].filter(Boolean);
 
 export const CHAIN_CONFIG = {
   base: {
     chainId: 8453,
     rpcUrls: [
-      "https://base-mainnet.core.chainstack.com/cbbd2d6beeb51cd356d3f2b3d13ccbd4",
       "https://mainnet.base.org",
+      "https://base.llamarpc.com",
     ],
     aavePoolAddressesProvider: AaveV3Base.POOL_ADDRESSES_PROVIDER,
     contractAddressEnvVar: "MAINNET_CONTRACT_ADDRESS_BASE",
@@ -25,11 +36,7 @@ export const CHAIN_CONFIG = {
   },
   polygon: {
     chainId: 137,
-    // 1rpc.ioは無料枠の上限に達したため後方へ。公式RPCを先に試す。
-    rpcUrls: [
-      "https://polygon-rpc.com",
-      "https://1rpc.io/matic",
-    ],
+    rpcUrls: POLYGON_RPCS,
     aavePoolAddressesProvider: AaveV3Polygon.POOL_ADDRESSES_PROVIDER,
     contractAddressEnvVar: "MAINNET_CONTRACT_ADDRESS_POLYGON",
     explorerTxUrl: (hash) => `https://polygonscan.com/tx/${hash}`,
