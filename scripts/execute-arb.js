@@ -2,20 +2,15 @@
 //
 // 観測システムが黒字と判定した案件を、実際にコントラクトのexecuteArbへ
 // 送信する(またはDRY_RUNならログに記録するだけの)ロジック。
-// chain-config.jsに登録済み・ルーター確認済みDEXの組み合わせのみを
-// 対象とする(仕様書3.1〜3.2節に対応)。
+// chain-config.jsに登録済み・ルーター確認済みDEXの組み合わせのみが対象。
 //
-// 実際に送信する金額は、段階的取引上限(scripts/trade-cap.js)で
-// さらに絞られる。フラッシュローンなので「借りる金額自体」に
-// リスクは無いが、まだ実績のないロジックをいきなり大きな金額で
-// 動かすリスクを避けるため。
-//
-// 一度「使えない」と判明したプール(V4形式のアドレス、getReserves
-// 呼び出しに応答しないプール等)は、scripts/incompatible-pools.jsに
-// 記録し、以降は最初からスキップする。
+// ルーターの呼び出し形式(Uniswap V2形式 / Solidly形式)は
+// router-addresses.js の kind を見てコントラクトへ明示的に渡す。
+// 以前はすべてUniswap V2形式と仮定していたため、Aerodrome・Velodromeが
+// 絡む案件は必ず失敗していた。
 
 import { ethers } from "ethers";
-import { getRouterAddress } from "../router-addresses.js";
+import { getRouterInfo, ROUTER_KIND_ENUM } from "../router-addresses.js";
 import { getChainConfig } from "../chain-config.js";
 import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
 import { recordRealExecution } from "./real-execution-log.js";
@@ -27,20 +22,9 @@ const PAIR_ABI = [
   "function token0() view returns (address)",
 ];
 const CONTRACT_ABI = [
-  "function executeArb(address asset, uint256 amount, (address routerCheap, address routerExpensive, address tokenX, address tokenY, uint256 minAmountOutStep1, uint256 minAmountOutStep2) params) external",
+  "function executeArb(address asset, uint256 amount, (address routerCheap, address routerExpensive, address tokenX, address tokenY, uint256 minAmountOutStep1, uint256 minAmountOutStep2, uint8 kindCheap, uint8 kindExpensive) params) external",
   "event ArbExecuted(address indexed tokenY, uint256 amountBorrowed, uint256 profit)",
 ];
-
-const DEX_FEE_BPS_BY_ID = {
-  aerodrome: 5,
-  uniswap: 30,
-  quickswap: 30,
-  velodrome: 5,
-  traderjoe: 30,
-};
-function getFeeBpsForDex(dexId) {
-  return DEX_FEE_BPS_BY_ID[(dexId || "").toLowerCase()] ?? 30;
-}
 
 function getAmountOutBigInt(amountIn, reserveIn, reserveOut, feeBps) {
   const feeRetainNumerator = 10000n - BigInt(feeBps);
@@ -88,13 +72,11 @@ const SLIPPAGE_TOLERANCE_BPS = 100n;
 
 export async function maybeExecuteArb(observed) {
   const chainConfig = getChainConfig(observed.chain);
-  if (!chainConfig) {
-    return;
-  }
+  if (!chainConfig) return;
 
-  const routerCheap = getRouterAddress(observed.chain, observed.cheapDex);
-  const routerExpensive = getRouterAddress(observed.chain, observed.expensiveDex);
-  if (!routerCheap || !routerExpensive) {
+  const infoCheap = getRouterInfo(observed.chain, observed.cheapDex);
+  const infoExpensive = getRouterInfo(observed.chain, observed.expensiveDex);
+  if (!infoCheap || !infoExpensive) {
     console.log(`[実行判定] ${observed.pairLabel}: ルーター未確認のため見送り`);
     return;
   }
@@ -154,32 +136,23 @@ export async function maybeExecuteArb(observed) {
     return;
   }
 
-  let minAmountOutStep1, minAmountOutStep2;
-  try {
-    const feeBpsCheap = getFeeBpsForDex(observed.cheapDex);
-    const feeBpsExpensive = getFeeBpsForDex(observed.expensiveDex);
+  const xOutExpected = getAmountOutBigInt(amountIn, cheapReserves.reserveY, cheapReserves.reserveX, infoCheap.feeBps);
+  const yOutExpected = getAmountOutBigInt(xOutExpected, expensiveReserves.reserveX, expensiveReserves.reserveY, infoExpensive.feeBps);
 
-    const xOutExpected = getAmountOutBigInt(amountIn, cheapReserves.reserveY, cheapReserves.reserveX, feeBpsCheap);
-    const yOutExpected = getAmountOutBigInt(xOutExpected, expensiveReserves.reserveX, expensiveReserves.reserveY, feeBpsExpensive);
-
-    if (yOutExpected <= amountIn) {
-      console.log(`[実行判定] ${observed.pairLabel}: 実行直前の再計算で利益が消えていたため見送り(投入額と同等以下の受取見込み)`);
-      return;
-    }
-
-    minAmountOutStep1 = (xOutExpected * (10000n - SLIPPAGE_TOLERANCE_BPS)) / 10000n;
-    minAmountOutStep2 = (yOutExpected * (10000n - SLIPPAGE_TOLERANCE_BPS)) / 10000n;
-  } catch (e) {
-    console.warn(`[実行判定] ${observed.pairLabel}: 利益の再計算に失敗、見送り:`, e.message);
+  if (yOutExpected <= amountIn) {
+    console.log(`[実行判定] ${observed.pairLabel}: 実行直前の再計算で利益が消えていたため見送り(投入額と同等以下の受取見込み)`);
     return;
   }
 
+  const minAmountOutStep1 = (xOutExpected * (10000n - SLIPPAGE_TOLERANCE_BPS)) / 10000n;
+  const minAmountOutStep2 = (yOutExpected * (10000n - SLIPPAGE_TOLERANCE_BPS)) / 10000n;
+
   const dryRun = process.env.DRY_RUN !== "false";
 
-  console.log(`[実行判定] ${observed.pairLabel}: 投入額=${amountInStr}(${decimalsY}桁、取引上限$${tradeCapUsd}適用後) 想定純利益=+$${observed.netProfit.toFixed(2)} minAmountOutStep1=${minAmountOutStep1} minAmountOutStep2=${minAmountOutStep2} DRY_RUN=${dryRun}`);
+  console.log(`[実行判定] ${observed.pairLabel}: 投入額=${amountInStr}(${decimalsY}桁、取引上限$${tradeCapUsd}適用後) 想定純利益=+$${observed.netProfit.toFixed(2)} 形式=${infoCheap.kind}→${infoExpensive.kind} DRY_RUN=${dryRun}`);
 
   if (dryRun) {
-    console.log(`[実行判定] DRY_RUNのため送信はスキップします(routerCheap=${routerCheap}, routerExpensive=${routerExpensive})`);
+    console.log(`[実行判定] DRY_RUNのため送信はスキップします(routerCheap=${infoCheap.address}, routerExpensive=${infoExpensive.address})`);
     return;
   }
 
@@ -193,30 +166,28 @@ export async function maybeExecuteArb(observed) {
 
   try {
     const tx = await contract.executeArb(observed.tokenB, amountIn, {
-      routerCheap,
-      routerExpensive,
+      routerCheap: infoCheap.address,
+      routerExpensive: infoExpensive.address,
       tokenX: observed.tokenA,
       tokenY: observed.tokenB,
       minAmountOutStep1,
       minAmountOutStep2,
+      kindCheap: ROUTER_KIND_ENUM[infoCheap.kind],
+      kindExpensive: ROUTER_KIND_ENUM[infoExpensive.kind],
     });
     console.log(`[実行] トランザクション送信: ${tx.hash}`);
     const receipt = await tx.wait();
     console.log(`[実行] 完了: ブロック${receipt.blockNumber}, ガス使用量=${receipt.gasUsed.toString()}`);
 
     let actualProfitTokens = null;
-    try {
-      for (const log of receipt.logs) {
-        try {
-          const parsed = contract.interface.parseLog({ topics: log.topics, data: log.data });
-          if (parsed && parsed.name === "ArbExecuted") {
-            actualProfitTokens = parseFloat(ethers.formatUnits(parsed.args.profit, decimalsY));
-            break;
-          }
-        } catch (inner) { /* このログは別のイベント */ }
-      }
-    } catch (e) {
-      console.warn("[実行] 利益イベントの読み取りに失敗:", e.message);
+    for (const log of receipt.logs) {
+      try {
+        const parsed = contract.interface.parseLog({ topics: log.topics, data: log.data });
+        if (parsed && parsed.name === "ArbExecuted") {
+          actualProfitTokens = parseFloat(ethers.formatUnits(parsed.args.profit, decimalsY));
+          break;
+        }
+      } catch (inner) { /* このログは別のイベント */ }
     }
 
     const priceUsdPerUnit = observed.tradeAmountUsd / observed.tradeAmountIn;
