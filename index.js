@@ -117,13 +117,18 @@ const DEX_LOG_FILE = process.env.WATCHER_LOG_FILE || "/tmp/dex-arb-observations.
 const DEX_STATS_FILE = process.env.STATS_FILE || "/tmp/dex-arb-stats.json";
 const KNOWN_DEX_FILE = process.env.KNOWN_DEX_FILE || "/tmp/dex-known-list.json";
 
+// Solidly系(Aerodrome/Velodrome)のvolatileプール(x*y=k型、本システムの
+// 対象)は手数料0.3%。0.05%はstableプール用の値で、以前これを誤って使い、
+// 手数料を6分の1に見積もっていたため利益を過大評価していた。
 const DEX_DEFAULT_FEE_BY_DEX = {
   uniswap: 0.003,
-  aerodrome: 0.0005,
-  "aerodrome-slipstream": 0.0005,
+  aerodrome: 0.003,
+  "aerodrome-slipstream": 0.003,
   sushiswap: 0.003,
   camelot: 0.003,
-  velodrome: 0.0005,
+  velodrome: 0.003,
+  quickswap: 0.003,
+  traderjoe: 0.003,
   default: 0.003,
 };
 
@@ -302,11 +307,7 @@ async function dexFetchPairsForToken(tokenAddress, chain, otherTokenAddress) {
   });
 
   const rawChainIds = [...new Set(allPairs.map((p) => p.chainId))];
-  console.log(`[DEX診断] candidate.chain="${chain}" → 正規化後="${targetChain}" / DexScreener取得件数=${allPairs.length}件(tokenA検索${pairsA.length}件+tokenB検索${pairsB.length}件、重複除去後・chainId内訳: ${JSON.stringify(rawChainIds)}) / フィルター後=${filtered.length}件(うちDEX一覧: ${JSON.stringify([...new Set(filtered.map(p=>p.dexId))])})`);
-
-  if (filtered.length === 0) {
-    console.log(`[DEX診断詳細] tokenA(${target})・tokenB(${other})両方で検索したが、${chain}上で両方を含むペアが見つからなかった`);
-  }
+  console.log(`[DEX診断] candidate.chain="${chain}" → 正規化後="${targetChain}" / DexScreener取得件数=${allPairs.length}件 / フィルター後=${filtered.length}件(うちDEX一覧: ${JSON.stringify([...new Set(filtered.map(p=>p.dexId))])})`);
 
   return filtered;
 }
@@ -325,20 +326,20 @@ function dexToPoolShape(pair, targetTokenAddress, chain) {
   checkAndRecordNewDex(pair.dexId, chain);
 
   if (isConcentratedLiquidity(pair)) {
-    console.log(`[DEX診断] ${pair.dexId}: 集中流動性型(V3方式)のため除外(labels=${JSON.stringify(pair.labels)}) - 今の計算式は通用しないため`);
+    console.log(`[DEX診断] ${pair.dexId}: 集中流動性型(V3方式)のため除外(labels=${JSON.stringify(pair.labels)})`);
     return null;
   }
 
   if (isDeadPool(pair)) {
     const volume24h = pair.volume?.h24 ?? 0;
     const txns24h = (pair.txns?.h24?.buys ?? 0) + (pair.txns?.h24?.sells ?? 0);
-    console.log(`[DEX診断] ${pair.dexId}: 取引がほぼ枯れているため除外(24時間出来高=$${volume24h.toFixed(2)}, 取引件数=${txns24h}件) - ZipSwap等で実際に確認された「活動停止プール」の誤検知パターン`);
+    console.log(`[DEX診断] ${pair.dexId}: 取引がほぼ枯れているため除外(24時間出来高=$${volume24h.toFixed(2)}, 取引件数=${txns24h}件)`);
     return null;
   }
 
   const marketCap = pair.marketCap ?? pair.fdv;
   if (marketCap != null && marketCap < MIN_MARKET_CAP_USD) {
-    console.log(`[DEX診断] ${pair.dexId}: 時価総額$${Math.round(marketCap).toLocaleString()}が小さすぎるため除外(NPC等の超小型ミームコイン対策、基準$${MIN_MARKET_CAP_USD.toLocaleString()})`);
+    console.log(`[DEX診断] ${pair.dexId}: 時価総額$${Math.round(marketCap).toLocaleString()}が小さすぎるため除外(基準$${MIN_MARKET_CAP_USD.toLocaleString()})`);
     return null;
   }
 
@@ -347,7 +348,7 @@ function dexToPoolShape(pair, targetTokenAddress, chain) {
   const priceNative = parseFloat(pair.priceNative);
 
   if (!liqBase || !liqQuote || !priceNative || !isFinite(priceNative)) {
-    console.log(`[DEX診断] ${pair.dexId}: liquidity情報が不完全のため除外(liqBase=${liqBase}, liqQuote=${liqQuote}, priceNative=${pair.priceNative})`);
+    console.log(`[DEX診断] ${pair.dexId}: liquidity情報が不完全のため除外`);
     return null;
   }
 
@@ -395,7 +396,7 @@ async function dexWatchOnePair(candidate) {
   const [poolA, poolB] = pools;
 
   if (poolA.dexId === poolB.dexId) {
-    console.log(`[DEX診断] ${candidate.symbol} on ${candidate.chain}: 同じDEX名同士(${poolA.dexId})のため除外(Stable/Volatileプールの取り違えの可能性 - 今の計算式では区別できないため)`);
+    console.log(`[DEX診断] ${candidate.symbol} on ${candidate.chain}: 同じDEX名同士(${poolA.dexId})のため除外`);
     return null;
   }
 
@@ -430,7 +431,7 @@ async function dexWatchOnePair(candidate) {
   const bothPoolsDeep = (cheapPool.liquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD
     && (expensivePool.liquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD;
   if (bothPoolsDeep && Math.abs(result.priceDiffPercent) > DEEP_POOL_MAX_GAP_PCT) {
-    console.warn(`[DEX] 両プールとも流動性十分($${Math.round(cheapPool.liquidityUsd).toLocaleString()} / $${Math.round(expensivePool.liquidityUsd).toLocaleString()})なのに価格差${result.priceDiffPercent.toFixed(2)}%は不自然、データ不備として除外`);
+    console.warn(`[DEX] 両プールとも流動性十分なのに価格差${result.priceDiffPercent.toFixed(2)}%は不自然、データ不備として除外`);
     return null;
   }
 
@@ -468,9 +469,8 @@ function dexSavePersistenceLog(entries) {
 }
 
 function trackPersistence(candidate, initialResult) {
-  const trackingId = `${candidate.chain}-${candidate.symbol}-${Date.now()}`;
   const record = {
-    trackingId,
+    trackingId: `${candidate.chain}-${candidate.symbol}-${Date.now()}`,
     pairLabel: initialResult.pairLabel,
     chain: candidate.chain,
     detectedAt: initialResult.timestamp,
@@ -547,7 +547,7 @@ async function handleOnchainSync(chainName, poolAddress, reserve0, reserve1, rec
       log.push({ ...observed, viaOnchainEvent: true, reactionLatencyMs: latencyMs });
       dexSaveLog(log);
       dexRecordStats(observed);
-      console.log(`[オンチェーン反応] ${observed.pairLabel}: Sync検知から${latencyMs}ms後に再評価完了(ズレ${observed.priceDiffPercent.toFixed(2)}%、純利益${observed.netProfit>=0?'+':''}$${observed.netProfit.toFixed(2)})`);
+      console.log(`[オンチェーン反応] ${observed.pairLabel}: Sync検知から${latencyMs}ms後に再評価完了(純利益${observed.netProfit>=0?'+':''}$${observed.netProfit.toFixed(2)})`);
       if (observed.profitable) {
         try {
           await maybeExecuteArb(observed);
@@ -677,10 +677,7 @@ async function dexWatchOnce() {
     const profitable = result.results.filter((r) => r.profitable);
     if (profitable.length > 0) {
       for (const r of profitable) {
-        const liq = [r.cheapPoolLiquidityUsd, r.expensivePoolLiquidityUsd]
-          .map((v) => v !== null && v !== undefined ? `$${Math.round(v).toLocaleString()}` : "不明")
-          .join(" / ");
-        console.log(`[DEX] ${r.pairLabel}: 純利益 +$${r.netProfit.toFixed(2)}(価格差${r.priceDiffPercent.toFixed(2)}%、投入額$${r.tradeAmountUsd.toFixed(2)}、両プール流動性=${liq}）`);
+        console.log(`[DEX] ${r.pairLabel}: 純利益 +$${r.netProfit.toFixed(2)}(価格差${r.priceDiffPercent.toFixed(2)}%、投入額$${r.tradeAmountUsd.toFixed(2)}）`);
       }
     } else {
       console.log(`[DEX] 観測${result.checked}件・記録${result.logged}件・黒字0件`);
@@ -716,7 +713,7 @@ function renderRealExecutionSection() {
   const successes = getSuccessCount();
   const isLive = process.env.DRY_RUN === "false";
 
-  const rows = real.recent.map((e, i) => {
+  const rows = real.recent.map((e) => {
     const actual = e.actualProfitUsd !== null && e.actualProfitUsd !== undefined
       ? `${e.actualProfitUsd >= 0 ? '+' : ''}$${e.actualProfitUsd.toFixed(4)}` : '取得できず';
     return `<tr><td>${new Date(e.timestamp).toLocaleString('ja-JP')}</td>
@@ -737,10 +734,10 @@ function renderRealExecutionSection() {
     <table><thead><tr><th>日時</th><th>ペア</th><th style="text-align:right;">投入額</th><th style="text-align:right;">実際の利益</th><th></th></tr></thead>
     <tbody>${rows}</tbody></table>
     <div class="note">
-      <strong>これが本当のお金の結果です。</strong>下の観測データ(紙上シミュレーション)とは完全に別物です。<br>
-      利益額は、コントラクトがブロックチェーン上に記録した確定値をそのまま読み取っています(事前の予測値ではありません)。<br>
+      <strong>これが本当のお金の結果です。</strong>下の観測データ(紙上シミュレーション)とは別物です。<br>
+      利益額は、コントラクトがブロックチェーン上に記録した確定値です。<br>
       取引上限は成功実績に応じて自動的に引き上がります(成功${successes}回、$50→$200→$500→$1000→$2000)。<br>
-      利益はコントラクト内に蓄積されます(ウォレット残高には反映されません)。「確認」リンクから実際の取引記録が見られます。
+      利益はコントラクト内に蓄積されます(ウォレット残高には反映されません)。
     </div>
   </div>`;
 }
@@ -777,7 +774,7 @@ ${renderRealExecutionSection()}
   <tbody>${dexRows}</tbody></table>
   <div class="note">
     <strong>これは「もし取引していたら」の理論値です。</strong>実際に実行できる案件は、ルーター確認済みDEX・対応チェーンに限られるため、この数字より少なくなります。<br>
-    ガス代・DEX手数料・Aaveのフラッシュローン手数料(0.05%)・スリッページを差し引いて計算しています。${lastDexError ? `<br><span style="color:#e74c3c;">エラー: ${lastDexError}</span>` : ''}
+    ガス代・DEX手数料(0.3%)・Aaveのフラッシュローン手数料(0.05%)・スリッページを差し引いて計算しています。${lastDexError ? `<br><span style="color:#e74c3c;">エラー: ${lastDexError}</span>` : ''}
   </div>
 </div>
 
@@ -838,7 +835,7 @@ function renderAboutPage() {
   <h2>② DEX観測ログ(3分ごと)</h2>
   <div class="note">
     キャッシュした候補を8件ずつDexScreenerで価格チェックします。<br>
-    純利益には、DEXの取引手数料・ガス代・Aaveのフラッシュローン手数料(0.05%)・スリッページの見積もりを差し引いています。<br>
+    純利益には、DEXの取引手数料(0.3%)・ガス代・Aaveのフラッシュローン手数料(0.05%)・スリッページの見積もりを差し引いています。<br>
     時価総額が$100,000未満の超小型トークンは、詐欺・急激な価格操作のリスクが高いため除外しています。
   </div>
 </div>
@@ -847,6 +844,7 @@ function renderAboutPage() {
   <h2>③ 実際の自動売買</h2>
   <div class="note">
     黒字判定された案件のうち、対応チェーン(Base/Polygon/Optimism/Avalanche)かつルーター確認済みDEXの組み合わせだけが実行対象です。<br>
+    ルーターには2つの呼び出し形式(Uniswap V2形式 / Aerodrome・Velodromeが使うSolidly形式)があり、それぞれ正しい形式で呼び分けています。<br>
     実行直前にプールの状態を再確認し、利益が消えていれば見送ります。スリッページ保護(1%)も設定します。<br>
     Aaveのフラッシュローンを使うため、取引資金は借りたもので、利益が出なければ取引全体が自動的に無かったことになります(実害はガス代のみ)。<br>
     実際に送信する金額は、成功実績に応じて段階的に引き上がります($50→$200→$500→$1000→$2000)。
