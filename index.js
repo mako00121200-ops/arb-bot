@@ -50,16 +50,11 @@ function dexComputeOptimalArbitrage(pool1, pool2) {
   const R = X2 + g2 * A;
   const inner = g1 * P * Q;
 
-  if (inner <= Q * Q) {
-    return { amountIn: 0, grossProfit: 0, profitable: false };
-  }
+  if (inner <= Q * Q) return { amountIn: 0, grossProfit: 0, profitable: false };
 
   const s = Math.sqrt(inner) - Q;
   const theoreticalAmountIn = s / (g1 * R);
-
-  if (theoreticalAmountIn <= 0) {
-    return { amountIn: 0, grossProfit: 0, profitable: false };
-  }
+  if (theoreticalAmountIn <= 0) return { amountIn: 0, grossProfit: 0, profitable: false };
 
   let bestT = theoreticalAmountIn;
   let bestProfit = dexSimulateProfitForAmount(pool1, pool2, theoreticalAmountIn);
@@ -86,7 +81,6 @@ function dexEvaluateOpportunity({ cheapPool, expensivePool, gasCostUsd, maxTrade
   const gasCostInY = gasCostUsd / priceUsdPerY;
 
   const optimalResult = dexComputeOptimalArbitrage(cheapPool, expensivePool);
-
   const actualTradeAmountIn = Math.min(optimalResult.amountIn, maxTradeAmountIn);
   const cappedByBudget = optimalResult.amountIn > maxTradeAmountIn;
 
@@ -118,8 +112,6 @@ const DEX_LOG_FILE = process.env.WATCHER_LOG_FILE || "/tmp/dex-arb-observations.
 const DEX_STATS_FILE = process.env.STATS_FILE || "/tmp/dex-arb-stats.json";
 const KNOWN_DEX_FILE = process.env.KNOWN_DEX_FILE || "/tmp/dex-known-list.json";
 
-// Solidly系(Aerodrome/Velodrome)のvolatileプール(x*y=k型、本システムの
-// 対象)は手数料0.3%。0.05%はstableプール用の値。
 const DEX_DEFAULT_FEE_BY_DEX = {
   uniswap: 0.003,
   aerodrome: 0.003,
@@ -148,27 +140,18 @@ function dexNormalizeChain(chain) {
 }
 
 const CHAIN_GAS_COST_USD = {
-  base: 0.05,
-  arbitrum: 0.10,
-  optimism: 0.05,
-  ethereum: 8.0,
-  polygon: 0.05,
-  avalanche: 0.05,
-  bsc: 0.10,
-  binance: 0.10,
-  bnb: 0.10,
-  flare: 0.02,
+  base: 0.05, arbitrum: 0.10, optimism: 0.05, ethereum: 8.0,
+  polygon: 0.05, avalanche: 0.05, bsc: 0.10, binance: 0.10, bnb: 0.10, flare: 0.02,
 };
 function getGasCostForChain(chain) {
-  const key = dexNormalizeChain(chain);
-  return CHAIN_GAS_COST_USD[key] ?? 0.25;
+  return CHAIN_GAS_COST_USD[dexNormalizeChain(chain)] ?? 0.25;
 }
 
 const DEEP_POOL_LIQUIDITY_USD = 500000;
 const DEEP_POOL_MAX_GAP_PCT = 1;
-
 const DEAD_POOL_MIN_VOLUME_USD = 50;
 const DEAD_POOL_MIN_TXNS_24H = 3;
+
 function isDeadPool(pair) {
   const volume24h = pair.volume?.h24 ?? 0;
   const txns24h = (pair.txns?.h24?.buys ?? 0) + (pair.txns?.h24?.sells ?? 0);
@@ -197,11 +180,7 @@ function dexLoadKnownDexes() {
   return {};
 }
 function dexSaveKnownDexes(known) {
-  try {
-    fs.writeFileSync(KNOWN_DEX_FILE, JSON.stringify(known));
-  } catch (e) {
-    console.warn("既知DEX一覧の保存に失敗:", e.message);
-  }
+  try { fs.writeFileSync(KNOWN_DEX_FILE, JSON.stringify(known)); } catch (e) {}
 }
 function checkAndRecordNewDex(dexId, chain) {
   if (!dexId) return;
@@ -234,9 +213,7 @@ function dexSaveLog(entries) {
   try {
     const trimmed = entries.length > 2000 ? entries.slice(-2000) : entries;
     fs.writeFileSync(DEX_LOG_FILE, JSON.stringify(trimmed));
-  } catch (e) {
-    console.warn("観測ログの保存に失敗:", e.message);
-  }
+  } catch (e) {}
 }
 
 function dexLoadStats() {
@@ -256,11 +233,7 @@ function dexLoadStats() {
   return seeded;
 }
 function dexSaveStats(stats) {
-  try {
-    fs.writeFileSync(DEX_STATS_FILE, JSON.stringify(stats));
-  } catch (e) {
-    console.warn("累積統計の保存に失敗:", e.message);
-  }
+  try { fs.writeFileSync(DEX_STATS_FILE, JSON.stringify(stats)); } catch (e) {}
 }
 function dexRecordStats(observed) {
   const stats = dexLoadStats();
@@ -268,8 +241,6 @@ function dexRecordStats(observed) {
   if (observed.profitable) {
     stats.totalProfitableCount = (stats.totalProfitableCount || 0) + 1;
     stats.cumulativeProfit = (stats.cumulativeProfit || 0) + observed.netProfit;
-    // オンチェーンの実測値で確認できた黒字は、別枠でも数える。
-    // DexScreener依存の推定値より信頼できる数字として扱う。
     if (observed.reserveSource === "onchain") {
       stats.onchainVerifiedCount = (stats.onchainVerifiedCount || 0) + 1;
       stats.onchainVerifiedProfit = (stats.onchainVerifiedProfit || 0) + observed.netProfit;
@@ -287,9 +258,7 @@ async function dexFetchPairsForToken(tokenAddress, chain, otherTokenAddress) {
     dexFetchWithTimeout(DEXSCREENER_TOKEN_API + tokenAddress),
     dexFetchWithTimeout(DEXSCREENER_TOKEN_API + otherTokenAddress),
   ]);
-  if (!resA.ok && !resB.ok) {
-    throw new Error(`DexScreener HTTP ${resA.status}/${resB.status}`);
-  }
+  if (!resA.ok && !resB.ok) throw new Error(`DexScreener HTTP ${resA.status}/${resB.status}`);
 
   const pairsA = resA.ok ? (await resA.json()).pairs || [] : [];
   const pairsB = resB.ok ? (await resB.json()).pairs || [] : [];
@@ -298,9 +267,8 @@ async function dexFetchPairsForToken(tokenAddress, chain, otherTokenAddress) {
   for (const p of [...pairsA, ...pairsB]) {
     if (p.pairAddress) merged.set(p.pairAddress, p);
   }
-  const allPairs = [...merged.values()];
 
-  return allPairs.filter((p) => {
+  return [...merged.values()].filter((p) => {
     if ((p.chainId || "").toLowerCase() !== targetChain) return false;
     const base = (p.baseToken?.address || "").toLowerCase();
     const quote = (p.quoteToken?.address || "").toLowerCase();
@@ -318,11 +286,8 @@ function isConcentratedLiquidity(pair) {
   return false;
 }
 
-// DexScreenerの情報だけで判断できる、明らかに対象外のものをここで弾く。
-// 準備量そのものは、後段でチェーンから直接読む。
 function dexPrefilterPair(pair, chain) {
   checkAndRecordNewDex(pair.dexId, chain);
-
   if (isConcentratedLiquidity(pair)) return null;
   if (isDeadPool(pair)) return null;
 
@@ -339,8 +304,6 @@ function dexPrefilterPair(pair, chain) {
   return { pair, priceNative, basePriceUsd };
 }
 
-// チェーンから直接、正確な準備量を読んでプール情報を組み立てる。
-// 読めない場合(V3/V4等)はnullを返し、その案件ごと見送る。
 async function buildPoolFromOnchain(prefiltered, targetTokenAddress, chain, decimalsX, decimalsY) {
   const { pair, priceNative, basePriceUsd } = prefiltered;
   const baseIsTarget = (pair.baseToken?.address || "").toLowerCase() === targetTokenAddress.toLowerCase();
@@ -351,14 +314,13 @@ async function buildPoolFromOnchain(prefiltered, targetTokenAddress, chain, deci
       chain, pairAddress: pair.pairAddress, tokenXAddress: targetTokenAddress, decimalsX, decimalsY,
     });
   } catch (e) {
-    console.log(`[DEX診断] ${pair.dexId}: オンチェーン読み取り不可のため除外(${e.message.slice(0, 80)})`);
+    console.log(`[DEX診断] ${pair.dexId}: オンチェーン読み取り不可のため除外(${e.message.slice(0, 70)})`);
     return null;
   }
 
   if (!reserves.reserveX || !reserves.reserveY) return null;
 
   const quotePriceUsd = basePriceUsd / priceNative;
-  const priceUsdPerY = baseIsTarget ? quotePriceUsd : basePriceUsd;
 
   return {
     dexId: pair.dexId,
@@ -368,12 +330,11 @@ async function buildPoolFromOnchain(prefiltered, targetTokenAddress, chain, deci
     fee: dexGetFeeForDex(pair.dexId),
     priceUsd: pair.priceUsd,
     liquidityUsd: (pair.liquidity?.usd ?? null),
-    priceUsdPerY,
+    priceUsdPerY: baseIsTarget ? quotePriceUsd : basePriceUsd,
     reserveSource: "onchain",
   };
 }
 
-// オンチェーン読み取りが使えないチェーン用の、従来のDexScreener方式。
 function buildPoolFromDexScreener(prefiltered, targetTokenAddress) {
   const { pair, priceNative, basePriceUsd } = prefiltered;
   const liqBase = pair.liquidity?.base;
@@ -407,10 +368,7 @@ async function dexWatchOnePair(candidate) {
   const gasCostUsd = getGasCostForChain(candidate.chain);
   const rawPairs = await dexFetchPairsForToken(candidate.tokenA, candidate.chain, candidate.tokenB);
 
-  const prefiltered = rawPairs
-    .map((p) => dexPrefilterPair(p, candidate.chain))
-    .filter(Boolean);
-
+  const prefiltered = rawPairs.map((p) => dexPrefilterPair(p, candidate.chain)).filter(Boolean);
   if (prefiltered.length < 2) return null;
 
   const normalizedChain = dexNormalizeChain(candidate.chain);
@@ -420,19 +378,20 @@ async function dexWatchOnePair(candidate) {
   if (useOnchain) {
     let decimalsX, decimalsY;
     try {
-      [decimalsX, decimalsY] = await Promise.all([
-        fetchTokenDecimals(normalizedChain, candidate.tokenA),
-        fetchTokenDecimals(normalizedChain, candidate.tokenB),
-      ]);
+      // RPCのレート制限に当たらないよう、並行させず順番に読む。
+      decimalsX = await fetchTokenDecimals(normalizedChain, candidate.tokenA);
+      decimalsY = await fetchTokenDecimals(normalizedChain, candidate.tokenB);
     } catch (e) {
       console.log(`[DEX診断] ${candidate.symbol} on ${candidate.chain}: decimals取得に失敗、DexScreener方式に切り替え`);
       pools = prefiltered.map((p) => buildPoolFromDexScreener(p, candidate.tokenA)).filter(Boolean);
     }
 
     if (decimalsX !== undefined && decimalsY !== undefined) {
-      const built = await Promise.all(
-        prefiltered.map((p) => buildPoolFromOnchain(p, candidate.tokenA, normalizedChain, decimalsX, decimalsY))
-      );
+      // ここも一斉に送らず、1つずつ順番に読む。
+      const built = [];
+      for (const p of prefiltered) {
+        built.push(await buildPoolFromOnchain(p, candidate.tokenA, normalizedChain, decimalsX, decimalsY));
+      }
       pools = built.filter(Boolean);
     }
   } else {
@@ -461,9 +420,7 @@ async function dexWatchOnePair(candidate) {
   if (!cheapPool.priceUsdPerY || !isFinite(cheapPool.priceUsdPerY) || cheapPool.priceUsdPerY <= 0) return null;
 
   const result = dexEvaluateOpportunity({
-    cheapPool,
-    expensivePool,
-    gasCostUsd,
+    cheapPool, expensivePool, gasCostUsd,
     maxTradeAmountUsd: MAX_TRADE_USD,
     slippageBuffer: 0.002,
     pairLabel: `${candidate.symbol} on ${candidate.chain} (${cheapPool.dexId} -> ${expensivePool.dexId})`,
@@ -474,8 +431,6 @@ async function dexWatchOnePair(candidate) {
     return null;
   }
 
-  // オンチェーンの実測値を使っている場合、この「厚いプール同士は不自然」
-  // という判定はDexScreenerのデータ不備を疑うためのものなので適用しない。
   if (cheapPool.reserveSource !== "onchain") {
     const bothPoolsDeep = (cheapPool.liquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD
       && (expensivePool.liquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD;
@@ -532,10 +487,9 @@ function trackPersistence(candidate, initialResult) {
     setTimeout(async () => {
       try {
         const followUp = await dexWatchOnePair(candidate);
-        const entry = followUp
+        record.followUps.push(followUp
           ? { delaySec, stillExists: true, priceDiffPercent: followUp.priceDiffPercent, netProfit: followUp.netProfit }
-          : { delaySec, stillExists: false, priceDiffPercent: null, netProfit: null };
-        record.followUps.push(entry);
+          : { delaySec, stillExists: false, priceDiffPercent: null, netProfit: null });
 
         if (delaySec === PERSISTENCE_CHECK_DELAYS_SEC[PERSISTENCE_CHECK_DELAYS_SEC.length - 1]) {
           const log = dexLoadPersistenceLog();
@@ -551,20 +505,19 @@ function getPersistenceSummary() {
   const log = dexLoadPersistenceLog();
   if (log.length === 0) return null;
 
-  const summary = PERSISTENCE_CHECK_DELAYS_SEC.map((delaySec) => {
-    const withThisDelay = log
-      .map((r) => r.followUps.find((f) => f.delaySec === delaySec))
-      .filter(Boolean);
-    const stillExisting = withThisDelay.filter((f) => f.stillExists).length;
-    return {
-      delaySec,
-      total: withThisDelay.length,
-      stillExisting,
-      survivalRate: withThisDelay.length > 0 ? (stillExisting / withThisDelay.length) * 100 : null,
-    };
-  });
-
-  return { trackedCount: log.length, byDelay: summary };
+  return {
+    trackedCount: log.length,
+    byDelay: PERSISTENCE_CHECK_DELAYS_SEC.map((delaySec) => {
+      const withThisDelay = log.map((r) => r.followUps.find((f) => f.delaySec === delaySec)).filter(Boolean);
+      const stillExisting = withThisDelay.filter((f) => f.stillExists).length;
+      return {
+        delaySec,
+        total: withThisDelay.length,
+        stillExisting,
+        survivalRate: withThisDelay.length > 0 ? (stillExisting / withThisDelay.length) * 100 : null,
+      };
+    }),
+  };
 }
 
 const DEX_PROSPECT_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
@@ -593,11 +546,7 @@ async function handleOnchainSync(chainName, poolAddress, reserve0, reserve1, rec
       dexRecordStats(observed);
       console.log(`[オンチェーン反応] ${observed.pairLabel}: ${latencyMs}ms後に再評価完了(純利益${observed.netProfit>=0?'+':''}$${observed.netProfit.toFixed(2)})`);
       if (observed.profitable) {
-        try {
-          await maybeExecuteArb(observed);
-        } catch (e) {
-          console.warn(`[実行判定] エラー:`, e.message);
-        }
+        try { await maybeExecuteArb(observed); } catch (e) { console.warn(`[実行判定] エラー:`, e.message); }
       }
     }
   } catch (e) {
@@ -608,9 +557,13 @@ async function handleOnchainSync(chainName, poolAddress, reserve0, reserve1, rec
 function getOnchainLatencyStats() {
   if (onchainLatencyLog.length === 0) return null;
   const sorted = [...onchainLatencyLog].sort((a, b) => a - b);
-  const avg = sorted.reduce((s, v) => s + v, 0) / sorted.length;
-  const median = sorted[Math.floor(sorted.length / 2)];
-  return { count: onchainReactionCount, avgMs: avg, medianMs: median, minMs: sorted[0], maxMs: sorted[sorted.length - 1] };
+  return {
+    count: onchainReactionCount,
+    avgMs: sorted.reduce((s, v) => s + v, 0) / sorted.length,
+    medianMs: sorted[Math.floor(sorted.length / 2)],
+    minMs: sorted[0],
+    maxMs: sorted[sorted.length - 1],
+  };
 }
 
 let dexLastProspectAt = 0;
@@ -642,9 +595,7 @@ async function dexGetCandidates(topN) {
   const batchSize = Math.min(topN, total);
   const start = dexCandidateRotationOffset % total;
   const selected = [];
-  for (let i = 0; i < batchSize; i++) {
-    selected.push(dexCachedCandidates[(start + i) % total]);
-  }
+  for (let i = 0; i < batchSize; i++) selected.push(dexCachedCandidates[(start + i) % total]);
   dexCandidateRotationOffset = (start + batchSize) % total;
 
   return selected;
@@ -653,7 +604,6 @@ async function dexGetCandidates(topN) {
 async function runWatchCycle({ topN = 8 } = {}) {
   console.log("[DEX] 観測サイクル開始");
   const candidates = await dexGetCandidates(topN);
-
   if (candidates.length === 0) {
     return { scannedAt: new Date().toISOString(), checked: 0, logged: 0, results: [] };
   }
@@ -677,11 +627,7 @@ async function runWatchCycle({ topN = 8 } = {}) {
           updatePoolSubscriptions(candidate.chain, [observed.cheapPoolAddress, observed.expensivePoolAddress]);
         }
         if (observed.profitable) {
-          try {
-            await maybeExecuteArb(observed);
-          } catch (e) {
-            console.warn(`[実行判定] エラー:`, e.message);
-          }
+          try { await maybeExecuteArb(observed); } catch (e) { console.warn(`[実行判定] エラー:`, e.message); }
         }
       }
     } catch (e) {
@@ -692,12 +638,7 @@ async function runWatchCycle({ topN = 8 } = {}) {
   dexSaveLog(log);
   console.log(`[DEX] 観測サイクル完了: 対象${candidates.length}件・記録${results.length}件・黒字${results.filter(r=>r.profitable).length}件`);
 
-  return {
-    scannedAt: new Date().toISOString(),
-    checked: candidates.length,
-    logged: results.length,
-    results,
-  };
+  return { scannedAt: new Date().toISOString(), checked: candidates.length, logged: results.length, results };
 }
 
 const DEX_WATCH_INTERVAL_SEC = parseInt(process.env.DEX_WATCH_INTERVAL_SEC || "180", 10);
@@ -808,13 +749,13 @@ ${renderRealExecutionSection()}
     <div><div class="v">${dexStats.totalObserved}</div><div class="l">記録件数</div></div>
     <div><div class="v" style="color:${dexStats.totalProfitableCount>0?'#2ecc71':'#888'};">${dexStats.totalProfitableCount}</div><div class="l">黒字だった件数</div></div>
     <div><div class="v" style="color:#2ecc71;">${(dexStats.onchainVerifiedCount||0)}</div><div class="l">うちオンチェーン実測</div></div>
-    <div><div class="v" style="color:${(dexStats.onchainVerifiedProfit||0)>=0?'#2ecc71':'#e74c3c'};">+$${(dexStats.onchainVerifiedProfit||0).toFixed(2)}</div><div class="l">実測ベースの利益</div></div>
+    <div><div class="v" style="color:#2ecc71;">+$${(dexStats.onchainVerifiedProfit||0).toFixed(2)}</div><div class="l">実測ベースの利益</div></div>
   </div>
   <table><thead><tr><th>#</th><th>ペア</th><th style="text-align:right;">価格差</th><th style="text-align:right;">純利益</th></tr></thead>
   <tbody>${dexRows}</tbody></table>
   <div class="note">
-    <strong>これは「もし取引していたら」の理論値です。</strong>実際に実行できる案件は、ルーター確認済みDEX・対応チェーンに限られます。<br>
-    <span class="badge">実測</span>が付いた案件は、チェーンから直接読んだ正確な準備量で計算しています(対応4チェーン)。付いていないものはDexScreenerの推定値です。<br>
+    <strong>これは「もし取引していたら」の理論値です。</strong><br>
+    <span class="badge">実測</span>が付いた案件は、チェーンから直接読んだ正確な準備量で計算しています(対応4チェーン)。<br>
     理論上の累積利益(全件): ${dexStats.cumulativeProfit>=0?'+':''}$${dexStats.cumulativeProfit.toFixed(2)}<br>
     ガス代・DEX手数料(0.3%)・Aaveのフラッシュローン手数料(0.05%)・スリッページを差し引いています。${lastDexError ? `<br><span style="color:#e74c3c;">エラー: ${lastDexError}</span>` : ''}
   </div>
@@ -868,17 +809,17 @@ function renderAboutPage() {
   <h2>① 候補ペアの選定(1時間ごと)</h2>
   <div class="note">
     DeFiLlamaから全DEXプールのデータを取得し、「同じトークンペアが複数のDEXに存在する組み合わせ」を洗い出します。<br>
-    Ethereumはガス代が確実に利益を上回るため除外。流動性・出来高の少なさからスコアリングして上位60件をキャッシュします。
+    Ethereumはガス代が確実に利益を上回るため除外。上位60件をキャッシュします。
   </div>
 </div>
 
 <div class="card">
   <h2>② DEX観測ログ(3分ごと)</h2>
   <div class="note">
-    候補を8件ずつチェックします。対応4チェーン(Base/Polygon/Optimism/Avalanche)では、<strong>プールの準備量をチェーンから直接読み取り</strong>、正確な値で計算します。<br>
-    それ以外のチェーンではDexScreenerの推定値を使い、自己整合性チェック(逆算価格との乖離5%以内)を通ったものだけ採用します。<br>
+    候補を8件ずつチェックします。対応4チェーン(Base/Polygon/Optimism/Avalanche)では、<strong>プールの準備量をチェーンから直接読み取り</strong>ます。<br>
+    RPCのレート制限に当たらないよう、問い合わせは並行させず一定間隔で順番に送っています。<br>
     純利益には、DEX手数料(0.3%)・ガス代・Aaveのフラッシュローン手数料(0.05%)・スリッページを差し引いています。<br>
-    時価総額$100,000未満の超小型トークンは、詐欺・価格操作リスクが高いため除外しています。
+    時価総額$100,000未満の超小型トークンは除外しています。
   </div>
 </div>
 
@@ -886,9 +827,9 @@ function renderAboutPage() {
   <h2>③ 実際の自動売買</h2>
   <div class="note">
     黒字判定された案件のうち、対応チェーンかつルーター確認済みDEXの組み合わせだけが実行対象です。<br>
-    ルーターには2つの呼び出し形式(Uniswap V2形式 / Aerodrome・Velodromeが使うSolidly形式)があり、それぞれ正しい形式で呼び分けています。<br>
-    実行直前にプールの状態を再確認し、利益が消えていれば見送ります。スリッページ保護(1%)も設定します。<br>
-    Aaveのフラッシュローンを使うため、取引資金は借りたもので、利益が出なければ取引全体が自動的に無かったことになります(実害はガス代のみ)。<br>
+    ルーターには2つの呼び出し形式(Uniswap V2形式 / Aerodrome・Velodromeが使うSolidly形式)があり、正しい形式で呼び分けています。<br>
+    最低受取量は、プール自身のgetAmountOutに問い合わせて求めます(手数料の推測が不要)。<br>
+    Aaveのフラッシュローンを使うため、利益が出なければ取引全体が自動的に無かったことになります(実害はガス代のみ)。<br>
     実際に送信する金額は、成功実績に応じて段階的に引き上がります($50→$200→$500→$1000→$2000)。
   </div>
 </div>
@@ -897,7 +838,7 @@ ${renderNewDexSection()}
 
 <div class="card">
   <h2>④ 持続性の追跡</h2>
-  <div class="note">価格差が0.1%以上見つかった時だけ、5/15/30/60秒後に再チェックし、「まだ残っていたか」を記録します。</div>
+  <div class="note">価格差が0.1%以上見つかった時だけ、5/15/30/60秒後に再チェックします。</div>
 </div>
 
 <div class="card">
@@ -913,11 +854,7 @@ function startServer() {
   const port = process.env.PORT || 8080;
   http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    if (req.url === "/about") {
-      res.end(renderAboutPage());
-    } else {
-      res.end(renderPage());
-    }
+    res.end(req.url === "/about" ? renderAboutPage() : renderPage());
   }).listen(port, () => console.log(`観測所ページ: ポート${port}`));
 }
 
@@ -926,19 +863,11 @@ async function main() {
   startServer();
 
   if (process.env.RUN_TESTNET_DEPLOY_CHECK === "true") {
-    try {
-      await runTestnetDeployCheck();
-    } catch (e) {
-      console.error("[テストネット検証] 失敗:", e.message);
-    }
+    try { await runTestnetDeployCheck(); } catch (e) { console.error("[テストネット検証] 失敗:", e.message); }
   }
   const deployTarget = process.env.RUN_MAINNET_DEPLOY;
   if (deployTarget && deployTarget !== "false") {
-    try {
-      await runMainnetDeploy(deployTarget);
-    } catch (e) {
-      console.error("[本番デプロイ] 失敗:", e.message);
-    }
+    try { await runMainnetDeploy(deployTarget); } catch (e) { console.error("[本番デプロイ] 失敗:", e.message); }
   }
 
   dexWatchOnce();
