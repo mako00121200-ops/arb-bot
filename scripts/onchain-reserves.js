@@ -9,6 +9,11 @@
 // そこでチェーンごとに候補URLを順に持ち、一定回数連続で失敗したら
 // 次の候補へ自動的に切り替える。全て失敗したら先頭に戻って再試行する。
 //
+// ただし「そのプールにgetReservesが無い」等のコントラクト側の正当な
+// 応答は、RPCの障害ではない。特に "missing revert data" はV3型プールを
+// 読んだ時に必ず出るため、これをRPC障害と誤認すると、正常なRPCから
+// 不要に切り替わってしまう(実際に発生させてしまった)。
+//
 // [レート制限対策]
 // RPCへの呼び出しは1本の待ち行列に通し、一定間隔を空けて順番に送る。
 // 同時並行で一斉に送ると "missing revert data (data=null)" という
@@ -34,7 +39,6 @@ function scheduleRpcCall(fn) {
   return result;
 }
 
-// チェーンごとの「今使っているRPCの番号」と「連続失敗回数」。
 const rpcState = new Map();
 const providerCache = new Map();
 
@@ -62,7 +66,6 @@ export function getProviderForChain(chain) {
   return providerCache.get(cacheKey);
 }
 
-/// このRPCで失敗したことを記録し、必要なら次の候補へ切り替える。
 function recordRpcFailure(chain, message) {
   const config = getChainConfig(chain);
   if (!config || config.rpcUrls.length < 2) return;
@@ -76,7 +79,7 @@ function recordRpcFailure(chain, message) {
   state.index = (state.index + 1) % config.rpcUrls.length;
   state.failures = 0;
   const newUrl = config.rpcUrls[state.index];
-  console.log(`[RPC切替] ${key}: ${oldUrl} が続けて失敗したため ${newUrl} に切り替えます(理由: ${(message || "").slice(0, 80)})`);
+  console.log(`[RPC切替] ${key}: 続けて失敗したため次の候補に切り替えます(${oldUrl.slice(0, 40)} → ${newUrl.slice(0, 40)} / 理由: ${(message || "").slice(0, 70)})`);
 }
 
 function recordRpcSuccess(chain) {
@@ -90,10 +93,12 @@ export async function callWithRpc(chain, fn) {
     recordRpcSuccess(chain);
     return result;
   } catch (e) {
-    // コントラクト側の正当な拒否(そのプールにgetReservesが無い等)は
-    // RPCの障害ではないため、切り替えの材料にしない。
     const msg = e.message || "";
-    const isContractLevel = msg.includes("execution reverted") || msg.includes("could not decode result data");
+    // コントラクト側の正当な応答は、RPCの障害ではないため切り替えない。
+    const isContractLevel = msg.includes("execution reverted")
+      || msg.includes("could not decode result data")
+      || msg.includes("missing revert data")
+      || msg.includes("CALL_EXCEPTION");
     if (!isContractLevel) recordRpcFailure(chain, msg);
     throw e;
   }
