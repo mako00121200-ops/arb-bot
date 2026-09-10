@@ -314,7 +314,7 @@ async function buildPoolFromOnchain(prefiltered, targetTokenAddress, chain, deci
       chain, pairAddress: pair.pairAddress, tokenXAddress: targetTokenAddress, decimalsX, decimalsY,
     });
   } catch (e) {
-    console.log(`[DEX診断] ${pair.dexId}: オンチェーン読み取り不可のため除外(${e.message.slice(0, 70)})`);
+        console.log(`[DEX診断] ${pair.dexId} (${pair.pairAddress}): オンチェーン読み取り不可のため除外(${e.message.slice(0, 60)})`);
     return null;
   }
 
