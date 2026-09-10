@@ -8,7 +8,7 @@ import { AaveV3Base, AaveV3Polygon, AaveV3Optimism, AaveV3Avalanche } from "@aav
 
 export const CHAIN_CONFIG = {
   base: {
-    rpcUrl: "https://mainnet.base.org",
+    rpcUrl: "https://base-mainnet.core.chainstack.com/cbbd2d6beeb51cd356d3f2b3d13ccbd4",
     aavePoolAddressesProvider: AaveV3Base.POOL_ADDRESSES_PROVIDER,
     contractAddressEnvVar: "MAINNET_CONTRACT_ADDRESS_BASE",
     explorerTxUrl: (hash) => `https://basescan.org/tx/${hash}`,
