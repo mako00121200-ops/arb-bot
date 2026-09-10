@@ -3,15 +3,19 @@
 // プールの準備量(reserve)を、DexScreenerのAPIではなくチェーンから
 // 直接読み取るための共通処理。
 //
-// [重要] RPCへのリクエストは、同時並行で一斉に送るとレート制限
-// (Chainstack無料枠は毎秒25回)に当たり、応答が返ってこなくなる。
-// その症状は "missing revert data (data=null)" というエラーとして現れ、
-// あたかもコントラクト側の問題のように見えるため原因を見誤りやすい。
-// ここでは全ての呼び出しを1本の待ち行列に通し、一定間隔を空けて
-// 順番に送ることで、制限に当たらないようにしている。
+// [RPCの自動切り替え]
+// 公開RPCは利用上限・403・障害で突然使えなくなる(1rpc.ioが実際に
+// 「usage limit」で停止し、Polygonの黒字案件を取り逃した)。
+// そこでチェーンごとに候補URLを順に持ち、一定回数連続で失敗したら
+// 次の候補へ自動的に切り替える。全て失敗したら先頭に戻って再試行する。
+//
+// [レート制限対策]
+// RPCへの呼び出しは1本の待ち行列に通し、一定間隔を空けて順番に送る。
+// 同時並行で一斉に送ると "missing revert data (data=null)" という
+// 紛らわしいエラーになり、コントラクト側の問題と誤認しやすい。
 
 import { ethers } from "ethers";
-import { getChainConfig } from "../chain-config.js";
+import { getChainConfig, CHAIN_CONFIG } from "../chain-config.js";
 
 const PAIR_ABI = [
   "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
@@ -19,65 +23,90 @@ const PAIR_ABI = [
 ];
 const ERC20_DECIMALS_ABI = ["function decimals() view returns (uint8)"];
 
-const CHAIN_IDS = {
-  base: 8453,
-  polygon: 137,
-  optimism: 10,
-  avalanche: 43114,
-};
-
-// 呼び出し同士の最小間隔(ミリ秒)。毎秒25回の制限に対して十分な余裕を持たせる。
 const MIN_REQUEST_INTERVAL_MS = 60;
+const FAILURES_BEFORE_ROTATE = 3;
 
 let requestChain = Promise.resolve();
 
-// 全てのRPC呼び出しをこの関数経由にして、順番に一定間隔で実行する。
 function scheduleRpcCall(fn) {
-  const result = requestChain.then(async () => {
-    const value = await fn();
-    return value;
-  });
-  // 次の呼び出しは、この呼び出しが終わってから一定時間後に始める。
-  requestChain = result
-    .catch(() => {})
-    .then(() => new Promise((r) => setTimeout(r, MIN_REQUEST_INTERVAL_MS)));
+  const result = requestChain.then(() => fn());
+  requestChain = result.catch(() => {}).then(() => new Promise((r) => setTimeout(r, MIN_REQUEST_INTERVAL_MS)));
   return result;
 }
 
+// チェーンごとの「今使っているRPCの番号」と「連続失敗回数」。
+const rpcState = new Map();
 const providerCache = new Map();
+
+function getState(chain) {
+  const key = (chain || "").toLowerCase();
+  if (!rpcState.has(key)) rpcState.set(key, { index: 0, failures: 0 });
+  return rpcState.get(key);
+}
 
 export function getProviderForChain(chain) {
   const config = getChainConfig(chain);
   if (!config) throw new Error(`未対応チェーン: ${chain}`);
 
   const key = (chain || "").toLowerCase();
-  if (providerCache.has(key)) return providerCache.get(key);
+  const state = getState(key);
+  const url = config.rpcUrls[state.index % config.rpcUrls.length];
+  const cacheKey = `${key}::${url}`;
 
-  const chainId = CHAIN_IDS[key];
-  const network = chainId ? ethers.Network.from(chainId) : undefined;
-  const provider = new ethers.JsonRpcProvider(config.rpcUrl, network, {
-    staticNetwork: network,
-  });
-
-  providerCache.set(key, provider);
-  return provider;
+  if (!providerCache.has(cacheKey)) {
+    // チェーンIDを明示して、ethersによるネットワーク自動判定
+    // (失敗するとリトライを繰り返す)を回避する。
+    const network = ethers.Network.from(config.chainId);
+    providerCache.set(cacheKey, new ethers.JsonRpcProvider(url, network, { staticNetwork: network }));
+  }
+  return providerCache.get(cacheKey);
 }
 
-/// チェーンから直接、指定プールの準備量を読む。
-/// 戻り値は人間が読める小数(トークンのdecimalsで割った後の値)。
-export async function fetchOnchainReserves({
-  chain, pairAddress, tokenXAddress, decimalsX, decimalsY,
-}) {
+/// このRPCで失敗したことを記録し、必要なら次の候補へ切り替える。
+function recordRpcFailure(chain, message) {
+  const config = getChainConfig(chain);
+  if (!config || config.rpcUrls.length < 2) return;
+
+  const key = (chain || "").toLowerCase();
+  const state = getState(key);
+  state.failures++;
+  if (state.failures < FAILURES_BEFORE_ROTATE) return;
+
+  const oldUrl = config.rpcUrls[state.index % config.rpcUrls.length];
+  state.index = (state.index + 1) % config.rpcUrls.length;
+  state.failures = 0;
+  const newUrl = config.rpcUrls[state.index];
+  console.log(`[RPC切替] ${key}: ${oldUrl} が続けて失敗したため ${newUrl} に切り替えます(理由: ${(message || "").slice(0, 80)})`);
+}
+
+function recordRpcSuccess(chain) {
+  getState(chain).failures = 0;
+}
+
+/// 呼び出しを待ち行列に通しつつ、失敗時はRPC切り替えの判断材料にする。
+export async function callWithRpc(chain, fn) {
+  try {
+    const result = await scheduleRpcCall(() => fn(getProviderForChain(chain)));
+    recordRpcSuccess(chain);
+    return result;
+  } catch (e) {
+    // コントラクト側の正当な拒否(そのプールにgetReservesが無い等)は
+    // RPCの障害ではないため、切り替えの材料にしない。
+    const msg = e.message || "";
+    const isContractLevel = msg.includes("execution reverted") || msg.includes("could not decode result data");
+    if (!isContractLevel) recordRpcFailure(chain, msg);
+    throw e;
+  }
+}
+
+export async function fetchOnchainReserves({ chain, pairAddress, tokenXAddress, decimalsX, decimalsY }) {
   if (!ethers.isAddress(pairAddress)) {
     throw new Error(`プールアドレスの形式が不正: ${pairAddress}`);
   }
+  const addr = ethers.getAddress(pairAddress);
 
-  const provider = getProviderForChain(chain);
-  const pair = new ethers.Contract(ethers.getAddress(pairAddress), PAIR_ABI, provider);
-
-  // 2つの呼び出しも並行させず、順番に行う。
-  const reserves = await scheduleRpcCall(() => pair.getReserves());
-  const token0 = await scheduleRpcCall(() => pair.token0());
+  const reserves = await callWithRpc(chain, (p) => new ethers.Contract(addr, PAIR_ABI, p).getReserves());
+  const token0 = await callWithRpc(chain, (p) => new ethers.Contract(addr, PAIR_ABI, p).token0());
 
   const isToken0X = token0.toLowerCase() === ethers.getAddress(tokenXAddress).toLowerCase();
   const rawX = isToken0X ? reserves[0] : reserves[1];
@@ -86,8 +115,7 @@ export async function fetchOnchainReserves({
   return {
     reserveX: parseFloat(ethers.formatUnits(rawX, decimalsX)),
     reserveY: parseFloat(ethers.formatUnits(rawY, decimalsY)),
-    rawX,
-    rawY,
+    rawX, rawY,
   };
 }
 
@@ -98,17 +126,31 @@ export async function fetchTokenDecimals(chain, tokenAddress) {
   const key = `${chain}:${normalized.toLowerCase()}`;
   if (decimalsCache.has(key)) return decimalsCache.get(key);
 
-  const provider = getProviderForChain(chain);
-  const contract = new ethers.Contract(normalized, ERC20_DECIMALS_ABI, provider);
-  const decimals = Number(await scheduleRpcCall(() => contract.decimals()));
+  const decimals = Number(await callWithRpc(chain, (p) =>
+    new ethers.Contract(normalized, ERC20_DECIMALS_ABI, p).decimals()
+  ));
   decimalsCache.set(key, decimals);
   return decimals;
 }
 
-/// 任意のRPC呼び出しを、この待ち行列に通して実行する(外部から使う用)。
-export { scheduleRpcCall };
-
-/// このチェーンでオンチェーン読み取りが使えるか。
 export function isOnchainReadAvailable(chain) {
   return getChainConfig(chain) !== null;
 }
+
+/// ダッシュボード表示用: 各チェーンが今どのRPCを使っているか。
+export function getRpcStatus() {
+  const out = {};
+  for (const [chain, config] of Object.entries(CHAIN_CONFIG)) {
+    const state = getState(chain);
+    const url = config.rpcUrls[state.index % config.rpcUrls.length];
+    out[chain] = {
+      url: url.replace(/\/[a-f0-9]{20,}/i, "/***"),
+      index: state.index + 1,
+      total: config.rpcUrls.length,
+      failures: state.failures,
+    };
+  }
+  return out;
+}
+
+export { scheduleRpcCall };
