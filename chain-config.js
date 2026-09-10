@@ -1,19 +1,20 @@
 // chain-config.js
 //
-// 対応チェーンごとの設定(RPC URL・AaveのPoolAddressesProvider・
-// デプロイ済みコントラクトアドレスを保存する環境変数名)を一元管理する。
+// 対応チェーンごとの設定を一元管理する。
 //
-// rpcUrls には「このシステムで実際に動作確認できたURLだけ」を入れる。
-// 未確認のURLを候補に入れると、存在しないホストへの接続リトライが
-// 大量に発生してログが埋まるため(実際に発生させてしまった)。
-// 各チェーンの先頭が主に使われ、応答しない場合に次の候補へ切り替わる。
+// rpcUrls は候補の配列。公開RPCは予告なく利用上限・403・障害に当たるため
+// (polygon-rpc.com・llamarpc・ankr・1rpc.io が順に使えなくなった実績あり)、
+// 1つに依存しない。切り替えは scripts/onchain-reserves.js が行い、
+// エラーが続いたRPCを自動的に次の候補へ回す。
+//
+// 注意: 未確認のURLを候補に入れると、存在しないホストへの接続リトライで
+// ログが埋まる。ここには実在を確認できたものだけを置く。
 
 import { AaveV3Base, AaveV3Polygon, AaveV3Optimism, AaveV3Avalanche } from "@aave-dao/aave-address-book";
 
 export const CHAIN_CONFIG = {
   base: {
-    // Chainstackの自前ノード(WebSocket監視でも使用中、実績あり)を優先し、
-    // 応答しない場合にBase公式の公開RPCへ切り替える。
+    chainId: 8453,
     rpcUrls: [
       "https://base-mainnet.core.chainstack.com/cbbd2d6beeb51cd356d3f2b3d13ccbd4",
       "https://mainnet.base.org",
@@ -23,23 +24,25 @@ export const CHAIN_CONFIG = {
     explorerTxUrl: (hash) => `https://basescan.org/tx/${hash}`,
   },
   polygon: {
-    // 1rpc.ioはコントラクトのデプロイに成功した実績があるが、
-    // 読み取りで403を返すことがあるため、Polygon公式も候補に入れる。
+    chainId: 137,
+    // 1rpc.ioは無料枠の上限に達したため後方へ。公式RPCを先に試す。
     rpcUrls: [
-      "https://1rpc.io/matic",
       "https://polygon-rpc.com",
+      "https://1rpc.io/matic",
     ],
     aavePoolAddressesProvider: AaveV3Polygon.POOL_ADDRESSES_PROVIDER,
     contractAddressEnvVar: "MAINNET_CONTRACT_ADDRESS_POLYGON",
     explorerTxUrl: (hash) => `https://polygonscan.com/tx/${hash}`,
   },
   optimism: {
+    chainId: 10,
     rpcUrls: ["https://mainnet.optimism.io"],
     aavePoolAddressesProvider: AaveV3Optimism.POOL_ADDRESSES_PROVIDER,
     contractAddressEnvVar: "MAINNET_CONTRACT_ADDRESS_OPTIMISM",
     explorerTxUrl: (hash) => `https://optimistic.etherscan.io/tx/${hash}`,
   },
   avalanche: {
+    chainId: 43114,
     rpcUrls: ["https://api.avax.network/ext/bc/C/rpc"],
     aavePoolAddressesProvider: AaveV3Avalanche.POOL_ADDRESSES_PROVIDER,
     contractAddressEnvVar: "MAINNET_CONTRACT_ADDRESS_AVALANCHE",
