@@ -10,9 +10,9 @@
 // getReservesに応答しないプール(Uniswap V3/V4、Balancer等)は、ここで
 // 自然にエラーになるため、V3判定の取りこぼしも同時に防げる。
 //
-// 公開RPCは予告なく403/410を返すため(polygon-rpc.com・llamarpc・ankr・
-// 1rpc.ioが順に使えなくなった実績あり)、ethersのFallbackProviderで
-// 複数のRPCを束ね、生きているものを自動的に使う。
+// [注意] 一時期ethersのFallbackProviderで複数RPCを束ねたが、
+// ネットワーク種別の自動判定に失敗して大量のリトライログを発生させた。
+// 単一接続 + チェーンIDの明示指定(自動判定を回避)が確実。
 
 import { ethers } from "ethers";
 import { getChainConfig } from "../chain-config.js";
@@ -23,6 +23,15 @@ const PAIR_ABI = [
 ];
 const ERC20_DECIMALS_ABI = ["function decimals() view returns (uint8)"];
 
+// チェーンIDを明示することで、ethersによるネットワーク自動判定
+// (失敗するとリトライを繰り返す)を回避する。
+const CHAIN_IDS = {
+  base: 8453,
+  polygon: 137,
+  optimism: 10,
+  avalanche: 43114,
+};
+
 const providerCache = new Map();
 
 export function getProviderForChain(chain) {
@@ -32,21 +41,11 @@ export function getProviderForChain(chain) {
   const key = (chain || "").toLowerCase();
   if (providerCache.has(key)) return providerCache.get(key);
 
-  const urls = config.rpcUrls || [config.rpcUrl];
-  let provider;
-  if (urls.length === 1) {
-    provider = new ethers.JsonRpcProvider(urls[0]);
-  } else {
-    // 先頭のURLほど優先度を高くする(自前のChainstack等を先に使う)。
-    // quorum:1 で「1つでも答えが返ればそれを採用」する設定。
-    const configs = urls.map((url, i) => ({
-      provider: new ethers.JsonRpcProvider(url),
-      priority: i + 1,
-      stallTimeout: 3000,
-      weight: 1,
-    }));
-    provider = new ethers.FallbackProvider(configs, undefined, { quorum: 1 });
-  }
+  const chainId = CHAIN_IDS[key];
+  const network = chainId ? ethers.Network.from(chainId) : undefined;
+  const provider = new ethers.JsonRpcProvider(config.rpcUrl, network, {
+    staticNetwork: network,
+  });
 
   providerCache.set(key, provider);
   return provider;
@@ -89,7 +88,7 @@ export async function fetchTokenDecimals(chain, tokenAddress) {
   return decimals;
 }
 
-/// このチェーンでオンチェーン読み取りが使えるか(RPC設定済みか)。
+/// このチェーンでオンチェーン読み取りが使えるか。
 export function isOnchainReadAvailable(chain) {
   return getChainConfig(chain) !== null;
 }
