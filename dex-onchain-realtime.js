@@ -14,6 +14,11 @@
  *   BASE_WSS_URL, ARBITRUM_WSS_URL, OPTIMISM_WSS_URL,
  *   ETHEREUM_WSS_URL, POLYGON_WSS_URL
  * 設定されていないチェーンは、自動的にスキップされる(エラーにはしない)。
+ *
+ * [修正] 以前は「60秒間Syncイベントが来なければ切断とみなす」方式だったが、
+ * 監視中のプールがたまたま閑散だっただけの場合も誤って再接続していた。
+ * 定期的に軽い問い合わせ(eth_blockNumber)を能動的に送り、その返事の
+ * 有無で接続の健全性を判定するように変更した。
  */
 
 const SYNC_TOPIC = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad";
@@ -27,6 +32,8 @@ const CHAIN_WS_ENV_VARS = {
 };
 
 const DATA_TIMEOUT_MS = 60 * 1000;
+const PING_INTERVAL_MS = 20 * 1000;
+const PING_REQUEST_ID = 999;
 
 export function decodeSyncData(dataHex) {
   const data = dataHex.startsWith("0x") ? dataHex.slice(2) : dataHex;
@@ -44,6 +51,7 @@ const chainReconnectDelays = {};
 const chainLastDataAt = {};
 const chainSubscribedPools = {};
 const chainWatchdogTimers = {};
+const chainPingTimers = {};
 const chainIntentionalClose = {};
 let globalOnSync = null;
 
@@ -56,6 +64,14 @@ function sendSubscription(chainName) {
     jsonrpc: "2.0", id: 1, method: "eth_subscribe",
     params: ["logs", { address: pools, topics: [SYNC_TOPIC] }],
   }));
+}
+
+function sendPing(chainName) {
+  const socket = chainSockets[chainName];
+  if (!socket || socket.readyState !== 1) return;
+  try {
+    socket.send(JSON.stringify({ jsonrpc: "2.0", id: PING_REQUEST_ID, method: "eth_blockNumber", params: [] }));
+  } catch (e) {}
 }
 
 function connectChain(chainName, wsUrl) {
@@ -75,15 +91,22 @@ function connectChain(chainName, wsUrl) {
       chainLastDataAt[chainName] = Date.now();
       console.log(`[オンチェーン] ${chainName}: WebSocket接続完了`);
       sendSubscription(chainName);
+
+      if (chainPingTimers[chainName]) clearInterval(chainPingTimers[chainName]);
+      chainPingTimers[chainName] = setInterval(() => sendPing(chainName), PING_INTERVAL_MS);
     });
 
     socket.addEventListener("message", (event) => {
       const receivedAt = Date.now();
-      chainLastDataAt[chainName] = receivedAt;
       try {
         const msg = JSON.parse(event.data);
-        if (msg.id !== undefined) return;
+        if (msg.id !== undefined) {
+          // 購読確認・pingの返事はどちらも「接続が生きている」証拠として扱う。
+          chainLastDataAt[chainName] = receivedAt;
+          return;
+        }
         if (msg.method === "eth_subscription" && msg.params?.result) {
+          chainLastDataAt[chainName] = receivedAt;
           const log = msg.params.result;
           const decoded = decodeSyncData(log.data);
           if (decoded && globalOnSync) {
@@ -94,6 +117,7 @@ function connectChain(chainName, wsUrl) {
     });
 
     socket.addEventListener("close", () => {
+      if (chainPingTimers[chainName]) clearInterval(chainPingTimers[chainName]);
       if (chainIntentionalClose[chainName]) {
         chainIntentionalClose[chainName] = false;
         return;
