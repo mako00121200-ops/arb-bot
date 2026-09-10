@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.10;
 
-// Aaveの公式パッケージ一式(@aave/core-v3)を丸ごと依存に加えるのではなく、
-// 実際に必要な3つのインターフェースだけをここに直接定義する軽量構成にしている。
-// ロジック自体はAave公式のFlashLoanSimpleReceiverパターンに準拠(仕様書4.4節)。
+// Aaveの公式パッケージ一式を丸ごと依存に加えるのではなく、実際に必要な
+// インターフェースだけをここに直接定義する軽量構成。ロジック自体は
+// Aave公式のFlashLoanSimpleReceiverパターンに準拠。
 interface IPoolAddressesProvider {
     function getPool() external view returns (address);
 }
@@ -24,7 +24,7 @@ interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
 }
 
-// Uniswap V2互換ルーターの最小インターフェース(V3は対象外。仕様書4.1節のV3除外方針と一致)。
+// Uniswap V2互換ルーター(uniswap, quickswap, sushiswap 等)。
 interface IUniswapV2Router {
     function swapExactTokensForTokens(
         uint amountIn,
@@ -35,11 +35,34 @@ interface IUniswapV2Router {
     ) external returns (uint[] memory amounts);
 }
 
+// Solidly系ルーター(Aerodrome on Base, Velodrome on Optimism 等)。
+// Uniswap V2と違い、経路をaddress[]ではなくRoute構造体の配列で渡す。
+// この違いのため、V2形式のまま呼び出すと必ず失敗する。
+interface ISolidlyRouter {
+    struct Route {
+        address from;
+        address to;
+        bool stable;
+        address factory;
+    }
+
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        Route[] calldata routes,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+
+    function defaultFactory() external view returns (address);
+}
+
 /// @title DexArbFlashLoan
 /// @notice 「安いDEXで買う→高いDEXで売る」を1トランザクションで完結させる、
 ///         Aave V3フラッシュローンを使ったDEXアービトラージ実行コントラクト。
-///         利益が出ない場合は returnの手前でrevertし、取引全体が無効化される
-///         (実害はガス代のみ。仕様書3.2節「1トランザクション完結方式」に対応)。
+///         利益が出ない場合はrequireでrevertし、取引全体が無効化される
+///         (実害はガス代のみ)。
+///         Uniswap V2形式とSolidly形式の両方のルーターに対応。
 contract DexArbFlashLoan {
     IPoolAddressesProvider public immutable ADDRESSES_PROVIDER;
     IPool public immutable POOL;
@@ -56,30 +79,68 @@ contract DexArbFlashLoan {
         _;
     }
 
+    /// @dev ルーターの種類。呼び出し形式が根本的に違うため、bot側から明示的に指定する。
+    enum RouterKind { UniswapV2, Solidly }
+
     /// @dev 1回のアービトラージ実行に必要な情報。
-    /// tokenYが「借りる・返す・利益を得る」通貨(観測システムのY相当)、
-    /// tokenXが途中で経由するだけの通貨(観測システムのX相当、例:AERO・NPC等)。
+    /// tokenYが「借りる・返す・利益を得る」通貨、tokenXが経由するだけの通貨。
     struct ArbParams {
-        address routerCheap;       // 安く買えるDEXのルーター(V2互換)
-        address routerExpensive;   // 高く売れるDEXのルーター(V2互換)
-        address tokenX;            // 経由するだけのトークン
-        address tokenY;            // 借入・返済・利益の通貨
-        uint256 minAmountOutStep1; // 1回目スワップの最低受取量(スリッページ保護)
-        uint256 minAmountOutStep2; // 2回目スワップの最低受取量(スリッページ保護)
+        address routerCheap;
+        address routerExpensive;
+        address tokenX;
+        address tokenY;
+        uint256 minAmountOutStep1;
+        uint256 minAmountOutStep2;
+        RouterKind kindCheap;
+        RouterKind kindExpensive;
     }
 
     event ArbExecuted(address indexed tokenY, uint256 amountBorrowed, uint256 profit);
 
     /// @notice botから呼び出すエントリーポイント。ここでフラッシュローンを開始する。
-    /// @param asset 借りるトークン(=tokenYと同じである必要がある)
-    /// @param amount 借入額。観測システムのtradeAmountIn(理論上の最適額 or 上限$2,000)に対応
     function executeArb(address asset, uint256 amount, ArbParams calldata params) external onlyOwner {
         require(asset == params.tokenY, "DexArbFlashLoan: asset must equal tokenY");
         bytes memory data = abi.encode(params);
         POOL.flashLoanSimple(address(this), asset, amount, data, 0);
     }
 
-    /// @notice Aave Poolから呼び戻されるコールバック。実際のアービトラージ処理はここに書く。
+    /// @dev ルーターの種類に応じて、正しい形式でスワップを呼び出す。
+    /// Solidly系はvolatileプール(stable=false)のみ対象。観測側もx*y=k型のみを
+    /// 扱っているため、ここでもstableは常にfalseで統一する。
+    function _swap(
+        address router,
+        RouterKind kind,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 minAmountOut
+    ) internal returns (uint256) {
+        IERC20(tokenIn).approve(router, amountIn);
+
+        if (kind == RouterKind.Solidly) {
+            ISolidlyRouter.Route[] memory routes = new ISolidlyRouter.Route[](1);
+            routes[0] = ISolidlyRouter.Route({
+                from: tokenIn,
+                to: tokenOut,
+                stable: false,
+                factory: ISolidlyRouter(router).defaultFactory()
+            });
+            uint256[] memory amounts = ISolidlyRouter(router).swapExactTokensForTokens(
+                amountIn, minAmountOut, routes, address(this), block.timestamp
+            );
+            return amounts[amounts.length - 1];
+        }
+
+        address[] memory path = new address[](2);
+        path[0] = tokenIn;
+        path[1] = tokenOut;
+        uint256[] memory outs = IUniswapV2Router(router).swapExactTokensForTokens(
+            amountIn, minAmountOut, path, address(this), block.timestamp
+        );
+        return outs[outs.length - 1];
+    }
+
+    /// @notice Aave Poolから呼び戻されるコールバック。実際のアービトラージ処理。
     function executeOperation(
         address asset,
         uint256 amount,
@@ -91,36 +152,24 @@ contract DexArbFlashLoan {
 
         ArbParams memory p = abi.decode(params, (ArbParams));
 
-        // ステップ1: 安いDEXで tokenY(借りた資金) → tokenX に交換
-        IERC20(asset).approve(p.routerCheap, amount);
-        address[] memory pathBuy = new address[](2);
-        pathBuy[0] = p.tokenY;
-        pathBuy[1] = p.tokenX;
-        uint256[] memory amountsOut1 = IUniswapV2Router(p.routerCheap).swapExactTokensForTokens(
-            amount, p.minAmountOutStep1, pathBuy, address(this), block.timestamp
+        // ステップ1: 安いDEXで tokenY(借りた資金) → tokenX
+        uint256 tokenXReceived = _swap(
+            p.routerCheap, p.kindCheap, p.tokenY, p.tokenX, amount, p.minAmountOutStep1
         );
-        uint256 tokenXReceived = amountsOut1[amountsOut1.length - 1];
 
-        // ステップ2: 高いDEXで tokenX → tokenY に交換
-        IERC20(p.tokenX).approve(p.routerExpensive, tokenXReceived);
-        address[] memory pathSell = new address[](2);
-        pathSell[0] = p.tokenX;
-        pathSell[1] = p.tokenY;
-        IUniswapV2Router(p.routerExpensive).swapExactTokensForTokens(
-            tokenXReceived, p.minAmountOutStep2, pathSell, address(this), block.timestamp
+        // ステップ2: 高いDEXで tokenX → tokenY
+        _swap(
+            p.routerExpensive, p.kindExpensive, p.tokenX, p.tokenY, tokenXReceived, p.minAmountOutStep2
         );
 
         // 返済額(元本+手数料)を用意できなければここでrevertする。
-        // これにより「利益が出ない取引は自動的に無かったことになる」を実現する。
         uint256 amountOwed = amount + premium;
         uint256 balance = IERC20(asset).balanceOf(address(this));
         require(balance >= amountOwed, "DexArbFlashLoan: not profitable, reverting");
 
         IERC20(asset).approve(address(POOL), amountOwed);
 
-        uint256 profit = balance - amountOwed;
-        emit ArbExecuted(asset, amount, profit);
-
+        emit ArbExecuted(asset, amount, balance - amountOwed);
         return true;
     }
 
