@@ -6,8 +6,7 @@
 //
 // ルーターの呼び出し形式(Uniswap V2形式 / Solidly形式)は
 // router-addresses.js の kind を見てコントラクトへ明示的に渡す。
-// 以前はすべてUniswap V2形式と仮定していたため、Aerodrome・Velodromeが
-// 絡む案件は必ず失敗していた。
+// RPCへの接続は onchain-reserves.js の複数RPC対応の仕組みを共用する。
 
 import { ethers } from "ethers";
 import { getRouterInfo, ROUTER_KIND_ENUM } from "../router-addresses.js";
@@ -15,12 +14,8 @@ import { getChainConfig } from "../chain-config.js";
 import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
 import { recordRealExecution } from "./real-execution-log.js";
 import { isKnownIncompatiblePool, recordIncompatiblePool } from "./incompatible-pools.js";
+import { getProviderForChain, fetchOnchainReserves, fetchTokenDecimals } from "./onchain-reserves.js";
 
-const ERC20_DECIMALS_ABI = ["function decimals() view returns (uint8)"];
-const PAIR_ABI = [
-  "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
-  "function token0() view returns (address)",
-];
 const CONTRACT_ABI = [
   "function executeArb(address asset, uint256 amount, (address routerCheap, address routerExpensive, address tokenX, address tokenY, uint256 minAmountOutStep1, uint256 minAmountOutStep2, uint8 kindCheap, uint8 kindExpensive) params) external",
   "event ArbExecuted(address indexed tokenY, uint256 amountBorrowed, uint256 profit)",
@@ -34,57 +29,37 @@ function getAmountOutBigInt(amountIn, reserveIn, reserveOut, feeBps) {
   return denominator === 0n ? 0n : numerator / denominator;
 }
 
-const providerCache = new Map();
-function getProviderForChain(rpcUrl) {
-  if (!providerCache.has(rpcUrl)) {
-    providerCache.set(rpcUrl, new ethers.JsonRpcProvider(rpcUrl));
-  }
-  return providerCache.get(rpcUrl);
-}
-
-const decimalsCache = new Map();
-async function getTokenDecimals(tokenAddress, provider, chain) {
-  const normalizedAddress = ethers.getAddress(tokenAddress);
-  const key = `${chain}:${normalizedAddress.toLowerCase()}`;
-  if (decimalsCache.has(key)) return decimalsCache.get(key);
-  const contract = new ethers.Contract(normalizedAddress, ERC20_DECIMALS_ABI, provider);
-  const decimals = Number(await contract.decimals());
-  decimalsCache.set(key, decimals);
-  return decimals;
-}
-
-async function getFreshReserves(pairAddress, tokenXAddress, provider) {
-  if (!ethers.isAddress(pairAddress)) {
-    throw new Error(`プールアドレスの形式が不正(標準的な20バイトアドレスではない): ${pairAddress}`);
-  }
-  const normalizedPairAddress = ethers.getAddress(pairAddress);
-  const normalizedTokenX = ethers.getAddress(tokenXAddress);
-  const pair = new ethers.Contract(normalizedPairAddress, PAIR_ABI, provider);
-  const [reserves, token0] = await Promise.all([pair.getReserves(), pair.token0()]);
-  const isToken0X = token0.toLowerCase() === normalizedTokenX.toLowerCase();
-  return {
-    reserveX: isToken0X ? reserves[0] : reserves[1],
-    reserveY: isToken0X ? reserves[1] : reserves[0],
-  };
-}
-
 const SLIPPAGE_TOLERANCE_BPS = 100n;
 
+// index.jsのdexNormalizeChainと同じ変換。DeFiLlamaが "OP Mainnet" のような
+// 表記を使うため、chain-config.jsのキーに合わせる必要がある。
+function normalizeChain(chain) {
+  const map = {
+    base: "base",
+    arbitrum: "arbitrum",
+    optimism: "optimism",
+    "op mainnet": "optimism",
+    ethereum: "ethereum",
+  };
+  return map[(chain || "").toLowerCase()] || (chain || "").toLowerCase();
+}
+
 export async function maybeExecuteArb(observed) {
-  const chainConfig = getChainConfig(observed.chain);
+  const chain = normalizeChain(observed.chain);
+  const chainConfig = getChainConfig(chain);
   if (!chainConfig) return;
 
-  const infoCheap = getRouterInfo(observed.chain, observed.cheapDex);
-  const infoExpensive = getRouterInfo(observed.chain, observed.expensiveDex);
+  const infoCheap = getRouterInfo(chain, observed.cheapDex);
+  const infoExpensive = getRouterInfo(chain, observed.expensiveDex);
   if (!infoCheap || !infoExpensive) {
     console.log(`[実行判定] ${observed.pairLabel}: ルーター未確認のため見送り`);
     return;
   }
 
-  const cheapKnownBad = isKnownIncompatiblePool(observed.chain, observed.cheapPoolAddress);
-  const expensiveKnownBad = isKnownIncompatiblePool(observed.chain, observed.expensivePoolAddress);
+  const cheapKnownBad = isKnownIncompatiblePool(chain, observed.cheapPoolAddress);
+  const expensiveKnownBad = isKnownIncompatiblePool(chain, observed.expensivePoolAddress);
   if (cheapKnownBad || expensiveKnownBad) {
-    console.log(`[実行判定] ${observed.pairLabel}: 既知の非対応プールのため見送り(${(cheapKnownBad || expensiveKnownBad).reason})`);
+    console.log(`[実行判定] ${observed.pairLabel}: 既知の非対応プールのため見送り`);
     return;
   }
 
@@ -94,13 +69,14 @@ export async function maybeExecuteArb(observed) {
     return;
   }
 
-  const provider = getProviderForChain(chainConfig.rpcUrl);
-
-  let decimalsY;
+  let decimalsX, decimalsY;
   try {
-    decimalsY = await getTokenDecimals(observed.tokenB, provider, observed.chain);
+    [decimalsX, decimalsY] = await Promise.all([
+      fetchTokenDecimals(chain, observed.tokenA),
+      fetchTokenDecimals(chain, observed.tokenB),
+    ]);
   } catch (e) {
-    console.warn(`[実行判定] ${observed.pairLabel}: トークンのdecimals取得に失敗、見送り:`, e.message);
+    console.warn(`[実行判定] ${observed.pairLabel}: decimals取得に失敗、見送り:`, e.message);
     return;
   }
 
@@ -120,27 +96,39 @@ export async function maybeExecuteArb(observed) {
     return;
   }
 
+  // 実行直前にプールの現在の状態を読み直す(観測時点から動いていないかの再確認)。
   let cheapReserves, expensiveReserves;
   try {
-    cheapReserves = await getFreshReserves(observed.cheapPoolAddress, observed.tokenA, provider);
+    cheapReserves = await fetchOnchainReserves({
+      chain, pairAddress: observed.cheapPoolAddress, tokenXAddress: observed.tokenA, decimalsX, decimalsY,
+    });
   } catch (e) {
-    recordIncompatiblePool(observed.chain, observed.cheapPoolAddress, e.message);
-    console.warn(`[実行判定] ${observed.pairLabel}: 安い方のプール状態の再確認に失敗、見送り:`, e.message);
+    recordIncompatiblePool(chain, observed.cheapPoolAddress, e.message);
+    console.warn(`[実行判定] ${observed.pairLabel}: 安い方のプール再確認に失敗、見送り:`, e.message);
     return;
   }
   try {
-    expensiveReserves = await getFreshReserves(observed.expensivePoolAddress, observed.tokenA, provider);
+    expensiveReserves = await fetchOnchainReserves({
+      chain, pairAddress: observed.expensivePoolAddress, tokenXAddress: observed.tokenA, decimalsX, decimalsY,
+    });
   } catch (e) {
-    recordIncompatiblePool(observed.chain, observed.expensivePoolAddress, e.message);
-    console.warn(`[実行判定] ${observed.pairLabel}: 高い方のプール状態の再確認に失敗、見送り:`, e.message);
+    recordIncompatiblePool(chain, observed.expensivePoolAddress, e.message);
+    console.warn(`[実行判定] ${observed.pairLabel}: 高い方のプール再確認に失敗、見送り:`, e.message);
     return;
   }
 
-  const xOutExpected = getAmountOutBigInt(amountIn, cheapReserves.reserveY, cheapReserves.reserveX, infoCheap.feeBps);
-  const yOutExpected = getAmountOutBigInt(xOutExpected, expensiveReserves.reserveX, expensiveReserves.reserveY, infoExpensive.feeBps);
+  // 最低受取量の計算はコントラクトへ渡す生の整数で行う必要があるため、
+  // 小数で受け取った準備量を最小単位に戻す。
+  const reserveCheapX = ethers.parseUnits(cheapReserves.reserveX.toFixed(Math.min(decimalsX, 18)), decimalsX);
+  const reserveCheapY = ethers.parseUnits(cheapReserves.reserveY.toFixed(Math.min(decimalsY, 18)), decimalsY);
+  const reserveExpX = ethers.parseUnits(expensiveReserves.reserveX.toFixed(Math.min(decimalsX, 18)), decimalsX);
+  const reserveExpY = ethers.parseUnits(expensiveReserves.reserveY.toFixed(Math.min(decimalsY, 18)), decimalsY);
+
+  const xOutExpected = getAmountOutBigInt(amountIn, reserveCheapY, reserveCheapX, infoCheap.feeBps);
+  const yOutExpected = getAmountOutBigInt(xOutExpected, reserveExpX, reserveExpY, infoExpensive.feeBps);
 
   if (yOutExpected <= amountIn) {
-    console.log(`[実行判定] ${observed.pairLabel}: 実行直前の再計算で利益が消えていたため見送り(投入額と同等以下の受取見込み)`);
+    console.log(`[実行判定] ${observed.pairLabel}: 実行直前の再計算で利益が消えていたため見送り`);
     return;
   }
 
@@ -149,10 +137,10 @@ export async function maybeExecuteArb(observed) {
 
   const dryRun = process.env.DRY_RUN !== "false";
 
-  console.log(`[実行判定] ${observed.pairLabel}: 投入額=${amountInStr}(${decimalsY}桁、取引上限$${tradeCapUsd}適用後) 想定純利益=+$${observed.netProfit.toFixed(2)} 形式=${infoCheap.kind}→${infoExpensive.kind} DRY_RUN=${dryRun}`);
+  console.log(`[実行判定] ${observed.pairLabel}: 投入額=${amountInStr}(取引上限$${tradeCapUsd}適用後) 想定純利益=+$${observed.netProfit.toFixed(2)} 形式=${infoCheap.kind}→${infoExpensive.kind} DRY_RUN=${dryRun}`);
 
   if (dryRun) {
-    console.log(`[実行判定] DRY_RUNのため送信はスキップします(routerCheap=${infoCheap.address}, routerExpensive=${infoExpensive.address})`);
+    console.log(`[実行判定] DRY_RUNのため送信はスキップします`);
     return;
   }
 
@@ -161,6 +149,8 @@ export async function maybeExecuteArb(observed) {
     console.warn("[実行判定] MAINNET_BOT_PRIVATE_KEYが未設定のため見送り");
     return;
   }
+
+  const provider = getProviderForChain(chain);
   const wallet = new ethers.Wallet(privateKey, provider);
   const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, wallet);
 
@@ -200,7 +190,7 @@ export async function maybeExecuteArb(observed) {
     recordRealExecution({
       timestamp: new Date().toISOString(),
       pairLabel: observed.pairLabel,
-      chain: observed.chain,
+      chain,
       txHash: tx.hash,
       explorerUrl: chainConfig.explorerTxUrl(tx.hash),
       tradeAmountUsd: Math.min(observed.tradeAmountUsd, tradeCapUsd),
