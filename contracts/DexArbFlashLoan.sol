@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.10;
 
-// Aaveの公式パッケージ一式を丸ごと依存に加えるのではなく、実際に必要な
-// インターフェースだけをここに直接定義する軽量構成。ロジック自体は
-// Aave公式のFlashLoanSimpleReceiverパターンに準拠。
 interface IPoolAddressesProvider {
     function getPool() external view returns (address);
 }
@@ -28,26 +25,23 @@ interface IERC20 {
 // Uniswap V2形式もSolidly形式(Aerodrome/Velodrome)も、この swap と
 // token0 は全く同じ形式で実装されている。ルーターはこれを呼び出す
 // 「便利な窓口」にすぎないため、プールを直接呼べばルーターアドレスの
-// 事前調査が一切不要になる(dfyn・swapr・apeswap等、無数のフォークに
-// 自動的に対応できる)。
+// 事前調査が一切不要になる。
 interface IAmmPool {
     function swap(uint amount0Out, uint amount1Out, address to, bytes calldata data) external;
     function token0() external view returns (address);
 }
 
 /// @title DexArbFlashLoan
-/// @notice 「安いプールで買う→高いプールで売る」を1トランザクションで完結させる、
-///         Aave V3フラッシュローンを使ったDEXアービトラージ実行コントラクト。
+/// @notice Aave V3フラッシュローンを使ったDEXアービトラージ実行コントラクト。
 ///         利益が出ない場合はrequireでrevertし、取引全体が無効化される
 ///         (実害はガス代のみ)。
 ///
-///         [設計変更] 以前はDEXごとのルーターアドレスを事前に調査して
-///         渡す方式だったが、候補の69%がルーター未確認で実行できなかった。
-///         プールを直接呼ぶ方式に変更し、この制約を撤廃した。
-///
-///         受取量(amountOut)はbot側が事前に計算して渡す。プール自身の
-///         getAmountOutで実測した手数料を使うため、計算式の違い
-///         (Uniswap V2 / Solidly)も吸収できる。
+///         2種類の裁定に対応する:
+///           executeArb     … 2ステップ。同じペアの価格差を2つのプールで取る。
+///           executeTriArb  … 3ステップ(三角裁定)。A→B→C→Aと巡回して、
+///                            トークン間の相対価格の歪みを取る。同じDEX内で
+///                            完結するため機会の母数が桁違いに多く、専業botとの
+///                            競合も比較的少ない。
 contract DexArbFlashLoan {
     IPoolAddressesProvider public immutable ADDRESSES_PROVIDER;
     IPool public immutable POOL;
@@ -64,11 +58,7 @@ contract DexArbFlashLoan {
         _;
     }
 
-    /// @dev 1回のアービトラージ実行に必要な情報。
-    /// tokenYが「借りる・返す・利益を得る」通貨、tokenXが経由するだけの通貨。
-    /// amountOutStep1/2 は、bot側がプールの現在の状態から計算した受取量。
-    /// この値が実際より大きすぎるとプール側でrevertするため、
-    /// 過大請求による損失は起こらない(スリッページ保護を兼ねる)。
+    /// @dev 2ステップ裁定のパラメータ。
     struct ArbParams {
         address poolCheap;
         address poolExpensive;
@@ -78,12 +68,38 @@ contract DexArbFlashLoan {
         uint256 amountOutStep2;
     }
 
-    event ArbExecuted(address indexed tokenY, uint256 amountBorrowed, uint256 profit);
+    /// @dev 3ステップ(三角)裁定のパラメータ。
+    /// tokenA(借りる通貨) → tokenB → tokenC → tokenA と巡回する。
+    /// pools[i] は i番目のスワップに使うプール。
+    struct TriArbParams {
+        address pool1;
+        address pool2;
+        address pool3;
+        address tokenA;
+        address tokenB;
+        address tokenC;
+        uint256 amountOut1;
+        uint256 amountOut2;
+        uint256 amountOut3;
+    }
 
-    /// @notice botから呼び出すエントリーポイント。ここでフラッシュローンを開始する。
+    event ArbExecuted(address indexed tokenY, uint256 amountBorrowed, uint256 profit);
+    event TriArbExecuted(address indexed tokenA, uint256 amountBorrowed, uint256 profit);
+
+    /// @dev フラッシュローンのコールバックで、どちらの処理を行うかの目印。
+    uint8 private constant MODE_TWO_STEP = 1;
+    uint8 private constant MODE_THREE_STEP = 2;
+
+    /// @notice 2ステップ裁定のエントリーポイント。
     function executeArb(address asset, uint256 amount, ArbParams calldata params) external onlyOwner {
         require(asset == params.tokenY, "DexArbFlashLoan: asset must equal tokenY");
-        POOL.flashLoanSimple(address(this), asset, amount, abi.encode(params), 0);
+        POOL.flashLoanSimple(address(this), asset, amount, abi.encode(MODE_TWO_STEP, abi.encode(params)), 0);
+    }
+
+    /// @notice 3ステップ(三角)裁定のエントリーポイント。
+    function executeTriArb(address asset, uint256 amount, TriArbParams calldata params) external onlyOwner {
+        require(asset == params.tokenA, "DexArbFlashLoan: asset must equal tokenA");
+        POOL.flashLoanSimple(address(this), asset, amount, abi.encode(MODE_THREE_STEP, abi.encode(params)), 0);
     }
 
     /// @dev プールを直接呼んでスワップする。
@@ -96,11 +112,8 @@ contract DexArbFlashLoan {
         uint256 amountOut
     ) internal {
         require(amountOut > 0, "DexArbFlashLoan: amountOut must be positive");
-
-        // プールへ入力トークンを直接送る(ルーターを経由しない)。
         IERC20(tokenIn).transfer(pool, amountIn);
 
-        // token0/token1のどちら側を受け取るかを決める。
         bool tokenInIsToken0 = IAmmPool(pool).token0() == tokenIn;
         uint256 amount0Out = tokenInIsToken0 ? 0 : amountOut;
         uint256 amount1Out = tokenInIsToken0 ? amountOut : 0;
@@ -108,7 +121,7 @@ contract DexArbFlashLoan {
         IAmmPool(pool).swap(amount0Out, amount1Out, address(this), new bytes(0));
     }
 
-    /// @notice Aave Poolから呼び戻されるコールバック。実際のアービトラージ処理。
+    /// @notice Aave Poolから呼び戻されるコールバック。
     function executeOperation(
         address asset,
         uint256 amount,
@@ -118,25 +131,44 @@ contract DexArbFlashLoan {
     ) external returns (bool) {
         require(msg.sender == address(POOL), "DexArbFlashLoan: caller must be Aave Pool");
 
-        ArbParams memory p = abi.decode(params, (ArbParams));
+        (uint8 mode, bytes memory inner) = abi.decode(params, (uint8, bytes));
 
-        // ステップ1: 安いプールで tokenY(借りた資金) → tokenX
-        _swapDirect(p.poolCheap, p.tokenY, amount, p.amountOutStep1);
+        if (mode == MODE_TWO_STEP) {
+            _runTwoStep(amount, abi.decode(inner, (ArbParams)));
+        } else {
+            _runThreeStep(amount, abi.decode(inner, (TriArbParams)));
+        }
 
-        // ステップ2: 高いプールで tokenX → tokenY
-        // 実際に受け取れたtokenXの全量を使う(見積もりより多いこともあるため)。
-        uint256 tokenXBalance = IERC20(p.tokenX).balanceOf(address(this));
-        _swapDirect(p.poolExpensive, p.tokenX, tokenXBalance, p.amountOutStep2);
-
-        // 返済額(元本+手数料)を用意できなければここでrevertする。
         uint256 amountOwed = amount + premium;
         uint256 balance = IERC20(asset).balanceOf(address(this));
         require(balance >= amountOwed, "DexArbFlashLoan: not profitable, reverting");
 
         IERC20(asset).approve(address(POOL), amountOwed);
 
-        emit ArbExecuted(asset, amount, balance - amountOwed);
+        if (mode == MODE_TWO_STEP) {
+            emit ArbExecuted(asset, amount, balance - amountOwed);
+        } else {
+            emit TriArbExecuted(asset, amount, balance - amountOwed);
+        }
         return true;
+    }
+
+    function _runTwoStep(uint256 amount, ArbParams memory p) internal {
+        _swapDirect(p.poolCheap, p.tokenY, amount, p.amountOutStep1);
+        uint256 tokenXBalance = IERC20(p.tokenX).balanceOf(address(this));
+        _swapDirect(p.poolExpensive, p.tokenX, tokenXBalance, p.amountOutStep2);
+    }
+
+    /// @dev A → B → C → A と3回スワップして巡回する。
+    /// 各段で「実際に受け取れた全量」を次に回す(見積もりより多いこともあるため)。
+    function _runThreeStep(uint256 amount, TriArbParams memory p) internal {
+        _swapDirect(p.pool1, p.tokenA, amount, p.amountOut1);
+
+        uint256 balanceB = IERC20(p.tokenB).balanceOf(address(this));
+        _swapDirect(p.pool2, p.tokenB, balanceB, p.amountOut2);
+
+        uint256 balanceC = IERC20(p.tokenC).balanceOf(address(this));
+        _swapDirect(p.pool3, p.tokenC, balanceC, p.amountOut3);
     }
 
     /// @notice 蓄積した利益をownerのウォレットへ引き出す。
