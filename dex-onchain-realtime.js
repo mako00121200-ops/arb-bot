@@ -1,19 +1,26 @@
 /**
  * オンチェーン Sync イベント リアルタイム購読モジュール
  * ------------------------------------------------------------
- * 対象プールの「Sync」イベント(取引のたびに発行される、最新の準備量そのもの)を
- * WebSocketで直接購読する。追加の問い合わせなしで取引直後の正しい準備量が
- * そのまま得られるため、検知から計算までの遅延をほぼゼロにできる。
+ * 取引のたびに発行される Sync イベント(最新の準備量そのもの)を
+ * WebSocketで直接受け取る。追加の問い合わせなしで取引直後の正しい
+ * 準備量が得られるため、検知から計算までの遅延をほぼゼロにできる。
  *
- * 環境変数: BASE_WSS_URL, ARBITRUM_WSS_URL, OPTIMISM_WSS_URL,
- *           POLYGON_WSS_URL, AVALANCHE_WSS_URL
- * 未設定のチェーンは自動的にスキップされる。
- *
- * [修正1] 「60秒間Syncイベントが無ければ切断」という誤判定で再接続が頻発した。
+ * [修正1] 「60秒間イベントが無ければ切断」という誤判定で再接続が頻発した。
  * 定期的なping(eth_blockNumber)で能動的に生存確認する方式に変更済み。
  *
- * [修正2] 購読アドレスが数千件になるとRPC側が1回の要求を拒否するため、
- * 一定数ごとに分割して複数の購読に分ける。
+ * [修正2] アドレスを指定して購読する方式をやめた。13,783プールを400件ずつ
+ * 35回に分けて購読したところ、RPC側の購読数制限に当たり、Syncイベントが
+ * 1件も届かなかった。
+ * チェーン上の全Syncイベントを「1つの購読」で受け取り、手元で自分の
+ * 監視対象かどうかを判定する方式に変更。購読は常に1回で済むため制限に
+ * 当たらず、登録済みの全プールを漏れなくカバーできる。
+ * (専業botが実際に使っている方式でもある)
+ *
+ * [修正3] イベント監視用のRPCを、読み取り用とは別に指定できるようにした。
+ * 無料枠のノードを複数契約し「ノードAで読み取り、ノードBでイベント監視」と
+ * 役割分担させることで、1ノードあたりの制限を回避しつつ速度を保てる。
+ *   環境変数: BASE_WSS_URL, ARBITRUM_WSS_URL, OPTIMISM_WSS_URL,
+ *             POLYGON_WSS_URL, AVALANCHE_WSS_URL
  */
 
 const SYNC_TOPIC = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad";
@@ -29,8 +36,7 @@ const CHAIN_WS_ENV_VARS = {
 const DATA_TIMEOUT_MS = 60 * 1000;
 const PING_INTERVAL_MS = 20 * 1000;
 const PING_REQUEST_ID = 999;
-// 1回の購読要求に含めるアドレス数の上限。多すぎるとRPC側が拒否する。
-const ADDRESSES_PER_SUBSCRIPTION = 400;
+const SUBSCRIBE_REQUEST_ID = 1;
 
 export function decodeSyncData(dataHex) {
   const data = dataHex.startsWith("0x") ? dataHex.slice(2) : dataHex;
@@ -44,30 +50,26 @@ export function decodeSyncData(dataHex) {
 const chainSockets = {};
 const chainReconnectDelays = {};
 const chainLastDataAt = {};
-const chainSubscribedPools = {};
 const chainWatchdogTimers = {};
 const chainPingTimers = {};
 const chainIntentionalClose = {};
+const chainEnabled = new Set();
+const chainEventCounts = {};
+const chainMatchedCounts = {};
 let globalOnSync = null;
 
-/// 購読アドレスを分割して、複数の eth_subscribe に分けて送る。
+/// チェーン上の全Syncイベントを1つの購読で受け取る。
+/// アドレスで絞らないため、購読数の制限に当たらない。
 function sendSubscription(chainName) {
   const socket = chainSockets[chainName];
   if (!socket || socket.readyState !== 1) return;
-  const pools = [...(chainSubscribedPools[chainName] || [])];
-  if (pools.length === 0) return;
-
-  let requestId = 100;
-  for (let i = 0; i < pools.length; i += ADDRESSES_PER_SUBSCRIPTION) {
-    const chunk = pools.slice(i, i + ADDRESSES_PER_SUBSCRIPTION);
-    try {
-      socket.send(JSON.stringify({
-        jsonrpc: "2.0", id: requestId++, method: "eth_subscribe",
-        params: ["logs", { address: chunk, topics: [SYNC_TOPIC] }],
-      }));
-    } catch (e) { break; }
-  }
-  console.log(`[オンチェーン] ${chainName}: ${pools.length}プールを${Math.ceil(pools.length / ADDRESSES_PER_SUBSCRIPTION)}回に分けて購読`);
+  try {
+    socket.send(JSON.stringify({
+      jsonrpc: "2.0", id: SUBSCRIBE_REQUEST_ID, method: "eth_subscribe",
+      params: ["logs", { topics: [SYNC_TOPIC] }],
+    }));
+    console.log(`[オンチェーン] ${chainName}: 全Syncイベントを購読しました(1接続1購読)`);
+  } catch (e) {}
 }
 
 function sendPing(chainName) {
@@ -106,14 +108,21 @@ function connectChain(chainName, wsUrl) {
         if (msg.id !== undefined) {
           // 購読確認・pingの返事は「接続が生きている」証拠として扱う。
           chainLastDataAt[chainName] = receivedAt;
+          if (msg.id === SUBSCRIBE_REQUEST_ID && msg.error) {
+            console.warn(`[オンチェーン] ${chainName}: 購読が拒否されました: ${JSON.stringify(msg.error).slice(0, 120)}`);
+          }
           return;
         }
         if (msg.method === "eth_subscription" && msg.params?.result) {
           chainLastDataAt[chainName] = receivedAt;
+          chainEventCounts[chainName] = (chainEventCounts[chainName] || 0) + 1;
           const log = msg.params.result;
           const decoded = decodeSyncData(log.data);
           if (decoded && globalOnSync) {
-            globalOnSync(chainName, log.address.toLowerCase(), decoded.reserve0, decoded.reserve1, receivedAt);
+            // 監視対象かどうかの判定は受け手(index.js)に任せる。
+            // 対象外なら即座に無視されるだけなので、ここでは絞らない。
+            const matched = globalOnSync(chainName, log.address.toLowerCase(), decoded.reserve0, decoded.reserve1, receivedAt);
+            if (matched) chainMatchedCounts[chainName] = (chainMatchedCounts[chainName] || 0) + 1;
           }
         }
       } catch (e) {}
@@ -162,7 +171,7 @@ export function startOnchainFeeds(onSync) {
       console.log(`[オンチェーン] ${chainName}: ${envVar} 未設定のためスキップ(定期スキャンのみで観測)`);
       continue;
     }
-    chainSubscribedPools[chainName] = new Set();
+    chainEnabled.add(chainName);
     connectChain(chainName, wsUrl);
     anyStarted = true;
   }
@@ -171,22 +180,23 @@ export function startOnchainFeeds(onSync) {
   }
 }
 
-/// 購読対象を追加する。既に接続済みなら、購読し直す。
-export function updatePoolSubscriptions(chainName, poolAddresses) {
-  if (!chainSubscribedPools[chainName]) return;
-  const before = chainSubscribedPools[chainName].size;
-  for (const addr of poolAddresses) {
-    if (addr) chainSubscribedPools[chainName].add(addr.toLowerCase());
-  }
-  if (chainSubscribedPools[chainName].size !== before) sendSubscription(chainName);
-}
+/// 全件購読に変更したため、個別のアドレス登録は不要になった。
+/// 呼び出し側の互換のために残してある。
+export function updatePoolSubscriptions() { /* 全件購読のため何もしない */ }
 
 export function isChainWsEnabled(chainName) {
-  return chainSubscribedPools[chainName] !== undefined;
+  return chainEnabled.has(chainName);
 }
 
-export function getSubscriptionCounts() {
+/// ダッシュボード表示用: チェーンごとの受信件数と、うち監視対象だった件数。
+export function getSyncStats() {
   const out = {};
-  for (const [chain, set] of Object.entries(chainSubscribedPools)) out[chain] = set.size;
+  for (const chain of chainEnabled) {
+    out[chain] = {
+      received: chainEventCounts[chain] || 0,
+      matched: chainMatchedCounts[chain] || 0,
+      connected: chainSockets[chain]?.readyState === 1,
+    };
+  }
   return out;
 }
