@@ -3,52 +3,52 @@
 // 全プールの準備量をメモリ上に保持する「プール地図」。
 //
 // [なぜ必要か]
-// 従来は判定のたびにRPCへ問い合わせていたため、1ペアあたり数百ミリ秒〜
-// 1秒かかり、150ペアを22分周期でしか見られなかった。
-// 起動時に一括で読み込み、以降はSyncイベント(取引が起きた瞬間に届く)で
-// 差分更新すれば、判定はメモリ上の計算だけで済み、ミリ秒で完了する。
+// 判定のたびにRPCへ問い合わせると1ペアあたり数百ミリ秒〜1秒かかる。
+// メモリ上に持ち、Syncイベントで差分更新すれば、判定はミリ秒で完了する。
+//
+// [永続化]
+// 地図の構築(ファクトリーからの全列挙)には約50分かかる。再デプロイのたびに
+// やり直すのは非現実的なので、「アドレス・トークン・実測手数料」だけを
+// ファイルに保存し、次回起動時はそれを読み込んで準備量だけ再取得する。
+// 準備量は保存しない(古い値で判定しないため)。
 //
 // [構造]
-//   pools:  アドレス → { token0, token1, raw0, raw1, feeBps, dexId, chain }
-//   byPair: "chain::tokenA|tokenB" → そのペアを扱うプールのアドレス一覧
-//   byToken: "chain::token" → そのトークンを含むプールのアドレス一覧(三角裁定用)
-//
-// トークンの並びは常に辞書順に正規化して保持する(A-BとB-Aを同一視するため)。
+//   pools:   "chain::address" → { token0, token1, raw0, raw1, feeBps, dexId, ... }
+//   byPair:  "chain::tokenA|tokenB" → そのペアを扱うプールの一覧
+//   byToken: "chain::token" → そのトークンを含むプールの一覧(三角裁定用)
+
+import fs from "fs";
+
+const POOL_MAP_FILE = process.env.POOL_MAP_FILE || "/tmp/pool-map.json";
 
 const pools = new Map();
 const byPair = new Map();
 const byToken = new Map();
-const tokenDecimals = new Map(); // "chain::token" -> decimals
-const tokenPriceUsd = new Map(); // "chain::token" -> USD価格
+const tokenDecimals = new Map();
+const tokenPriceUsd = new Map();
 
 function pairKey(chain, tokenA, tokenB) {
   const [a, b] = [tokenA.toLowerCase(), tokenB.toLowerCase()].sort();
   return `${chain}::${a}|${b}`;
 }
-function tokenKey(chain, token) {
-  return `${chain}::${token.toLowerCase()}`;
-}
-function poolKey(chain, address) {
-  return `${chain}::${address.toLowerCase()}`;
-}
+function tokenKey(chain, token) { return `${chain}::${token.toLowerCase()}`; }
+function poolKey(chain, address) { return `${chain}::${address.toLowerCase()}`; }
 
-/// プールを地図に登録する(起動時の一括取り込み、および新規発見時)。
-export function registerPool({ chain, address, dexId, token0, token1, raw0, raw1, feeBps = 30 }) {
+export function registerPool({ chain, address, dexId, factory, token0, token1, raw0 = 0n, raw1 = 0n, feeBps = 30, feeProbed = false }) {
   const key = poolKey(chain, address);
   const existing = pools.get(key);
   pools.set(key, {
-    chain, address, dexId,
+    chain, address, dexId, factory,
     token0: token0.toLowerCase(), token1: token1.toLowerCase(),
     raw0, raw1,
     feeBps: existing?.feeBps ?? feeBps,
+    feeProbed: existing?.feeProbed || feeProbed,
     updatedAt: Date.now(),
   });
-
   if (!existing) {
     const pk = pairKey(chain, token0, token1);
     if (!byPair.has(pk)) byPair.set(pk, new Set());
     byPair.get(pk).add(key);
-
     for (const t of [token0, token1]) {
       const tk = tokenKey(chain, t);
       if (!byToken.has(tk)) byToken.set(tk, new Set());
@@ -57,11 +57,8 @@ export function registerPool({ chain, address, dexId, token0, token1, raw0, raw1
   }
 }
 
-/// Syncイベントで届いた最新の準備量をメモリ上に反映する(RPC不要)。
-/// 戻り値: 更新できたプール情報(登録外なら null)。
 export function updateReservesFromSync(chain, address, raw0, raw1) {
-  const key = poolKey(chain, address);
-  const pool = pools.get(key);
+  const pool = pools.get(poolKey(chain, address));
   if (!pool) return null;
   pool.raw0 = raw0;
   pool.raw1 = raw1;
@@ -69,32 +66,25 @@ export function updateReservesFromSync(chain, address, raw0, raw1) {
   return pool;
 }
 
-/// 実測した手数料を記録する(プール自身のgetAmountOutから逆算した値)。
 export function setPoolFee(chain, address, feeBps) {
   const pool = pools.get(poolKey(chain, address));
   if (pool && feeBps != null) pool.feeBps = feeBps;
 }
 
-export function getPool(chain, address) {
-  return pools.get(poolKey(chain, address)) ?? null;
-}
+export function getPool(chain, address) { return pools.get(poolKey(chain, address)) ?? null; }
 
-/// 指定ペアを扱う全プールを返す(2ステップ裁定用)。
 export function getPoolsForPair(chain, tokenA, tokenB) {
   const set = byPair.get(pairKey(chain, tokenA, tokenB));
   if (!set) return [];
   return [...set].map((k) => pools.get(k)).filter(Boolean);
 }
 
-/// 指定トークンを含む全プールを返す(三角裁定の経路探索用)。
 export function getPoolsForToken(chain, token) {
   const set = byToken.get(tokenKey(chain, token));
   if (!set) return [];
   return [...set].map((k) => pools.get(k)).filter(Boolean);
 }
 
-/// 同じペアを2つ以上のプールが扱っている組み合わせを列挙する。
-/// これが2ステップ裁定の候補そのものになる。
 export function getArbitragablePairs(chain = null) {
   const out = [];
   for (const [pk, set] of byPair.entries()) {
@@ -103,59 +93,73 @@ export function getArbitragablePairs(chain = null) {
     if (chain && chainPart !== chain) continue;
     const list = [...set].map((k) => pools.get(k)).filter(Boolean);
     if (list.length < 2) continue;
-    // 同じDEXの同じプールだけの場合は除外(異なるプールが2つ以上必要)。
-    const uniqueAddresses = new Set(list.map((p) => p.address.toLowerCase()));
-    if (uniqueAddresses.size < 2) continue;
     out.push({ chain: chainPart, token0: list[0].token0, token1: list[0].token1, pools: list });
   }
   return out;
 }
 
-export function setTokenDecimals(chain, token, decimals) {
-  tokenDecimals.set(tokenKey(chain, token), decimals);
-}
-export function getTokenDecimals(chain, token) {
-  return tokenDecimals.get(tokenKey(chain, token)) ?? null;
-}
-export function setTokenPriceUsd(chain, token, price) {
-  if (price > 0 && isFinite(price)) tokenPriceUsd.set(tokenKey(chain, token), price);
-}
-export function getTokenPriceUsd(chain, token) {
-  return tokenPriceUsd.get(tokenKey(chain, token)) ?? null;
-}
+export function setTokenDecimals(chain, token, decimals) { tokenDecimals.set(tokenKey(chain, token), decimals); }
+export function getTokenDecimals(chain, token) { return tokenDecimals.get(tokenKey(chain, token)) ?? null; }
+export function setTokenPriceUsd(chain, token, price) { if (price > 0 && isFinite(price)) tokenPriceUsd.set(tokenKey(chain, token), price); }
+export function getTokenPriceUsd(chain, token) { return tokenPriceUsd.get(tokenKey(chain, token)) ?? null; }
 
-/// 監視対象の全プールアドレスを、チェーンごとに返す(Sync購読の登録用)。
 export function getAllPoolAddressesByChain() {
   const byChain = {};
-  for (const pool of pools.values()) {
-    (byChain[pool.chain] ||= []).push(pool.address);
-  }
+  for (const pool of pools.values()) (byChain[pool.chain] ||= []).push(pool.address);
   return byChain;
 }
 
 export function getStats() {
   const byChain = {};
-  let arbitragable = 0;
+  let arbitragable = 0, feeProbed = 0;
   for (const pool of pools.values()) {
     byChain[pool.chain] = (byChain[pool.chain] || 0) + 1;
+    if (pool.feeProbed) feeProbed++;
   }
   for (const set of byPair.values()) if (set.size >= 2) arbitragable++;
-  return {
-    totalPools: pools.size,
-    totalPairs: byPair.size,
-    arbitragablePairs: arbitragable,
-    totalTokens: byToken.size,
-    byChain,
-  };
+  return { totalPools: pools.size, totalPairs: byPair.size, arbitragablePairs: arbitragable, totalTokens: byToken.size, feeProbed, byChain };
 }
 
-/// 準備量が長時間更新されていないプールを返す(定期的な読み直し用)。
 export function getStalePools(chain, olderThanMs) {
   const cutoff = Date.now() - olderThanMs;
   const out = [];
   for (const pool of pools.values()) {
-    if (pool.chain !== chain) continue;
-    if (pool.updatedAt < cutoff) out.push(pool);
+    if (pool.chain === chain && pool.updatedAt < cutoff) out.push(pool);
   }
   return out;
+}
+
+// ===== 永続化 =====
+
+/// 地図をファイルに保存する(準備量は含めない)。
+export function savePoolMap() {
+  const entries = [];
+  for (const p of pools.values()) {
+    entries.push({ chain: p.chain, address: p.address, dexId: p.dexId, factory: p.factory, token0: p.token0, token1: p.token1, feeBps: p.feeBps, feeProbed: !!p.feeProbed });
+  }
+  try {
+    const tmp = POOL_MAP_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify({ savedAt: new Date().toISOString(), count: entries.length, pools: entries }));
+    fs.renameSync(tmp, POOL_MAP_FILE);
+    return entries.length;
+  } catch (e) {
+    console.warn(`[プール地図] 保存に失敗: ${e.message}`);
+    return 0;
+  }
+}
+
+/// ファイルから地図を読み込む。準備量は0のまま登録されるため、
+/// 呼び出し側で必ず全件の再取得を行うこと。
+export function loadPoolMap() {
+  try {
+    if (!fs.existsSync(POOL_MAP_FILE)) return { count: 0, savedAt: null };
+    const data = JSON.parse(fs.readFileSync(POOL_MAP_FILE, "utf8"));
+    for (const e of data.pools || []) {
+      registerPool({ ...e, raw0: 0n, raw1: 0n });
+    }
+    return { count: (data.pools || []).length, savedAt: data.savedAt || null };
+  } catch (e) {
+    console.warn(`[プール地図] 読み込みに失敗: ${e.message}`);
+    return { count: 0, savedAt: null };
+  }
 }
