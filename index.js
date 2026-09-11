@@ -15,6 +15,8 @@ import {
 } from "./scripts/verified-pairs.js";
 import { readVerifiedPairPools } from "./scripts/multicall-reserves.js";
 import { shouldSkipChain, recordChainSuccess, recordChainFailure, getThrottleStatus } from "./scripts/chain-throttle.js";
+import { evaluateTriangle, maybeExecuteTriangle } from "./scripts/triangular-arb.js";
+import { findTriangles } from "./scripts/triangle-finder.js";
 
 const DEX_FETCH_TIMEOUT_MS = 20000;
 async function dexFetchWithTimeout(url, timeoutMs = DEX_FETCH_TIMEOUT_MS) {
@@ -277,8 +279,6 @@ async function dexWatchOnePair(candidate) {
         const built = await buildPoolFromOnchain(p, candidate.tokenA, candidate.tokenB, normalizedChain, decimalsX, decimalsY);
         if (built) pools.push(built);
       }
-      // プールを直接呼ぶ方式になったため、ルーター確認は不要。
-      // 準備量を読めたプールが2つ以上あれば、そのまま実行できる。
       if (pools.length >= 2) {
         const isNew = recordVerifiedPair({
           chain: normalizedChain, symbol: candidate.symbol, tokenA: candidate.tokenA, tokenB: candidate.tokenB,
@@ -294,7 +294,7 @@ async function dexWatchOnePair(candidate) {
   return evaluatePools({ pools, symbol: candidate.symbol, chain: candidate.chain, tokenA: candidate.tokenA, tokenB: candidate.tokenB, reserveSource: pools[0]?.reserveSource || "dexscreener" });
 }
 
-// ===== 高速観測 =====
+// ===== 高速観測(2ステップ) =====
 const FAST_WATCH_INTERVAL_SEC = parseInt(process.env.FAST_WATCH_INTERVAL_SEC || "5", 10);
 let fastWatchRunning = false, fastWatchCount = 0, fastWatchLastAt = null;
 const executingPairs = new Set();
@@ -354,6 +354,35 @@ async function fastWatchOnce() {
   finally { fastWatchRunning = false; }
 }
 
+// ===== 三角裁定(A→B→C→A) =====
+// 2ステップ裁定とは独立して動く。同じDEX内の3トークンの相対価格の歪みを
+// 取るため、組み合わせの母数が桁違いに多く、競合も比較的少ない。
+const TRI_WATCH_INTERVAL_SEC = parseInt(process.env.TRI_WATCH_INTERVAL_SEC || "20", 10);
+let triWatchRunning = false, triWatchCount = 0, triRouteCount = 0, triProfitableCount = 0, triLastAt = null;
+
+async function triWatchOnce() {
+  if (triWatchRunning) return;
+  triWatchRunning = true;
+  try {
+    const triangles = findTriangles();
+    triRouteCount = triangles.length;
+    for (const route of triangles) {
+      if (shouldSkipChain(route.chain)) continue;
+      try {
+        const evaluated = await evaluateTriangle(route, getGasCostForChain(route.chain));
+        if (evaluated && evaluated.profitable) {
+          triProfitableCount++;
+          console.log(`[三角裁定] ${evaluated.pairLabel}: 純利益 +$${evaluated.netProfitUsd.toFixed(4)}(投入$${evaluated.tradeAmountUsd.toFixed(2)}）`);
+          await maybeExecuteTriangle(evaluated);
+        }
+      } catch (e) { /* 個別の経路の失敗は無視して次へ */ }
+    }
+    triWatchCount++;
+    triLastAt = new Date().toISOString();
+  } catch (e) { console.error("[三角裁定] エラー:", e.message); }
+  finally { triWatchRunning = false; }
+}
+
 let onchainReactionCount = 0, onchainLatencyLog = [];
 async function handleOnchainSync(chainName, poolAddress, reserve0, reserve1, receivedAt) {
   const pair = findVerifiedPairByPool(chainName, poolAddress);
@@ -403,7 +432,7 @@ async function runWatchCycle({ topN = 8 } = {}) {
       if (observed) { results.push(observed); await evaluateAndMaybeExecute(observed, "定期観測"); }
     } catch (e) { console.warn(`[DEX] 観測失敗 (${candidate.symbol} / ${candidate.chain}):`, e.message); }
   }
-  console.log(`[DEX] 定期観測完了: 対象${candidates.length}件・記録${results.length}件・黒字${results.filter(r=>r.profitable).length}件 / 実行可能ペア${getVerifiedPairCount()}件`);
+  console.log(`[DEX] 定期観測完了: 対象${candidates.length}件・記録${results.length}件・黒字${results.filter(r=>r.profitable).length}件 / 実行可能ペア${getVerifiedPairCount()}件・三角経路${triRouteCount}件`);
   return { checked: candidates.length, logged: results.length, results };
 }
 
@@ -449,19 +478,26 @@ function renderRealExecutionSection() {
     <table><thead><tr><th>日時</th><th>ペア</th><th style="text-align:right;">投入額</th><th style="text-align:right;">実際の利益</th><th></th></tr></thead><tbody>${rows}</tbody></table>
     <div class="note"><strong>これが本当のお金の結果です。</strong>取引上限は成功実績(${getSuccessCount()}回)に応じて自動的に上がります($500→$1000→$2000)。</div></div>`;
 }
+function renderTriangleSection() {
+  return `<div class="card"><h2>🔺 三角裁定(A→B→C→A)</h2>
+    <div class="stat"><div><div class="v">${triRouteCount}</div><div class="l">探索中の経路</div></div><div><div class="v">${TRI_WATCH_INTERVAL_SEC}秒</div><div class="l">観測間隔</div></div>
+      <div><div class="v">${triWatchCount}</div><div class="l">観測回数</div></div><div><div class="v" style="color:${triProfitableCount>0?'#2ecc71':'#888'};">${triProfitableCount}</div><div class="l">黒字検出</div></div></div>
+    <div class="note">1つのDEX内で3つのトークンを巡回し、相対価格の歪みを取ります。2つのDEXを比較する必要がないため組み合わせの母数が桁違いに多く、専業botの監視も行き届きにくい領域です。<br>
+    経路は「実行可能ペア」から自動的に組み立てられ、フラッシュローンで借りられる通貨(USDC・WETH等)を起点とするものだけを対象にします。${triLastAt ? `<br>最終観測: ${new Date(triLastAt).toLocaleTimeString('ja-JP')}` : ''}</div></div>`;
+}
 function renderFastWatchSection() {
-  const pairs = getVerifiedPairs(), throttle = getThrottleStatus(), rpc = getRpcStatus(), gas = getGasCostStatus();
+  const pairs = getVerifiedPairs(), throttle = getThrottleStatus(), gas = getGasCostStatus();
   const byChain = {};
   for (const p of pairs) byChain[p.chain] = (byChain[p.chain] || 0) + 1;
   const chainList = Object.entries(byChain).map(([c, n]) => { const t = throttle[c]; return `${c}:${n}${t && t.pausedForSec > 0 ? `<span style="color:#e74c3c;">(${t.pausedForSec}秒休止中)</span>` : ''}`; }).join(' / ') || 'なし';
   const gasList = Object.entries(gas).map(([c, g]) => `${c}: $${g.costUsd}`).join(' / ') || '取得中';
   const rows = pairs.slice(0, 30).map((p) => `<tr><td style="font-size:9px;">${p.symbol}</td><td>${p.chain}</td>
     <td style="font-size:9px;">${p.pools.map((x) => `${x.dexId}${x.feeBps != null ? `(${x.feeBps})` : ''}`).join(', ')}</td></tr>`).join('') || `<tr><td colspan="3" style="color:#888;">まだ登録されていません</td></tr>`;
-  return `<div class="card"><h2>⚡ 高速観測(実行可能ペア)</h2>
+  return `<div class="card"><h2>⚡ 高速観測(2ステップ裁定)</h2>
     <div class="stat"><div><div class="v">${pairs.length}</div><div class="l">実行可能ペア</div></div><div><div class="v">${FAST_WATCH_INTERVAL_SEC}秒</div><div class="l">観測間隔</div></div>
       <div><div class="v">${fastWatchCount}</div><div class="l">観測回数</div></div><div><div class="v">${fastWatchLastAt ? new Date(fastWatchLastAt).toLocaleTimeString('ja-JP') : '-'}</div><div class="l">最終観測</div></div></div>
     <table><thead><tr><th>ペア</th><th>チェーン</th><th>DEX(実測手数料bps)</th></tr></thead><tbody>${rows}</tbody></table>
-    <div class="note">プールを直接呼ぶ方式のため、DEXの種類を問わず実行できます(ルーターの事前調査が不要)。<br>内訳: ${chainList}<br>実測ガス代: ${gasList}</div></div>`;
+    <div class="note">プールを直接呼ぶ方式のため、DEXの種類を問わず実行できます。<br>内訳: ${chainList}<br>実測ガス代: ${gasList}</div></div>`;
 }
 function renderPage() {
   const dexStats = dexLoadStats(), lat = getOnchainLatencyStats();
@@ -469,8 +505,8 @@ function renderPage() {
     <td style="text-align:right;color:${r.profitable?'#2ecc71':'#888'};font-weight:600;">${r.netProfit>=0?'+':''}$${r.netProfit.toFixed(2)}</td></tr>`).join("") || `<tr><td colspan="4" style="color:#888;">観測データがまだありません</td></tr>`;
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="refresh" content="30">
 <title>DEXアービトラージ観測所</title><style>${PAGE_STYLE}</style></head><body>
-<h1>🔍 DEXアービトラージ観測所</h1><div class="sub">定期観測${dexWatchCount}回 / 高速観測${fastWatchCount}回 / 観測上限$${MAX_TRADE_USD}</div>
-${renderRealExecutionSection()}${renderFastWatchSection()}
+<h1>🔍 DEXアービトラージ観測所</h1><div class="sub">定期観測${dexWatchCount}回 / 高速観測${fastWatchCount}回 / 三角裁定${triWatchCount}回</div>
+${renderRealExecutionSection()}${renderTriangleSection()}${renderFastWatchSection()}
 <div class="card"><h2>🔍 観測データ(紙上シミュレーション)</h2>
   <div class="stat"><div><div class="v">${dexStats.totalObserved}</div><div class="l">記録件数</div></div><div><div class="v" style="color:${dexStats.totalProfitableCount>0?'#2ecc71':'#888'};">${dexStats.totalProfitableCount}</div><div class="l">黒字だった件数</div></div>
     <div><div class="v" style="color:#2ecc71;">${dexStats.onchainVerifiedCount||0}</div><div class="l">うちオンチェーン実測</div></div><div><div class="v" style="color:#2ecc71;">+$${(dexStats.onchainVerifiedProfit||0).toFixed(2)}</div><div class="l">実測ベースの利益</div></div></div>
@@ -482,10 +518,10 @@ ${lat ? `<div class="card"><h2>⚡ Sync反応速度</h2><div class="stat"><div><
 function renderAboutPage() {
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>収集データについて</title><style>${PAGE_STYLE}</style></head><body>
 <h1>📊 このサイトが集めているデータ</h1>
-<div class="card"><h2>① 発掘(定期観測)</h2><div class="note">DeFiLlamaから、対応5チェーン(Base/Polygon/Arbitrum/Optimism/Avalanche)の流動性$3万〜$300万の中小プールを150件選びます。専業botが常時監視する大型ペアは価格差が手数料を超えないため、意図的に避けています。</div></div>
-<div class="card"><h2>② 高速観測(${FAST_WATCH_INTERVAL_SEC}秒ごと)</h2><div class="note">準備量を読めたペアを、Multicall3で一括読み取り。手数料はプール自身のgetAmountOutから逆算した実測値を使います。</div></div>
-<div class="card"><h2>③ 実行</h2><div class="note">ルーターを経由せず、プールを直接呼びます。Uniswap V2形式もSolidly形式もプールのswap関数は同一のため、DEXの種類を問わず実行できます(以前はルーター未確認で候補の69%を捨てていました)。受取量はbot側が計算して渡し、過大ならプール側が自動的に拒否します。</div></div>
-<div class="card"><h2>④ 安全性</h2><div class="note">Aaveのフラッシュローンを使うため、利益が出なければ取引全体が自動的に無効化されます(実害はガス代のみ)。ガス代・Aave手数料(0.05%)を差し引いた後の利益が下限を超える場合のみ送信します。</div></div>
+<div class="card"><h2>① 発掘(定期観測)</h2><div class="note">DeFiLlamaから、対応5チェーンの流動性$3万〜$300万の中小プールを150件選びます。専業botが常時監視する大型ペアは価格差が手数料を超えないため、意図的に避けています。</div></div>
+<div class="card"><h2>② 2ステップ裁定(${FAST_WATCH_INTERVAL_SEC}秒ごと)</h2><div class="note">同じペアが複数のプールにある場合の価格差を取ります。Multicall3で一括読み取りし、手数料はプール自身から逆算した実測値を使います。</div></div>
+<div class="card"><h2>③ 三角裁定(${TRI_WATCH_INTERVAL_SEC}秒ごと)</h2><div class="note">A→B→C→Aと巡回し、トークン間の相対価格の歪みを取ります。2つのDEXを比較する必要がないため、組み合わせの母数が桁違いに多く、競合も比較的少ない領域です。</div></div>
+<div class="card"><h2>④ 実行</h2><div class="note">ルーターを経由せず、プールを直接呼びます。Uniswap V2形式もSolidly形式もプールのswap関数は同一のため、DEXの種類を問わず実行できます。Aaveのフラッシュローンを使うため、利益が出なければ取引全体が自動的に無効化されます(実害はガス代のみ)。</div></div>
 <div class="footerlink"><a href="/">← 観測所トップに戻る</a></div></body></html>`;
 }
 function startServer() {
@@ -506,11 +542,13 @@ async function main() {
 
   await refreshGasCosts();
   setInterval(refreshGasCosts, 5 * 60 * 1000);
-  console.log(`[起動] 実行可能ペア${getVerifiedPairCount()}件 / 高速観測${FAST_WATCH_INTERVAL_SEC}秒 / 定期観測${DEX_WATCH_INTERVAL_SEC}秒 / 取引上限$${getCurrentTradeCapUsd()}`);
+  console.log(`[起動] 実行可能ペア${getVerifiedPairCount()}件 / 高速観測${FAST_WATCH_INTERVAL_SEC}秒 / 三角裁定${TRI_WATCH_INTERVAL_SEC}秒 / 取引上限$${getCurrentTradeCapUsd()}`);
 
   dexWatchOnce();
   setInterval(dexWatchOnce, DEX_WATCH_INTERVAL_SEC * 1000);
   setTimeout(fastWatchOnce, 5000);
   setInterval(fastWatchOnce, FAST_WATCH_INTERVAL_SEC * 1000);
+  setTimeout(triWatchOnce, 15000);
+  setInterval(triWatchOnce, TRI_WATCH_INTERVAL_SEC * 1000);
 }
 main().catch((e) => { console.error("致命的エラー:", e); process.exit(1); });
