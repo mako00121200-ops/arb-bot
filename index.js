@@ -9,7 +9,6 @@ import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
 import { fetchOnchainReserves, fetchTokenDecimals, isOnchainReadAvailable, probePoolFeeBps, getRpcStatus } from "./scripts/onchain-reserves.js";
 import { estimateGasCostUsd, getGasCostStatus } from "./scripts/gas-cost.js";
-import { getRouterInfo } from "./router-addresses.js";
 import {
   recordVerifiedPair, removePoolFromVerifiedPairs, getVerifiedPairs,
   getVerifiedPairsByChain, findVerifiedPairByPool, getVerifiedPairCount, pruneInvalidVerifiedPairs,
@@ -89,20 +88,17 @@ function dexNormalizeChain(chain) {
   return map[(chain || "").toLowerCase()] || (chain || "").toLowerCase();
 }
 
-// ガス代はチェーンから実測する。固定値($0.05)は実際の10倍近い過大見積もりで、
-// 中小プール狙いで中心となる$0.1〜$2の利益を軒並み赤字判定にしていた。
-const FALLBACK_GAS_COST_USD = { base: 0.01, arbitrum: 0.03, optimism: 0.01, ethereum: 8.0, polygon: 0.01, avalanche: 0.03 };
+const FALLBACK_GAS_COST_USD = { base: 0.025, arbitrum: 0.03, optimism: 0.01, polygon: 0.033, avalanche: 0.002 };
 const gasCostCache = new Map();
 function getGasCostForChain(chain) {
   const key = dexNormalizeChain(chain);
   return gasCostCache.get(key) ?? FALLBACK_GAS_COST_USD[key] ?? 0.05;
 }
 async function refreshGasCosts() {
-  for (const chain of ["base", "polygon", "optimism", "avalanche", "arbitrum"]) {
+  for (const chain of ["base", "polygon", "arbitrum", "optimism", "avalanche"]) {
     try { gasCostCache.set(chain, await estimateGasCostUsd(chain)); } catch (e) {}
   }
-  const summary = [...gasCostCache.entries()].map(([c, v]) => `${c}:$${v.toFixed(4)}`).join(" ");
-  console.log(`[ガス代実測] ${summary}`);
+  console.log(`[ガス代実測] ${[...gasCostCache.entries()].map(([c, v]) => `${c}:$${v.toFixed(4)}`).join(" ")}`);
 }
 
 const DEAD_POOL_MIN_VOLUME_USD = 50, DEAD_POOL_MIN_TXNS_24H = 3;
@@ -148,7 +144,6 @@ function dexLoadLog() {
 function dexSaveLog(entries) {
   try { fs.writeFileSync(DEX_LOG_FILE, JSON.stringify(entries.length > 2000 ? entries.slice(-2000) : entries)); } catch (e) {}
 }
-// 高速観測の成果も記録に残す(以前は定期観測とSync反応でしか保存していなかった)。
 function appendToLog(observed, extra = {}) {
   const log = dexLoadLog();
   log.push({ ...observed, ...extra });
@@ -246,7 +241,7 @@ function evaluatePools({ pools, symbol, chain, tokenA, tokenB, reserveSource }) 
   const withPrice = pools.map((p) => ({ ...p, price: p.reserveY / p.reserveX }));
   withPrice.sort((a, b) => a.price - b.price);
   const cheapPool = withPrice[0], expensivePool = withPrice[withPrice.length - 1];
-  if (cheapPool.dexId === expensivePool.dexId) return null;
+  if (cheapPool.pairAddress === expensivePool.pairAddress) return null;
   if (isKnownFalsePositive({ symbol, cheapDexId: cheapPool.dexId, expensiveDexId: expensivePool.dexId, chain })) return null;
   if (!cheapPool.priceUsdPerY || !isFinite(cheapPool.priceUsdPerY) || cheapPool.priceUsdPerY <= 0) return null;
 
@@ -282,15 +277,16 @@ async function dexWatchOnePair(candidate) {
         const built = await buildPoolFromOnchain(p, candidate.tokenA, candidate.tokenB, normalizedChain, decimalsX, decimalsY);
         if (built) pools.push(built);
       }
-      const executablePools = pools.filter((p) => getRouterInfo(normalizedChain, p.dexId));
-      // 登録時だけでなく毎回、最新のUSD換算価格も一緒に更新する。
-      // 価格が動いたまま古い値を使うと、投入額の計算がズレるため。
-      const isNew = recordVerifiedPair({
-        chain: normalizedChain, symbol: candidate.symbol, tokenA: candidate.tokenA, tokenB: candidate.tokenB,
-        decimalsX, decimalsY, priceUsdPerY: executablePools[0]?.priceUsdPerY,
-        pools: executablePools.map((p) => ({ address: p.pairAddress, dexId: p.dexId, feeBps: p.feeBps })),
-      });
-      if (isNew) updatePoolSubscriptions(normalizedChain, executablePools.map((p) => p.pairAddress));
+      // プールを直接呼ぶ方式になったため、ルーター確認は不要。
+      // 準備量を読めたプールが2つ以上あれば、そのまま実行できる。
+      if (pools.length >= 2) {
+        const isNew = recordVerifiedPair({
+          chain: normalizedChain, symbol: candidate.symbol, tokenA: candidate.tokenA, tokenB: candidate.tokenB,
+          decimalsX, decimalsY, priceUsdPerY: pools[0].priceUsdPerY,
+          pools: pools.map((p) => ({ address: p.pairAddress, dexId: p.dexId, feeBps: p.feeBps })),
+        });
+        if (isNew) updatePoolSubscriptions(normalizedChain, pools.map((p) => p.pairAddress));
+      }
     }
   } else {
     pools = prefiltered.map((p) => buildPoolFromDexScreener(p, candidate.tokenA)).filter(Boolean);
@@ -317,7 +313,7 @@ async function evaluateAndMaybeExecute(observed, source) {
   if (!observed.profitable || executingPairs.has(key)) return;
   executingPairs.add(key);
   try {
-    console.log(`[${source}] ${observed.pairLabel}: 純利益 +$${observed.netProfit.toFixed(2)}(価格差${observed.priceDiffPercent.toFixed(2)}%、投入額$${observed.tradeAmountUsd.toFixed(2)}、手数料${observed.cheapFeeBps ?? "?"}/${observed.expensiveFeeBps ?? "?"}bps、ガス$${getGasCostForChain(observed.chain).toFixed(4)}）`);
+    console.log(`[${source}] ${observed.pairLabel}: 純利益 +$${observed.netProfit.toFixed(2)}(価格差${observed.priceDiffPercent.toFixed(2)}%、投入額$${observed.tradeAmountUsd.toFixed(2)}、手数料${observed.cheapFeeBps ?? "?"}/${observed.expensiveFeeBps ?? "?"}bps）`);
     latestDexResults = [observed, ...latestDexResults.filter((r) => r.pairLabel !== observed.pairLabel)].slice(0, 30);
     await maybeExecuteArb(observed);
   } catch (e) { console.warn(`[実行判定] エラー:`, e.message); }
@@ -376,7 +372,6 @@ function getOnchainLatencyStats() {
   return { count: onchainReactionCount, medianMs: sorted[Math.floor(sorted.length / 2)], minMs: sorted[0], maxMs: sorted[sorted.length - 1] };
 }
 
-// ===== 定期観測(発掘用) =====
 const DEX_PROSPECT_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 let dexCachedCandidates = [], dexCandidateRotationOffset = 0, dexLastProspectAt = 0, dexProspectRefreshing = false;
 async function dexGetCandidates(topN) {
@@ -425,7 +420,6 @@ async function dexWatchOnce() {
   finally { dexWatchRunning = false; }
 }
 
-// ===== ダッシュボード =====
 const PAGE_STYLE = `
 body{font-family:-apple-system,sans-serif;background:#0d100c;color:#e8e6d8;margin:0;padding:18px 12px;}
 h1{font-size:17px;margin:0 0 4px;} h2{font-size:13px;margin:0 0 10px;font-weight:600;}
@@ -460,15 +454,14 @@ function renderFastWatchSection() {
   const byChain = {};
   for (const p of pairs) byChain[p.chain] = (byChain[p.chain] || 0) + 1;
   const chainList = Object.entries(byChain).map(([c, n]) => { const t = throttle[c]; return `${c}:${n}${t && t.pausedForSec > 0 ? `<span style="color:#e74c3c;">(${t.pausedForSec}秒休止中)</span>` : ''}`; }).join(' / ') || 'なし';
-  const gasList = Object.entries(gas).map(([c, g]) => `${c}: $${g.costUsd}(${g.gwei}gwei)`).join(' / ') || '取得中';
-  const rpcList = Object.entries(rpc).map(([c, r]) => `${c}: ${r.url.replace(/^https?:\/\//, '')}`).join('<br>');
-  const rows = pairs.slice(0, 25).map((p) => `<tr><td style="font-size:9px;">${p.symbol}</td><td>${p.chain}</td>
-    <td style="font-size:9px;">${p.pools.map((x) => `${x.dexId}${x.feeBps != null ? `(${x.feeBps}bps)` : ''}`).join(', ')}</td></tr>`).join('') || `<tr><td colspan="3" style="color:#888;">まだ登録されていません</td></tr>`;
+  const gasList = Object.entries(gas).map(([c, g]) => `${c}: $${g.costUsd}`).join(' / ') || '取得中';
+  const rows = pairs.slice(0, 30).map((p) => `<tr><td style="font-size:9px;">${p.symbol}</td><td>${p.chain}</td>
+    <td style="font-size:9px;">${p.pools.map((x) => `${x.dexId}${x.feeBps != null ? `(${x.feeBps})` : ''}`).join(', ')}</td></tr>`).join('') || `<tr><td colspan="3" style="color:#888;">まだ登録されていません</td></tr>`;
   return `<div class="card"><h2>⚡ 高速観測(実行可能ペア)</h2>
     <div class="stat"><div><div class="v">${pairs.length}</div><div class="l">実行可能ペア</div></div><div><div class="v">${FAST_WATCH_INTERVAL_SEC}秒</div><div class="l">観測間隔</div></div>
       <div><div class="v">${fastWatchCount}</div><div class="l">観測回数</div></div><div><div class="v">${fastWatchLastAt ? new Date(fastWatchLastAt).toLocaleTimeString('ja-JP') : '-'}</div><div class="l">最終観測</div></div></div>
-    <table><thead><tr><th>ペア</th><th>チェーン</th><th>DEX(実測手数料)</th></tr></thead><tbody>${rows}</tbody></table>
-    <div class="note">異なるDEXのプールが2つ以上あるペアを、Multicallで一括読み取り。手数料はプール自身から逆算した実測値。<br>内訳: ${chainList}<br>実測ガス代(1回あたり): ${gasList}<br>使用中RPC:<br>${rpcList}</div></div>`;
+    <table><thead><tr><th>ペア</th><th>チェーン</th><th>DEX(実測手数料bps)</th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="note">プールを直接呼ぶ方式のため、DEXの種類を問わず実行できます(ルーターの事前調査が不要)。<br>内訳: ${chainList}<br>実測ガス代: ${gasList}</div></div>`;
 }
 function renderPage() {
   const dexStats = dexLoadStats(), lat = getOnchainLatencyStats();
@@ -483,16 +476,16 @@ ${renderRealExecutionSection()}${renderFastWatchSection()}
     <div><div class="v" style="color:#2ecc71;">${dexStats.onchainVerifiedCount||0}</div><div class="l">うちオンチェーン実測</div></div><div><div class="v" style="color:#2ecc71;">+$${(dexStats.onchainVerifiedProfit||0).toFixed(2)}</div><div class="l">実測ベースの利益</div></div></div>
   <table><thead><tr><th>#</th><th>ペア</th><th style="text-align:right;">価格差</th><th style="text-align:right;">純利益</th></tr></thead><tbody>${dexRows}</tbody></table>
   <div class="note"><strong>これは「もし取引していたら」の理論値です。</strong>同じ案件は3分に1回だけ数えます。理論上の累積利益(全件): ${dexStats.cumulativeProfit>=0?'+':''}$${dexStats.cumulativeProfit.toFixed(2)}。${lastDexError ? `<br><span style="color:#e74c3c;">エラー: ${lastDexError}</span>` : ''}</div></div>
-${lat ? `<div class="card"><h2>⚡ Sync反応速度</h2><div class="stat"><div><div class="v">${lat.count}</div><div class="l">反応回数</div></div><div><div class="v">${lat.medianMs}ms</div><div class="l">中央値</div></div><div><div class="v">${lat.minMs}ms</div><div class="l">最速</div></div><div><div class="v">${lat.maxMs}ms</div><div class="l">最遅</div></div></div><div class="note">取引が起きた瞬間の通知を受けてから判定完了までの実測時間(Polygon)。</div></div>` : ''}
+${lat ? `<div class="card"><h2>⚡ Sync反応速度</h2><div class="stat"><div><div class="v">${lat.count}</div><div class="l">反応回数</div></div><div><div class="v">${lat.medianMs}ms</div><div class="l">中央値</div></div><div><div class="v">${lat.minMs}ms</div><div class="l">最速</div></div><div><div class="v">${lat.maxMs}ms</div><div class="l">最遅</div></div></div></div>` : ''}
 <div class="footerlink"><a href="/about">→ このサイトが集めているデータについて</a></div></body></html>`;
 }
 function renderAboutPage() {
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>収集データについて</title><style>${PAGE_STYLE}</style></head><body>
 <h1>📊 このサイトが集めているデータ</h1>
-<div class="card"><h2>① 発掘(定期観測)</h2><div class="note">DeFiLlamaから、流動性$3万〜$300万の中小プールで、かつルーター確認済みDEXが2つ以上あるペアを150件選びます。専業botが常時監視する大型ペアは価格差が手数料を超えないため、意図的に避けています。手数料の低いPolygon・Arbitrumを優先します。</div></div>
-<div class="card"><h2>② 高速観測(${FAST_WATCH_INTERVAL_SEC}秒ごと)</h2><div class="note">実行可能ペアだけを、Multicall3で一括読み取り。手数料はプール自身のgetAmountOutから逆算した実測値を使います(Aerodromeは実測99bpsで、既定の30bpsとは大きく違いました)。</div></div>
-<div class="card"><h2>③ ガス代の実測</h2><div class="note">チェーンの現在のガス価格とネイティブトークンのUSD価格から、1回あたりの実費を5分ごとに算出します。以前は一律$0.05の固定値で、実際の10倍近い過大見積もりになっていました。</div></div>
-<div class="card"><h2>④ 実行</h2><div class="note">実行直前にプール自身へ問い合わせて受取量を確定し、Aave手数料(0.05%)込みの返済額を上回り、かつ最低利益以上の場合のみ送信します。利益が出なければ取引全体が無効化されます(実害はガス代のみ)。</div></div>
+<div class="card"><h2>① 発掘(定期観測)</h2><div class="note">DeFiLlamaから、対応5チェーン(Base/Polygon/Arbitrum/Optimism/Avalanche)の流動性$3万〜$300万の中小プールを150件選びます。専業botが常時監視する大型ペアは価格差が手数料を超えないため、意図的に避けています。</div></div>
+<div class="card"><h2>② 高速観測(${FAST_WATCH_INTERVAL_SEC}秒ごと)</h2><div class="note">準備量を読めたペアを、Multicall3で一括読み取り。手数料はプール自身のgetAmountOutから逆算した実測値を使います。</div></div>
+<div class="card"><h2>③ 実行</h2><div class="note">ルーターを経由せず、プールを直接呼びます。Uniswap V2形式もSolidly形式もプールのswap関数は同一のため、DEXの種類を問わず実行できます(以前はルーター未確認で候補の69%を捨てていました)。受取量はbot側が計算して渡し、過大ならプール側が自動的に拒否します。</div></div>
+<div class="card"><h2>④ 安全性</h2><div class="note">Aaveのフラッシュローンを使うため、利益が出なければ取引全体が自動的に無効化されます(実害はガス代のみ)。ガス代・Aave手数料(0.05%)を差し引いた後の利益が下限を超える場合のみ送信します。</div></div>
 <div class="footerlink"><a href="/">← 観測所トップに戻る</a></div></body></html>`;
 }
 function startServer() {
