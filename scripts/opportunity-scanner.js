@@ -5,11 +5,12 @@
 // [設計の要点]
 // RPCへの問い合わせを一切行わない。全てメモリ上の計算で完結するため、
 // Syncイベントが届いた瞬間(ミリ秒単位)に判定できる。
-// 送信直前の最終確認だけは、実行側(execute-arb.js)がRPCで行う。
+// 送信直前の最終確認だけは、実行側(execute-opportunity.js)がRPCで行う。
 //
-// [2種類の機会]
-//   2ステップ … 同じペアを扱う2つのプール間の価格差
-//   三角     … A→B→C→Aと巡回したときの相対価格の歪み
+// [計算量への配慮]
+// 同じペアに20プールあるとき、全組み合わせ(N²=400通り)を試すと
+// Syncが来るたびに処理が詰まる。価格順に並べて「最も安く買えるプール」と
+// 「最も高く売れるプール」の組だけを見ることで、計算量をNに抑える。
 
 import {
   getPoolsForPair, getPoolsForToken, getArbitragablePairs,
@@ -115,40 +116,48 @@ function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, p
 }
 
 /// 2ステップ裁定: 同じペアの2プール間の価格差。
-/// borrowableTokens には、そのチェーンでフラッシュローンできるトークンを渡す。
 export function scanTwoStep({ chain, tokenA, tokenB, pools, capUsd, gasCostUsd, isBorrowable }) {
   if (pools.length < 2) return null;
 
-  // 借りられる側を起点にする。両方借りられるなら利益の大きい方を後で選ぶ。
   const candidates = [];
+  // 借りられる側を起点にする。両方借りられるなら、後で利益の大きい方を選ぶ。
   for (const [borrow, other] of [[tokenA, tokenB], [tokenB, tokenA]]) {
     if (!isBorrowable(chain, borrow)) continue;
     const maxAmountIn = maxAmountFromUsd(chain, borrow, capUsd);
     if (!maxAmountIn) continue;
 
-    // 全プールの組み合わせを試す(3つ以上ある場合、最良の組を選ぶため)。
-    for (const poolBuy of pools) {
-      for (const poolSell of pools) {
-        if (poolBuy.address.toLowerCase() === poolSell.address.toLowerCase()) continue;
-        const leg1 = orient(poolBuy, borrow);
-        const leg2 = orient(poolSell, other);
-        if (leg1.tokenOut !== other.toLowerCase()) continue;
-        if (leg2.tokenOut !== borrow.toLowerCase()) continue;
-
-        const legs = [
-          { ...leg1, feeBps: poolBuy.feeBps },
-          { ...leg2, feeBps: poolSell.feeBps },
-        ];
-        const result = finalize({
-          chain, tokenA: borrow, legs, maxAmountIn, gasCostUsd,
-          kind: "2step",
-          label: `${poolBuy.dexId}→${poolSell.dexId}`,
-          poolAddresses: [poolBuy.address, poolSell.address],
-        });
-        if (result) candidates.push(result);
-      }
+    // 各プールについて「借りる通貨1単位で何単位のotherが買えるか」を求める。
+    // この比率が高いプールで買い、低いプールで売るのが最良の組み合わせ。
+    const priced = [];
+    for (const p of pools) {
+      const o = orient(p, borrow);
+      if (o.tokenOut !== other.toLowerCase()) continue;
+      if (o.reserveIn <= 0n || o.reserveOut <= 0n) continue;
+      priced.push({ pool: p, orientation: o, rate: Number(o.reserveOut) / Number(o.reserveIn) });
     }
+    if (priced.length < 2) continue;
+    priced.sort((a, b) => b.rate - a.rate);
+
+    const buySide = priced[0];                    // 最も有利に買えるプール
+    const sellSide = priced[priced.length - 1];   // 最も有利に売れるプール
+    if (buySide.pool.address.toLowerCase() === sellSide.pool.address.toLowerCase()) continue;
+
+    const leg2 = orient(sellSide.pool, other);
+    if (leg2.tokenOut !== borrow.toLowerCase()) continue;
+
+    const legs = [
+      { ...buySide.orientation, feeBps: buySide.pool.feeBps },
+      { ...leg2, feeBps: sellSide.pool.feeBps },
+    ];
+    const result = finalize({
+      chain, tokenA: borrow, legs, maxAmountIn, gasCostUsd,
+      kind: "2step",
+      label: `${buySide.pool.dexId}→${sellSide.pool.dexId}`,
+      poolAddresses: [buySide.pool.address, sellSide.pool.address],
+    });
+    if (result) candidates.push(result);
   }
+
   if (candidates.length === 0) return null;
   candidates.sort((a, b) => b.netProfitUsd - a.netProfitUsd);
   return candidates[0];
@@ -160,22 +169,23 @@ export function scanTrianglesForPool({ chain, pool, capUsd, gasCostUsd, isBorrow
   const results = [];
   let examined = 0;
 
-  // このプールが繋ぐ2トークンのうち、借りられる方を起点にする。
   for (const [tokenA, tokenB] of [[pool.token0, pool.token1], [pool.token1, pool.token0]]) {
     if (!isBorrowable(chain, tokenA)) continue;
     const maxAmountIn = maxAmountFromUsd(chain, tokenA, capUsd);
     if (!maxAmountIn) continue;
 
-    // A→B は changedPool を使う(この経路を再計算したいのが目的のため)。
+    // A→B は変化したプールを使う(この経路を再計算したいのが目的のため)。
     const leg1 = orient(pool, tokenA);
     if (leg1.tokenOut !== tokenB) continue;
 
     // B→C を探す。
     for (const pool2 of getPoolsForToken(chain, tokenB)) {
+      if (examined > maxRoutes) break;
       if (pool2.address.toLowerCase() === pool.address.toLowerCase()) continue;
       const leg2 = orient(pool2, tokenB);
       const tokenC = leg2.tokenOut;
       if (tokenC === tokenA) continue;
+      if (leg2.reserveIn <= 0n || leg2.reserveOut <= 0n) continue;
 
       // C→A を探す。
       for (const pool3 of getPoolsForPair(chain, tokenC, tokenA)) {
@@ -183,6 +193,7 @@ export function scanTrianglesForPool({ chain, pool, capUsd, gasCostUsd, isBorrow
         if (addr3 === pool.address.toLowerCase() || addr3 === pool2.address.toLowerCase()) continue;
         const leg3 = orient(pool3, tokenC);
         if (leg3.tokenOut !== tokenA) continue;
+        if (leg3.reserveIn <= 0n || leg3.reserveOut <= 0n) continue;
 
         examined++;
         if (examined > maxRoutes) break;
@@ -200,7 +211,6 @@ export function scanTrianglesForPool({ chain, pool, capUsd, gasCostUsd, isBorrow
         });
         if (result) results.push(result);
       }
-      if (examined > maxRoutes) break;
     }
   }
 
