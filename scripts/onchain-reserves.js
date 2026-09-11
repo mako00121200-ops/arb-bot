@@ -4,20 +4,16 @@
 // 直接読み取るための共通処理。
 //
 // [RPCの自動切り替え]
-// 公開RPCは利用上限・403・障害で突然使えなくなる(1rpc.ioが実際に
-// 「usage limit」で停止し、Polygonの黒字案件を取り逃した)。
-// そこでチェーンごとに候補URLを順に持ち、一定回数連続で失敗したら
-// 次の候補へ自動的に切り替える。全て失敗したら先頭に戻って再試行する。
+// 公開RPCは利用上限・403・障害で突然使えなくなるため、チェーンごとに
+// 候補URLを順に持ち、一定回数連続で失敗したら次の候補へ自動的に切り替える。
+// ただし "missing revert data" 等のコントラクト側の正当な応答(V3型プールを
+// 読んだ時に必ず出る)はRPC障害ではないため、切り替えの材料にしない。
 //
-// ただし「そのプールにgetReservesが無い」等のコントラクト側の正当な
-// 応答は、RPCの障害ではない。特に "missing revert data" はV3型プールを
-// 読んだ時に必ず出るため、これをRPC障害と誤認すると、正常なRPCから
-// 不要に切り替わってしまう(実際に発生させてしまった)。
-//
-// [レート制限対策]
-// RPCへの呼び出しは1本の待ち行列に通し、一定間隔を空けて順番に送る。
-// 同時並行で一斉に送ると "missing revert data (data=null)" という
-// 紛らわしいエラーになり、コントラクト側の問題と誤認しやすい。
+// [手数料の実測]
+// Aerodrome等のSolidly系プールは、手数料がプールごとに違う。0.3%と決め打ち
+// すると観測と実行の判定がズレる(観測は黒字、実行直前は赤字、という現象が
+// 実際に起きた)。そこでプール自身の getAmountOut に極小額を問い合わせ、
+// 実際の手数料を逆算して記録する。
 
 import { ethers } from "ethers";
 import { getChainConfig, CHAIN_CONFIG } from "../chain-config.js";
@@ -25,6 +21,7 @@ import { getChainConfig, CHAIN_CONFIG } from "../chain-config.js";
 const PAIR_ABI = [
   "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
   "function token0() view returns (address)",
+  "function getAmountOut(uint256 amountIn, address tokenIn) view returns (uint256)",
 ];
 const ERC20_DECIMALS_ABI = ["function decimals() view returns (uint8)"];
 
@@ -58,8 +55,6 @@ export function getProviderForChain(chain) {
   const cacheKey = `${key}::${url}`;
 
   if (!providerCache.has(cacheKey)) {
-    // チェーンIDを明示して、ethersによるネットワーク自動判定
-    // (失敗するとリトライを繰り返す)を回避する。
     const network = ethers.Network.from(config.chainId);
     providerCache.set(cacheKey, new ethers.JsonRpcProvider(url, network, { staticNetwork: network }));
   }
@@ -69,32 +64,23 @@ export function getProviderForChain(chain) {
 function recordRpcFailure(chain, message) {
   const config = getChainConfig(chain);
   if (!config || config.rpcUrls.length < 2) return;
-
-  const key = (chain || "").toLowerCase();
-  const state = getState(key);
+  const state = getState(chain);
   state.failures++;
   if (state.failures < FAILURES_BEFORE_ROTATE) return;
 
   const oldUrl = config.rpcUrls[state.index % config.rpcUrls.length];
   state.index = (state.index + 1) % config.rpcUrls.length;
   state.failures = 0;
-  const newUrl = config.rpcUrls[state.index];
-  console.log(`[RPC切替] ${key}: 続けて失敗したため次の候補に切り替えます(${oldUrl.slice(0, 40)} → ${newUrl.slice(0, 40)} / 理由: ${(message || "").slice(0, 70)})`);
+  console.log(`[RPC切替] ${chain}: 続けて失敗したため次の候補に切り替えます(${oldUrl.slice(0, 40)} → ${config.rpcUrls[state.index].slice(0, 40)} / 理由: ${(message || "").slice(0, 70)})`);
 }
 
-function recordRpcSuccess(chain) {
-  getState(chain).failures = 0;
-}
-
-/// 呼び出しを待ち行列に通しつつ、失敗時はRPC切り替えの判断材料にする。
 export async function callWithRpc(chain, fn) {
   try {
     const result = await scheduleRpcCall(() => fn(getProviderForChain(chain)));
-    recordRpcSuccess(chain);
+    getState(chain).failures = 0;
     return result;
   } catch (e) {
     const msg = e.message || "";
-    // コントラクト側の正当な応答は、RPCの障害ではないため切り替えない。
     const isContractLevel = msg.includes("execution reverted")
       || msg.includes("could not decode result data")
       || msg.includes("missing revert data")
@@ -105,9 +91,7 @@ export async function callWithRpc(chain, fn) {
 }
 
 export async function fetchOnchainReserves({ chain, pairAddress, tokenXAddress, decimalsX, decimalsY }) {
-  if (!ethers.isAddress(pairAddress)) {
-    throw new Error(`プールアドレスの形式が不正: ${pairAddress}`);
-  }
+  if (!ethers.isAddress(pairAddress)) throw new Error(`プールアドレスの形式が不正: ${pairAddress}`);
   const addr = ethers.getAddress(pairAddress);
 
   const reserves = await callWithRpc(chain, (p) => new ethers.Contract(addr, PAIR_ABI, p).getReserves());
@@ -124,16 +108,43 @@ export async function fetchOnchainReserves({ chain, pairAddress, tokenXAddress, 
   };
 }
 
+/// プール自身の getAmountOut に「準備量の100万分の1」という極小額を問い合わせ、
+/// 手数料なしの理論値との差から実際の手数料(bps)を逆算する。
+/// 極小額なら価格への影響は無視できるため、差はほぼ手数料そのもの。
+/// getAmountOut を持たないプール(Uniswap V2等)は null を返し、既定値を使う。
+export async function probePoolFeeBps({ chain, pairAddress, tokenInAddress, reserveIn, reserveOut }) {
+  if (reserveIn <= 0n || reserveOut <= 0n) return null;
+  const addr = ethers.getAddress(pairAddress);
+  const amountIn = reserveIn / 1_000_000n;
+  if (amountIn <= 0n) return null;
+
+  let amountOut;
+  try {
+    amountOut = await callWithRpc(chain, (p) =>
+      new ethers.Contract(addr, PAIR_ABI, p).getAmountOut(amountIn, ethers.getAddress(tokenInAddress))
+    );
+  } catch (e) {
+    return null;
+  }
+  if (amountOut <= 0n) return null;
+
+  // 手数料なしの理論値(x*y=k)。
+  const ideal = (amountIn * reserveOut) / (reserveIn + amountIn);
+  if (ideal <= 0n) return null;
+  const feeBps = Number(((ideal - amountOut) * 10000n) / ideal);
+
+  // 逆算結果が不自然(負・10%超)なら信用しない。
+  if (feeBps < 0 || feeBps > 1000) return null;
+  return feeBps;
+}
+
 const decimalsCache = new Map();
 
 export async function fetchTokenDecimals(chain, tokenAddress) {
   const normalized = ethers.getAddress(tokenAddress);
   const key = `${chain}:${normalized.toLowerCase()}`;
   if (decimalsCache.has(key)) return decimalsCache.get(key);
-
-  const decimals = Number(await callWithRpc(chain, (p) =>
-    new ethers.Contract(normalized, ERC20_DECIMALS_ABI, p).decimals()
-  ));
+  const decimals = Number(await callWithRpc(chain, (p) => new ethers.Contract(normalized, ERC20_DECIMALS_ABI, p).decimals()));
   decimalsCache.set(key, decimals);
   return decimals;
 }
@@ -142,17 +153,13 @@ export function isOnchainReadAvailable(chain) {
   return getChainConfig(chain) !== null;
 }
 
-/// ダッシュボード表示用: 各チェーンが今どのRPCを使っているか。
 export function getRpcStatus() {
   const out = {};
   for (const [chain, config] of Object.entries(CHAIN_CONFIG)) {
     const state = getState(chain);
-    const url = config.rpcUrls[state.index % config.rpcUrls.length];
     out[chain] = {
-      url: url.replace(/\/[a-f0-9]{20,}/i, "/***"),
-      index: state.index + 1,
-      total: config.rpcUrls.length,
-      failures: state.failures,
+      url: config.rpcUrls[state.index % config.rpcUrls.length].replace(/\/[a-f0-9]{20,}/i, "/***"),
+      index: state.index + 1, total: config.rpcUrls.length, failures: state.failures,
     };
   }
   return out;
