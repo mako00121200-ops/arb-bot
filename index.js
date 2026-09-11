@@ -8,6 +8,7 @@ import { maybeExecuteArb } from "./scripts/execute-arb.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
 import { fetchOnchainReserves, fetchTokenDecimals, isOnchainReadAvailable, probePoolFeeBps, getRpcStatus } from "./scripts/onchain-reserves.js";
+import { estimateGasCostUsd, getGasCostStatus } from "./scripts/gas-cost.js";
 import { getRouterInfo } from "./router-addresses.js";
 import {
   recordVerifiedPair, removePoolFromVerifiedPairs, getVerifiedPairs,
@@ -23,7 +24,7 @@ async function dexFetchWithTimeout(url, timeoutMs = DEX_FETCH_TIMEOUT_MS) {
   try { return await fetch(url, { signal: controller.signal }); } finally { clearTimeout(timer); }
 }
 
-const MAX_TRADE_USD = parseFloat(process.env.MAX_TRADE_USD || "300");
+const MAX_TRADE_USD = parseFloat(process.env.MAX_TRADE_USD || "2000");
 const AAVE_FLASHLOAN_FEE_RATE = 0.0005;
 const MIN_MARKET_CAP_USD = 100000;
 const DEFAULT_FEE_BPS = 30;
@@ -87,10 +88,23 @@ function dexNormalizeChain(chain) {
   const map = { base: "base", arbitrum: "arbitrum", optimism: "optimism", "op mainnet": "optimism", ethereum: "ethereum" };
   return map[(chain || "").toLowerCase()] || (chain || "").toLowerCase();
 }
-const CHAIN_GAS_COST_USD = { base: 0.05, arbitrum: 0.10, optimism: 0.05, ethereum: 8.0, polygon: 0.05, avalanche: 0.05, bsc: 0.10, binance: 0.10, bnb: 0.10, flare: 0.02 };
-function getGasCostForChain(chain) { return CHAIN_GAS_COST_USD[dexNormalizeChain(chain)] ?? 0.25; }
 
-const DEEP_POOL_LIQUIDITY_USD = 500000, DEEP_POOL_MAX_GAP_PCT = 1;
+// ガス代はチェーンから実測する。固定値($0.05)は実際の10倍近い過大見積もりで、
+// 中小プール狙いで中心となる$0.1〜$2の利益を軒並み赤字判定にしていた。
+const FALLBACK_GAS_COST_USD = { base: 0.01, arbitrum: 0.03, optimism: 0.01, ethereum: 8.0, polygon: 0.01, avalanche: 0.03 };
+const gasCostCache = new Map();
+function getGasCostForChain(chain) {
+  const key = dexNormalizeChain(chain);
+  return gasCostCache.get(key) ?? FALLBACK_GAS_COST_USD[key] ?? 0.05;
+}
+async function refreshGasCosts() {
+  for (const chain of ["base", "polygon", "optimism", "avalanche", "arbitrum"]) {
+    try { gasCostCache.set(chain, await estimateGasCostUsd(chain)); } catch (e) {}
+  }
+  const summary = [...gasCostCache.entries()].map(([c, v]) => `${c}:$${v.toFixed(4)}`).join(" ");
+  console.log(`[ガス代実測] ${summary}`);
+}
+
 const DEAD_POOL_MIN_VOLUME_USD = 50, DEAD_POOL_MIN_TXNS_24H = 3;
 function isDeadPool(pair) {
   const volume24h = pair.volume?.h24 ?? 0;
@@ -134,6 +148,13 @@ function dexLoadLog() {
 function dexSaveLog(entries) {
   try { fs.writeFileSync(DEX_LOG_FILE, JSON.stringify(entries.length > 2000 ? entries.slice(-2000) : entries)); } catch (e) {}
 }
+// 高速観測の成果も記録に残す(以前は定期観測とSync反応でしか保存していなかった)。
+function appendToLog(observed, extra = {}) {
+  const log = dexLoadLog();
+  log.push({ ...observed, ...extra });
+  dexSaveLog(log);
+}
+
 function dexLoadStats() {
   try { if (fs.existsSync(DEX_STATS_FILE)) return JSON.parse(fs.readFileSync(DEX_STATS_FILE, "utf8")); } catch (e) {}
   const existing = dexLoadLog(), profitable = existing.filter((r) => r.profitable);
@@ -187,7 +208,6 @@ function dexPrefilterPair(pair, chain) {
   return { pair, priceNative, basePriceUsd };
 }
 
-// チェーンから準備量を読み、可能なら手数料もプール自身から逆算する。
 async function buildPoolFromOnchain(prefiltered, targetTokenAddress, otherTokenAddress, chain, decimalsX, decimalsY) {
   const { pair, priceNative, basePriceUsd } = prefiltered;
   const baseIsTarget = (pair.baseToken?.address || "").toLowerCase() === targetTokenAddress.toLowerCase();
@@ -197,10 +217,8 @@ async function buildPoolFromOnchain(prefiltered, targetTokenAddress, otherTokenA
   } catch (e) { return null; }
   if (!reserves.reserveX || !reserves.reserveY) return null;
 
-  // 実際の手数料をプールから逆算(getAmountOutを持たないプールは既定値)。
   const probed = await probePoolFeeBps({ chain, pairAddress: pair.pairAddress, tokenInAddress: otherTokenAddress, reserveIn: reserves.rawY, reserveOut: reserves.rawX });
   const feeBps = probed ?? DEFAULT_FEE_BPS;
-
   const quotePriceUsd = basePriceUsd / priceNative;
   return {
     dexId: pair.dexId, pairAddress: pair.pairAddress, reserveX: reserves.reserveX, reserveY: reserves.reserveY,
@@ -223,7 +241,6 @@ function buildPoolFromDexScreener(prefiltered, targetTokenAddress) {
   };
 }
 
-// 全プールの中から「最も安い」と「最も高い」を選ぶ(流動性上位2つではなく)。
 function evaluatePools({ pools, symbol, chain, tokenA, tokenB, reserveSource }) {
   if (pools.length < 2) return null;
   const withPrice = pools.map((p) => ({ ...p, price: p.reserveY / p.reserveX }));
@@ -238,10 +255,6 @@ function evaluatePools({ pools, symbol, chain, tokenA, tokenB, reserveSource }) 
     pairLabel: `${symbol} on ${chain} (${cheapPool.dexId} -> ${expensivePool.dexId})`,
   });
   if (Math.abs(result.priceDiffPercent) > 20) return null;
-  if (reserveSource === "dexscreener") {
-    const bothDeep = (cheapPool.liquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD && (expensivePool.liquidityUsd ?? 0) >= DEEP_POOL_LIQUIDITY_USD;
-    if (bothDeep && Math.abs(result.priceDiffPercent) > DEEP_POOL_MAX_GAP_PCT) return null;
-  }
   return {
     ...result, chain, tokenA, tokenB, cheapDex: cheapPool.dexId, expensiveDex: expensivePool.dexId,
     cheapPoolAddress: cheapPool.pairAddress, expensivePoolAddress: expensivePool.pairAddress,
@@ -270,6 +283,8 @@ async function dexWatchOnePair(candidate) {
         if (built) pools.push(built);
       }
       const executablePools = pools.filter((p) => getRouterInfo(normalizedChain, p.dexId));
+      // 登録時だけでなく毎回、最新のUSD換算価格も一緒に更新する。
+      // 価格が動いたまま古い値を使うと、投入額の計算がズレるため。
       const isNew = recordVerifiedPair({
         chain: normalizedChain, symbol: candidate.symbol, tokenA: candidate.tokenA, tokenB: candidate.tokenB,
         decimalsX, decimalsY, priceUsdPerY: executablePools[0]?.priceUsdPerY,
@@ -287,21 +302,22 @@ async function dexWatchOnePair(candidate) {
 const FAST_WATCH_INTERVAL_SEC = parseInt(process.env.FAST_WATCH_INTERVAL_SEC || "5", 10);
 let fastWatchRunning = false, fastWatchCount = 0, fastWatchLastAt = null;
 const executingPairs = new Set();
-// 同じ案件を5秒ごとに何度も統計に数えないよう、ペアごとに直近の記録時刻を持つ。
 const lastStatRecordAt = new Map();
 const STAT_DEDUP_MS = 3 * 60 * 1000;
 
-async function evaluateAndMaybeExecute(observed, source, { recordStats = true } = {}) {
+async function evaluateAndMaybeExecute(observed, source) {
   if (!observed) return;
   const key = `${observed.chain}::${observed.tokenA}::${observed.tokenB}`.toLowerCase();
-  if (recordStats) {
-    const last = lastStatRecordAt.get(key) || 0;
-    if (Date.now() - last > STAT_DEDUP_MS) { dexRecordStats(observed); lastStatRecordAt.set(key, Date.now()); }
+  const last = lastStatRecordAt.get(key) || 0;
+  if (Date.now() - last > STAT_DEDUP_MS) {
+    dexRecordStats(observed);
+    appendToLog(observed, { source });
+    lastStatRecordAt.set(key, Date.now());
   }
   if (!observed.profitable || executingPairs.has(key)) return;
   executingPairs.add(key);
   try {
-    console.log(`[${source}] ${observed.pairLabel}: 純利益 +$${observed.netProfit.toFixed(2)}(価格差${observed.priceDiffPercent.toFixed(2)}%、投入額$${observed.tradeAmountUsd.toFixed(2)}、手数料${observed.cheapFeeBps ?? "?"}/${observed.expensiveFeeBps ?? "?"}bps）`);
+    console.log(`[${source}] ${observed.pairLabel}: 純利益 +$${observed.netProfit.toFixed(2)}(価格差${observed.priceDiffPercent.toFixed(2)}%、投入額$${observed.tradeAmountUsd.toFixed(2)}、手数料${observed.cheapFeeBps ?? "?"}/${observed.expensiveFeeBps ?? "?"}bps、ガス$${getGasCostForChain(observed.chain).toFixed(4)}）`);
     latestDexResults = [observed, ...latestDexResults.filter((r) => r.pairLabel !== observed.pairLabel)].slice(0, 30);
     await maybeExecuteArb(observed);
   } catch (e) { console.warn(`[実行判定] エラー:`, e.message); }
@@ -342,18 +358,16 @@ async function fastWatchOnce() {
   finally { fastWatchRunning = false; }
 }
 
-// ===== Syncイベント受信時の高速経路 =====
 let onchainReactionCount = 0, onchainLatencyLog = [];
 async function handleOnchainSync(chainName, poolAddress, reserve0, reserve1, receivedAt) {
   const pair = findVerifiedPairByPool(chainName, poolAddress);
   if (!pair) return;
   try {
-    const observed = await evaluateVerifiedPair(pair, "Sync反応");
+    await evaluateVerifiedPair(pair, "Sync反応");
     const latencyMs = Date.now() - receivedAt;
     onchainReactionCount++;
     onchainLatencyLog.push(latencyMs);
     if (onchainLatencyLog.length > 200) onchainLatencyLog.shift();
-    if (observed) { const log = dexLoadLog(); log.push({ ...observed, viaOnchainEvent: true, reactionLatencyMs: latencyMs }); dexSaveLog(log); }
   } catch (e) { console.warn(`[Sync反応] 失敗:`, e.message); }
 }
 function getOnchainLatencyStats() {
@@ -370,7 +384,7 @@ async function dexGetCandidates(topN) {
   if ((dexCachedCandidates.length === 0 || now - dexLastProspectAt > DEX_PROSPECT_REFRESH_INTERVAL_MS) && !dexProspectRefreshing) {
     dexProspectRefreshing = true;
     try {
-      const prospect = await runProspect({ minTvlUSD: 5000, topN: 60 });
+      const prospect = await runProspect({ topN: 150 });
       dexCachedCandidates = prospect.topPairs; dexLastProspectAt = now; dexCandidateRotationOffset = 0;
       console.log(`[DEX] 候補ペア再選定完了: ${dexCachedCandidates.length}件`);
     } catch (e) { console.error("[DEX] 候補ペア選定に失敗:", e.message); }
@@ -383,22 +397,22 @@ async function dexGetCandidates(topN) {
   dexCandidateRotationOffset = (start + batchSize) % total;
   return selected;
 }
+
 async function runWatchCycle({ topN = 8 } = {}) {
   const candidates = await dexGetCandidates(topN);
   if (candidates.length === 0) return { checked: 0, logged: 0, results: [] };
-  const log = dexLoadLog(), results = [];
+  const results = [];
   for (const candidate of candidates) {
     try {
       const observed = await dexWatchOnePair(candidate);
-      if (observed) { results.push(observed); log.push(observed); await evaluateAndMaybeExecute(observed, "定期観測"); }
+      if (observed) { results.push(observed); await evaluateAndMaybeExecute(observed, "定期観測"); }
     } catch (e) { console.warn(`[DEX] 観測失敗 (${candidate.symbol} / ${candidate.chain}):`, e.message); }
   }
-  dexSaveLog(log);
   console.log(`[DEX] 定期観測完了: 対象${candidates.length}件・記録${results.length}件・黒字${results.filter(r=>r.profitable).length}件 / 実行可能ペア${getVerifiedPairCount()}件`);
   return { checked: candidates.length, logged: results.length, results };
 }
 
-const DEX_WATCH_INTERVAL_SEC = parseInt(process.env.DEX_WATCH_INTERVAL_SEC || "180", 10);
+const DEX_WATCH_INTERVAL_SEC = parseInt(process.env.DEX_WATCH_INTERVAL_SEC || "70", 10);
 let dexWatchRunning = false, dexWatchCount = 0, lastDexError = null, latestDexResults = [];
 async function dexWatchOnce() {
   if (dexWatchRunning) return;
@@ -439,21 +453,22 @@ function renderRealExecutionSection() {
       <div><div class="v">$${getCurrentTradeCapUsd()}</div><div class="l">現在の取引上限</div></div>
       <div><div class="v" style="color:${isLive?'#2ecc71':'#888'};">${isLive ? '稼働中' : '停止中'}</div><div class="l">自動売買</div></div></div>
     <table><thead><tr><th>日時</th><th>ペア</th><th style="text-align:right;">投入額</th><th style="text-align:right;">実際の利益</th><th></th></tr></thead><tbody>${rows}</tbody></table>
-    <div class="note"><strong>これが本当のお金の結果です。</strong>利益はコントラクト内に蓄積されます。取引上限は成功実績(${getSuccessCount()}回)に応じて自動的に上がります($500→$1000→$2000)。</div></div>`;
+    <div class="note"><strong>これが本当のお金の結果です。</strong>取引上限は成功実績(${getSuccessCount()}回)に応じて自動的に上がります($500→$1000→$2000)。</div></div>`;
 }
 function renderFastWatchSection() {
-  const pairs = getVerifiedPairs(), throttle = getThrottleStatus(), rpc = getRpcStatus();
+  const pairs = getVerifiedPairs(), throttle = getThrottleStatus(), rpc = getRpcStatus(), gas = getGasCostStatus();
   const byChain = {};
   for (const p of pairs) byChain[p.chain] = (byChain[p.chain] || 0) + 1;
   const chainList = Object.entries(byChain).map(([c, n]) => { const t = throttle[c]; return `${c}:${n}${t && t.pausedForSec > 0 ? `<span style="color:#e74c3c;">(${t.pausedForSec}秒休止中)</span>` : ''}`; }).join(' / ') || 'なし';
-  const rpcList = Object.entries(rpc).map(([c, r]) => `${c}: ${r.url.replace(/^https?:\/\//, '')}(${r.index}/${r.total})`).join('<br>');
-  const rows = pairs.slice(0, 20).map((p) => `<tr><td style="font-size:9px;">${p.symbol}</td><td>${p.chain}</td>
+  const gasList = Object.entries(gas).map(([c, g]) => `${c}: $${g.costUsd}(${g.gwei}gwei)`).join(' / ') || '取得中';
+  const rpcList = Object.entries(rpc).map(([c, r]) => `${c}: ${r.url.replace(/^https?:\/\//, '')}`).join('<br>');
+  const rows = pairs.slice(0, 25).map((p) => `<tr><td style="font-size:9px;">${p.symbol}</td><td>${p.chain}</td>
     <td style="font-size:9px;">${p.pools.map((x) => `${x.dexId}${x.feeBps != null ? `(${x.feeBps}bps)` : ''}`).join(', ')}</td></tr>`).join('') || `<tr><td colspan="3" style="color:#888;">まだ登録されていません</td></tr>`;
   return `<div class="card"><h2>⚡ 高速観測(実行可能ペア)</h2>
     <div class="stat"><div><div class="v">${pairs.length}</div><div class="l">実行可能ペア</div></div><div><div class="v">${FAST_WATCH_INTERVAL_SEC}秒</div><div class="l">観測間隔</div></div>
       <div><div class="v">${fastWatchCount}</div><div class="l">観測回数</div></div><div><div class="v">${fastWatchLastAt ? new Date(fastWatchLastAt).toLocaleTimeString('ja-JP') : '-'}</div><div class="l">最終観測</div></div></div>
     <table><thead><tr><th>ペア</th><th>チェーン</th><th>DEX(実測手数料)</th></tr></thead><tbody>${rows}</tbody></table>
-    <div class="note">異なるDEXのプールが2つ以上あるペアだけを、Multicallで一括読み取り。手数料はプール自身から逆算した実測値(既定は30bps)。内訳: ${chainList}<br>使用中RPC:<br>${rpcList}</div></div>`;
+    <div class="note">異なるDEXのプールが2つ以上あるペアを、Multicallで一括読み取り。手数料はプール自身から逆算した実測値。<br>内訳: ${chainList}<br>実測ガス代(1回あたり): ${gasList}<br>使用中RPC:<br>${rpcList}</div></div>`;
 }
 function renderPage() {
   const dexStats = dexLoadStats(), lat = getOnchainLatencyStats();
@@ -474,10 +489,10 @@ ${lat ? `<div class="card"><h2>⚡ Sync反応速度</h2><div class="stat"><div><
 function renderAboutPage() {
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>収集データについて</title><style>${PAGE_STYLE}</style></head><body>
 <h1>📊 このサイトが集めているデータ</h1>
-<div class="card"><h2>① 発掘(定期観測、3分ごと)</h2><div class="note">DeFiLlamaの候補60件を8件ずつ、DexScreenerでプールを探し、対応4チェーンではチェーンから直接準備量を読みます。あわせてプール自身のgetAmountOutから実際の手数料を逆算します。「読めた かつ ルーター確認済み」のプールが異なるDEXで2つ以上あるペアを「実行可能ペア」として登録します。</div></div>
-<div class="card"><h2>② 高速観測(${FAST_WATCH_INTERVAL_SEC}秒ごと)</h2><div class="note">実行可能ペアだけを対象に、Multicall3で全プールを一括読み取り。全プールの中から最も安い/高いの組み合わせを選び、実測した手数料で利益を計算します。</div></div>
-<div class="card"><h2>③ Sync反応(即時、Polygon)</h2><div class="note">実行可能ペアのプールでの取引を即座に検知し、そのペアだけを読み直して判定します。</div></div>
-<div class="card"><h2>④ 実行</h2><div class="note">黒字判定された案件は、実行直前にプール自身のgetAmountOutで受取量を確定し、Aave手数料(0.05%)込みの返済額を上回り、かつ最低利益($0.10)以上の場合のみ送信します。利益が出なければ取引全体が無効化されます(実害はガス代のみ)。</div></div>
+<div class="card"><h2>① 発掘(定期観測)</h2><div class="note">DeFiLlamaから、流動性$3万〜$300万の中小プールで、かつルーター確認済みDEXが2つ以上あるペアを150件選びます。専業botが常時監視する大型ペアは価格差が手数料を超えないため、意図的に避けています。手数料の低いPolygon・Arbitrumを優先します。</div></div>
+<div class="card"><h2>② 高速観測(${FAST_WATCH_INTERVAL_SEC}秒ごと)</h2><div class="note">実行可能ペアだけを、Multicall3で一括読み取り。手数料はプール自身のgetAmountOutから逆算した実測値を使います(Aerodromeは実測99bpsで、既定の30bpsとは大きく違いました)。</div></div>
+<div class="card"><h2>③ ガス代の実測</h2><div class="note">チェーンの現在のガス価格とネイティブトークンのUSD価格から、1回あたりの実費を5分ごとに算出します。以前は一律$0.05の固定値で、実際の10倍近い過大見積もりになっていました。</div></div>
+<div class="card"><h2>④ 実行</h2><div class="note">実行直前にプール自身へ問い合わせて受取量を確定し、Aave手数料(0.05%)込みの返済額を上回り、かつ最低利益以上の場合のみ送信します。利益が出なければ取引全体が無効化されます(実害はガス代のみ)。</div></div>
 <div class="footerlink"><a href="/">← 観測所トップに戻る</a></div></body></html>`;
 }
 function startServer() {
@@ -495,7 +510,10 @@ async function main() {
   pruneInvalidVerifiedPairs();
   startOnchainFeeds(handleOnchainSync);
   for (const [chain, pairs] of Object.entries(getVerifiedPairsByChain())) updatePoolSubscriptions(chain, pairs.flatMap((p) => p.pools.map((x) => x.address)));
-  console.log(`[起動] 実行可能ペア${getVerifiedPairCount()}件を読み込み / 高速観測${FAST_WATCH_INTERVAL_SEC}秒間隔 / 取引上限$${getCurrentTradeCapUsd()}`);
+
+  await refreshGasCosts();
+  setInterval(refreshGasCosts, 5 * 60 * 1000);
+  console.log(`[起動] 実行可能ペア${getVerifiedPairCount()}件 / 高速観測${FAST_WATCH_INTERVAL_SEC}秒 / 定期観測${DEX_WATCH_INTERVAL_SEC}秒 / 取引上限$${getCurrentTradeCapUsd()}`);
 
   dexWatchOnce();
   setInterval(dexWatchOnce, DEX_WATCH_INTERVAL_SEC * 1000);
