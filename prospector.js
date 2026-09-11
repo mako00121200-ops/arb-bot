@@ -4,28 +4,34 @@
  * DeFiLlamaの全プールデータから、「同一チェーン上で同じトークンペアが
  * 複数のDEXに存在する」組み合わせを洗い出し、裁定候補としてランキングする。
  *
- * [方針転換] 以前は流動性が大きいほど高スコアにしていたが、実測の結果
- * それは専業MEV botの狩場そのものだった。主要ペアは価格差が常に
- * 0.0〜0.4%で、手数料(往復0.6%+Aave0.05%)を超えることが無い。
- * 逆に、専業botが相手にしない中小プールでは2%超の価格差が実測された。
+ * [方針1] 流動性が大きいほど高評価という設計を逆転させた。実測の結果、
+ * 大型ペアは専業MEV botが常時監視しており、価格差が常に0.0〜0.4%で
+ * 手数料(往復0.6%+Aave0.05%)を超えることが無かった。逆に中小プールでは
+ * 2%超の価格差が実測された。
+ *
+ * [方針2] 「ルーター確認済みDEXが2つ以上」という条件を撤廃した。
+ * コントラクトがプールを直接呼ぶ方式になり、DEXの種類を問わず実行
+ * できるようになったため。この条件が候補の69%を捨てていた。
+ * 代わりに、コントラクトをデプロイ済みのチェーンかどうかだけを見る。
  */
 
-import { getRouterInfo } from "./router-addresses.js";
+import { CHAIN_CONFIG } from "./chain-config.js";
 
 const DEFILLAMA_POOLS = "https://yields.llama.fi/pools";
 const PROSPECTOR_FETCH_TIMEOUT_MS = 25000;
 
-const EXCLUDED_CHAINS = new Set(["ethereum"]);
+// コントラクトをデプロイ済みのチェーンだけを対象にする。
+const SUPPORTED_CHAINS = new Set(Object.keys(CHAIN_CONFIG));
 
 const TARGET_MIN_TVL_USD = 30_000;
 const TARGET_MAX_TVL_USD = 3_000_000;
 
-// ガス代の実測値(1回あたり)と、主要DEXの実測手数料を反映した優先度:
-//   avalanche $0.0014 … 桁違いに安い。TraderJoe/Uniswapとも0.3%。最優先。
-//   arbitrum  $0.0300 … Uniswap/SushiSwapとも0.3%で有利。
-//   polygon   $0.0343 … ガス代は最も高いが、DEXの数が多く機会も多い。
+// ガス代の実測値(1回あたり)と主要DEXの実測手数料を反映した優先度:
+//   avalanche $0.0012 … 桁違いに安い。手数料も0.3%。最優先。
+//   arbitrum  $0.0300 … 手数料0.3%のDEXが多く有利。
+//   polygon   $0.0320 … ガス代は高いがDEXの数が多い。
 //   optimism  $0.0100 … Velodromeの手数料が実測約1%で不利。
-//   base      $0.0242 … Aerodromeの手数料が実測99bps(約1%)で最も不利。
+//   base      $0.0243 … Aerodromeの手数料が実測99bps(約1%)で最も不利。
 const CHAIN_PREFERENCE = {
   avalanche: 2.0,
   arbitrum: 1.4,
@@ -51,17 +57,12 @@ const DEX_KEYWORDS = [
   "zyberswap", "arbidex", "chronos", "solidlizard", "sterling",
   "equalizer", "nile", "cleo", "lynex", "nuri", "blackhole",
   "jetswap", "polyzap", "dfyn", "polycat", "waultswap", "infusion",
+  "swapr", "deltaswap", "windswap", "pendle",
 ];
 
 export function isDexProject(project) {
   const p = (project || "").toLowerCase();
   return DEX_KEYWORDS.some((k) => p.includes(k));
-}
-
-function hasConfirmedRouter(chain, project) {
-  const p = (project || "").toLowerCase();
-  const base = p.replace(/-v\d.*$/, "").replace(/-classic$/, "");
-  return getRouterInfo(chain, base) !== null || getRouterInfo(chain, p) !== null;
 }
 
 export async function fetchAllPools() {
@@ -73,13 +74,13 @@ export async function fetchAllPools() {
 
 export function findArbitragablePairs(pools, { minTvlUSD = TARGET_MIN_TVL_USD } = {}) {
   const groups = new Map();
-  let dexPoolCount = 0, excludedChainCount = 0;
+  let dexPoolCount = 0, unsupportedChainCount = 0;
 
   for (const p of pools) {
     if (!isDexProject(p.project)) continue;
     if (!p.underlyingTokens || p.underlyingTokens.length !== 2) continue;
     if ((p.tvlUsd || 0) < minTvlUSD) continue;
-    if (EXCLUDED_CHAINS.has((p.chain || "").toLowerCase())) { excludedChainCount++; continue; }
+    if (!SUPPORTED_CHAINS.has((p.chain || "").toLowerCase())) { unsupportedChainCount++; continue; }
     dexPoolCount++;
 
     const toks = p.underlyingTokens.map((t) => String(t).toLowerCase());
@@ -104,46 +105,44 @@ export function findArbitragablePairs(pools, { minTvlUSD = TARGET_MIN_TVL_USD } 
     const tvls = venues.map((v) => v.tvlUsd);
     const totalTvl = tvls.reduce((s, v) => s + v, 0);
     const totalVol = venues.reduce((s, v) => s + (v.volumeUsd1d || 0), 0);
-    const confirmedVenues = venues.filter((v) => hasConfirmedRouter(g.chain, v.project));
 
     arbitragable.push({
       chain: g.chain, symbol: g.symbol, tokenA: g.tokenA, tokenB: g.tokenB,
       venueCount: venues.length, venues,
-      confirmedVenueCount: confirmedVenues.length,
       minTvl: Math.min(...tvls), totalTvl, totalVol1d: totalVol,
       turnover: totalTvl > 0 ? totalVol / totalTvl : 0,
     });
   }
 
-  return { arbitragable, dexPoolCount, excludedChainCount, groupCount: groups.size, totalPools: pools.length };
+  return { arbitragable, dexPoolCount, unsupportedChainCount, groupCount: groups.size, totalPools: pools.length };
 }
 
 export function summarizeByChain(arbitragable) {
   const byChain = new Map();
   for (const a of arbitragable) {
-    if (!byChain.has(a.chain)) {
-      byChain.set(a.chain, { chain: a.chain, pairCount: 0, executableCount: 0, totalTvl: 0, dexes: new Set() });
-    }
+    if (!byChain.has(a.chain)) byChain.set(a.chain, { chain: a.chain, pairCount: 0, totalTvl: 0, dexes: new Set() });
     const c = byChain.get(a.chain);
     c.pairCount++;
-    if (a.confirmedVenueCount >= 2) c.executableCount++;
     c.totalTvl += a.totalTvl;
     for (const v of a.venues) c.dexes.add(v.project);
   }
   return [...byChain.values()]
-    .map((c) => ({ chain: c.chain, pairCount: c.pairCount, executableCount: c.executableCount, dexCount: c.dexes.size, dexList: [...c.dexes], totalTvl: c.totalTvl }))
-    .sort((a, b) => b.executableCount - a.executableCount);
+    .map((c) => ({ chain: c.chain, pairCount: c.pairCount, dexCount: c.dexes.size, dexList: [...c.dexes], totalTvl: c.totalTvl }))
+    .sort((a, b) => b.pairCount - a.pairCount);
 }
 
 export function scoreOpportunity(a) {
-  if (a.confirmedVenueCount < 2) return 0;
-
+  // 流動性は「ほどよい大きさ」が最良。$30万を中心に、離れるほど減点。
   const tvl = Math.max(a.minTvl, 1);
   if (tvl > TARGET_MAX_TVL_USD) return 0;
   const sizeScore = 1 / (1 + Math.abs(Math.log10(tvl / 300_000)));
 
+  // 取引が静かなほど、価格差が埋められずに残りやすい。
   const quietScore = a.turnover > 0 ? 1 / (1 + a.turnover * 3) : 1;
-  const venueScore = Math.min(a.confirmedVenueCount, 4) / 2;
+
+  // プールの数が多いほど、組み合わせも増える。
+  const venueScore = Math.min(a.venueCount, 4) / 2;
+
   const chainScore = CHAIN_PREFERENCE[(a.chain || "").toLowerCase()] ?? 1.0;
 
   return sizeScore * quietScore * venueScore * chainScore;
@@ -151,13 +150,12 @@ export function scoreOpportunity(a) {
 
 export async function runProspect({ minTvlUSD = TARGET_MIN_TVL_USD, topN = 150 } = {}) {
   const pools = await fetchAllPools();
-  const { arbitragable, dexPoolCount, excludedChainCount, groupCount, totalPools } = findArbitragablePairs(pools, { minTvlUSD });
+  const { arbitragable, dexPoolCount, unsupportedChainCount, groupCount, totalPools } = findArbitragablePairs(pools, { minTvlUSD });
 
-  const executable = arbitragable.filter((a) => a.confirmedVenueCount >= 2);
-  console.log(`[Prospector] 候補${arbitragable.length}件のうち、ルーター確認済みDEXが2つ以上あるのは${executable.length}件(Ethereum除外${excludedChainCount}件)`);
+  console.log(`[Prospector] 対応5チェーンで候補${arbitragable.length}件(未対応チェーンのプール${unsupportedChainCount}件を除外)`);
 
   const chainSummary = summarizeByChain(arbitragable);
-  console.log(`[Prospector] 実行可能な候補が多いチェーン: ${chainSummary.slice(0, 4).map((c) => `${c.chain}:${c.executableCount}件`).join(" / ")}`);
+  console.log(`[Prospector] チェーン別: ${chainSummary.map((c) => `${c.chain}:${c.pairCount}件`).join(" / ")}`);
 
   const scored = arbitragable
     .map((a) => ({ ...a, score: scoreOpportunity(a) }))
@@ -170,13 +168,12 @@ export async function runProspect({ minTvlUSD = TARGET_MIN_TVL_USD, topN = 150 }
 
   return {
     scannedAt: new Date().toISOString(),
-    stats: { totalPools, dexPoolCount, excludedChainCount, groupCount, arbitragableCount: arbitragable.length, executableCount: executable.length },
+    stats: { totalPools, dexPoolCount, unsupportedChainCount, groupCount, arbitragableCount: arbitragable.length },
     chainSummary: chainSummary.slice(0, 30),
     arbitragableRaw: arbitragable,
     topPairs: scored.slice(0, topN).map((a) => ({
       chain: a.chain, symbol: a.symbol, tokenA: a.tokenA, tokenB: a.tokenB,
-      venueCount: a.venueCount, confirmedVenueCount: a.confirmedVenueCount,
-      minTvl: a.minTvl, turnover: a.turnover, score: a.score,
+      venueCount: a.venueCount, minTvl: a.minTvl, turnover: a.turnover, score: a.score,
       venues: a.venues.map((v) => ({ project: v.project, tvlUsd: v.tvlUsd })),
     })),
     quietPairs: [],
