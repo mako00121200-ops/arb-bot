@@ -9,12 +9,9 @@
  * 定期的なping(eth_blockNumber)で能動的に生存確認する方式に変更済み。
  *
  * [修正2] アドレスを指定して購読する方式をやめた。13,783プールを400件ずつ
- * 35回に分けて購読したところ、RPC側の購読数制限に当たり、Syncイベントが
- * 1件も届かなかった。
- * チェーン上の全Syncイベントを「1つの購読」で受け取り、手元で自分の
- * 監視対象かどうかを判定する方式に変更。購読は常に1回で済むため制限に
- * 当たらず、登録済みの全プールを漏れなくカバーできる。
- * (専業botが実際に使っている方式でもある)
+ * 35回に分けて購読するとRPC側の購読数制限に当たるため、チェーン上の全Sync
+ * イベントを「1つの購読」で受け取り、手元で監視対象かどうかを判定する。
+ * 購読は常に1回で済むため制限に当たらず、全プールを漏れなくカバーできる。
  *
  * [修正3] イベント監視用のRPCを、読み取り用とは別に指定できるようにした。
  * 無料枠のノードを複数契約し「ノードAで読み取り、ノードBでイベント監視」と
@@ -23,7 +20,12 @@
  *             POLYGON_WSS_URL, AVALANCHE_WSS_URL
  */
 
-const SYNC_TOPIC = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad";
+// keccak256("Sync(uint112,uint112)")。
+// 以前、末尾の1文字が欠けた63文字の値が書かれており、RPCに
+// 「hex string of odd length」と拒否され続けていた。そのため
+// Syncイベントはシステムの最初期から一度も届いていなかった。
+// 16進64文字(0x込みで66文字)であることが正しさの目印。
+const SYNC_TOPIC = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1";
 
 const CHAIN_WS_ENV_VARS = {
   base: "BASE_WSS_URL",
@@ -56,10 +58,10 @@ const chainIntentionalClose = {};
 const chainEnabled = new Set();
 const chainEventCounts = {};
 const chainMatchedCounts = {};
+const chainSubscribeErrors = {};
 let globalOnSync = null;
 
 /// チェーン上の全Syncイベントを1つの購読で受け取る。
-/// アドレスで絞らないため、購読数の制限に当たらない。
 function sendSubscription(chainName) {
   const socket = chainSockets[chainName];
   if (!socket || socket.readyState !== 1) return;
@@ -108,8 +110,14 @@ function connectChain(chainName, wsUrl) {
         if (msg.id !== undefined) {
           // 購読確認・pingの返事は「接続が生きている」証拠として扱う。
           chainLastDataAt[chainName] = receivedAt;
-          if (msg.id === SUBSCRIBE_REQUEST_ID && msg.error) {
-            console.warn(`[オンチェーン] ${chainName}: 購読が拒否されました: ${JSON.stringify(msg.error).slice(0, 120)}`);
+          if (msg.id === SUBSCRIBE_REQUEST_ID) {
+            if (msg.error) {
+              chainSubscribeErrors[chainName] = JSON.stringify(msg.error).slice(0, 120);
+              console.warn(`[オンチェーン] ${chainName}: 購読が拒否されました: ${chainSubscribeErrors[chainName]}`);
+            } else {
+              chainSubscribeErrors[chainName] = null;
+              console.log(`[オンチェーン] ${chainName}: 購読が受理されました`);
+            }
           }
           return;
         }
@@ -120,7 +128,6 @@ function connectChain(chainName, wsUrl) {
           const decoded = decodeSyncData(log.data);
           if (decoded && globalOnSync) {
             // 監視対象かどうかの判定は受け手(index.js)に任せる。
-            // 対象外なら即座に無視されるだけなので、ここでは絞らない。
             const matched = globalOnSync(chainName, log.address.toLowerCase(), decoded.reserve0, decoded.reserve1, receivedAt);
             if (matched) chainMatchedCounts[chainName] = (chainMatchedCounts[chainName] || 0) + 1;
           }
@@ -164,6 +171,12 @@ function connectChain(chainName, wsUrl) {
 
 export function startOnchainFeeds(onSync) {
   globalOnSync = onSync;
+
+  // 起動時に識別子の長さを検算する(過去、1文字欠けたまま気づかなかったため)。
+  if (SYNC_TOPIC.length !== 66) {
+    console.error(`[オンチェーン] 致命的: SYNC_TOPICの長さが不正です(${SYNC_TOPIC.length}文字、正しくは66文字)`);
+  }
+
   let anyStarted = false;
   for (const [chainName, envVar] of Object.entries(CHAIN_WS_ENV_VARS)) {
     const wsUrl = process.env[envVar];
@@ -180,8 +193,7 @@ export function startOnchainFeeds(onSync) {
   }
 }
 
-/// 全件購読に変更したため、個別のアドレス登録は不要になった。
-/// 呼び出し側の互換のために残してある。
+/// 全件購読に変更したため、個別のアドレス登録は不要。呼び出し側の互換のため残す。
 export function updatePoolSubscriptions() { /* 全件購読のため何もしない */ }
 
 export function isChainWsEnabled(chainName) {
@@ -196,6 +208,7 @@ export function getSyncStats() {
       received: chainEventCounts[chain] || 0,
       matched: chainMatchedCounts[chain] || 0,
       connected: chainSockets[chain]?.readyState === 1,
+      error: chainSubscribeErrors[chain] || null,
     };
   }
   return out;
