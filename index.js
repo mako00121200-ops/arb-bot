@@ -1,592 +1,374 @@
+// index.js
+//
+// [設計] イベント駆動型のDEXアービトラージbot。
+//
+// 従来はDeFiLlama→DexScreener経由で150ペアを22分周期で見ていたため、
+// 専業bot(数千プールを常時監視)に対して構造的に機会を見逃していた。
+//
+// 新設計:
+//   ①起動時: 実在するプールからファクトリーを逆算し、全プールを列挙して
+//            メモリ上の「プール地図」を構築する
+//   ②常時:   Syncイベントで準備量を差分更新し、変化したプールを含む経路
+//            だけをメモリ上で即座に再計算する(RPC不要・ミリ秒)
+//   ③補助:   Sync購読が無いチェーンは、定期的に一括読み直しする
+
 import http from "http";
-import fs from "fs";
-import { runProspect } from "./prospector.js";
+import { ethers } from "ethers";
 import { startOnchainFeeds, updatePoolSubscriptions } from "./dex-onchain-realtime.js";
-import { runTestnetDeployCheck } from "./scripts/testnet-deploy-check.js";
 import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
-import { maybeExecuteArb } from "./scripts/execute-arb.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
-import { fetchOnchainReserves, fetchTokenDecimals, isOnchainReadAvailable, probePoolFeeBps, getRpcStatus } from "./scripts/onchain-reserves.js";
+import { callWithRpc, fetchTokenDecimals, probePoolFeeBps, getRpcStatus } from "./scripts/onchain-reserves.js";
+import { fetchReservesBatch } from "./scripts/multicall-reserves.js";
 import { estimateGasCostUsd, getGasCostStatus } from "./scripts/gas-cost.js";
+import { discoverFactory, discoverPoolsFromFactory } from "./scripts/pool-discovery.js";
 import {
-  recordVerifiedPair, removePoolFromVerifiedPairs, getVerifiedPairs,
-  getVerifiedPairsByChain, findVerifiedPairByPool, getVerifiedPairCount, pruneInvalidVerifiedPairs,
-} from "./scripts/verified-pairs.js";
-import { readVerifiedPairPools } from "./scripts/multicall-reserves.js";
-import { shouldSkipChain, recordChainSuccess, recordChainFailure, getThrottleStatus } from "./scripts/chain-throttle.js";
-import { evaluateTriangle, maybeExecuteTriangle } from "./scripts/triangular-arb.js";
-import { findTriangles } from "./scripts/triangle-finder.js";
+  registerPool, updateReservesFromSync, setPoolFee, getPool, getStats,
+  setTokenDecimals, getTokenDecimals, setTokenPriceUsd, getTokenPriceUsd,
+  getAllPoolAddressesByChain, getPoolsForToken, getStalePools,
+} from "./scripts/pool-registry.js";
+import { scanForChangedPool, scanAllPairs } from "./scripts/opportunity-scanner.js";
+import { executeOpportunity } from "./scripts/execute-opportunity.js";
+import { isBorrowable, getBorrowableTokens } from "./scripts/borrowable-tokens.js";
+import { CHAIN_CONFIG } from "./chain-config.js";
 
-const DEX_FETCH_TIMEOUT_MS = 20000;
-async function dexFetchWithTimeout(url, timeoutMs = DEX_FETCH_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try { return await fetch(url, { signal: controller.signal }); } finally { clearTimeout(timer); }
-}
+const MIN_PROFIT_USD = parseFloat(process.env.MIN_PROFIT_USD || "0.05");
+const FULL_SCAN_INTERVAL_SEC = parseInt(process.env.FULL_SCAN_INTERVAL_SEC || "30", 10);
+const REFRESH_STALE_SEC = parseInt(process.env.REFRESH_STALE_SEC || "60", 10);
 
-const MAX_TRADE_USD = parseFloat(process.env.MAX_TRADE_USD || "2000");
-const AAVE_FLASHLOAN_FEE_RATE = 0.0005;
-const MIN_MARKET_CAP_USD = 100000;
-const DEFAULT_FEE_BPS = 30;
-
-function dexGetAmountOut(amountIn, reserveIn, reserveOut, feeRetain) {
-  if (amountIn <= 0) return 0;
-  const amountInWithFee = amountIn * feeRetain;
-  return (reserveOut * amountInWithFee) / (reserveIn + amountInWithFee);
-}
-function dexSimulateProfitForAmount(pool1, pool2, amountIn) {
-  const xOut = dexGetAmountOut(amountIn, pool1.reserveY, pool1.reserveX, 1 - pool1.fee);
-  const yOut = dexGetAmountOut(xOut, pool2.reserveX, pool2.reserveY, 1 - pool2.fee);
-  return yOut - amountIn;
-}
-function dexComputeOptimalArbitrage(pool1, pool2) {
-  const a = pool1.reserveY, A = pool1.reserveX, X2 = pool2.reserveX, Y2 = pool2.reserveY;
-  const g1 = 1 - pool1.fee, g2 = 1 - pool2.fee;
-  const P = Y2 * g2 * A, Q = X2 * a, R = X2 + g2 * A;
-  const inner = g1 * P * Q;
-  if (inner <= Q * Q) return { amountIn: 0, grossProfit: 0, profitable: false };
-  const theoreticalAmountIn = (Math.sqrt(inner) - Q) / (g1 * R);
-  if (theoreticalAmountIn <= 0) return { amountIn: 0, grossProfit: 0, profitable: false };
-  let bestT = theoreticalAmountIn, bestProfit = dexSimulateProfitForAmount(pool1, pool2, theoreticalAmountIn);
-  for (let mult = 0.5; mult <= 1.5; mult += 0.01) {
-    const t = theoreticalAmountIn * mult, p = dexSimulateProfitForAmount(pool1, pool2, t);
-    if (p > bestProfit) { bestProfit = p; bestT = t; }
-  }
-  return { amountIn: bestT, grossProfit: bestProfit, profitable: bestProfit > 0 };
-}
-
-function dexEvaluateOpportunity({ cheapPool, expensivePool, gasCostUsd, maxTradeAmountUsd, slippageBuffer = 0, pairLabel = "" }) {
-  const priceCheap = cheapPool.reserveY / cheapPool.reserveX;
-  const priceExpensive = expensivePool.reserveY / expensivePool.reserveX;
-  const priceDiffPercent = ((priceExpensive - priceCheap) / priceCheap) * 100;
-  const priceUsdPerY = cheapPool.priceUsdPerY;
-  const maxTradeAmountIn = maxTradeAmountUsd / priceUsdPerY;
-  const gasCostInY = gasCostUsd / priceUsdPerY;
-  const optimalResult = dexComputeOptimalArbitrage(cheapPool, expensivePool);
-  const actualTradeAmountIn = Math.min(optimalResult.amountIn, maxTradeAmountIn);
-  const actualGrossProfitY = dexSimulateProfitForAmount(cheapPool, expensivePool, actualTradeAmountIn);
-  const actualSlippageCostY = actualGrossProfitY * slippageBuffer;
-  const aaveFeeInY = actualTradeAmountIn * AAVE_FLASHLOAN_FEE_RATE;
-  const actualNetProfitY = actualGrossProfitY - gasCostInY - actualSlippageCostY - aaveFeeInY;
-  return {
-    timestamp: new Date().toISOString(), pairLabel, priceDiffPercent,
-    tradeAmountUsd: actualTradeAmountIn * priceUsdPerY, tradeAmountIn: actualTradeAmountIn,
-    grossProfit: actualGrossProfitY * priceUsdPerY, gasCostInY: gasCostUsd,
-    slippageCost: actualSlippageCostY * priceUsdPerY, aaveFeeCost: aaveFeeInY * priceUsdPerY,
-    netProfit: actualNetProfitY * priceUsdPerY, profitable: actualNetProfitY > 0,
-    optimalAmountIn: optimalResult.amountIn, optimalGrossProfitUsd: optimalResult.grossProfit * priceUsdPerY,
-    cappedByBudget: optimalResult.amountIn > maxTradeAmountIn,
-  };
-}
-
-const DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/latest/dex/tokens/";
-const DEX_LOG_FILE = process.env.WATCHER_LOG_FILE || "/tmp/dex-arb-observations.json";
-const DEX_STATS_FILE = process.env.STATS_FILE || "/tmp/dex-arb-stats.json";
-const KNOWN_DEX_FILE = process.env.KNOWN_DEX_FILE || "/tmp/dex-known-list.json";
-
-function dexNormalizeChain(chain) {
-  const map = { base: "base", arbitrum: "arbitrum", optimism: "optimism", "op mainnet": "optimism", ethereum: "ethereum" };
-  return map[(chain || "").toLowerCase()] || (chain || "").toLowerCase();
-}
-
-const FALLBACK_GAS_COST_USD = { base: 0.025, arbitrum: 0.03, optimism: 0.01, polygon: 0.033, avalanche: 0.002 };
+// ===== ガス代 =====
+const FALLBACK_GAS = { base: 0.025, arbitrum: 0.03, optimism: 0.01, polygon: 0.033, avalanche: 0.002 };
 const gasCostCache = new Map();
-function getGasCostForChain(chain) {
-  const key = dexNormalizeChain(chain);
-  return gasCostCache.get(key) ?? FALLBACK_GAS_COST_USD[key] ?? 0.05;
-}
+function getGasCost(chain) { return gasCostCache.get(chain) ?? FALLBACK_GAS[chain] ?? 0.05; }
 async function refreshGasCosts() {
-  for (const chain of ["base", "polygon", "arbitrum", "optimism", "avalanche"]) {
+  for (const chain of Object.keys(CHAIN_CONFIG)) {
     try { gasCostCache.set(chain, await estimateGasCostUsd(chain)); } catch (e) {}
   }
-  console.log(`[ガス代実測] ${[...gasCostCache.entries()].map(([c, v]) => `${c}:$${v.toFixed(4)}`).join(" ")}`);
+  console.log(`[ガス代] ${[...gasCostCache.entries()].map(([c, v]) => `${c}:$${v.toFixed(4)}`).join(" ")}`);
 }
 
-const DEAD_POOL_MIN_VOLUME_USD = 50, DEAD_POOL_MIN_TXNS_24H = 3;
-function isDeadPool(pair) {
-  const volume24h = pair.volume?.h24 ?? 0;
-  const txns24h = (pair.txns?.h24?.buys ?? 0) + (pair.txns?.h24?.sells ?? 0);
-  return volume24h < DEAD_POOL_MIN_VOLUME_USD || txns24h < DEAD_POOL_MIN_TXNS_24H;
-}
-function isKnownFalsePositive({ symbol, cheapDexId, expensiveDexId, chain }) {
-  if (cheapDexId === "zipswap" || expensiveDexId === "zipswap") return true;
-  const lowerChain = dexNormalizeChain(chain);
-  if (lowerChain === "arbitrum" && (cheapDexId === "pancakeswap" || expensiveDexId === "pancakeswap")) return true;
-  if ((cheapDexId || "").includes("sparkdex") || (expensiveDexId || "").includes("sparkdex")) return true;
-  if ((cheapDexId || "").includes("traderjoe-v2") || (expensiveDexId || "").includes("traderjoe-v2")) return true;
-  if (lowerChain === "base" && (cheapDexId === "quickswap" || expensiveDexId === "quickswap")) return true;
-  return false;
+// ===== 統計 =====
+const stats = {
+  scans: 0, opportunitiesFound: 0, feeWallCleared: 0,
+  executed: 0, lastOpportunity: null, recent: [],
+  syncEvents: 0, latencies: [],
+};
+function recordOpportunity(opp) {
+  stats.opportunitiesFound++;
+  if (opp.feeWallPercent != null) stats.feeWallCleared++;
+  stats.lastOpportunity = new Date().toISOString();
+  stats.recent = [{ ...opp, at: new Date().toISOString() }, ...stats.recent.filter((r) => r.label !== opp.label)].slice(0, 20);
 }
 
-function dexLoadKnownDexes() {
-  try { if (fs.existsSync(KNOWN_DEX_FILE)) return JSON.parse(fs.readFileSync(KNOWN_DEX_FILE, "utf8")); } catch (e) {}
-  return {};
-}
-function checkAndRecordNewDex(dexId, chain) {
-  if (!dexId) return;
-  const key = `${chain}::${dexId}`, known = dexLoadKnownDexes();
-  if (known[key]) return;
-  known[key] = new Date().toISOString();
-  try { fs.writeFileSync(KNOWN_DEX_FILE, JSON.stringify(known)); } catch (e) {}
-  console.log(`[DEX診断] 新しいDEXを初めて検出: "${dexId}" on ${chain}`);
-}
+// ===== 起動時のプール発見 =====
+// 既に実在が確認できているプールを種にして、ファクトリーを逆算する。
+// 推測でアドレスを置かない(過去、推測で何度も失敗したため)。
+const SEED_POOLS = {
+  // チェーン: [{ address, dexId }] … 実在確認済みのプール
+  base: [
+    { address: "0xcDAC0d6c6C59727a65F871236188350531885C43", dexId: "aerodrome" },
+    { address: "0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C", dexId: "uniswap" },
+  ],
+  polygon: [
+    { address: "0x6e7a5FAFcec6BB1e78bAE2A1F0B612012BF14827", dexId: "quickswap" },
+    { address: "0x34965ba0ac2451A34a0471F04CCa3F990b8dea27", dexId: "sushiswap" },
+  ],
+  arbitrum: [
+    { address: "0x905dfCD5649217c42684f23958568e533C711Aa3", dexId: "sushiswap" },
+    { address: "0x84652bb2539513BAf36e225c930Fdd8eaa63CE27", dexId: "camelot" },
+  ],
+  optimism: [
+    { address: "0x0493Bf8b6DBB159Ce2Db2E0E8403E753Abd1235b", dexId: "velodrome" },
+  ],
+  avalanche: [
+    { address: "0xf4003F4efBE8691B60249E6afbD307aBE7758adb", dexId: "traderjoe" },
+    { address: "0xE530dC2095Ef5653205CF5ea79F8979a7028065c", dexId: "pangolin" },
+  ],
+};
 
-function dexLoadLog() {
-  try {
-    if (fs.existsSync(DEX_LOG_FILE)) {
-      return JSON.parse(fs.readFileSync(DEX_LOG_FILE, "utf8")).filter((e) => e.cheapDex !== e.expensiveDex);
-    }
-  } catch (e) {}
-  return [];
-}
-function dexSaveLog(entries) {
-  try { fs.writeFileSync(DEX_LOG_FILE, JSON.stringify(entries.length > 2000 ? entries.slice(-2000) : entries)); } catch (e) {}
-}
-function appendToLog(observed, extra = {}) {
-  const log = dexLoadLog();
-  log.push({ ...observed, ...extra });
-  dexSaveLog(log);
-}
-
-function dexLoadStats() {
-  try { if (fs.existsSync(DEX_STATS_FILE)) return JSON.parse(fs.readFileSync(DEX_STATS_FILE, "utf8")); } catch (e) {}
-  const seeded = { totalObserved: 0, totalProfitableCount: 0, cumulativeProfit: 0, onchainVerifiedCount: 0, onchainVerifiedProfit: 0, feeWallClearedCount: 0 };
-  dexSaveStats(seeded);
-  return seeded;
-}
-function dexSaveStats(stats) { try { fs.writeFileSync(DEX_STATS_FILE, JSON.stringify(stats)); } catch (e) {} }
-function dexRecordStats(observed) {
-  const stats = dexLoadStats();
-  stats.totalObserved = (stats.totalObserved || 0) + 1;
-  // 手数料の壁を超えた件数(=構造的に黒字になり得た件数)を別枠で数える。
-  if (observed.clearsFeeWall) stats.feeWallClearedCount = (stats.feeWallClearedCount || 0) + 1;
-  if (observed.profitable) {
-    stats.totalProfitableCount = (stats.totalProfitableCount || 0) + 1;
-    stats.cumulativeProfit = (stats.cumulativeProfit || 0) + observed.netProfit;
-    if ((observed.reserveSource || "").startsWith("onchain")) {
-      stats.onchainVerifiedCount = (stats.onchainVerifiedCount || 0) + 1;
-      stats.onchainVerifiedProfit = (stats.onchainVerifiedProfit || 0) + observed.netProfit;
-    }
-  }
-  dexSaveStats(stats);
-}
-
-async function dexFetchPairsForToken(tokenAddress, chain, otherTokenAddress) {
-  const targetChain = dexNormalizeChain(chain);
-  const target = tokenAddress.toLowerCase(), other = otherTokenAddress.toLowerCase();
-  const [resA, resB] = await Promise.all([dexFetchWithTimeout(DEXSCREENER_TOKEN_API + tokenAddress), dexFetchWithTimeout(DEXSCREENER_TOKEN_API + otherTokenAddress)]);
-  if (!resA.ok && !resB.ok) throw new Error(`DexScreener HTTP ${resA.status}/${resB.status}`);
-  const pairsA = resA.ok ? (await resA.json()).pairs || [] : [], pairsB = resB.ok ? (await resB.json()).pairs || [] : [];
-  const merged = new Map();
-  for (const p of [...pairsA, ...pairsB]) if (p.pairAddress) merged.set(p.pairAddress, p);
-  return [...merged.values()].filter((p) => {
-    if ((p.chainId || "").toLowerCase() !== targetChain) return false;
-    const base = (p.baseToken?.address || "").toLowerCase(), quote = (p.quoteToken?.address || "").toLowerCase();
-    return (base === target || quote === target) && (base === other || quote === other);
-  });
-}
-
-const CONCENTRATED_LIQUIDITY_DEX_IDS = new Set(["aerodrome-slipstream", "velodrome-slipstream", "pancakeswap-v3", "uniswap-v3"]);
-function isConcentratedLiquidity(pair) {
-  const labels = (pair.labels || []).map((l) => String(l).toLowerCase());
-  if (labels.some((l) => /v3|v4|concentrated|slipstream|\bcl\b/.test(l))) return true;
-  return CONCENTRATED_LIQUIDITY_DEX_IDS.has((pair.dexId || "").toLowerCase());
-}
-function dexPrefilterPair(pair, chain) {
-  checkAndRecordNewDex(pair.dexId, chain);
-  if (isConcentratedLiquidity(pair) || isDeadPool(pair)) return null;
-  const marketCap = pair.marketCap ?? pair.fdv;
-  if (marketCap != null && marketCap < MIN_MARKET_CAP_USD) return null;
-  const priceNative = parseFloat(pair.priceNative), basePriceUsd = parseFloat(pair.priceUsd);
-  if (!priceNative || !isFinite(priceNative) || !isFinite(basePriceUsd) || basePriceUsd <= 0) return null;
-  return { pair, priceNative, basePriceUsd };
-}
-
-async function buildPoolFromOnchain(prefiltered, targetTokenAddress, otherTokenAddress, chain, decimalsX, decimalsY) {
-  const { pair, priceNative, basePriceUsd } = prefiltered;
-  const baseIsTarget = (pair.baseToken?.address || "").toLowerCase() === targetTokenAddress.toLowerCase();
-  let reserves;
-  try {
-    reserves = await fetchOnchainReserves({ chain, pairAddress: pair.pairAddress, tokenXAddress: targetTokenAddress, decimalsX, decimalsY });
-  } catch (e) { return null; }
-  if (!reserves.reserveX || !reserves.reserveY) return null;
-
-  const probed = await probePoolFeeBps({ chain, pairAddress: pair.pairAddress, tokenInAddress: otherTokenAddress, reserveIn: reserves.rawY, reserveOut: reserves.rawX });
-  const feeBps = probed ?? DEFAULT_FEE_BPS;
-  const quotePriceUsd = basePriceUsd / priceNative;
-  return {
-    dexId: pair.dexId, pairAddress: pair.pairAddress, reserveX: reserves.reserveX, reserveY: reserves.reserveY,
-    fee: feeBps / 10000, feeBps, liquidityUsd: (pair.liquidity?.usd ?? null),
-    priceUsdPerY: baseIsTarget ? quotePriceUsd : basePriceUsd, reserveSource: "onchain",
-  };
-}
-function buildPoolFromDexScreener(prefiltered, targetTokenAddress) {
-  const { pair, priceNative, basePriceUsd } = prefiltered;
-  const liqBase = pair.liquidity?.base, liqQuote = pair.liquidity?.quote;
-  if (!liqBase || !liqQuote) return null;
-  if (Math.abs(liqQuote / liqBase - priceNative) / priceNative > 0.05) return null;
-  const baseIsTarget = (pair.baseToken?.address || "").toLowerCase() === targetTokenAddress.toLowerCase();
-  const quotePriceUsd = basePriceUsd / priceNative;
-  return {
-    dexId: pair.dexId, pairAddress: pair.pairAddress,
-    reserveX: baseIsTarget ? liqBase : liqQuote, reserveY: baseIsTarget ? liqQuote : liqBase,
-    fee: DEFAULT_FEE_BPS / 10000, feeBps: DEFAULT_FEE_BPS, liquidityUsd: (pair.liquidity?.usd ?? null),
-    priceUsdPerY: baseIsTarget ? quotePriceUsd : basePriceUsd, reserveSource: "dexscreener",
-  };
-}
-
-function evaluatePools({ pools, symbol, chain, tokenA, tokenB, reserveSource }) {
-  if (pools.length < 2) return null;
-  const withPrice = pools.map((p) => ({ ...p, price: p.reserveY / p.reserveX }));
-  withPrice.sort((a, b) => a.price - b.price);
-  const cheapPool = withPrice[0], expensivePool = withPrice[withPrice.length - 1];
-  if (cheapPool.pairAddress === expensivePool.pairAddress) return null;
-  if (isKnownFalsePositive({ symbol, cheapDexId: cheapPool.dexId, expensiveDexId: expensivePool.dexId, chain })) return null;
-  if (!cheapPool.priceUsdPerY || !isFinite(cheapPool.priceUsdPerY) || cheapPool.priceUsdPerY <= 0) return null;
-
-  const result = dexEvaluateOpportunity({
-    cheapPool, expensivePool, gasCostUsd: getGasCostForChain(chain), maxTradeAmountUsd: MAX_TRADE_USD, slippageBuffer: 0.002,
-    pairLabel: `${symbol} on ${chain} (${cheapPool.dexId} -> ${expensivePool.dexId})`,
-  });
-  if (Math.abs(result.priceDiffPercent) > 20) return null;
-
-  // 手数料の壁: 往復の実測手数料 + Aave手数料0.05%。
-  // 価格差がこれを上回らなければ、投入額をどう調整しても構造的に黒字にならない。
-  const feeWallPercent = ((cheapPool.feeBps ?? 30) + (expensivePool.feeBps ?? 30) + 5) / 100;
-  const clearsFeeWall = Math.abs(result.priceDiffPercent) > feeWallPercent;
-
-  return {
-    ...result, chain, tokenA, tokenB, cheapDex: cheapPool.dexId, expensiveDex: expensivePool.dexId,
-    cheapPoolAddress: cheapPool.pairAddress, expensivePoolAddress: expensivePool.pairAddress,
-    cheapFeeBps: cheapPool.feeBps, expensiveFeeBps: expensivePool.feeBps,
-    feeWallPercent, clearsFeeWall,
-    cheapPoolLiquidityUsd: cheapPool.liquidityUsd, expensivePoolLiquidityUsd: expensivePool.liquidityUsd, reserveSource,
-  };
-}
-
-async function dexWatchOnePair(candidate) {
-  const rawPairs = await dexFetchPairsForToken(candidate.tokenA, candidate.chain, candidate.tokenB);
-  const prefiltered = rawPairs.map((p) => dexPrefilterPair(p, candidate.chain)).filter(Boolean);
-  if (prefiltered.length < 2) return null;
-
-  const normalizedChain = dexNormalizeChain(candidate.chain);
-  let pools = [], decimalsX, decimalsY;
-  if (isOnchainReadAvailable(normalizedChain)) {
-    try {
-      decimalsX = await fetchTokenDecimals(normalizedChain, candidate.tokenA);
-      decimalsY = await fetchTokenDecimals(normalizedChain, candidate.tokenB);
-    } catch (e) {
-      pools = prefiltered.map((p) => buildPoolFromDexScreener(p, candidate.tokenA)).filter(Boolean);
-    }
-    if (decimalsX !== undefined && decimalsY !== undefined) {
-      for (const p of prefiltered) {
-        const built = await buildPoolFromOnchain(p, candidate.tokenA, candidate.tokenB, normalizedChain, decimalsX, decimalsY);
-        if (built) pools.push(built);
-      }
-      if (pools.length >= 2) {
-        const isNew = recordVerifiedPair({
-          chain: normalizedChain, symbol: candidate.symbol, tokenA: candidate.tokenA, tokenB: candidate.tokenB,
-          decimalsX, decimalsY, priceUsdPerY: pools[0].priceUsdPerY,
-          pools: pools.map((p) => ({ address: p.pairAddress, dexId: p.dexId, feeBps: p.feeBps })),
-        });
-        if (isNew) updatePoolSubscriptions(normalizedChain, pools.map((p) => p.pairAddress));
-      }
-    }
-  } else {
-    pools = prefiltered.map((p) => buildPoolFromDexScreener(p, candidate.tokenA)).filter(Boolean);
-  }
-  return evaluatePools({ pools, symbol: candidate.symbol, chain: candidate.chain, tokenA: candidate.tokenA, tokenB: candidate.tokenB, reserveSource: pools[0]?.reserveSource || "dexscreener" });
-}
-
-// ===== 高速観測(2ステップ) =====
-const FAST_WATCH_INTERVAL_SEC = parseInt(process.env.FAST_WATCH_INTERVAL_SEC || "5", 10);
-let fastWatchRunning = false, fastWatchCount = 0, fastWatchLastAt = null;
-const executingPairs = new Set();
-const lastStatRecordAt = new Map();
-const STAT_DEDUP_MS = 3 * 60 * 1000;
-
-async function evaluateAndMaybeExecute(observed, source) {
-  if (!observed) return;
-  const key = `${observed.chain}::${observed.tokenA}::${observed.tokenB}`.toLowerCase();
-  const last = lastStatRecordAt.get(key) || 0;
-  if (Date.now() - last > STAT_DEDUP_MS) {
-    dexRecordStats(observed);
-    appendToLog(observed, { source });
-    lastStatRecordAt.set(key, Date.now());
-  }
-  if (!observed.profitable || executingPairs.has(key)) return;
-  executingPairs.add(key);
-  try {
-    console.log(`[${source}] ${observed.pairLabel}: 純利益 +$${observed.netProfit.toFixed(2)}(価格差${observed.priceDiffPercent.toFixed(2)}% 手数料の壁${observed.feeWallPercent?.toFixed(2)}% 投入$${observed.tradeAmountUsd.toFixed(2)}）`);
-    latestDexResults = [observed, ...latestDexResults.filter((r) => r.pairLabel !== observed.pairLabel)].slice(0, 30);
-    await maybeExecuteArb(observed);
-  } catch (e) { console.warn(`[実行判定] エラー:`, e.message); }
-  finally { executingPairs.delete(key); }
-}
-
-async function evaluateVerifiedPair(pair, source) {
-  let pools;
-  try { pools = await readVerifiedPairPools(pair); } catch (e) { return undefined; }
-  const readable = new Set(pools.map((p) => p.pairAddress.toLowerCase()));
-  for (const p of pair.pools) if (!readable.has(p.address.toLowerCase())) removePoolFromVerifiedPairs(pair.chain, p.address);
-  if (pools.length === 0) return undefined;
-  if (pools.length < 2 || !pair.priceUsdPerY) return null;
-
-  const feeByAddress = new Map(pair.pools.map((p) => [p.address.toLowerCase(), p.feeBps]));
-  const shaped = pools.map((p) => {
-    const feeBps = feeByAddress.get(p.pairAddress.toLowerCase()) ?? DEFAULT_FEE_BPS;
-    return { ...p, fee: feeBps / 10000, feeBps, liquidityUsd: null, priceUsdPerY: pair.priceUsdPerY, reserveSource: "onchain-fast" };
-  });
-  const observed = evaluatePools({ pools: shaped, symbol: pair.symbol, chain: pair.chain, tokenA: pair.tokenA, tokenB: pair.tokenB, reserveSource: "onchain-fast" });
-  await evaluateAndMaybeExecute(observed, source);
-  return observed;
-}
-
-async function fastWatchOnce() {
-  if (fastWatchRunning) return;
-  fastWatchRunning = true;
-  try {
-    for (const [chain, pairs] of Object.entries(getVerifiedPairsByChain())) {
-      if (shouldSkipChain(chain)) continue;
-      let anyFailed = false;
-      for (const pair of pairs) if ((await evaluateVerifiedPair(pair, "高速観測")) === undefined) anyFailed = true;
-      if (anyFailed) recordChainFailure(chain, "プール読み取りに失敗"); else recordChainSuccess(chain);
-    }
-    fastWatchCount++;
-    fastWatchLastAt = new Date().toISOString();
-  } catch (e) { console.error("[高速観測] エラー:", e.message); }
-  finally { fastWatchRunning = false; }
-}
-
-// ===== 三角裁定(A→B→C→A) =====
-const TRI_WATCH_INTERVAL_SEC = parseInt(process.env.TRI_WATCH_INTERVAL_SEC || "20", 10);
-let triWatchRunning = false, triWatchCount = 0, triRouteCount = 0, triProfitableCount = 0, triLastAt = null;
-
-async function triWatchOnce() {
-  if (triWatchRunning) return;
-  triWatchRunning = true;
-  try {
-    const triangles = findTriangles();
-    triRouteCount = triangles.length;
-    for (const route of triangles) {
-      if (shouldSkipChain(route.chain)) continue;
+async function discoverAllPools() {
+  for (const [chain, seeds] of Object.entries(SEED_POOLS)) {
+    if (!CHAIN_CONFIG[chain]) continue;
+    const seenFactories = new Set();
+    for (const seed of seeds) {
       try {
-        const evaluated = await evaluateTriangle(route, getGasCostForChain(route.chain));
-        if (evaluated && evaluated.profitable) {
-          triProfitableCount++;
-          console.log(`[三角裁定] ${evaluated.pairLabel}: 純利益 +$${evaluated.netProfitUsd.toFixed(4)}(投入$${evaluated.tradeAmountUsd.toFixed(2)}）`);
-          await maybeExecuteTriangle(evaluated);
-        }
-      } catch (e) { /* 個別の経路の失敗は無視して次へ */ }
+        const factory = await discoverFactory(chain, seed.address);
+        if (!factory || seenFactories.has(factory.toLowerCase())) continue;
+        seenFactories.add(factory.toLowerCase());
+        const pools = await discoverPoolsFromFactory(chain, factory, seed.dexId);
+        for (const p of pools) registerPool(p);
+      } catch (e) {
+        console.warn(`[プール発見] ${seed.dexId} on ${chain}: 失敗 ${e.message.slice(0, 70)}`);
+      }
     }
-    triWatchCount++;
-    triLastAt = new Date().toISOString();
-  } catch (e) { console.error("[三角裁定] エラー:", e.message); }
-  finally { triWatchRunning = false; }
-}
-
-let onchainReactionCount = 0, onchainLatencyLog = [];
-async function handleOnchainSync(chainName, poolAddress, reserve0, reserve1, receivedAt) {
-  const pair = findVerifiedPairByPool(chainName, poolAddress);
-  if (!pair) return;
-  try {
-    await evaluateVerifiedPair(pair, "Sync反応");
-    const latencyMs = Date.now() - receivedAt;
-    onchainReactionCount++;
-    onchainLatencyLog.push(latencyMs);
-    if (onchainLatencyLog.length > 200) onchainLatencyLog.shift();
-  } catch (e) { console.warn(`[Sync反応] 失敗:`, e.message); }
-}
-function getOnchainLatencyStats() {
-  if (onchainLatencyLog.length === 0) return null;
-  const sorted = [...onchainLatencyLog].sort((a, b) => a - b);
-  return { count: onchainReactionCount, medianMs: sorted[Math.floor(sorted.length / 2)], minMs: sorted[0], maxMs: sorted[sorted.length - 1] };
-}
-
-const DEX_PROSPECT_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
-let dexCachedCandidates = [], dexCandidateRotationOffset = 0, dexLastProspectAt = 0, dexProspectRefreshing = false;
-async function dexGetCandidates(topN) {
-  const now = Date.now();
-  if ((dexCachedCandidates.length === 0 || now - dexLastProspectAt > DEX_PROSPECT_REFRESH_INTERVAL_MS) && !dexProspectRefreshing) {
-    dexProspectRefreshing = true;
-    try {
-      const prospect = await runProspect({ topN: 150 });
-      dexCachedCandidates = prospect.topPairs; dexLastProspectAt = now; dexCandidateRotationOffset = 0;
-      console.log(`[DEX] 候補ペア再選定完了: ${dexCachedCandidates.length}件`);
-    } catch (e) { console.error("[DEX] 候補ペア選定に失敗:", e.message); }
-    finally { dexProspectRefreshing = false; }
   }
-  const total = dexCachedCandidates.length;
-  if (total === 0) return [];
-  const batchSize = Math.min(topN, total), start = dexCandidateRotationOffset % total, selected = [];
-  for (let i = 0; i < batchSize; i++) selected.push(dexCachedCandidates[(start + i) % total]);
-  dexCandidateRotationOffset = (start + batchSize) % total;
-  return selected;
+  const s = getStats();
+  console.log(`[プール地図] 構築完了: ${s.totalPools}プール / ${s.totalPairs}ペア / うち複数プールを持つペア${s.arbitragablePairs}件`);
+  console.log(`[プール地図] チェーン別: ${Object.entries(s.byChain).map(([c, n]) => `${c}:${n}`).join(" / ")}`);
 }
 
-async function runWatchCycle({ topN = 8 } = {}) {
-  const candidates = await dexGetCandidates(topN);
-  if (candidates.length === 0) return { checked: 0, logged: 0, results: [] };
-  const results = [];
-  for (const candidate of candidates) {
-    try {
-      const observed = await dexWatchOnePair(candidate);
-      if (observed) { results.push(observed); await evaluateAndMaybeExecute(observed, "定期観測"); }
-    } catch (e) { console.warn(`[DEX] 観測失敗 (${candidate.symbol} / ${candidate.chain}):`, e.message); }
+// ===== 借りる通貨の桁数と価格を用意する =====
+async function prepareBorrowableTokens() {
+  for (const chain of Object.keys(CHAIN_CONFIG)) {
+    for (const [address, info] of Object.entries(getBorrowableTokens(chain))) {
+      setTokenDecimals(chain, address, info.decimals);
+      // 安定通貨は$1固定。それ以外はネイティブ価格から推定する。
+      if (info.stable) {
+        setTokenPriceUsd(chain, address, 1);
+      } else if (info.priceHintUsd) {
+        setTokenPriceUsd(chain, address, info.priceHintUsd);
+      }
+    }
   }
-  const cleared = results.filter((r) => r.clearsFeeWall).length;
-  console.log(`[DEX] 定期観測完了: 対象${candidates.length}件・記録${results.length}件・手数料の壁超え${cleared}件・黒字${results.filter(r=>r.profitable).length}件 / 実行可能ペア${getVerifiedPairCount()}件・三角経路${triRouteCount}件`);
-  return { checked: candidates.length, logged: results.length, results };
+  // 非安定通貨(WETH等)の価格を、安定通貨との既存プールから実測する。
+  for (const chain of Object.keys(CHAIN_CONFIG)) {
+    for (const [address, info] of Object.entries(getBorrowableTokens(chain))) {
+      if (info.stable) continue;
+      const price = derivePriceFromPools(chain, address, info.decimals);
+      if (price) setTokenPriceUsd(chain, address, price);
+    }
+  }
+  const prices = [];
+  for (const chain of Object.keys(CHAIN_CONFIG)) {
+    for (const [address, info] of Object.entries(getBorrowableTokens(chain))) {
+      const p = getTokenPriceUsd(chain, address);
+      if (p) prices.push(`${chain}/${info.symbol}:$${p.toFixed(2)}`);
+    }
+  }
+  console.log(`[価格] ${prices.join(" ")}`);
 }
 
-const DEX_WATCH_INTERVAL_SEC = parseInt(process.env.DEX_WATCH_INTERVAL_SEC || "70", 10);
-let dexWatchRunning = false, dexWatchCount = 0, lastDexError = null, latestDexResults = [];
-async function dexWatchOnce() {
-  if (dexWatchRunning) return;
-  dexWatchRunning = true;
+/// 安定通貨と組んだプールの準備量比から、そのトークンのUSD価格を求める。
+function derivePriceFromPools(chain, token, decimals) {
+  const borrowables = getBorrowableTokens(chain);
+  let best = null, bestLiquidity = 0n;
+  for (const pool of getPoolsForToken(chain, token)) {
+    const other = pool.token0 === token.toLowerCase() ? pool.token1 : pool.token0;
+    const otherInfo = borrowables[other];
+    if (!otherInfo || !otherInfo.stable) continue;
+    const isToken0 = pool.token0 === token.toLowerCase();
+    const reserveToken = isToken0 ? pool.raw0 : pool.raw1;
+    const reserveStable = isToken0 ? pool.raw1 : pool.raw0;
+    if (reserveToken <= 0n || reserveStable <= 0n) continue;
+    if (reserveStable > bestLiquidity) {
+      bestLiquidity = reserveStable;
+      const tokenAmount = Number(reserveToken) / Math.pow(10, decimals);
+      const stableAmount = Number(reserveStable) / Math.pow(10, otherInfo.decimals);
+      if (tokenAmount > 0) best = stableAmount / tokenAmount;
+    }
+  }
+  return best && isFinite(best) && best > 0 ? best : null;
+}
+
+// ===== 手数料の実測(バックグラウンドで少しずつ) =====
+let feeProbeQueue = [];
+async function probeFeesGradually() {
+  if (feeProbeQueue.length === 0) {
+    const byChain = getAllPoolAddressesByChain();
+    for (const [chain, addresses] of Object.entries(byChain)) {
+      for (const address of addresses) {
+        const pool = getPool(chain, address);
+        if (pool && pool.feeBps === 30 && !pool.feeProbed) feeProbeQueue.push({ chain, address });
+      }
+    }
+  }
+  // 1回につき少数だけ処理し、RPCを圧迫しない。
+  const batch = feeProbeQueue.splice(0, 5);
+  for (const { chain, address } of batch) {
+    const pool = getPool(chain, address);
+    if (!pool) continue;
+    pool.feeProbed = true;
+    try {
+      const fee = await probePoolFeeBps({
+        chain, pairAddress: address, tokenInAddress: pool.token0,
+        reserveIn: pool.raw0, reserveOut: pool.raw1,
+      });
+      if (fee != null && fee !== 30) setPoolFee(chain, address, fee);
+    } catch (e) {}
+  }
+}
+
+// ===== 機会が見つかった時の処理 =====
+const executing = new Set();
+async function handleOpportunity(opp) {
+  recordOpportunity(opp);
+  if (!opp.profitable || opp.netProfitUsd < MIN_PROFIT_USD) return;
+
+  const key = opp.poolAddresses.join("|").toLowerCase();
+  if (executing.has(key)) return;
+  executing.add(key);
   try {
-    const result = await runWatchCycle({ topN: 8 });
-    for (const r of result.results) if (!latestDexResults.some((x) => x.pairLabel === r.pairLabel)) latestDexResults = [r, ...latestDexResults].slice(0, 30);
-    dexWatchCount++;
-  } catch (e) { lastDexError = e.message; console.error("DEX観測エラー:", e.message); }
-  finally { dexWatchRunning = false; }
+    console.log(`[機会] ${opp.kind} ${opp.chain} ${opp.label}: 純利益+$${opp.netProfitUsd.toFixed(4)}(投入$${opp.tradeAmountUsd.toFixed(2)} 手数料の壁${opp.feeWallPercent.toFixed(2)}%)`);
+    const ok = await executeOpportunity(opp);
+    if (ok) stats.executed++;
+  } catch (e) {
+    console.warn(`[実行] エラー: ${e.message.slice(0, 120)}`);
+  } finally {
+    executing.delete(key);
+  }
 }
 
-const PAGE_STYLE = `
-body{font-family:-apple-system,sans-serif;background:#0d100c;color:#e8e6d8;margin:0;padding:18px 12px;}
-h1{font-size:17px;margin:0 0 4px;} h2{font-size:13px;margin:0 0 10px;font-weight:600;}
-.sub{color:#888;font-size:11px;margin-bottom:16px;}
-.card{background:#14180f;border:1px solid #2a331d;border-radius:8px;padding:13px;margin-bottom:13px;}
-.card.real{border-color:#2ecc71;}
-table{width:100%;border-collapse:collapse;font-size:11px;}
-th{text-align:left;color:#888;font-weight:500;font-size:9.5px;padding:5px 3px;border-bottom:1px solid #2a331d;}
-td{padding:6px 3px;border-bottom:1px solid #1c1c1c;}
-.note{font-size:10px;color:#888;line-height:1.6;margin-top:9px;padding-top:9px;border-top:1px solid #222;}
-.stat{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:13px;}
-.stat div{background:#14180f;border:1px solid #2a331d;border-radius:8px;padding:11px 4px;text-align:center;}
-.stat .v{font-size:17px;font-weight:600;} .stat .l{font-size:8.5px;color:#888;margin-top:2px;}
-.badge{font-size:8px;padding:1px 4px;border-radius:3px;background:#2a331d;color:#6fae62;}
-a{color:#6fae62;} .footerlink{margin-top:18px;font-size:11px;}
-`;
-function renderRealExecutionSection() {
-  const real = getRealExecutionStats(), isLive = process.env.DRY_RUN === "false";
-  const rows = real.recent.map((e) => `<tr><td>${new Date(e.timestamp).toLocaleString('ja-JP')}</td><td style="font-size:9px;">${e.pairLabel}</td>
-    <td style="text-align:right;">$${e.tradeAmountUsd.toFixed(2)}</td><td style="text-align:right;color:#2ecc71;font-weight:600;">${e.actualProfitUsd != null ? `${e.actualProfitUsd >= 0 ? '+' : ''}$${e.actualProfitUsd.toFixed(4)}` : '取得できず'}</td>
-    <td><a href="${e.explorerUrl}" target="_blank">確認</a></td></tr>`).join('') || `<tr><td colspan="5" style="color:#888;">まだ実際の取引はありません</td></tr>`;
-  return `<div class="card real"><h2>💰 実際の取引結果(本物のお金)</h2>
-    <div class="stat"><div><div class="v">${real.count}</div><div class="l">実行回数</div></div>
-      <div><div class="v" style="color:${real.totalProfitUsd>=0?'#2ecc71':'#e74c3c'};">${real.totalProfitUsd>=0?'+':''}$${real.totalProfitUsd.toFixed(4)}</div><div class="l">実際の累積利益</div></div>
-      <div><div class="v">$${getCurrentTradeCapUsd()}</div><div class="l">現在の取引上限</div></div>
-      <div><div class="v" style="color:${isLive?'#2ecc71':'#888'};">${isLive ? '稼働中' : '停止中'}</div><div class="l">自動売買</div></div></div>
-    <table><thead><tr><th>日時</th><th>ペア</th><th style="text-align:right;">投入額</th><th style="text-align:right;">実際の利益</th><th></th></tr></thead><tbody>${rows}</tbody></table>
-    <div class="note"><strong>これが本当のお金の結果です。</strong>取引上限は成功実績(${getSuccessCount()}回)に応じて自動的に上がります。</div></div>`;
+// ===== Syncイベント受信(最速経路) =====
+async function handleSync(chain, poolAddress, reserve0, reserve1, receivedAt) {
+  stats.syncEvents++;
+  const pool = updateReservesFromSync(chain, poolAddress, reserve0, reserve1);
+  if (!pool) return;
+  try {
+    const opp = scanForChangedPool({
+      chain, poolAddress, capUsd: getCurrentTradeCapUsd(),
+      gasCostUsd: getGasCost(chain), isBorrowable,
+    });
+    const latency = Date.now() - receivedAt;
+    stats.latencies.push(latency);
+    if (stats.latencies.length > 200) stats.latencies.shift();
+    if (opp) await handleOpportunity(opp);
+  } catch (e) {}
 }
-function renderTriangleSection() {
-  return `<div class="card"><h2>🔺 三角裁定(A→B→C→A)</h2>
-    <div class="stat"><div><div class="v">${triRouteCount}</div><div class="l">探索中の経路</div></div><div><div class="v">${TRI_WATCH_INTERVAL_SEC}秒</div><div class="l">観測間隔</div></div>
-      <div><div class="v">${triWatchCount}</div><div class="l">観測回数</div></div><div><div class="v" style="color:${triProfitableCount>0?'#2ecc71':'#888'};">${triProfitableCount}</div><div class="l">黒字検出</div></div></div>
-    <div class="note">1つのDEX内で3つのトークンを巡回し、相対価格の歪みを取ります。経路は実行可能ペアから自動的に組み立てられ、ペアが増えるほど急激に増えます。</div></div>`;
+
+// ===== 全件スキャン(Sync購読が無いチェーンの補助) =====
+let fullScanRunning = false;
+async function fullScanOnce() {
+  if (fullScanRunning) return;
+  fullScanRunning = true;
+  try {
+    for (const chain of Object.keys(CHAIN_CONFIG)) {
+      const opportunities = scanAllPairs({
+        chain, capUsd: getCurrentTradeCapUsd(),
+        gasCostUsd: getGasCost(chain), isBorrowable,
+      });
+      for (const opp of opportunities.slice(0, 3)) await handleOpportunity(opp);
+    }
+    stats.scans++;
+  } catch (e) {
+    console.error(`[全件スキャン] エラー: ${e.message.slice(0, 100)}`);
+  } finally {
+    fullScanRunning = false;
+  }
 }
-function renderFastWatchSection() {
-  const pairs = getVerifiedPairs(), throttle = getThrottleStatus(), gas = getGasCostStatus();
-  const byChain = {};
-  for (const p of pairs) byChain[p.chain] = (byChain[p.chain] || 0) + 1;
-  const chainList = Object.entries(byChain).map(([c, n]) => { const t = throttle[c]; return `${c}:${n}${t && t.pausedForSec > 0 ? `<span style="color:#e74c3c;">(${t.pausedForSec}秒休止)</span>` : ''}`; }).join(' / ') || 'なし';
-  const gasList = Object.entries(gas).map(([c, g]) => `${c}: $${g.costUsd}`).join(' / ') || '取得中';
-  // 手数料が低いプールを持つペアを先に表示する(狙い目のため)。
-  const sorted = [...pairs].sort((a, b) => {
-    const minA = Math.min(...a.pools.map((x) => x.feeBps ?? 30));
-    const minB = Math.min(...b.pools.map((x) => x.feeBps ?? 30));
-    return minA - minB;
-  });
-  const rows = sorted.slice(0, 30).map((p) => {
-    const fees = p.pools.map((x) => x.feeBps ?? 30);
-    const wall = ((Math.min(...fees) + fees.sort((a,b)=>a-b)[1] + 5) / 100).toFixed(2);
-    return `<tr><td style="font-size:9px;">${p.symbol}</td><td>${p.chain}</td>
-    <td style="font-size:9px;">${p.pools.map((x) => `${x.dexId}(${x.feeBps ?? 30})`).join(', ')}</td>
-    <td style="text-align:right;color:${parseFloat(wall) < 0.3 ? '#2ecc71' : '#888'};">${wall}%</td></tr>`;
-  }).join('') || `<tr><td colspan="4" style="color:#888;">まだ登録されていません</td></tr>`;
-  return `<div class="card"><h2>⚡ 高速観測(2ステップ裁定)</h2>
-    <div class="stat"><div><div class="v">${pairs.length}</div><div class="l">実行可能ペア</div></div><div><div class="v">${FAST_WATCH_INTERVAL_SEC}秒</div><div class="l">観測間隔</div></div>
-      <div><div class="v">${fastWatchCount}</div><div class="l">観測回数</div></div><div><div class="v">${fastWatchLastAt ? new Date(fastWatchLastAt).toLocaleTimeString('ja-JP') : '-'}</div><div class="l">最終観測</div></div></div>
-    <table><thead><tr><th>ペア</th><th>チェーン</th><th>DEX(手数料bps)</th><th style="text-align:right;">必要価格差</th></tr></thead><tbody>${rows}</tbody></table>
-    <div class="note"><strong>「必要価格差」がこのペアで黒字になる最低ライン</strong>です(往復手数料+Aave0.05%)。手数料の低いペアほど上に表示しています。<br>内訳: ${chainList}<br>実測ガス代: ${gasList}</div></div>`;
+
+// ===== 古くなった準備量の読み直し =====
+async function refreshStaleReserves() {
+  for (const chain of Object.keys(CHAIN_CONFIG)) {
+    const stale = getStalePools(chain, REFRESH_STALE_SEC * 1000).slice(0, 200);
+    if (stale.length === 0) continue;
+    try {
+      const batch = await fetchReservesBatch(chain, stale.map((p) => ({ address: p.address })));
+      for (const pool of stale) {
+        const r = batch.get(pool.address.toLowerCase());
+        if (r) updateReservesFromSync(chain, pool.address, r.raw0, r.raw1);
+      }
+    } catch (e) {}
+  }
 }
+
+// ===== ダッシュボード =====
+const STYLE = `body{font-family:-apple-system,sans-serif;background:#0d100c;color:#e8e6d8;margin:0;padding:18px 12px}
+h1{font-size:17px;margin:0 0 4px}h2{font-size:13px;margin:0 0 10px;font-weight:600}
+.sub{color:#888;font-size:11px;margin-bottom:16px}
+.card{background:#14180f;border:1px solid #2a331d;border-radius:8px;padding:13px;margin-bottom:13px}
+.card.real{border-color:#2ecc71}
+table{width:100%;border-collapse:collapse;font-size:11px}
+th{text-align:left;color:#888;font-weight:500;font-size:9.5px;padding:5px 3px;border-bottom:1px solid #2a331d}
+td{padding:6px 3px;border-bottom:1px solid #1c1c1c}
+.note{font-size:10px;color:#888;line-height:1.6;margin-top:9px;padding-top:9px;border-top:1px solid #222}
+.stat{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:13px}
+.stat div{background:#14180f;border:1px solid #2a331d;border-radius:8px;padding:11px 4px;text-align:center}
+.stat .v{font-size:17px;font-weight:600}.stat .l{font-size:8.5px;color:#888;margin-top:2px}
+a{color:#6fae62}.footerlink{margin-top:18px;font-size:11px}`;
+
 function renderPage() {
-  const dexStats = dexLoadStats(), lat = getOnchainLatencyStats();
-  const dexRows = latestDexResults.slice(0, 15).map((r, i) => `<tr><td>${i+1}</td><td style="font-size:9px;">${r.pairLabel}</td>
-    <td style="text-align:right;">${r.priceDiffPercent.toFixed(2)}%</td>
-    <td style="text-align:right;color:${r.clearsFeeWall?'#2ecc71':'#888'};">${r.feeWallPercent?.toFixed(2) ?? '?'}%</td>
-    <td style="text-align:right;color:${r.profitable?'#2ecc71':'#888'};font-weight:600;">${r.netProfit>=0?'+':''}$${r.netProfit.toFixed(2)}</td></tr>`).join("") || `<tr><td colspan="5" style="color:#888;">観測データがまだありません</td></tr>`;
-  return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="refresh" content="30">
-<title>DEXアービトラージ観測所</title><style>${PAGE_STYLE}</style></head><body>
-<h1>🔍 DEXアービトラージ観測所</h1><div class="sub">定期観測${dexWatchCount}回 / 高速観測${fastWatchCount}回 / 三角裁定${triWatchCount}回</div>
-${renderRealExecutionSection()}${renderTriangleSection()}${renderFastWatchSection()}
-<div class="card"><h2>🔍 観測データ(紙上シミュレーション)</h2>
-  <div class="stat"><div><div class="v">${dexStats.totalObserved}</div><div class="l">記録件数</div></div>
-    <div><div class="v" style="color:${(dexStats.feeWallClearedCount||0)>0?'#2ecc71':'#888'};">${dexStats.feeWallClearedCount||0}</div><div class="l">手数料の壁を超えた件数</div></div>
-    <div><div class="v" style="color:${dexStats.totalProfitableCount>0?'#2ecc71':'#888'};">${dexStats.totalProfitableCount}</div><div class="l">黒字だった件数</div></div>
-    <div><div class="v" style="color:#2ecc71;">+$${(dexStats.cumulativeProfit||0).toFixed(2)}</div><div class="l">理論上の累積利益</div></div></div>
-  <table><thead><tr><th>#</th><th>ペア</th><th style="text-align:right;">価格差</th><th style="text-align:right;">必要ライン</th><th style="text-align:right;">純利益</th></tr></thead><tbody>${dexRows}</tbody></table>
-  <div class="note"><strong>「必要ライン」を価格差が超えていなければ、構造的に黒字になりません。</strong>これが今まで一度も実際の利益が出なかった根本原因です。手数料の低いプール(安定通貨ペアなど)を優先的に探すよう変更しました。<br>
-  <a href="/reset-stats">→ 統計をリセットする</a>(誤った前提で積み上がった過去の記録を消し、正しい条件で測り直す)${lastDexError ? `<br><span style="color:#e74c3c;">エラー: ${lastDexError}</span>` : ''}</div></div>
-${lat ? `<div class="card"><h2>⚡ Sync反応速度</h2><div class="stat"><div><div class="v">${lat.count}</div><div class="l">反応回数</div></div><div><div class="v">${lat.medianMs}ms</div><div class="l">中央値</div></div><div><div class="v">${lat.minMs}ms</div><div class="l">最速</div></div><div><div class="v">${lat.maxMs}ms</div><div class="l">最遅</div></div></div></div>` : ''}
-<div class="footerlink"><a href="/about">→ このサイトが集めているデータについて</a></div></body></html>`;
+  const s = getStats();
+  const real = getRealExecutionStats();
+  const isLive = process.env.DRY_RUN === "false";
+  const lat = stats.latencies.length ? [...stats.latencies].sort((a, b) => a - b)[Math.floor(stats.latencies.length / 2)] : null;
+
+  const realRows = real.recent.map((e) => `<tr><td>${new Date(e.timestamp).toLocaleString('ja-JP')}</td><td style="font-size:9px">${e.pairLabel}</td>
+    <td style="text-align:right">$${e.tradeAmountUsd.toFixed(2)}</td>
+    <td style="text-align:right;color:#2ecc71;font-weight:600">${e.actualProfitUsd != null ? `+$${e.actualProfitUsd.toFixed(4)}` : '-'}</td>
+    <td><a href="${e.explorerUrl}" target="_blank">確認</a></td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ実際の取引はありません</td></tr>`;
+
+  const oppRows = stats.recent.slice(0, 15).map((o, i) => `<tr><td>${i+1}</td>
+    <td style="font-size:9px">${o.kind} ${o.chain}<br>${o.label}</td>
+    <td style="text-align:right">${o.feeWallPercent.toFixed(2)}%</td>
+    <td style="text-align:right">$${o.tradeAmountUsd.toFixed(0)}</td>
+    <td style="text-align:right;color:${o.profitable?'#2ecc71':'#888'};font-weight:600">${o.netProfitUsd>=0?'+':''}$${o.netProfitUsd.toFixed(4)}</td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ機会が見つかっていません</td></tr>`;
+
+  return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="refresh" content="20">
+<title>DEXアービトラージ</title><style>${STYLE}</style></head><body>
+<h1>🔍 DEXアービトラージ</h1><div class="sub">イベント駆動型 / Sync受信${stats.syncEvents}回 / 全件スキャン${stats.scans}回</div>
+
+<div class="card real"><h2>💰 実際の取引結果</h2>
+<div class="stat"><div><div class="v">${real.count}</div><div class="l">実行回数</div></div>
+<div><div class="v" style="color:#2ecc71">+$${real.totalProfitUsd.toFixed(4)}</div><div class="l">累積利益</div></div>
+<div><div class="v">$${getCurrentTradeCapUsd()}</div><div class="l">取引上限</div></div>
+<div><div class="v" style="color:${isLive?'#2ecc71':'#888'}">${isLive?'稼働中':'停止中'}</div><div class="l">自動売買</div></div></div>
+<table><thead><tr><th>日時</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table></div>
+
+<div class="card"><h2>🗺️ プール地図(メモリ上)</h2>
+<div class="stat"><div><div class="v">${s.totalPools}</div><div class="l">監視中プール</div></div>
+<div><div class="v">${s.arbitragablePairs}</div><div class="l">複数プールを持つペア</div></div>
+<div><div class="v">${s.totalTokens}</div><div class="l">トークン数</div></div>
+<div><div class="v">${lat != null ? lat + 'ms' : '-'}</div><div class="l">判定時間(中央値)</div></div></div>
+<div class="note">ファクトリーから直接列挙した全プールをメモリ上に保持し、Syncイベントで差分更新しています。判定はRPCを使わずメモリ上で完結するため、ミリ秒で完了します。<br>
+チェーン別: ${Object.entries(s.byChain).map(([c, n]) => `${c}:${n}`).join(' / ') || '構築中'}</div></div>
+
+<div class="card"><h2>🎯 検出した機会</h2>
+<div class="stat"><div><div class="v" style="color:${stats.opportunitiesFound>0?'#2ecc71':'#888'}">${stats.opportunitiesFound}</div><div class="l">検出数</div></div>
+<div><div class="v">${stats.executed}</div><div class="l">実行数</div></div>
+<div><div class="v">$${MIN_PROFIT_USD}</div><div class="l">最低利益</div></div>
+<div><div class="v">${stats.lastOpportunity ? new Date(stats.lastOpportunity).toLocaleTimeString('ja-JP') : '-'}</div><div class="l">最終検出</div></div></div>
+<table><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table>
+<div class="note">「壁」は、その経路で黒字になる最低ラインの価格差(往復手数料+Aave0.05%)です。純利益は実測ガス代を差し引いた後の値です。</div></div>
+
+<div class="footerlink"><a href="/about">→ 仕組みについて</a></div></body></html>`;
 }
-function renderAboutPage() {
-  return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>収集データについて</title><style>${PAGE_STYLE}</style></head><body>
-<h1>📊 このサイトが集めているデータ</h1>
-<div class="card"><h2>① 手数料の壁という考え方</h2><div class="note">裁定が成立する条件は「価格差 > 往復の手数料 + Aave手数料0.05%」です。手数料0.3%のDEX同士なら0.65%以上の価格差が必要ですが、実測ではほとんどの価格差が0.5%未満でした。<br>
-一方、安定通貨ペアなどで使われる低手数料プール(0.01〜0.05%)なら必要ラインは0.15%程度まで下がり、実際に観測されている価格差で黒字になります。この発見を受けて、低手数料プールを優先的に探す設計に変更しました。</div></div>
-<div class="card"><h2>② 発掘(定期観測)</h2><div class="note">DeFiLlamaから候補を選びます。価格が連動するペア(安定通貨同士、ETH系同士など)は低手数料プールが使われるため、流動性が大きくても除外せず優遇します。</div></div>
-<div class="card"><h2>③ 2ステップ裁定(${FAST_WATCH_INTERVAL_SEC}秒ごと)</h2><div class="note">同じペアの複数プール間の価格差を取ります。手数料はプール自身から逆算した実測値を使います。</div></div>
-<div class="card"><h2>④ 三角裁定(${TRI_WATCH_INTERVAL_SEC}秒ごと)</h2><div class="note">A→B→C→Aと巡回し、トークン間の相対価格の歪みを取ります。</div></div>
-<div class="card"><h2>⑤ 実行の安全性</h2><div class="note">ルーターを経由せずプールを直接呼びます。Aaveのフラッシュローンを使うため、利益が出なければ取引全体が自動的に無効化されます(実害はガス代のみ)。</div></div>
-<div class="footerlink"><a href="/">← 観測所トップに戻る</a></div></body></html>`;
+
+function renderAbout() {
+  return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>仕組み</title><style>${STYLE}</style></head><body>
+<h1>📊 仕組み</h1>
+<div class="card"><h2>① プール地図の構築(起動時)</h2><div class="note">実在が確認できているプールに factory() を呼んでファクトリーアドレスを逆算し、そこから allPairs() で全プールを列挙します。推測でアドレスを置かないため、間違いが起きません。数千プールをMulticallで一括取得し、メモリ上に保持します。</div></div>
+<div class="card"><h2>② 差分更新(常時)</h2><div class="note">取引が起きるとSyncイベントが届き、そのプールの準備量だけをメモリ上で更新します。RPCへの問い合わせは不要です。</div></div>
+<div class="card"><h2>③ 即時判定</h2><div class="note">変化したプールを含む経路(2ステップ・三角の両方)だけを再計算します。全てメモリ上の計算なので、ミリ秒で完了します。</div></div>
+<div class="card"><h2>④ 実行</h2><div class="note">送信直前にプール自身へ受取量を問い合わせて確定させ、Aaveのフラッシュローンで実行します。利益が出なければ取引全体が無効化されます(実害はガス代のみ)。</div></div>
+<div class="footerlink"><a href="/">← 戻る</a></div></body></html>`;
 }
+
 function startServer() {
   const port = process.env.PORT || 8080;
   http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    // 統計のリセット。誤った前提(手数料・ガス代の誤設定)で積み上がった
-    // 過去の記録を消し、修正後の正しい条件だけで測り直すために使う。
-    if (req.url === "/reset-stats") {
-      try {
-        dexSaveStats({ totalObserved: 0, totalProfitableCount: 0, cumulativeProfit: 0, onchainVerifiedCount: 0, onchainVerifiedProfit: 0, feeWallClearedCount: 0 });
-        dexSaveLog([]);
-        latestDexResults = [];
-        console.log("[統計] リセットしました(過去の誤った前提での記録を破棄)");
-        res.end("<html><body style='font-family:sans-serif;padding:20px;background:#0d100c;color:#e8e6d8;'><h2>統計をリセットしました</h2><p>修正後の正しい条件で測り直します。</p><a href='/' style='color:#6fae62;'>← 観測所に戻る</a></body></html>");
-      } catch (e) {
-        res.end("リセットに失敗しました: " + e.message);
-      }
-      return;
-    }
-    res.end(req.url === "/about" ? renderAboutPage() : renderPage());
-  }).listen(port, () => console.log(`観測所ページ: ポート${port}`));
+    res.end(req.url === "/about" ? renderAbout() : renderPage());
+  }).listen(port, () => console.log(`ダッシュボード: ポート${port}`));
 }
 
 async function main() {
-  console.log("=== DEXアービトラージ観測所 起動 ===");
+  console.log("=== DEXアービトラージ(イベント駆動型) 起動 ===");
   startServer();
-  if (process.env.RUN_TESTNET_DEPLOY_CHECK === "true") { try { await runTestnetDeployCheck(); } catch (e) { console.error("[テストネット検証] 失敗:", e.message); } }
-  const deployTarget = process.env.RUN_MAINNET_DEPLOY;
-  if (deployTarget && deployTarget !== "false") { try { await runMainnetDeploy(deployTarget); } catch (e) { console.error("[本番デプロイ] 失敗:", e.message); } }
 
-  pruneInvalidVerifiedPairs();
-  startOnchainFeeds(handleOnchainSync);
-  for (const [chain, pairs] of Object.entries(getVerifiedPairsByChain())) updatePoolSubscriptions(chain, pairs.flatMap((p) => p.pools.map((x) => x.address)));
+  const deployTarget = process.env.RUN_MAINNET_DEPLOY;
+  if (deployTarget && deployTarget !== "false") {
+    try { await runMainnetDeploy(deployTarget); } catch (e) { console.error("[本番デプロイ] 失敗:", e.message); }
+  }
 
   await refreshGasCosts();
   setInterval(refreshGasCosts, 5 * 60 * 1000);
-  console.log(`[起動] 実行可能ペア${getVerifiedPairCount()}件 / 高速観測${FAST_WATCH_INTERVAL_SEC}秒 / 三角裁定${TRI_WATCH_INTERVAL_SEC}秒 / 取引上限$${getCurrentTradeCapUsd()}`);
 
-  dexWatchOnce();
-  setInterval(dexWatchOnce, DEX_WATCH_INTERVAL_SEC * 1000);
-  setTimeout(fastWatchOnce, 5000);
-  setInterval(fastWatchOnce, FAST_WATCH_INTERVAL_SEC * 1000);
-  setTimeout(triWatchOnce, 15000);
-  setInterval(triWatchOnce, TRI_WATCH_INTERVAL_SEC * 1000);
+  console.log("[起動] プール地図を構築中(数分かかります)...");
+  await discoverAllPools();
+  await prepareBorrowableTokens();
+
+  // 全プールのSyncを購読する。
+  startOnchainFeeds(handleSync);
+  for (const [chain, addresses] of Object.entries(getAllPoolAddressesByChain())) {
+    updatePoolSubscriptions(chain, addresses);
+  }
+
+  setInterval(probeFeesGradually, 3000);
+  setInterval(refreshStaleReserves, REFRESH_STALE_SEC * 1000);
+  setTimeout(fullScanOnce, 5000);
+  setInterval(fullScanOnce, FULL_SCAN_INTERVAL_SEC * 1000);
+
+  console.log(`[起動] 準備完了 / 取引上限$${getCurrentTradeCapUsd()} / 最低利益$${MIN_PROFIT_USD}`);
 }
+
 main().catch((e) => { console.error("致命的エラー:", e); process.exit(1); });
