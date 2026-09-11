@@ -1,23 +1,21 @@
 // scripts/trade-cap.js
 //
-// フラッシュローンなので「借りる金額自体」にリスクは無い(返せなければ
-// 自動的に無かったことになるため)。本当のリスクは「まだ実績のない
-// ロジックが、いきなり大きな金額で本番実行されること」なので、
 // 実際に成功した実行回数に応じて、段階的に上限を引き上げる。
 //
-// 観測(紙上シミュレーション)側の上限($2,000)はこの対象外。
-// ここで絞るのは、実際にオンチェーンへ送信する金額のみ。
+// フラッシュローンなので「借りる金額自体」にリスクは無い(返せなければ
+// 自動的に無かったことになり、実害はガス代のみ)。一方でアービトラージの
+// 利益は投入額にほぼ比例するため、上限を小さくしすぎると利益が手数料に
+// 埋もれ、「実績を作るための実行」自体が起きなくなる。
+// 初期上限$50でこれが実際に起きたため、$500から始める。
 
 import fs from "fs";
 
 const SUCCESS_COUNT_FILE = process.env.SUCCESS_COUNT_FILE || "/tmp/execution-success-count.json";
 
 const CAP_STAGES = [
-  { minSuccesses: 0, maxTradeUsd: 50 },
-  { minSuccesses: 3, maxTradeUsd: 200 },
-  { minSuccesses: 8, maxTradeUsd: 500 },
-  { minSuccesses: 15, maxTradeUsd: 1000 },
-  { minSuccesses: 25, maxTradeUsd: 2000 },
+  { minSuccesses: 0, maxTradeUsd: 500 },
+  { minSuccesses: 3, maxTradeUsd: 1000 },
+  { minSuccesses: 8, maxTradeUsd: 2000 },
 ];
 
 function loadSuccessCount() {
