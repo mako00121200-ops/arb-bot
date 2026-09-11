@@ -28,15 +28,19 @@ const EXCLUDED_CHAINS = new Set(["ethereum"]);
 const TARGET_MIN_TVL_USD = 30_000;
 const TARGET_MAX_TVL_USD = 3_000_000;
 
-// チェーンごとの有利さ。Solidly系(Aerodrome/Velodrome)は実測手数料が
-// 約1%で、往復2%+αの価格差が必要になり現実的に勝てない。
-// Polygonは主要DEXが全て0.3%で、最も現実的な狩場。
+// ガス代の実測値(2026年9月時点、フラッシュローン1回あたり)と、
+// 各チェーンの主要DEXの実測手数料を反映した優先度:
+//   avalanche $0.0012 … 桁違いに安い。TraderJoe/Uniswapとも0.3%。最優先。
+//   arbitrum  $0.0300 … Uniswap/SushiSwapとも0.3%で有利。
+//   polygon   $0.0351 … ガス代は最も高いが、DEXの数が多く機会も多い。
+//   optimism  $0.0100 … Velodromeの手数料が実測約1%で不利。
+//   base      $0.0242 … Aerodromeの手数料が実測99bps(約1%)で最も不利。
 const CHAIN_PREFERENCE = {
-  polygon: 1.6,
-  arbitrum: 1.2,
-  avalanche: 1.1,
-  base: 0.8,
-  optimism: 0.8,
+  avalanche: 2.0,
+  arbitrum: 1.4,
+  polygon: 1.3,
+  optimism: 0.7,
+  base: 0.6,
 };
 
 async function fetchWithTimeout(url, timeoutMs = PROSPECTOR_FETCH_TIMEOUT_MS) {
@@ -156,8 +160,7 @@ export function scoreOpportunity(a) {
   const tvl = Math.max(a.minTvl, 1);
   if (tvl > TARGET_MAX_TVL_USD) return 0;
   const idealTvl = 300_000;
-  const tvlRatio = tvl / idealTvl;
-  const sizeScore = 1 / (1 + Math.abs(Math.log10(tvlRatio)));
+  const sizeScore = 1 / (1 + Math.abs(Math.log10(tvl / idealTvl)));
 
   // ③取引が静かなほど、価格差が埋められずに残りやすい。
   const quietScore = a.turnover > 0 ? 1 / (1 + a.turnover * 3) : 1;
@@ -165,7 +168,7 @@ export function scoreOpportunity(a) {
   // ④実行できるDEXの組み合わせが多いほど、機会も増える。
   const venueScore = Math.min(a.confirmedVenueCount, 4) / 2;
 
-  // ⑤手数料が低いチェーンを優先(Solidly系1%のBase/Optimismは不利)。
+  // ⑤ガス代と手数料の実測値を反映したチェーン優先度。
   const chainScore = CHAIN_PREFERENCE[(a.chain || "").toLowerCase()] ?? 1.0;
 
   return sizeScore * quietScore * venueScore * chainScore;
@@ -179,13 +182,16 @@ export async function runProspect({ minTvlUSD = TARGET_MIN_TVL_USD, topN = 150 }
   console.log(`[Prospector] 候補${arbitragable.length}件のうち、ルーター確認済みDEXが2つ以上あるのは${executable.length}件(Ethereum除外${excludedChainCount}件)`);
 
   const chainSummary = summarizeByChain(arbitragable);
-  const top3 = chainSummary.slice(0, 3).map((c) => `${c.chain}:${c.executableCount}件`).join(" / ");
-  console.log(`[Prospector] 実行可能な候補が多いチェーン: ${top3}`);
+  console.log(`[Prospector] 実行可能な候補が多いチェーン: ${chainSummary.slice(0, 4).map((c) => `${c.chain}:${c.executableCount}件`).join(" / ")}`);
 
   const scored = arbitragable
     .map((a) => ({ ...a, score: scoreOpportunity(a) }))
     .filter((a) => a.score > 0)
     .sort((x, y) => y.score - x.score);
+
+  const topChains = {};
+  for (const a of scored.slice(0, topN)) topChains[a.chain] = (topChains[a.chain] || 0) + 1;
+  console.log(`[Prospector] 選定した${Math.min(scored.length, topN)}件の内訳: ${Object.entries(topChains).map(([c, n]) => `${c}:${n}`).join(" / ")}`);
 
   return {
     scannedAt: new Date().toISOString(),
