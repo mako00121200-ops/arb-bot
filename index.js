@@ -110,8 +110,6 @@ function isDeadPool(pair) {
   return volume24h < DEAD_POOL_MIN_VOLUME_USD || txns24h < DEAD_POOL_MIN_TXNS_24H;
 }
 function isKnownFalsePositive({ symbol, cheapDexId, expensiveDexId, chain }) {
-  const upperSymbol = (symbol || "").toUpperCase();
-  if (upperSymbol.includes("USDBC") || upperSymbol.includes("USDC.E") || upperSymbol.includes("USDCE")) return true;
   if (cheapDexId === "zipswap" || expensiveDexId === "zipswap") return true;
   const lowerChain = dexNormalizeChain(chain);
   if (lowerChain === "arbitrum" && (cheapDexId === "pancakeswap" || expensiveDexId === "pancakeswap")) return true;
@@ -137,8 +135,7 @@ function checkAndRecordNewDex(dexId, chain) {
 function dexLoadLog() {
   try {
     if (fs.existsSync(DEX_LOG_FILE)) {
-      return JSON.parse(fs.readFileSync(DEX_LOG_FILE, "utf8")).filter((e) =>
-        e.cheapDex !== e.expensiveDex && !isKnownFalsePositive({ symbol: e.pairLabel, cheapDexId: e.cheapDex, expensiveDexId: e.expensiveDex, chain: e.chain }));
+      return JSON.parse(fs.readFileSync(DEX_LOG_FILE, "utf8")).filter((e) => e.cheapDex !== e.expensiveDex);
     }
   } catch (e) {}
   return [];
@@ -154,8 +151,7 @@ function appendToLog(observed, extra = {}) {
 
 function dexLoadStats() {
   try { if (fs.existsSync(DEX_STATS_FILE)) return JSON.parse(fs.readFileSync(DEX_STATS_FILE, "utf8")); } catch (e) {}
-  const existing = dexLoadLog(), profitable = existing.filter((r) => r.profitable);
-  const seeded = { totalObserved: existing.length, totalProfitableCount: profitable.length, cumulativeProfit: profitable.reduce((s, r) => s + r.netProfit, 0), onchainVerifiedCount: 0, onchainVerifiedProfit: 0 };
+  const seeded = { totalObserved: 0, totalProfitableCount: 0, cumulativeProfit: 0, onchainVerifiedCount: 0, onchainVerifiedProfit: 0, feeWallClearedCount: 0 };
   dexSaveStats(seeded);
   return seeded;
 }
@@ -163,6 +159,8 @@ function dexSaveStats(stats) { try { fs.writeFileSync(DEX_STATS_FILE, JSON.strin
 function dexRecordStats(observed) {
   const stats = dexLoadStats();
   stats.totalObserved = (stats.totalObserved || 0) + 1;
+  // 手数料の壁を超えた件数(=構造的に黒字になり得た件数)を別枠で数える。
+  if (observed.clearsFeeWall) stats.feeWallClearedCount = (stats.feeWallClearedCount || 0) + 1;
   if (observed.profitable) {
     stats.totalProfitableCount = (stats.totalProfitableCount || 0) + 1;
     stats.cumulativeProfit = (stats.cumulativeProfit || 0) + observed.netProfit;
@@ -252,10 +250,17 @@ function evaluatePools({ pools, symbol, chain, tokenA, tokenB, reserveSource }) 
     pairLabel: `${symbol} on ${chain} (${cheapPool.dexId} -> ${expensivePool.dexId})`,
   });
   if (Math.abs(result.priceDiffPercent) > 20) return null;
+
+  // 手数料の壁: 往復の実測手数料 + Aave手数料0.05%。
+  // 価格差がこれを上回らなければ、投入額をどう調整しても構造的に黒字にならない。
+  const feeWallPercent = ((cheapPool.feeBps ?? 30) + (expensivePool.feeBps ?? 30) + 5) / 100;
+  const clearsFeeWall = Math.abs(result.priceDiffPercent) > feeWallPercent;
+
   return {
     ...result, chain, tokenA, tokenB, cheapDex: cheapPool.dexId, expensiveDex: expensivePool.dexId,
     cheapPoolAddress: cheapPool.pairAddress, expensivePoolAddress: expensivePool.pairAddress,
     cheapFeeBps: cheapPool.feeBps, expensiveFeeBps: expensivePool.feeBps,
+    feeWallPercent, clearsFeeWall,
     cheapPoolLiquidityUsd: cheapPool.liquidityUsd, expensivePoolLiquidityUsd: expensivePool.liquidityUsd, reserveSource,
   };
 }
@@ -313,7 +318,7 @@ async function evaluateAndMaybeExecute(observed, source) {
   if (!observed.profitable || executingPairs.has(key)) return;
   executingPairs.add(key);
   try {
-    console.log(`[${source}] ${observed.pairLabel}: 純利益 +$${observed.netProfit.toFixed(2)}(価格差${observed.priceDiffPercent.toFixed(2)}%、投入額$${observed.tradeAmountUsd.toFixed(2)}、手数料${observed.cheapFeeBps ?? "?"}/${observed.expensiveFeeBps ?? "?"}bps）`);
+    console.log(`[${source}] ${observed.pairLabel}: 純利益 +$${observed.netProfit.toFixed(2)}(価格差${observed.priceDiffPercent.toFixed(2)}% 手数料の壁${observed.feeWallPercent?.toFixed(2)}% 投入$${observed.tradeAmountUsd.toFixed(2)}）`);
     latestDexResults = [observed, ...latestDexResults.filter((r) => r.pairLabel !== observed.pairLabel)].slice(0, 30);
     await maybeExecuteArb(observed);
   } catch (e) { console.warn(`[実行判定] エラー:`, e.message); }
@@ -355,8 +360,6 @@ async function fastWatchOnce() {
 }
 
 // ===== 三角裁定(A→B→C→A) =====
-// 2ステップ裁定とは独立して動く。同じDEX内の3トークンの相対価格の歪みを
-// 取るため、組み合わせの母数が桁違いに多く、競合も比較的少ない。
 const TRI_WATCH_INTERVAL_SEC = parseInt(process.env.TRI_WATCH_INTERVAL_SEC || "20", 10);
 let triWatchRunning = false, triWatchCount = 0, triRouteCount = 0, triProfitableCount = 0, triLastAt = null;
 
@@ -432,7 +435,8 @@ async function runWatchCycle({ topN = 8 } = {}) {
       if (observed) { results.push(observed); await evaluateAndMaybeExecute(observed, "定期観測"); }
     } catch (e) { console.warn(`[DEX] 観測失敗 (${candidate.symbol} / ${candidate.chain}):`, e.message); }
   }
-  console.log(`[DEX] 定期観測完了: 対象${candidates.length}件・記録${results.length}件・黒字${results.filter(r=>r.profitable).length}件 / 実行可能ペア${getVerifiedPairCount()}件・三角経路${triRouteCount}件`);
+  const cleared = results.filter((r) => r.clearsFeeWall).length;
+  console.log(`[DEX] 定期観測完了: 対象${candidates.length}件・記録${results.length}件・手数料の壁超え${cleared}件・黒字${results.filter(r=>r.profitable).length}件 / 実行可能ペア${getVerifiedPairCount()}件・三角経路${triRouteCount}件`);
   return { checked: candidates.length, logged: results.length, results };
 }
 
@@ -476,57 +480,91 @@ function renderRealExecutionSection() {
       <div><div class="v">$${getCurrentTradeCapUsd()}</div><div class="l">現在の取引上限</div></div>
       <div><div class="v" style="color:${isLive?'#2ecc71':'#888'};">${isLive ? '稼働中' : '停止中'}</div><div class="l">自動売買</div></div></div>
     <table><thead><tr><th>日時</th><th>ペア</th><th style="text-align:right;">投入額</th><th style="text-align:right;">実際の利益</th><th></th></tr></thead><tbody>${rows}</tbody></table>
-    <div class="note"><strong>これが本当のお金の結果です。</strong>取引上限は成功実績(${getSuccessCount()}回)に応じて自動的に上がります($500→$1000→$2000)。</div></div>`;
+    <div class="note"><strong>これが本当のお金の結果です。</strong>取引上限は成功実績(${getSuccessCount()}回)に応じて自動的に上がります。</div></div>`;
 }
 function renderTriangleSection() {
   return `<div class="card"><h2>🔺 三角裁定(A→B→C→A)</h2>
     <div class="stat"><div><div class="v">${triRouteCount}</div><div class="l">探索中の経路</div></div><div><div class="v">${TRI_WATCH_INTERVAL_SEC}秒</div><div class="l">観測間隔</div></div>
       <div><div class="v">${triWatchCount}</div><div class="l">観測回数</div></div><div><div class="v" style="color:${triProfitableCount>0?'#2ecc71':'#888'};">${triProfitableCount}</div><div class="l">黒字検出</div></div></div>
-    <div class="note">1つのDEX内で3つのトークンを巡回し、相対価格の歪みを取ります。2つのDEXを比較する必要がないため組み合わせの母数が桁違いに多く、専業botの監視も行き届きにくい領域です。<br>
-    経路は「実行可能ペア」から自動的に組み立てられ、フラッシュローンで借りられる通貨(USDC・WETH等)を起点とするものだけを対象にします。${triLastAt ? `<br>最終観測: ${new Date(triLastAt).toLocaleTimeString('ja-JP')}` : ''}</div></div>`;
+    <div class="note">1つのDEX内で3つのトークンを巡回し、相対価格の歪みを取ります。経路は実行可能ペアから自動的に組み立てられ、ペアが増えるほど急激に増えます。</div></div>`;
 }
 function renderFastWatchSection() {
   const pairs = getVerifiedPairs(), throttle = getThrottleStatus(), gas = getGasCostStatus();
   const byChain = {};
   for (const p of pairs) byChain[p.chain] = (byChain[p.chain] || 0) + 1;
-  const chainList = Object.entries(byChain).map(([c, n]) => { const t = throttle[c]; return `${c}:${n}${t && t.pausedForSec > 0 ? `<span style="color:#e74c3c;">(${t.pausedForSec}秒休止中)</span>` : ''}`; }).join(' / ') || 'なし';
+  const chainList = Object.entries(byChain).map(([c, n]) => { const t = throttle[c]; return `${c}:${n}${t && t.pausedForSec > 0 ? `<span style="color:#e74c3c;">(${t.pausedForSec}秒休止)</span>` : ''}`; }).join(' / ') || 'なし';
   const gasList = Object.entries(gas).map(([c, g]) => `${c}: $${g.costUsd}`).join(' / ') || '取得中';
-  const rows = pairs.slice(0, 30).map((p) => `<tr><td style="font-size:9px;">${p.symbol}</td><td>${p.chain}</td>
-    <td style="font-size:9px;">${p.pools.map((x) => `${x.dexId}${x.feeBps != null ? `(${x.feeBps})` : ''}`).join(', ')}</td></tr>`).join('') || `<tr><td colspan="3" style="color:#888;">まだ登録されていません</td></tr>`;
+  // 手数料が低いプールを持つペアを先に表示する(狙い目のため)。
+  const sorted = [...pairs].sort((a, b) => {
+    const minA = Math.min(...a.pools.map((x) => x.feeBps ?? 30));
+    const minB = Math.min(...b.pools.map((x) => x.feeBps ?? 30));
+    return minA - minB;
+  });
+  const rows = sorted.slice(0, 30).map((p) => {
+    const fees = p.pools.map((x) => x.feeBps ?? 30);
+    const wall = ((Math.min(...fees) + fees.sort((a,b)=>a-b)[1] + 5) / 100).toFixed(2);
+    return `<tr><td style="font-size:9px;">${p.symbol}</td><td>${p.chain}</td>
+    <td style="font-size:9px;">${p.pools.map((x) => `${x.dexId}(${x.feeBps ?? 30})`).join(', ')}</td>
+    <td style="text-align:right;color:${parseFloat(wall) < 0.3 ? '#2ecc71' : '#888'};">${wall}%</td></tr>`;
+  }).join('') || `<tr><td colspan="4" style="color:#888;">まだ登録されていません</td></tr>`;
   return `<div class="card"><h2>⚡ 高速観測(2ステップ裁定)</h2>
     <div class="stat"><div><div class="v">${pairs.length}</div><div class="l">実行可能ペア</div></div><div><div class="v">${FAST_WATCH_INTERVAL_SEC}秒</div><div class="l">観測間隔</div></div>
       <div><div class="v">${fastWatchCount}</div><div class="l">観測回数</div></div><div><div class="v">${fastWatchLastAt ? new Date(fastWatchLastAt).toLocaleTimeString('ja-JP') : '-'}</div><div class="l">最終観測</div></div></div>
-    <table><thead><tr><th>ペア</th><th>チェーン</th><th>DEX(実測手数料bps)</th></tr></thead><tbody>${rows}</tbody></table>
-    <div class="note">プールを直接呼ぶ方式のため、DEXの種類を問わず実行できます。<br>内訳: ${chainList}<br>実測ガス代: ${gasList}</div></div>`;
+    <table><thead><tr><th>ペア</th><th>チェーン</th><th>DEX(手数料bps)</th><th style="text-align:right;">必要価格差</th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="note"><strong>「必要価格差」がこのペアで黒字になる最低ライン</strong>です(往復手数料+Aave0.05%)。手数料の低いペアほど上に表示しています。<br>内訳: ${chainList}<br>実測ガス代: ${gasList}</div></div>`;
 }
 function renderPage() {
   const dexStats = dexLoadStats(), lat = getOnchainLatencyStats();
-  const dexRows = latestDexResults.slice(0, 15).map((r, i) => `<tr><td>${i+1}</td><td style="font-size:9px;">${r.pairLabel} ${(r.reserveSource || "").startsWith("onchain") ? `<span class="badge">実測</span>` : ''}</td><td style="text-align:right;">${r.priceDiffPercent.toFixed(2)}%</td>
-    <td style="text-align:right;color:${r.profitable?'#2ecc71':'#888'};font-weight:600;">${r.netProfit>=0?'+':''}$${r.netProfit.toFixed(2)}</td></tr>`).join("") || `<tr><td colspan="4" style="color:#888;">観測データがまだありません</td></tr>`;
+  const dexRows = latestDexResults.slice(0, 15).map((r, i) => `<tr><td>${i+1}</td><td style="font-size:9px;">${r.pairLabel}</td>
+    <td style="text-align:right;">${r.priceDiffPercent.toFixed(2)}%</td>
+    <td style="text-align:right;color:${r.clearsFeeWall?'#2ecc71':'#888'};">${r.feeWallPercent?.toFixed(2) ?? '?'}%</td>
+    <td style="text-align:right;color:${r.profitable?'#2ecc71':'#888'};font-weight:600;">${r.netProfit>=0?'+':''}$${r.netProfit.toFixed(2)}</td></tr>`).join("") || `<tr><td colspan="5" style="color:#888;">観測データがまだありません</td></tr>`;
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="refresh" content="30">
 <title>DEXアービトラージ観測所</title><style>${PAGE_STYLE}</style></head><body>
 <h1>🔍 DEXアービトラージ観測所</h1><div class="sub">定期観測${dexWatchCount}回 / 高速観測${fastWatchCount}回 / 三角裁定${triWatchCount}回</div>
 ${renderRealExecutionSection()}${renderTriangleSection()}${renderFastWatchSection()}
 <div class="card"><h2>🔍 観測データ(紙上シミュレーション)</h2>
-  <div class="stat"><div><div class="v">${dexStats.totalObserved}</div><div class="l">記録件数</div></div><div><div class="v" style="color:${dexStats.totalProfitableCount>0?'#2ecc71':'#888'};">${dexStats.totalProfitableCount}</div><div class="l">黒字だった件数</div></div>
-    <div><div class="v" style="color:#2ecc71;">${dexStats.onchainVerifiedCount||0}</div><div class="l">うちオンチェーン実測</div></div><div><div class="v" style="color:#2ecc71;">+$${(dexStats.onchainVerifiedProfit||0).toFixed(2)}</div><div class="l">実測ベースの利益</div></div></div>
-  <table><thead><tr><th>#</th><th>ペア</th><th style="text-align:right;">価格差</th><th style="text-align:right;">純利益</th></tr></thead><tbody>${dexRows}</tbody></table>
-  <div class="note"><strong>これは「もし取引していたら」の理論値です。</strong>同じ案件は3分に1回だけ数えます。理論上の累積利益(全件): ${dexStats.cumulativeProfit>=0?'+':''}$${dexStats.cumulativeProfit.toFixed(2)}。${lastDexError ? `<br><span style="color:#e74c3c;">エラー: ${lastDexError}</span>` : ''}</div></div>
+  <div class="stat"><div><div class="v">${dexStats.totalObserved}</div><div class="l">記録件数</div></div>
+    <div><div class="v" style="color:${(dexStats.feeWallClearedCount||0)>0?'#2ecc71':'#888'};">${dexStats.feeWallClearedCount||0}</div><div class="l">手数料の壁を超えた件数</div></div>
+    <div><div class="v" style="color:${dexStats.totalProfitableCount>0?'#2ecc71':'#888'};">${dexStats.totalProfitableCount}</div><div class="l">黒字だった件数</div></div>
+    <div><div class="v" style="color:#2ecc71;">+$${(dexStats.cumulativeProfit||0).toFixed(2)}</div><div class="l">理論上の累積利益</div></div></div>
+  <table><thead><tr><th>#</th><th>ペア</th><th style="text-align:right;">価格差</th><th style="text-align:right;">必要ライン</th><th style="text-align:right;">純利益</th></tr></thead><tbody>${dexRows}</tbody></table>
+  <div class="note"><strong>「必要ライン」を価格差が超えていなければ、構造的に黒字になりません。</strong>これが今まで一度も実際の利益が出なかった根本原因です。手数料の低いプール(安定通貨ペアなど)を優先的に探すよう変更しました。<br>
+  <a href="/reset-stats">→ 統計をリセットする</a>(誤った前提で積み上がった過去の記録を消し、正しい条件で測り直す)${lastDexError ? `<br><span style="color:#e74c3c;">エラー: ${lastDexError}</span>` : ''}</div></div>
 ${lat ? `<div class="card"><h2>⚡ Sync反応速度</h2><div class="stat"><div><div class="v">${lat.count}</div><div class="l">反応回数</div></div><div><div class="v">${lat.medianMs}ms</div><div class="l">中央値</div></div><div><div class="v">${lat.minMs}ms</div><div class="l">最速</div></div><div><div class="v">${lat.maxMs}ms</div><div class="l">最遅</div></div></div></div>` : ''}
 <div class="footerlink"><a href="/about">→ このサイトが集めているデータについて</a></div></body></html>`;
 }
 function renderAboutPage() {
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>収集データについて</title><style>${PAGE_STYLE}</style></head><body>
 <h1>📊 このサイトが集めているデータ</h1>
-<div class="card"><h2>① 発掘(定期観測)</h2><div class="note">DeFiLlamaから、対応5チェーンの流動性$3万〜$300万の中小プールを150件選びます。専業botが常時監視する大型ペアは価格差が手数料を超えないため、意図的に避けています。</div></div>
-<div class="card"><h2>② 2ステップ裁定(${FAST_WATCH_INTERVAL_SEC}秒ごと)</h2><div class="note">同じペアが複数のプールにある場合の価格差を取ります。Multicall3で一括読み取りし、手数料はプール自身から逆算した実測値を使います。</div></div>
-<div class="card"><h2>③ 三角裁定(${TRI_WATCH_INTERVAL_SEC}秒ごと)</h2><div class="note">A→B→C→Aと巡回し、トークン間の相対価格の歪みを取ります。2つのDEXを比較する必要がないため、組み合わせの母数が桁違いに多く、競合も比較的少ない領域です。</div></div>
-<div class="card"><h2>④ 実行</h2><div class="note">ルーターを経由せず、プールを直接呼びます。Uniswap V2形式もSolidly形式もプールのswap関数は同一のため、DEXの種類を問わず実行できます。Aaveのフラッシュローンを使うため、利益が出なければ取引全体が自動的に無効化されます(実害はガス代のみ)。</div></div>
+<div class="card"><h2>① 手数料の壁という考え方</h2><div class="note">裁定が成立する条件は「価格差 > 往復の手数料 + Aave手数料0.05%」です。手数料0.3%のDEX同士なら0.65%以上の価格差が必要ですが、実測ではほとんどの価格差が0.5%未満でした。<br>
+一方、安定通貨ペアなどで使われる低手数料プール(0.01〜0.05%)なら必要ラインは0.15%程度まで下がり、実際に観測されている価格差で黒字になります。この発見を受けて、低手数料プールを優先的に探す設計に変更しました。</div></div>
+<div class="card"><h2>② 発掘(定期観測)</h2><div class="note">DeFiLlamaから候補を選びます。価格が連動するペア(安定通貨同士、ETH系同士など)は低手数料プールが使われるため、流動性が大きくても除外せず優遇します。</div></div>
+<div class="card"><h2>③ 2ステップ裁定(${FAST_WATCH_INTERVAL_SEC}秒ごと)</h2><div class="note">同じペアの複数プール間の価格差を取ります。手数料はプール自身から逆算した実測値を使います。</div></div>
+<div class="card"><h2>④ 三角裁定(${TRI_WATCH_INTERVAL_SEC}秒ごと)</h2><div class="note">A→B→C→Aと巡回し、トークン間の相対価格の歪みを取ります。</div></div>
+<div class="card"><h2>⑤ 実行の安全性</h2><div class="note">ルーターを経由せずプールを直接呼びます。Aaveのフラッシュローンを使うため、利益が出なければ取引全体が自動的に無効化されます(実害はガス代のみ)。</div></div>
 <div class="footerlink"><a href="/">← 観測所トップに戻る</a></div></body></html>`;
 }
 function startServer() {
   const port = process.env.PORT || 8080;
-  http.createServer((req, res) => { res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }); res.end(req.url === "/about" ? renderAboutPage() : renderPage()); }).listen(port, () => console.log(`観測所ページ: ポート${port}`));
+  http.createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    // 統計のリセット。誤った前提(手数料・ガス代の誤設定)で積み上がった
+    // 過去の記録を消し、修正後の正しい条件だけで測り直すために使う。
+    if (req.url === "/reset-stats") {
+      try {
+        dexSaveStats({ totalObserved: 0, totalProfitableCount: 0, cumulativeProfit: 0, onchainVerifiedCount: 0, onchainVerifiedProfit: 0, feeWallClearedCount: 0 });
+        dexSaveLog([]);
+        latestDexResults = [];
+        console.log("[統計] リセットしました(過去の誤った前提での記録を破棄)");
+        res.end("<html><body style='font-family:sans-serif;padding:20px;background:#0d100c;color:#e8e6d8;'><h2>統計をリセットしました</h2><p>修正後の正しい条件で測り直します。</p><a href='/' style='color:#6fae62;'>← 観測所に戻る</a></body></html>");
+      } catch (e) {
+        res.end("リセットに失敗しました: " + e.message);
+      }
+      return;
+    }
+    res.end(req.url === "/about" ? renderAboutPage() : renderPage());
+  }).listen(port, () => console.log(`観測所ページ: ポート${port}`));
 }
 
 async function main() {
