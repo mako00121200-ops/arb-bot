@@ -4,11 +4,12 @@
 //
 // [流れ]
 //   ①送信直前に、各段の受取量をプール自身へ問い合わせて確定させる
-//     (メモリ上の値は最大数十ミリ秒古い可能性があるため)
-//   ②Aave手数料込みの返済額を上回り、かつ実測ガス代を引いても
-//     最低利益を超える場合のみ送信する
-//   ③受取量は計算値より僅かに低い値を要求する。過大ならプール側が
-//     自動的に拒否するため、これがスリッページ保護を兼ねる
+//   ②Aave手数料込みの返済額を上回り、実測ガス代を引いても最低利益を
+//     超える場合のみ送信する
+//   ③受取量は計算値より僅かに低い値を要求する(過大ならプール側が拒否)
+//
+// [修正] 送信失敗をここで握りつぶしていたため、呼び出し側が失敗を知れず
+// 同じ組み合わせを1.5秒ごとに無限に再試行していた。失敗は必ず投げ直す。
 
 import { ethers } from "ethers";
 import { getChainConfig } from "../chain-config.js";
@@ -16,7 +17,7 @@ import { getProviderForChain, callWithRpc } from "./onchain-reserves.js";
 import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
 import { recordRealExecution } from "./real-execution-log.js";
 import { estimateGasCostUsd } from "./gas-cost.js";
-import { getPool, getTokenDecimals, getTokenPriceUsd } from "./pool-registry.js";
+import { getTokenDecimals, getTokenPriceUsd } from "./pool-registry.js";
 
 const CONTRACT_ABI = [
   "function executeArb(address asset, uint256 amount, (address poolCheap, address poolExpensive, address tokenX, address tokenY, uint256 amountOutStep1, uint256 amountOutStep2) params) external",
@@ -28,10 +29,17 @@ const POOL_QUOTE_ABI = ["function getAmountOut(uint256 amountIn, address tokenIn
 
 const AAVE_PREMIUM_BPS = 5n;
 const MIN_PROFIT_USD = parseFloat(process.env.MIN_PROFIT_USD || "0.05");
-// 受取量に持たせる余裕。ブロック間の微小な変動で拒否されないようにする。
-const SAFETY_MARGIN_BPS = 5n;
-// 三角は2ステップよりガス使用量が多い。
+// 受取量に持たせる余裕。準備量の僅かなズレでプールに拒否されないようにする。
+const SAFETY_MARGIN_BPS = 10n;
 const GAS_MULTIPLIER = { "2step": 1.0, "3step": 1.35 };
+
+/// 送信失敗を表す。呼び出し側がプールの無効化や再試行の抑制に使う。
+export class ExecutionError extends Error {
+  constructor(message, { reverted = false } = {}) {
+    super(message);
+    this.reverted = reverted;
+  }
+}
 
 function getAmountOutCalc(amountIn, reserveIn, reserveOut, feeBps) {
   const amountInWithFee = amountIn * (10000n - BigInt(feeBps));
@@ -39,7 +47,6 @@ function getAmountOutCalc(amountIn, reserveIn, reserveOut, feeBps) {
   return denominator === 0n ? 0n : (amountInWithFee * reserveOut) / denominator;
 }
 
-/// プール自身に聞き、答えられなければ準備量から自前計算する。
 async function quoteOut({ chain, pool, amountIn, tokenIn, reserveIn, reserveOut, feeBps }) {
   try {
     const out = await callWithRpc(chain, (p) =>
@@ -50,30 +57,26 @@ async function quoteOut({ chain, pool, amountIn, tokenIn, reserveIn, reserveOut,
   return getAmountOutCalc(amountIn, reserveIn, reserveOut, feeBps);
 }
 
-/// 経路の各段が使うトークンの並びを組み立てる。
-/// 2ステップ: [tokenA, tokenB, tokenA] / 三角: [tokenA, tokenB, tokenC, tokenA]
 function buildTokenPath(opp) {
   const path = [opp.tokenA];
   for (const leg of opp.legs) path.push(leg.tokenOut);
   return path;
 }
 
+/// 戻り値: 送信して成功したら true、条件を満たさず見送ったら false。
+/// 送信を試みて失敗した場合は ExecutionError を投げる。
 export async function executeOpportunity(opp) {
   const chain = opp.chain;
   const chainConfig = getChainConfig(chain);
   if (!chainConfig) return false;
 
   const contractAddress = process.env[chainConfig.contractAddressEnvVar];
-  if (!contractAddress) {
-    console.warn(`[実行] ${chainConfig.contractAddressEnvVar}が未設定`);
-    return false;
-  }
+  if (!contractAddress) return false;
 
   const decimals = getTokenDecimals(chain, opp.tokenA);
   const priceUsd = getTokenPriceUsd(chain, opp.tokenA);
   if (decimals == null || !priceUsd) return false;
 
-  // 取引上限を適用する。
   const capUsd = getCurrentTradeCapUsd();
   let amountIn = opp.amountIn;
   if (opp.tradeAmountUsd > capUsd) {
@@ -82,47 +85,37 @@ export async function executeOpportunity(opp) {
   }
   if (amountIn <= 0n) return false;
 
-  // 送信直前に、各段の受取量をプール自身へ問い合わせて確定させる。
   const tokenPath = buildTokenPath(opp);
   const amountOuts = [];
   let amount = amountIn;
   for (let i = 0; i < opp.legs.length; i++) {
     const leg = opp.legs[i];
-    const poolAddress = opp.poolAddresses[i];
     const out = await quoteOut({
-      chain, pool: poolAddress, amountIn: amount, tokenIn: tokenPath[i],
+      chain, pool: opp.poolAddresses[i], amountIn: amount, tokenIn: tokenPath[i],
       reserveIn: leg.reserveIn, reserveOut: leg.reserveOut, feeBps: leg.feeBps,
     });
-    if (out <= 0n) {
-      console.log(`[実行] ${opp.label}: ${i + 1}段目の見積もりが0のため見送り`);
-      return false;
-    }
+    if (out <= 0n) return false;
     amountOuts.push(out);
     amount = out;
   }
 
   const finalOut = amountOuts[amountOuts.length - 1];
   const amountOwed = amountIn + (amountIn * AAVE_PREMIUM_BPS) / 10000n;
-
   if (finalOut <= amountOwed) {
     console.log(`[実行] ${opp.label}: 送信直前の再計算で返済額に届かず見送り`);
     return false;
   }
 
   let gasCostUsd = 0.02;
-  try {
-    gasCostUsd = (await estimateGasCostUsd(chain)) * (GAS_MULTIPLIER[opp.kind] ?? 1.0);
-  } catch (e) {}
+  try { gasCostUsd = (await estimateGasCostUsd(chain)) * (GAS_MULTIPLIER[opp.kind] ?? 1.0); } catch (e) {}
 
   const netTokens = Number(finalOut - amountOwed) / Math.pow(10, decimals);
   const finalProfitUsd = netTokens * priceUsd - gasCostUsd;
-
   if (finalProfitUsd < MIN_PROFIT_USD) {
     console.log(`[実行] ${opp.label}: ガス代差引後$${finalProfitUsd.toFixed(4)}が下限未満のため見送り`);
     return false;
   }
 
-  // プールへ要求する受取量(計算値より僅かに低くする)。
   const requested = amountOuts.map((v) => (v * (10000n - SAFETY_MARGIN_BPS)) / 10000n);
   if (requested[requested.length - 1] <= amountOwed) {
     console.log(`[実行] ${opp.label}: 余裕分を引くと返済額を下回るため見送り`);
@@ -135,16 +128,13 @@ export async function executeOpportunity(opp) {
   if (dryRun) return false;
 
   const privateKey = process.env.MAINNET_BOT_PRIVATE_KEY;
-  if (!privateKey) {
-    console.warn("[実行] MAINNET_BOT_PRIVATE_KEYが未設定");
-    return false;
-  }
+  if (!privateKey) return false;
 
   const wallet = new ethers.Wallet(privateKey, getProviderForChain(chain));
   const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, wallet);
 
+  let tx;
   try {
-    let tx;
     if (opp.kind === "3step") {
       tx = await contract.executeTriArb(opp.tokenA, amountIn, {
         pool1: opp.poolAddresses[0], pool2: opp.poolAddresses[1], pool3: opp.poolAddresses[2],
@@ -158,36 +148,42 @@ export async function executeOpportunity(opp) {
         amountOutStep1: requested[0], amountOutStep2: requested[1],
       });
     }
-
-    console.log(`[実行] 送信: ${tx.hash}`);
-    const receipt = await tx.wait();
-    console.log(`[実行] 完了: ブロック${receipt.blockNumber} ガス${receipt.gasUsed.toString()}`);
-
-    let actualProfitTokens = null;
-    for (const log of receipt.logs) {
-      try {
-        const parsed = contract.interface.parseLog({ topics: log.topics, data: log.data });
-        if (parsed && (parsed.name === "ArbExecuted" || parsed.name === "TriArbExecuted")) {
-          actualProfitTokens = Number(parsed.args.profit) / Math.pow(10, decimals);
-          break;
-        }
-      } catch (inner) {}
-    }
-    const actualProfitUsd = actualProfitTokens != null ? actualProfitTokens * priceUsd : null;
-    if (actualProfitUsd != null) console.log(`[実行] 確定利益: +$${actualProfitUsd.toFixed(4)}`);
-
-    recordRealExecution({
-      timestamp: new Date().toISOString(),
-      pairLabel: `${opp.kind} ${chain} ${opp.label}`,
-      chain, txHash: tx.hash, explorerUrl: chainConfig.explorerTxUrl(tx.hash),
-      tradeAmountUsd: tradeUsd,
-      predictedProfitUsd: finalProfitUsd, actualProfitUsd,
-      gasUsed: receipt.gasUsed.toString(), gasCostUsd,
-    });
-    recordExecutionSuccess();
-    return true;
   } catch (e) {
-    console.error(`[実行] 失敗: ${e.message.slice(0, 180)}`);
-    return false;
+    const msg = e.message || "";
+    const reverted = msg.includes("execution reverted") || msg.includes("CALL_EXCEPTION");
+    throw new ExecutionError(msg.slice(0, 160), { reverted });
   }
+
+  console.log(`[実行] 送信: ${tx.hash}`);
+  let receipt;
+  try {
+    receipt = await tx.wait();
+  } catch (e) {
+    throw new ExecutionError(`確定待ちで失敗: ${(e.message || "").slice(0, 120)}`, { reverted: true });
+  }
+  console.log(`[実行] 完了: ブロック${receipt.blockNumber} ガス${receipt.gasUsed.toString()}`);
+
+  let actualProfitTokens = null;
+  for (const log of receipt.logs) {
+    try {
+      const parsed = contract.interface.parseLog({ topics: log.topics, data: log.data });
+      if (parsed && (parsed.name === "ArbExecuted" || parsed.name === "TriArbExecuted")) {
+        actualProfitTokens = Number(parsed.args.profit) / Math.pow(10, decimals);
+        break;
+      }
+    } catch (inner) {}
+  }
+  const actualProfitUsd = actualProfitTokens != null ? actualProfitTokens * priceUsd : null;
+  if (actualProfitUsd != null) console.log(`[実行] 確定利益: +$${actualProfitUsd.toFixed(4)}`);
+
+  recordRealExecution({
+    timestamp: new Date().toISOString(),
+    pairLabel: `${opp.kind} ${chain} ${opp.label}`,
+    chain, txHash: tx.hash, explorerUrl: chainConfig.explorerTxUrl(tx.hash),
+    tradeAmountUsd: tradeUsd,
+    predictedProfitUsd: finalProfitUsd, actualProfitUsd,
+    gasUsed: receipt.gasUsed.toString(), gasCostUsd,
+  });
+  recordExecutionSuccess();
+  return true;
 }
