@@ -1,15 +1,14 @@
 // scripts/multicall-reserves.js
 //
-// Multicall3(4チェーン全てに同一アドレスで存在する標準コントラクト)を
-// 使い、多数のプールの準備量を「1回のRPC呼び出し」でまとめて読む。
+// Multicall3(対応チェーン全てに同一アドレスで存在する標準コントラクト)を
+// 使い、多数のプールのデータを「1回のRPC呼び出し」でまとめて読む。
 //
-// 従来はプール1つごとに2回(getReserves + token0)呼んでいたため、
-// 60プールで120回のRPC呼び出しが必要だった。Multicall3なら1〜2回で済み、
-// 観測間隔を5秒に縮めてもレート制限に当たりにくい。
+// プール1つごとに個別に問い合わせると、数万プールの読み取りに何時間も
+// かかるため、一括取得が必須になる。
 //
 // RPCへの接続は onchain-reserves.js の callWithRpc を経由する。
-// これにより、利用上限や障害で失敗が続いたRPCは自動的に次の候補へ
-// 切り替わる(1rpc.ioが「usage limit」で停止した経験を踏まえた対策)。
+// これにより8秒のタイムアウトとチェーンごとの待ち行列、失敗時の
+// RPC自動切り替えがそのまま適用される。
 
 import { ethers } from "ethers";
 import { callWithRpc } from "./onchain-reserves.js";
@@ -22,12 +21,19 @@ const MULTICALL3_ABI = [
 const PAIR_IFACE = new ethers.Interface([
   "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
   "function token0() view returns (address)",
+  "function token1() view returns (address)",
 ]);
 
-// 1回のMulticallに詰めるプール数の上限(1プール=2呼び出し)。
+// 1回のMulticallに詰めるプール数(1プールあたり2呼び出し)。
+// 多すぎるとRPC側の応答サイズ制限に当たる。
 const MAX_POOLS_PER_CALL = 40;
 
-/// 複数プールの準備量を一括で読む。
+async function multicall(chain, calls) {
+  return callWithRpc(chain, (provider) =>
+    new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider).aggregate3(calls));
+}
+
+/// 複数プールの準備量とtoken0を一括で読む。
 /// 戻り値: Map<小文字アドレス, { raw0, raw1, token0 } | null(読めない)>
 export async function fetchReservesBatch(chain, pools) {
   const result = new Map();
@@ -43,9 +49,7 @@ export async function fetchReservesBatch(chain, pools) {
 
     let returned;
     try {
-      returned = await callWithRpc(chain, (provider) =>
-        new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider).aggregate3(calls)
-      );
+      returned = await multicall(chain, calls);
     } catch (e) {
       // RPC側の問題。onchain-reserves.js側で切り替え判断が行われる。
       for (const p of chunk) result.set(p.address.toLowerCase(), null);
@@ -55,7 +59,7 @@ export async function fetchReservesBatch(chain, pools) {
     for (let j = 0; j < chunk.length; j++) {
       const key = chunk[j].address.toLowerCase();
       const r1 = returned[j * 2], r2 = returned[j * 2 + 1];
-      if (!r1.success || !r2.success || r1.returnData === "0x" || r2.returnData === "0x") {
+      if (!r1?.success || !r2?.success || r1.returnData === "0x" || r2.returnData === "0x") {
         result.set(key, null);
         continue;
       }
@@ -66,6 +70,44 @@ export async function fetchReservesBatch(chain, pools) {
       } catch (e) {
         result.set(key, null);
       }
+    }
+  }
+
+  return result;
+}
+
+/// 複数プールの token0 / token1 を一括で読む。
+/// Syncイベントで見つかった未知のプールを地図へ取り込む際に使う。
+/// 戻り値: Map<小文字アドレス, { token0, token1 }>
+export async function fetchPoolTokensBatch(chain, addresses) {
+  const result = new Map();
+  const perChunk = Math.floor(MAX_POOLS_PER_CALL);
+
+  for (let i = 0; i < addresses.length; i += perChunk) {
+    const chunk = addresses.slice(i, i + perChunk);
+    const calls = [];
+    for (const addr of chunk) {
+      const target = ethers.getAddress(addr);
+      calls.push({ target, allowFailure: true, callData: PAIR_IFACE.encodeFunctionData("token0") });
+      calls.push({ target, allowFailure: true, callData: PAIR_IFACE.encodeFunctionData("token1") });
+    }
+
+    let returned;
+    try {
+      returned = await multicall(chain, calls);
+    } catch (e) {
+      continue;
+    }
+
+    for (let j = 0; j < chunk.length; j++) {
+      const r0 = returned[j * 2], r1 = returned[j * 2 + 1];
+      if (!r0?.success || !r1?.success || r0.returnData === "0x" || r1.returnData === "0x") continue;
+      try {
+        const token0 = PAIR_IFACE.decodeFunctionResult("token0", r0.returnData)[0];
+        const token1 = PAIR_IFACE.decodeFunctionResult("token1", r1.returnData)[0];
+        if (token0.toLowerCase() === token1.toLowerCase()) continue;
+        result.set(chunk[j].toLowerCase(), { token0: token0.toLowerCase(), token1: token1.toLowerCase() });
+      } catch (e) {}
     }
   }
 
