@@ -2,14 +2,15 @@
 //
 // 検出した機会(2ステップ・三角の両方)を実際に送信する。
 //
-// [流れ]
-//   ①送信直前に、各段の受取量をプール自身へ問い合わせて確定させる
-//   ②Aave手数料込みの返済額を上回り、実測ガス代を引いても最低利益を
-//     超える場合のみ送信する
-//   ③受取量は計算値より僅かに低い値を要求する(過大ならプール側が拒否)
+// [修正: 各段の見積もりの繋ぎ方]
+// 以前は「1段目の見積もり(余裕を引く前)」を2段目の入力として使っていた。
+// しかしプールは要求した量(=余裕を引いた後)しか渡さないため、2段目には
+// 想定より少ない量しか届かず、要求量に届かずに「K」で拒否されていた。
+// 各段の入力には「前の段で実際に要求する量」を使い、余裕を正しく連鎖させる。
 //
-// [修正] 送信失敗をここで握りつぶしていたため、呼び出し側が失敗を知れず
-// 同じ組み合わせを1.5秒ごとに無限に再試行していた。失敗は必ず投げ直す。
+// [送信失敗の扱い]
+// 失敗は必ず ExecutionError として投げ直す。呼び出し側がプールの無効化や
+// 再試行の抑制に使う(握りつぶすと同じ失敗を無限に繰り返す)。
 
 import { ethers } from "ethers";
 import { getChainConfig } from "../chain-config.js";
@@ -29,11 +30,9 @@ const POOL_QUOTE_ABI = ["function getAmountOut(uint256 amountIn, address tokenIn
 
 const AAVE_PREMIUM_BPS = 5n;
 const MIN_PROFIT_USD = parseFloat(process.env.MIN_PROFIT_USD || "0.05");
-// 受取量に持たせる余裕。準備量の僅かなズレでプールに拒否されないようにする。
 const SAFETY_MARGIN_BPS = 10n;
 const GAS_MULTIPLIER = { "2step": 1.0, "3step": 1.35 };
 
-/// 送信失敗を表す。呼び出し側がプールの無効化や再試行の抑制に使う。
 export class ExecutionError extends Error {
   constructor(message, { reverted = false } = {}) {
     super(message);
@@ -63,13 +62,10 @@ function buildTokenPath(opp) {
   return path;
 }
 
-/// 戻り値: 送信して成功したら true、条件を満たさず見送ったら false。
-/// 送信を試みて失敗した場合は ExecutionError を投げる。
 export async function executeOpportunity(opp) {
   const chain = opp.chain;
   const chainConfig = getChainConfig(chain);
   if (!chainConfig) return false;
-
   const contractAddress = process.env[chainConfig.contractAddressEnvVar];
   if (!contractAddress) return false;
 
@@ -85,8 +81,10 @@ export async function executeOpportunity(opp) {
   }
   if (amountIn <= 0n) return false;
 
+  // 各段の受取量を、プール自身に問い合わせて確定させる。
+  // 次の段の入力には「実際に要求する量(余裕を引いた後)」を使う。
   const tokenPath = buildTokenPath(opp);
-  const amountOuts = [];
+  const requested = [];
   let amount = amountIn;
   for (let i = 0; i < opp.legs.length; i++) {
     const leg = opp.legs[i];
@@ -95,11 +93,13 @@ export async function executeOpportunity(opp) {
       reserveIn: leg.reserveIn, reserveOut: leg.reserveOut, feeBps: leg.feeBps,
     });
     if (out <= 0n) return false;
-    amountOuts.push(out);
-    amount = out;
+    const req = (out * (10000n - SAFETY_MARGIN_BPS)) / 10000n;
+    if (req <= 0n) return false;
+    requested.push(req);
+    amount = req;
   }
 
-  const finalOut = amountOuts[amountOuts.length - 1];
+  const finalOut = requested[requested.length - 1];
   const amountOwed = amountIn + (amountIn * AAVE_PREMIUM_BPS) / 10000n;
   if (finalOut <= amountOwed) {
     console.log(`[実行] ${opp.label}: 送信直前の再計算で返済額に届かず見送り`);
@@ -113,12 +113,6 @@ export async function executeOpportunity(opp) {
   const finalProfitUsd = netTokens * priceUsd - gasCostUsd;
   if (finalProfitUsd < MIN_PROFIT_USD) {
     console.log(`[実行] ${opp.label}: ガス代差引後$${finalProfitUsd.toFixed(4)}が下限未満のため見送り`);
-    return false;
-  }
-
-  const requested = amountOuts.map((v) => (v * (10000n - SAFETY_MARGIN_BPS)) / 10000n);
-  if (requested[requested.length - 1] <= amountOwed) {
-    console.log(`[実行] ${opp.label}: 余裕分を引くと返済額を下回るため見送り`);
     return false;
   }
 
