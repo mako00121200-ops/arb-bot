@@ -7,15 +7,16 @@
 // ②常時:   チェーン上の全Syncイベントを1つの購読で受け取り、監視対象なら
 //          メモリ上で準備量を更新して、その経路だけを即座に再計算する。
 // ③発見:   Syncが届いた未知のプールは「実際に取引が起きている証拠」なので、
-//          自動的に地図へ取り込む。ファクトリーから取った「最新の3,000件」は
-//          大半が空のプールで、取引の96%は追跡外で起きていたため。
+//          自動的に地図へ取り込む。
+// ④抑制:   送信に失敗した組み合わせは10分間再試行しない。3回失敗した
+//          プールは無効化する(以前は同じ失敗を1.5秒ごとに無限に繰り返した)。
 
 import http from "http";
 import { startOnchainFeeds, getSyncStats, isChainWsEnabled } from "./dex-onchain-realtime.js";
 import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
-import { probePoolFeeBps, getRpcStatus, callWithRpc } from "./scripts/onchain-reserves.js";
+import { probePoolFeeBps, getRpcStatus } from "./scripts/onchain-reserves.js";
 import { fetchReservesBatch, fetchPoolTokensBatch } from "./scripts/multicall-reserves.js";
 import { estimateGasCostUsd } from "./scripts/gas-cost.js";
 import { discoverFactory, discoverPoolsFromFactory } from "./scripts/pool-discovery.js";
@@ -26,7 +27,7 @@ import {
   getArbitragablePairs, savePoolMap, loadPoolMap,
 } from "./scripts/pool-registry.js";
 import { scanForChangedPool, scanAllPairs } from "./scripts/opportunity-scanner.js";
-import { executeOpportunity } from "./scripts/execute-opportunity.js";
+import { executeOpportunity, ExecutionError } from "./scripts/execute-opportunity.js";
 import { isBorrowable, getBorrowableTokens } from "./scripts/borrowable-tokens.js";
 import { getVerifiedPairs } from "./scripts/verified-pairs.js";
 import { isKnownIncompatiblePool, recordIncompatiblePool } from "./scripts/incompatible-pools.js";
@@ -42,9 +43,12 @@ const SAVE_MAP_INTERVAL_MS = 5 * 60 * 1000;
 const MAP_REBUILD_AFTER_HOURS = parseInt(process.env.MAP_REBUILD_AFTER_HOURS || "168", 10);
 const HEARTBEAT_INTERVAL_MS = 60 * 1000;
 const EXECUTION_TIMEOUT_MS = 60 * 1000;
-// 未知のプールを取り込む処理の間隔と、1回あたりの件数。
 const ADOPT_INTERVAL_MS = 5000;
 const ADOPT_PER_TICK = 60;
+// 送信失敗後、同じ組み合わせを再試行しない時間。
+const FAILURE_COOLDOWN_MS = 10 * 60 * 1000;
+// この回数失敗したプールは無効化する。
+const DISABLE_AFTER_FAILURES = 3;
 
 // ===== ガス代 =====
 const FALLBACK_GAS = { base: 0.025, arbitrum: 0.03, optimism: 0.01, polygon: 0.033, avalanche: 0.002 };
@@ -58,29 +62,58 @@ async function refreshGasCosts() {
 
 // ===== 統計 =====
 const stats = {
-  scans: 0, opportunitiesFound: 0, executed: 0, failed: 0,
-  lastOpportunity: null, recent: [], syncMatched: 0, syncUnknown: 0, adopted: 0,
+  scans: 0, opportunitiesFound: 0, executed: 0, failed: 0, skippedCooldown: 0,
+  lastOpportunity: null, recent: [], syncMatched: 0, syncUnknown: 0, adopted: 0, disabled: 0,
   latencies: [], ready: false, refreshCycles: 0, mapSource: "-", mapSavedAt: null,
   feeProbed: 0, lastHeartbeat: null, reservesLoaded: 0,
 };
 
+// ===== 失敗の抑制と無効化 =====
+const cooldownUntil = new Map();   // 組み合わせキー → 再試行してよい時刻
+const poolFailures = new Map();    // "chain::address" → 失敗回数
+const disabledPools = new Set();   // 無効化したプール
+
+function poolKeyOf(chain, address) { return `${chain}::${address.toLowerCase()}`; }
+
+function disablePool(chain, address, reason) {
+  const key = poolKeyOf(chain, address);
+  if (disabledPools.has(key)) return;
+  disabledPools.add(key);
+  stats.disabled++;
+  // 準備量を0にして判定対象から外す(Syncによる更新も止める)。
+  const pool = getPool(chain, address);
+  if (pool) { pool.raw0 = 0n; pool.raw1 = 0n; }
+  recordIncompatiblePool(chain, address, reason);
+  console.log(`[無効化] ${chain} ${address.slice(0, 10)}…: ${reason.slice(0, 60)}`);
+}
+
+function noteExecutionFailure(opp, reason) {
+  cooldownUntil.set(opp.poolAddresses.join("|").toLowerCase(), Date.now() + FAILURE_COOLDOWN_MS);
+  for (const address of opp.poolAddresses) {
+    const key = poolKeyOf(opp.chain, address);
+    const n = (poolFailures.get(key) || 0) + 1;
+    poolFailures.set(key, n);
+    if (n >= DISABLE_AFTER_FAILURES) disablePool(opp.chain, address, `送信失敗${n}回: ${reason}`);
+  }
+}
+
+function hasDisabledPool(opp) {
+  return opp.poolAddresses.some((a) => disabledPools.has(poolKeyOf(opp.chain, a)));
+}
+
 // ===== Syncで見つかった未知のプールを取り込む =====
-// Syncが届いた = そのプールで実際に取引が起きている、という強い証拠。
-// 死んだプールを追いかけるより、この方法で集まるプールの方が価値が高い。
-const pendingAdoption = new Map(); // "chain::address" → { chain, address, raw0, raw1 }
-const rejectedPools = new Set();   // 取り込めないと分かったプール
+const pendingAdoption = new Map();
+const rejectedPools = new Set();
 
 function queueUnknownPool(chain, address, raw0, raw1) {
-  const key = `${chain}::${address.toLowerCase()}`;
-  if (rejectedPools.has(key) || pendingAdoption.has(key)) return;
+  const key = poolKeyOf(chain, address);
+  if (rejectedPools.has(key) || pendingAdoption.has(key) || disabledPools.has(key)) return;
   if (isKnownIncompatiblePool(chain, address)) { rejectedPools.add(key); return; }
   pendingAdoption.set(key, { chain, address, raw0, raw1 });
 }
 
 async function adoptPendingPools() {
   if (!stats.ready || pendingAdoption.size === 0) return;
-
-  // チェーンごとにまとめて処理する。
   const byChain = new Map();
   for (const [key, v] of pendingAdoption) {
     if (!byChain.has(v.chain)) byChain.set(v.chain, []);
@@ -89,22 +122,16 @@ async function adoptPendingPools() {
       pendingAdoption.delete(key);
     }
   }
-
   for (const [chain, items] of byChain) {
     try {
       const tokens = await fetchPoolTokensBatch(chain, items.map((i) => i.address));
       for (const item of items) {
         const t = tokens.get(item.address.toLowerCase());
         if (!t) { rejectedPools.add(item.key); continue; }
-        registerPool({
-          chain, address: item.address, dexId: "sync発見",
-          token0: t.token0, token1: t.token1,
-          raw0: item.raw0, raw1: item.raw1,
-        });
+        registerPool({ chain, address: item.address, dexId: "sync発見", token0: t.token0, token1: t.token1, raw0: item.raw0, raw1: item.raw1 });
         stats.adopted++;
       }
     } catch (e) {
-      // 失敗した分は次回に回す(取りこぼさないため)。
       for (const item of items) pendingAdoption.set(item.key, item);
     }
   }
@@ -151,7 +178,6 @@ async function buildPoolMapFromFactories() {
   }
 }
 
-/// 準備量を全件取得する。件数が多いため、進捗を記録しながら進める。
 async function loadAllReserves() {
   let loaded = 0;
   for (const [chain, addresses] of Object.entries(getAllPoolAddressesByChain())) {
@@ -191,9 +217,24 @@ async function preparePoolMap() {
     savePoolMap();
     stats.mapSavedAt = new Date().toISOString();
   }
+  // 過去に非対応と判明したプールは、読み込んだ地図からも外す。
+  for (const [chain, addresses] of Object.entries(getAllPoolAddressesByChain())) {
+    for (const address of addresses) {
+      if (isKnownIncompatiblePool(chain, address)) {
+        disabledPools.add(poolKeyOf(chain, address));
+        const pool = getPool(chain, address);
+        if (pool) { pool.raw0 = 0n; pool.raw1 = 0n; }
+      }
+    }
+  }
   await loadAllReserves();
+  for (const key of disabledPools) {
+    const [chain, address] = key.split("::");
+    const pool = getPool(chain, address);
+    if (pool) { pool.raw0 = 0n; pool.raw1 = 0n; }
+  }
   const s = getStats();
-  console.log(`[プール地図] 準備完了: ${s.totalPools}プール / 裁定候補${s.arbitragablePairs}ペア`);
+  console.log(`[プール地図] 準備完了: ${s.totalPools}プール / 裁定候補${s.arbitragablePairs}ペア / 無効化${disabledPools.size}件`);
   console.log(`[プール地図] チェーン別: ${Object.entries(s.byChain).map(([c, n]) => `${c}:${n}`).join(" / ") || "なし"}`);
 }
 
@@ -252,13 +293,10 @@ async function probeFeesGradually() {
   if (feeProbeQueue.length === 0) {
     const priority = new Set();
     for (const entry of getArbitragablePairs()) {
-      for (const p of entry.pools) if (!p.feeProbed) priority.add(`${p.chain}::${p.address}`);
+      for (const p of entry.pools) if (!p.feeProbed && !disabledPools.has(poolKeyOf(p.chain, p.address))) priority.add(`${p.chain}::${p.address}`);
     }
-    let pending = [...priority].map((k) => {
-      const [chain, address] = k.split("::");
-      return { chain, address, priority: true };
-    });
-    if (pending.length === 0) return; // 裁定候補が全て済んだら休む
+    const pending = [...priority].map((k) => { const [chain, address] = k.split("::"); return { chain, address }; });
+    if (pending.length === 0) return;
     feeProbeQueue = pending;
     console.log(`[手数料実測] 裁定候補のうち未実測${pending.length}プール`);
   }
@@ -267,10 +305,7 @@ async function probeFeesGradually() {
     const pool = getPool(chain, address);
     if (!pool) return;
     try {
-      const fee = await probePoolFeeBps({
-        chain, pairAddress: address, tokenInAddress: pool.token0,
-        reserveIn: pool.raw0, reserveOut: pool.raw1,
-      });
+      const fee = await probePoolFeeBps({ chain, pairAddress: address, tokenInAddress: pool.token0, reserveIn: pool.raw0, reserveOut: pool.raw1 });
       if (fee != null && fee !== 30) setPoolFee(chain, address, fee);
       pool.feeProbed = true;
       stats.feeProbed++;
@@ -281,29 +316,37 @@ async function probeFeesGradually() {
 // ===== 機会が見つかった時の処理 =====
 const executing = new Set();
 async function handleOpportunity(opp) {
+  if (hasDisabledPool(opp)) return;
+
+  const key = opp.poolAddresses.join("|").toLowerCase();
+  const until = cooldownUntil.get(key);
+  if (until && Date.now() < until) { stats.skippedCooldown++; return; }
+
   stats.opportunitiesFound++;
   stats.lastOpportunity = new Date().toISOString();
   stats.recent = [{ ...opp, at: new Date().toISOString() }, ...stats.recent.filter((r) => r.label !== opp.label)].slice(0, 20);
 
   if (!opp.profitable || opp.netProfitUsd < MIN_PROFIT_USD) return;
-
-  const key = opp.poolAddresses.join("|").toLowerCase();
   if (executing.has(key)) return;
   executing.add(key);
   try {
     console.log(`[機会] ${opp.kind} ${opp.chain} ${opp.label}: 純利益+$${opp.netProfitUsd.toFixed(4)}(投入$${opp.tradeAmountUsd.toFixed(2)} 壁${opp.feeWallPercent.toFixed(2)}%)`);
     const ok = await Promise.race([
       executeOpportunity(opp),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("実行が制限時間を超えました")), EXECUTION_TIMEOUT_MS)),
+      new Promise((_, reject) => setTimeout(() => reject(new ExecutionError("実行が制限時間を超えました")), EXECUTION_TIMEOUT_MS)),
     ]);
-    if (ok) stats.executed++; else stats.failed++;
+    if (ok) {
+      stats.executed++;
+      cooldownUntil.delete(key);
+    } else {
+      // 条件を満たさず見送っただけ。短い冷却で連打を避ける。
+      cooldownUntil.set(key, Date.now() + 30 * 1000);
+    }
   } catch (e) {
     stats.failed++;
     const msg = e.message || "";
-    if (msg.includes("execution reverted") || msg.includes("CALL_EXCEPTION")) {
-      for (const addr of opp.poolAddresses) recordIncompatiblePool(opp.chain, addr, msg.slice(0, 80));
-    }
-    console.warn(`[実行] エラー: ${msg.slice(0, 120)}`);
+    console.warn(`[実行] 失敗: ${msg.slice(0, 120)}`);
+    noteExecutionFailure(opp, msg);
   } finally {
     executing.delete(key);
   }
@@ -311,9 +354,9 @@ async function handleOpportunity(opp) {
 
 // ===== Syncイベント受信 =====
 function handleSync(chain, poolAddress, reserve0, reserve1, receivedAt) {
+  if (disabledPools.has(poolKeyOf(chain, poolAddress))) return false;
   const pool = updateReservesFromSync(chain, poolAddress, reserve0, reserve1);
   if (!pool) {
-    // 未知のプール。取引が起きている証拠なので、取り込み候補に入れる。
     stats.syncUnknown++;
     queueUnknownPool(chain, poolAddress, reserve0, reserve1);
     return false;
@@ -321,10 +364,7 @@ function handleSync(chain, poolAddress, reserve0, reserve1, receivedAt) {
   stats.syncMatched++;
   if (!stats.ready) return true;
   try {
-    const opp = scanForChangedPool({
-      chain, poolAddress, capUsd: getCurrentTradeCapUsd(),
-      gasCostUsd: getGasCost(chain), isBorrowable,
-    });
+    const opp = scanForChangedPool({ chain, poolAddress, capUsd: getCurrentTradeCapUsd(), gasCostUsd: getGasCost(chain), isBorrowable });
     const latency = Date.now() - receivedAt;
     stats.latencies.push(latency);
     if (stats.latencies.length > 200) stats.latencies.shift();
@@ -340,10 +380,7 @@ async function fullScanOnce() {
   fullScanRunning = true;
   try {
     for (const chain of Object.keys(CHAIN_CONFIG)) {
-      const opportunities = scanAllPairs({
-        chain, capUsd: getCurrentTradeCapUsd(),
-        gasCostUsd: getGasCost(chain), isBorrowable,
-      });
+      const opportunities = scanAllPairs({ chain, capUsd: getCurrentTradeCapUsd(), gasCostUsd: getGasCost(chain), isBorrowable });
       for (const opp of opportunities.slice(0, 3)) await handleOpportunity(opp);
     }
     stats.scans++;
@@ -362,7 +399,9 @@ async function refreshStaleReserves() {
   try {
     for (const chain of Object.keys(CHAIN_CONFIG)) {
       if (isChainWsEnabled(chain)) continue;
-      const stale = getStalePools(chain, REFRESH_STALE_SEC * 1000).slice(0, REFRESH_BATCH_SIZE);
+      const stale = getStalePools(chain, REFRESH_STALE_SEC * 1000)
+        .filter((p) => !disabledPools.has(poolKeyOf(chain, p.address)))
+        .slice(0, REFRESH_BATCH_SIZE);
       if (stale.length === 0) continue;
       const batch = await fetchReservesBatch(chain, stale.map((p) => ({ address: p.address })));
       for (const pool of stale) {
@@ -382,7 +421,7 @@ function heartbeat() {
   stats.lastHeartbeat = new Date().toISOString();
   const rpc = getRpcStatus();
   const queued = Object.entries(rpc).filter(([, v]) => v.queued > 0).map(([c, v]) => `${c}:${v.queued}`).join(" ");
-  console.log(`[生存] スキャン${stats.scans} 読直${stats.refreshCycles} 検出${stats.opportunitiesFound} 実行${stats.executed}/${stats.failed} Sync一致${stats.syncMatched}/未知${stats.syncUnknown} 取込${stats.adopted} 待機${pendingAdoption.size} 手数料${stats.feeProbed} 行列[${queued || "空"}]`);
+  console.log(`[生存] スキャン${stats.scans} 読直${stats.refreshCycles} 検出${stats.opportunitiesFound} 実行${stats.executed}/${stats.failed} 冷却${stats.skippedCooldown} 無効${stats.disabled} Sync一致${stats.syncMatched}/未知${stats.syncUnknown} 取込${stats.adopted} 手数料${stats.feeProbed} 行列[${queued || "空"}]`);
 }
 
 // ===== ダッシュボード =====
@@ -408,8 +447,8 @@ function renderPage() {
   const syncStats = getSyncStats();
   const rpc = getRpcStatus();
   const hbAge = stats.lastHeartbeat ? Math.round((Date.now() - new Date(stats.lastHeartbeat).getTime()) / 1000) : null;
-  const matchRate = (stats.syncMatched + stats.syncUnknown) > 0
-    ? (stats.syncMatched / (stats.syncMatched + stats.syncUnknown) * 100).toFixed(1) : "0.0";
+  const total = stats.syncMatched + stats.syncUnknown;
+  const matchRate = total > 0 ? (stats.syncMatched / total * 100).toFixed(1) : "0.0";
 
   const realRows = real.recent.map((e) => `<tr><td>${new Date(e.timestamp).toLocaleString('ja-JP')}</td><td style="font-size:9px">${e.pairLabel}</td>
     <td style="text-align:right">$${e.tradeAmountUsd.toFixed(2)}</td>
@@ -422,9 +461,7 @@ function renderPage() {
     <td style="text-align:right">$${o.tradeAmountUsd.toFixed(0)}</td>
     <td style="text-align:right;color:${o.profitable?'#2ecc71':'#888'};font-weight:600">${o.netProfitUsd>=0?'+':''}$${o.netProfitUsd.toFixed(4)}</td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ機会が見つかっていません</td></tr>`;
 
-  const syncLine = Object.entries(syncStats).map(([c, v]) =>
-    `${c}: 受信${v.received.toLocaleString()}件${v.connected ? '' : ' <span style="color:#e74c3c">(切断中)</span>'}`
-  ).join('<br>') || 'WebSocket未設定';
+  const syncLine = Object.entries(syncStats).map(([c, v]) => `${c}: 受信${v.received.toLocaleString()}件${v.connected ? '' : ' <span style="color:#e74c3c">(切断中)</span>'}`).join('<br>') || 'WebSocket未設定';
 
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="refresh" content="20">
 <title>DEXアービトラージ</title><style>${STYLE}</style></head><body>
@@ -438,36 +475,34 @@ function renderPage() {
 <table><thead><tr><th>日時</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table>
 <div class="note">成功実績${getSuccessCount()}回に応じて取引上限が自動的に上がります。</div></div>
 
+<div class="card"><h2>🎯 検出した機会</h2>
+<div class="stat"><div><div class="v" style="color:${stats.opportunitiesFound>0?'#2ecc71':'#888'}">${stats.opportunitiesFound}</div><div class="l">検出数</div></div>
+<div><div class="v">${stats.executed}</div><div class="l">実行成功</div></div>
+<div><div class="v" style="color:${stats.failed>0?'#e74c3c':'#888'}">${stats.failed}</div><div class="l">実行失敗</div></div>
+<div><div class="v">${stats.disabled}</div><div class="l">無効化プール</div></div></div>
+<table><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table>
+<div class="note">送信に失敗した組み合わせは10分間再試行せず、3回失敗したプールは無効化します。「壁」は黒字になる最低ラインの価格差です。最低$${MIN_PROFIT_USD}を超えたものだけ送信します。</div></div>
+
 <div class="card"><h2>🔭 活発なプールの自動発見</h2>
 <div class="stat"><div><div class="v" style="color:#2ecc71">${stats.adopted.toLocaleString()}</div><div class="l">新たに取り込んだ</div></div>
 <div><div class="v">${matchRate}%</div><div class="l">取引の捕捉率</div></div>
 <div><div class="v">${stats.syncUnknown.toLocaleString()}</div><div class="l">未知プールの取引</div></div>
 <div><div class="v">${pendingAdoption.size.toLocaleString()}</div><div class="l">取り込み待ち</div></div></div>
-<div class="note">Syncイベントが届いたプールは「実際に取引が起きている」証拠です。未知のプールは自動的に地図へ取り込むため、活発なプールだけが自然に集まります。<br>
-捕捉率は、チェーン上で起きた取引のうち監視できている割合です。当初は3.8%で、取引の96%を見逃していました。</div></div>
+<div class="note">Syncイベントが届いた未知のプールは、取引が起きている証拠なので自動的に取り込みます(stable型は除外)。捕捉率は当初3.8%でした。</div></div>
 
 <div class="card"><h2>🩺 システムの生存確認</h2>
 <div class="stat"><div><div class="v" style="color:${hbAge != null && hbAge < 120 ? '#2ecc71' : '#e74c3c'}">${hbAge != null ? hbAge + '秒前' : '-'}</div><div class="l">最終生存確認</div></div>
-<div><div class="v">${stats.scans}</div><div class="l">スキャン回数</div></div>
-<div><div class="v">${stats.feeProbed.toLocaleString()}</div><div class="l">手数料実測済み</div></div>
-<div><div class="v">${stats.executed}/${stats.failed}</div><div class="l">実行 成功/失敗</div></div></div>
-<div class="note">RPC呼び出しには8秒、取引の実行には60秒の上限があります(以前は上限が無く14時間凍結しました)。<br>
-待ち行列: ${Object.entries(rpc).map(([c, v]) => `${c}:${v.queued}`).join(' / ')}</div></div>
+<div><div class="v">${stats.syncMatched.toLocaleString()}</div><div class="l">監視対象の更新</div></div>
+<div><div class="v">${lat != null ? lat + 'ms' : '-'}</div><div class="l">判定時間</div></div>
+<div><div class="v">${stats.feeProbed.toLocaleString()}</div><div class="l">手数料実測済み</div></div></div>
+<div class="note">${syncLine}<br>待ち行列: ${Object.entries(rpc).map(([c, v]) => `${c}:${v.queued}`).join(' / ')}</div></div>
 
-<div class="card"><h2>⚡ リアルタイム監視</h2>
-<div class="stat"><div><div class="v" style="color:${stats.syncMatched>0?'#2ecc71':'#888'}">${stats.syncMatched.toLocaleString()}</div><div class="l">監視対象の更新</div></div>
-<div><div class="v">${lat != null ? lat + 'ms' : '-'}</div><div class="l">判定時間(中央値)</div></div>
+<div class="card"><h2>🗺️ プール地図(メモリ上)</h2>
+<div class="stat"><div><div class="v">${s.totalPools.toLocaleString()}</div><div class="l">プール</div></div>
 <div><div class="v">${s.arbitragablePairs.toLocaleString()}</div><div class="l">裁定候補ペア</div></div>
-<div><div class="v">${s.totalPools.toLocaleString()}</div><div class="l">監視中プール</div></div></div>
-<div class="note">${syncLine}<br>チェーン別プール: ${Object.entries(s.byChain).map(([c, n]) => `${c}:${n.toLocaleString()}`).join(' / ') || '構築中'}</div></div>
-
-<div class="card"><h2>🎯 検出した機会</h2>
-<div class="stat"><div><div class="v" style="color:${stats.opportunitiesFound>0?'#2ecc71':'#888'}">${stats.opportunitiesFound}</div><div class="l">検出数</div></div>
-<div><div class="v">${stats.executed}</div><div class="l">実行成功</div></div>
-<div><div class="v">${stats.failed}</div><div class="l">実行失敗</div></div>
-<div><div class="v">${stats.lastOpportunity ? new Date(stats.lastOpportunity).toLocaleTimeString('ja-JP') : '-'}</div><div class="l">最終検出</div></div></div>
-<table><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table>
-<div class="note">「壁」はその経路で黒字になる最低ラインの価格差(往復手数料+Aave0.05%)です。最低$${MIN_PROFIT_USD}を超えたものだけ送信します。</div></div>
+<div><div class="v">${s.totalTokens.toLocaleString()}</div><div class="l">トークン</div></div>
+<div><div class="v" style="font-size:11px">${stats.mapSource}</div><div class="l">地図の由来</div></div></div>
+<div class="note">チェーン別: ${Object.entries(s.byChain).map(([c, n]) => `${c}:${n.toLocaleString()}`).join(' / ') || '構築中'}<br>${stats.mapSavedAt ? `最終保存: ${new Date(stats.mapSavedAt).toLocaleString('ja-JP')}` : ''}</div></div>
 
 <div class="footerlink"><a href="/about">→ 仕組みについて</a></div></body></html>`;
 }
@@ -475,10 +510,10 @@ function renderPage() {
 function renderAbout() {
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>仕組み</title><style>${STYLE}</style></head><body>
 <h1>📊 仕組み</h1>
-<div class="card"><h2>① プール地図</h2><div class="note">実在が確認できているプールに factory() を呼んでファクトリーを逆算し、全プールを列挙します。地図はファイルに保存し、再起動時は数秒で復元します。準備量だけは毎回全件を取得し直します。</div></div>
-<div class="card"><h2>② 活発なプールの自動発見</h2><div class="note">ファクトリーから取った「最新のプール」は大半が取引のない空のプールでした(取引の96%が追跡外で起きていました)。Syncイベントが届いたプールは実際に取引が起きている証拠なので、未知なら自動的に地図へ取り込みます。これにより活発なプールだけが自然に集まります。</div></div>
-<div class="card"><h2>③ 即時判定</h2><div class="note">変化したプールを含む経路(2ステップ・三角の両方)だけをメモリ上で再計算します。RPCを使わないためミリ秒で完了します。</div></div>
-<div class="card"><h2>④ 凍結対策</h2><div class="note">RPC呼び出しには8秒、取引の実行には60秒の上限を設けています。待ち行列はチェーンごとに分けており、1チェーンの障害が他に波及しません。</div></div>
+<div class="card"><h2>① プール地図</h2><div class="note">実在が確認できているプールからファクトリーを逆算し、全プールを列挙します。地図はファイルに保存し、再起動時は数秒で復元します。準備量は毎回全件を取得し直します。</div></div>
+<div class="card"><h2>② 活発なプールの自動発見</h2><div class="note">Syncイベントが届いた未知のプールは、取引が起きている証拠なので自動的に取り込みます。stable型(計算式が異なる)は除外します。</div></div>
+<div class="card"><h2>③ 即時判定</h2><div class="note">変化したプールを含む経路だけをメモリ上で再計算します。RPCを使わないためミリ秒で完了します。</div></div>
+<div class="card"><h2>④ 失敗の抑制</h2><div class="note">送信に失敗した組み合わせは10分間再試行しません。3回失敗したプールは無効化し、記録して次回起動時も除外します。以前は同じ失敗を1.5秒ごとに無限に繰り返していました。</div></div>
 <div class="card"><h2>⑤ 実行</h2><div class="note">送信直前にプール自身へ受取量を問い合わせて確定させ、Aaveのフラッシュローンで実行します。利益が出なければ取引全体が無効化されます(実害はガス代のみ)。</div></div>
 <div class="footerlink"><a href="/">← 戻る</a></div></body></html>`;
 }
