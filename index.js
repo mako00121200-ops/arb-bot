@@ -3,13 +3,13 @@
 // [設計] イベント駆動型のDEXアービトラージbot。
 //
 // ①起動時: プール地図をファイルから読み込む(無ければファクトリーから構築)。
-//          準備量だけは必ず全件を再取得し、古い値で判定しない。
 // ②常時:   チェーン上の全Syncイベントを1つの購読で受け取り、監視対象なら
 //          メモリ上で準備量を更新して、その経路だけを即座に再計算する。
-// ③発見:   Syncが届いた未知のプールは「実際に取引が起きている証拠」なので、
-//          自動的に地図へ取り込む。
-// ④抑制:   送信に失敗した組み合わせは10分間再試行しない。3回失敗した
-//          プールは無効化する(以前は同じ失敗を1.5秒ごとに無限に繰り返した)。
+// ③発見:   Syncが届いた未知のプールは自動的に地図へ取り込む。
+// ④罠対策: 「投入$2で利益$24」のような案件はハニーポット(売れない詐欺
+//          トークン)であり、本物の裁定は投入額の0.1〜5%程度。異常なリターンの
+//          案件は送信せずにプールを無効化する。「blacklist」等の拒否理由が
+//          出たプールも1回で無効化する。
 
 import http from "http";
 import { startOnchainFeeds, getSyncStats, isChainWsEnabled } from "./dex-onchain-realtime.js";
@@ -45,10 +45,13 @@ const HEARTBEAT_INTERVAL_MS = 60 * 1000;
 const EXECUTION_TIMEOUT_MS = 60 * 1000;
 const ADOPT_INTERVAL_MS = 5000;
 const ADOPT_PER_TICK = 60;
-// 送信失敗後、同じ組み合わせを再試行しない時間。
 const FAILURE_COOLDOWN_MS = 10 * 60 * 1000;
-// この回数失敗したプールは無効化する。
 const DISABLE_AFTER_FAILURES = 3;
+// 投入額に対する利益がこの割合を超える案件は、罠(ハニーポット)とみなす。
+// 本物の裁定は0.1〜5%程度。1,100%のような値は「売れないトークン」の証拠。
+const MAX_SANE_RETURN_RATIO = parseFloat(process.env.MAX_SANE_RETURN_RATIO || "0.20");
+// この文言を含む拒否は、トークン自体が送金を拒む詐欺なので1回で無効化する。
+const SCAM_REVERT_PATTERNS = [/blacklist/i, /not allowed/i, /forbidden/i, /bot/i, /trading (is )?not (enabled|open)/i, /cooldown/i, /max ?tx/i, /max ?wallet/i, /antiwhale/i];
 
 // ===== ガス代 =====
 const FALLBACK_GAS = { base: 0.025, arbitrum: 0.03, optimism: 0.01, polygon: 0.033, avalanche: 0.002 };
@@ -62,16 +65,16 @@ async function refreshGasCosts() {
 
 // ===== 統計 =====
 const stats = {
-  scans: 0, opportunitiesFound: 0, executed: 0, failed: 0, skippedCooldown: 0,
+  scans: 0, opportunitiesFound: 0, executed: 0, failed: 0, skippedCooldown: 0, trapsRejected: 0,
   lastOpportunity: null, recent: [], syncMatched: 0, syncUnknown: 0, adopted: 0, disabled: 0,
   latencies: [], ready: false, refreshCycles: 0, mapSource: "-", mapSavedAt: null,
   feeProbed: 0, lastHeartbeat: null, reservesLoaded: 0,
 };
 
 // ===== 失敗の抑制と無効化 =====
-const cooldownUntil = new Map();   // 組み合わせキー → 再試行してよい時刻
-const poolFailures = new Map();    // "chain::address" → 失敗回数
-const disabledPools = new Set();   // 無効化したプール
+const cooldownUntil = new Map();
+const poolFailures = new Map();
+const disabledPools = new Set();
 
 function poolKeyOf(chain, address) { return `${chain}::${address.toLowerCase()}`; }
 
@@ -80,25 +83,45 @@ function disablePool(chain, address, reason) {
   if (disabledPools.has(key)) return;
   disabledPools.add(key);
   stats.disabled++;
-  // 準備量を0にして判定対象から外す(Syncによる更新も止める)。
   const pool = getPool(chain, address);
   if (pool) { pool.raw0 = 0n; pool.raw1 = 0n; }
   recordIncompatiblePool(chain, address, reason);
-  console.log(`[無効化] ${chain} ${address.slice(0, 10)}…: ${reason.slice(0, 60)}`);
+  console.log(`[無効化] ${chain} ${address.slice(0, 10)}…: ${reason.slice(0, 70)}`);
+}
+
+function isScamRevert(message) {
+  return SCAM_REVERT_PATTERNS.some((re) => re.test(message || ""));
 }
 
 function noteExecutionFailure(opp, reason) {
   cooldownUntil.set(opp.poolAddresses.join("|").toLowerCase(), Date.now() + FAILURE_COOLDOWN_MS);
+  const scam = isScamRevert(reason);
   for (const address of opp.poolAddresses) {
     const key = poolKeyOf(opp.chain, address);
     const n = (poolFailures.get(key) || 0) + 1;
     poolFailures.set(key, n);
-    if (n >= DISABLE_AFTER_FAILURES) disablePool(opp.chain, address, `送信失敗${n}回: ${reason}`);
+    if (scam || n >= DISABLE_AFTER_FAILURES) {
+      disablePool(opp.chain, address, scam ? `詐欺トークン: ${reason}` : `送信失敗${n}回: ${reason}`);
+    }
   }
 }
 
 function hasDisabledPool(opp) {
   return opp.poolAddresses.some((a) => disabledPools.has(poolKeyOf(opp.chain, a)));
+}
+
+/// 異常なリターンの案件を罠として弾く。プールごと無効化する。
+function rejectIfTrap(opp) {
+  if (opp.tradeAmountUsd <= 0) return false;
+  const ratio = opp.netProfitUsd / opp.tradeAmountUsd;
+  if (ratio <= MAX_SANE_RETURN_RATIO) return false;
+  stats.trapsRejected++;
+  const reason = `異常なリターン${(ratio * 100).toFixed(0)}%(投入$${opp.tradeAmountUsd.toFixed(2)}→利益$${opp.netProfitUsd.toFixed(2)})`;
+  console.log(`[罠] ${opp.kind} ${opp.chain} ${opp.label}: ${reason}。送信せずに無効化します`);
+  // 借りる通貨(USDC等)のプール自体は無害なので、借りる通貨を含まない側を疑う。
+  // 判別が難しいため、この経路の全プールを無効化する(安全側)。
+  for (const address of opp.poolAddresses) disablePool(opp.chain, address, reason);
+  return true;
 }
 
 // ===== Syncで見つかった未知のプールを取り込む =====
@@ -217,7 +240,6 @@ async function preparePoolMap() {
     savePoolMap();
     stats.mapSavedAt = new Date().toISOString();
   }
-  // 過去に非対応と判明したプールは、読み込んだ地図からも外す。
   for (const [chain, addresses] of Object.entries(getAllPoolAddressesByChain())) {
     for (const address of addresses) {
       if (isKnownIncompatiblePool(chain, address)) {
@@ -322,6 +344,9 @@ async function handleOpportunity(opp) {
   const until = cooldownUntil.get(key);
   if (until && Date.now() < until) { stats.skippedCooldown++; return; }
 
+  // 異常なリターンは罠。統計にも「機会」として数えない。
+  if (rejectIfTrap(opp)) return;
+
   stats.opportunitiesFound++;
   stats.lastOpportunity = new Date().toISOString();
   stats.recent = [{ ...opp, at: new Date().toISOString() }, ...stats.recent.filter((r) => r.label !== opp.label)].slice(0, 20);
@@ -335,13 +360,8 @@ async function handleOpportunity(opp) {
       executeOpportunity(opp),
       new Promise((_, reject) => setTimeout(() => reject(new ExecutionError("実行が制限時間を超えました")), EXECUTION_TIMEOUT_MS)),
     ]);
-    if (ok) {
-      stats.executed++;
-      cooldownUntil.delete(key);
-    } else {
-      // 条件を満たさず見送っただけ。短い冷却で連打を避ける。
-      cooldownUntil.set(key, Date.now() + 30 * 1000);
-    }
+    if (ok) { stats.executed++; cooldownUntil.delete(key); }
+    else cooldownUntil.set(key, Date.now() + 30 * 1000);
   } catch (e) {
     stats.failed++;
     const msg = e.message || "";
@@ -421,7 +441,7 @@ function heartbeat() {
   stats.lastHeartbeat = new Date().toISOString();
   const rpc = getRpcStatus();
   const queued = Object.entries(rpc).filter(([, v]) => v.queued > 0).map(([c, v]) => `${c}:${v.queued}`).join(" ");
-  console.log(`[生存] スキャン${stats.scans} 読直${stats.refreshCycles} 検出${stats.opportunitiesFound} 実行${stats.executed}/${stats.failed} 冷却${stats.skippedCooldown} 無効${stats.disabled} Sync一致${stats.syncMatched}/未知${stats.syncUnknown} 取込${stats.adopted} 手数料${stats.feeProbed} 行列[${queued || "空"}]`);
+  console.log(`[生存] スキャン${stats.scans} 検出${stats.opportunitiesFound} 実行${stats.executed}/${stats.failed} 罠${stats.trapsRejected} 無効${stats.disabled} Sync一致${stats.syncMatched}/未知${stats.syncUnknown} 取込${stats.adopted} 手数料${stats.feeProbed} 行列[${queued || "空"}]`);
 }
 
 // ===== ダッシュボード =====
@@ -458,7 +478,7 @@ function renderPage() {
   const oppRows = stats.recent.slice(0, 15).map((o, i) => `<tr><td>${i+1}</td>
     <td style="font-size:9px">${o.kind} ${o.chain}<br>${o.label}</td>
     <td style="text-align:right">${o.feeWallPercent.toFixed(2)}%</td>
-    <td style="text-align:right">$${o.tradeAmountUsd.toFixed(0)}</td>
+    <td style="text-align:right">$${o.tradeAmountUsd.toFixed(2)}</td>
     <td style="text-align:right;color:${o.profitable?'#2ecc71':'#888'};font-weight:600">${o.netProfitUsd>=0?'+':''}$${o.netProfitUsd.toFixed(4)}</td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ機会が見つかっていません</td></tr>`;
 
   const syncLine = Object.entries(syncStats).map(([c, v]) => `${c}: 受信${v.received.toLocaleString()}件${v.connected ? '' : ' <span style="color:#e74c3c">(切断中)</span>'}`).join('<br>') || 'WebSocket未設定';
@@ -473,22 +493,22 @@ function renderPage() {
 <div><div class="v">$${getCurrentTradeCapUsd()}</div><div class="l">取引上限</div></div>
 <div><div class="v" style="color:${isLive?'#2ecc71':'#888'}">${isLive?'稼働中':'停止中'}</div><div class="l">自動売買</div></div></div>
 <table><thead><tr><th>日時</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table>
-<div class="note">成功実績${getSuccessCount()}回に応じて取引上限が自動的に上がります。</div></div>
+<div class="note">成功実績${getSuccessCount()}回に応じて取引上限が自動的に上がります。投入額はプールの準備量から利益が最大になる値を自動計算します。</div></div>
 
 <div class="card"><h2>🎯 検出した機会</h2>
 <div class="stat"><div><div class="v" style="color:${stats.opportunitiesFound>0?'#2ecc71':'#888'}">${stats.opportunitiesFound}</div><div class="l">検出数</div></div>
 <div><div class="v">${stats.executed}</div><div class="l">実行成功</div></div>
 <div><div class="v" style="color:${stats.failed>0?'#e74c3c':'#888'}">${stats.failed}</div><div class="l">実行失敗</div></div>
-<div><div class="v">${stats.disabled}</div><div class="l">無効化プール</div></div></div>
+<div><div class="v" style="color:${stats.trapsRejected>0?'#e8a33d':'#888'}">${stats.trapsRejected}</div><div class="l">罠を回避</div></div></div>
 <table><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table>
-<div class="note">送信に失敗した組み合わせは10分間再試行せず、3回失敗したプールは無効化します。「壁」は黒字になる最低ラインの価格差です。最低$${MIN_PROFIT_USD}を超えたものだけ送信します。</div></div>
+<div class="note">投入額に対して${(MAX_SANE_RETURN_RATIO*100).toFixed(0)}%を超えるリターンの案件は、売れない詐欺トークン(ハニーポット)とみなして送信せず、プールを無効化します。本物の裁定は0.1〜5%程度です。無効化プール: ${stats.disabled}件</div></div>
 
 <div class="card"><h2>🔭 活発なプールの自動発見</h2>
 <div class="stat"><div><div class="v" style="color:#2ecc71">${stats.adopted.toLocaleString()}</div><div class="l">新たに取り込んだ</div></div>
 <div><div class="v">${matchRate}%</div><div class="l">取引の捕捉率</div></div>
 <div><div class="v">${stats.syncUnknown.toLocaleString()}</div><div class="l">未知プールの取引</div></div>
 <div><div class="v">${pendingAdoption.size.toLocaleString()}</div><div class="l">取り込み待ち</div></div></div>
-<div class="note">Syncイベントが届いた未知のプールは、取引が起きている証拠なので自動的に取り込みます(stable型は除外)。捕捉率は当初3.8%でした。</div></div>
+<div class="note">Syncイベントが届いた未知のプールは、取引が起きている証拠なので自動的に取り込みます(stable型は除外)。</div></div>
 
 <div class="card"><h2>🩺 システムの生存確認</h2>
 <div class="stat"><div><div class="v" style="color:${hbAge != null && hbAge < 120 ? '#2ecc71' : '#e74c3c'}">${hbAge != null ? hbAge + '秒前' : '-'}</div><div class="l">最終生存確認</div></div>
@@ -511,10 +531,10 @@ function renderAbout() {
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>仕組み</title><style>${STYLE}</style></head><body>
 <h1>📊 仕組み</h1>
 <div class="card"><h2>① プール地図</h2><div class="note">実在が確認できているプールからファクトリーを逆算し、全プールを列挙します。地図はファイルに保存し、再起動時は数秒で復元します。準備量は毎回全件を取得し直します。</div></div>
-<div class="card"><h2>② 活発なプールの自動発見</h2><div class="note">Syncイベントが届いた未知のプールは、取引が起きている証拠なので自動的に取り込みます。stable型(計算式が異なる)は除外します。</div></div>
-<div class="card"><h2>③ 即時判定</h2><div class="note">変化したプールを含む経路だけをメモリ上で再計算します。RPCを使わないためミリ秒で完了します。</div></div>
-<div class="card"><h2>④ 失敗の抑制</h2><div class="note">送信に失敗した組み合わせは10分間再試行しません。3回失敗したプールは無効化し、記録して次回起動時も除外します。以前は同じ失敗を1.5秒ごとに無限に繰り返していました。</div></div>
-<div class="card"><h2>⑤ 実行</h2><div class="note">送信直前にプール自身へ受取量を問い合わせて確定させ、Aaveのフラッシュローンで実行します。利益が出なければ取引全体が無効化されます(実害はガス代のみ)。</div></div>
+<div class="card"><h2>② 活発なプールの自動発見</h2><div class="note">Syncイベントが届いた未知のプールは、取引が起きている証拠なので自動的に取り込みます。</div></div>
+<div class="card"><h2>③ 投入額の最適化</h2><div class="note">各プールの準備量(x·y=k)から、利益が最大になる投入額を計算します。フラッシュローンなのでいくらでも借りられますが、プールの深さが利益の上限を決めます。小さなプールなら小さく、大きなプールなら大きく入れます。</div></div>
+<div class="card"><h2>④ 罠の回避</h2><div class="note">「投入$2で利益$24」のような異常なリターンは、売れない詐欺トークン(ハニーポット)が作る見せかけの価格差です。本物の裁定は0.1〜5%程度。異常なリターンの案件は送信せずにプールを無効化し、「blacklist」等の拒否理由が出たプールも1回で無効化します。</div></div>
+<div class="card"><h2>⑤ 実行</h2><div class="note">送信直前にプール自身へ受取量を問い合わせて確定させ、各段の入力には実際に要求する量を使います。Aaveのフラッシュローンで実行し、利益が出なければ取引全体が無効化されます(実害はガス代のみ)。</div></div>
 <div class="footerlink"><a href="/">← 戻る</a></div></body></html>`;
 }
 
