@@ -2,19 +2,13 @@
 //
 // [設計] イベント駆動型のDEXアービトラージbot。
 //
-// ①起動時: プール地図をファイルから読み込む(無ければファクトリーから構築)。
-//          準備量だけは必ず全件を再取得し、古い値で判定しない。
+// ①起動時: プール地図をファイルから読み込み、準備量は必ず全件を再取得する。
 // ②常時:   チェーン上の全Syncイベントを1つの購読で受け取り、監視対象なら
 //          メモリ上で準備量を更新して、その経路だけを即座に再計算する。
 // ③発見:   Syncが届いた未知のプールは自動的に地図へ取り込む。
-// ④罠対策: 投入額に対するリターンが異常な案件はハニーポットとみなし、
-//          送信せずにプールを無効化する。
-//
-// [今回の修正]
-//   ・手数料の実測を、裁定候補だけでなく全プールに広げる(三角経路の脚が
-//     既定の0.3%のまま判定されていた)
-//   ・ガス代の概算を経路の段数(2step/3step)に応じて使い分ける
-//   ・「検出数」を黒字案件だけ数え、実態と一致させる
+// ④除外:   実測手数料が1%を超えるプールは「送金時に税を取るトークン」で
+//          あり、構造上裁定できないため恒久的に除外する。異常なリターンの
+//          案件(ハニーポット)も同様に除外する。
 
 import http from "http";
 import { startOnchainFeeds, getSyncStats, isChainWsEnabled } from "./dex-onchain-realtime.js";
@@ -32,7 +26,7 @@ import {
   getArbitragablePairs, savePoolMap, loadPoolMap,
 } from "./scripts/pool-registry.js";
 import { scanForChangedPool, scanAllPairs } from "./scripts/opportunity-scanner.js";
-import { executeOpportunity, ExecutionError } from "./scripts/execute-opportunity.js";
+import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS } from "./scripts/execute-opportunity.js";
 import { isBorrowable, getBorrowableTokens } from "./scripts/borrowable-tokens.js";
 import { getVerifiedPairs } from "./scripts/verified-pairs.js";
 import { isKnownIncompatiblePool, recordIncompatiblePool } from "./scripts/incompatible-pools.js";
@@ -56,9 +50,8 @@ const MAX_SANE_RETURN_RATIO = parseFloat(process.env.MAX_SANE_RETURN_RATIO || "0
 const SCAM_REVERT_PATTERNS = [/blacklist/i, /not allowed/i, /forbidden/i, /trading (is )?not (enabled|open)/i, /cooldown/i, /max ?tx/i, /max ?wallet/i, /antiwhale/i];
 
 // ===== ガス代 =====
-// 経路の段数によってガス使用量が違うため、種類ごとに保持する。
 const FALLBACK_GAS = { base: 0.010, arbitrum: 0.015, optimism: 0.005, polygon: 0.012, avalanche: 0.001 };
-const gasCostCache = new Map(); // "chain::kind" → USD
+const gasCostCache = new Map();
 function getGasCost(chain, kind = "2step") {
   return gasCostCache.get(`${chain}::${kind}`) ?? FALLBACK_GAS[chain] ?? 0.02;
 }
@@ -73,7 +66,7 @@ async function refreshGasCosts() {
 // ===== 統計 =====
 const stats = {
   scans: 0, profitableFound: 0, examined: 0, executed: 0, failed: 0,
-  skippedCooldown: 0, trapsRejected: 0,
+  skippedCooldown: 0, trapsRejected: 0, taxTokensRejected: 0,
   lastOpportunity: null, recent: [], syncMatched: 0, syncUnknown: 0, adopted: 0, disabled: 0,
   latencies: [], ready: false, refreshCycles: 0, mapSource: "-", mapSavedAt: null,
   feeProbed: 0, feeProbePending: 0, lastHeartbeat: null, reservesLoaded: 0,
@@ -101,8 +94,20 @@ function isScamRevert(message) {
   return SCAM_REVERT_PATTERNS.some((re) => re.test(message || ""));
 }
 
-function noteExecutionFailure(opp, reason) {
+function noteExecutionFailure(opp, error) {
+  const reason = error?.message || String(error);
   cooldownUntil.set(opp.poolAddresses.join("|").toLowerCase(), Date.now() + FAILURE_COOLDOWN_MS);
+
+  // 税トークンと判明したプールは、原因が特定できているので即座に除外する。
+  if (error instanceof ExecutionError && error.taxToken) {
+    stats.taxTokensRejected++;
+    const targets = error.taxPools?.length ? error.taxPools : opp.poolAddresses;
+    for (const address of targets) {
+      disablePool(opp.chain, address, `送金時に税を取るトークン(手数料${TAX_TOKEN_FEE_BPS}bps超)`);
+    }
+    return;
+  }
+
   const scam = isScamRevert(reason);
   for (const address of opp.poolAddresses) {
     const key = poolKeyOf(opp.chain, address);
@@ -116,6 +121,21 @@ function noteExecutionFailure(opp, reason) {
 
 function hasDisabledPool(opp) {
   return opp.poolAddresses.some((a) => disabledPools.has(poolKeyOf(opp.chain, a)));
+}
+
+/// 実測手数料が税トークンの水準に達したプールを除外する。
+function pruneTaxTokenPools(opp) {
+  let found = false;
+  for (const address of opp.poolAddresses) {
+    const pool = getPool(opp.chain, address);
+    if (!pool || !pool.feeProbed) continue;
+    if (pool.feeBps > TAX_TOKEN_FEE_BPS) {
+      stats.taxTokensRejected++;
+      disablePool(opp.chain, address, `実測手数料${pool.feeBps}bps(税トークン)`);
+      found = true;
+    }
+  }
+  return found;
 }
 
 function rejectIfTrap(opp) {
@@ -208,7 +228,6 @@ async function buildPoolMapFromFactories() {
 
 async function loadAllReserves() {
   let loaded = 0;
-  // チェーンごとに並行して取得する(待ち行列はチェーン別なので競合しない)。
   await Promise.all(Object.entries(getAllPoolAddressesByChain()).map(async ([chain, addresses]) => {
     const CHUNK = 2000;
     for (let i = 0; i < addresses.length; i += CHUNK) {
@@ -246,11 +265,14 @@ async function preparePoolMap() {
     savePoolMap();
     stats.mapSavedAt = new Date().toISOString();
   }
+  // 過去に非対応と判明したプール、および実測手数料が税トークン水準の
+  // プールを、判定対象から外す。
   for (const [chain, addresses] of Object.entries(getAllPoolAddressesByChain())) {
     for (const address of addresses) {
-      if (isKnownIncompatiblePool(chain, address)) {
+      const pool = getPool(chain, address);
+      const isTax = pool && pool.feeProbed && pool.feeBps > TAX_TOKEN_FEE_BPS;
+      if (isKnownIncompatiblePool(chain, address) || isTax) {
         disabledPools.add(poolKeyOf(chain, address));
-        const pool = getPool(chain, address);
         if (pool) { pool.raw0 = 0n; pool.raw1 = 0n; }
       }
     }
@@ -261,6 +283,7 @@ async function preparePoolMap() {
     const pool = getPool(chain, address);
     if (pool) { pool.raw0 = 0n; pool.raw1 = 0n; }
   }
+  stats.disabled = disabledPools.size;
   const s = getStats();
   console.log(`[プール地図] 準備完了: ${s.totalPools}プール / 裁定候補${s.arbitragablePairs}ペア / 無効化${disabledPools.size}件`);
   console.log(`[プール地図] チェーン別: ${Object.entries(s.byChain).map(([c, n]) => `${c}:${n}`).join(" / ") || "なし"}`);
@@ -314,9 +337,7 @@ function prepareBorrowableTokens() {
   console.log(`[価格実測] ${prices.join(" ") || "なし"}`);
 }
 
-// ===== 手数料の実測 =====
-// 未実測のプールは既定30bpsとして扱われる。Aerodromeのように実測99bpsの
-// プールが混ざると偽の機会が出るため、裁定候補を優先しつつ全プールを埋める。
+// ===== 手数料の実測(Solidly系のみ。V2形式は実行時に学習する) =====
 let feeProbeQueue = [];
 async function probeFeesGradually() {
   if (!stats.ready) return;
@@ -347,9 +368,15 @@ async function probeFeesGradually() {
     if (!pool) return;
     try {
       const fee = await probePoolFeeBps({ chain, pairAddress: address, tokenInAddress: pool.token0, reserveIn: pool.raw0, reserveOut: pool.raw1 });
-      if (fee != null && fee !== 30) setPoolFee(chain, address, fee);
-      pool.feeProbed = true;
-      stats.feeProbed++;
+      if (fee != null) {
+        if (fee !== 30) setPoolFee(chain, address, fee);
+        pool.feeProbed = true;
+        stats.feeProbed++;
+        if (fee > TAX_TOKEN_FEE_BPS) {
+          stats.taxTokensRejected++;
+          disablePool(chain, address, `実測手数料${fee}bps(税トークン)`);
+        }
+      }
     } catch (e) {}
   }));
 }
@@ -359,15 +386,16 @@ const executing = new Set();
 async function handleOpportunity(opp) {
   stats.examined++;
   if (hasDisabledPool(opp)) return;
+  // 実測済みで税トークン水準のプールが含まれていれば、ここで除外する。
+  if (pruneTaxTokenPools(opp)) return;
 
   const key = opp.poolAddresses.join("|").toLowerCase();
   const until = cooldownUntil.get(key);
   if (until && Date.now() < until) { stats.skippedCooldown++; return; }
 
   if (rejectIfTrap(opp)) return;
-
-  // 黒字の案件だけを「検出」として数える(赤字を混ぜると実態が見えない)。
   if (!opp.profitable) return;
+
   stats.profitableFound++;
   stats.lastOpportunity = new Date().toISOString();
   stats.recent = [{ ...opp, at: new Date().toISOString() }, ...stats.recent.filter((r) => r.label !== opp.label)].slice(0, 20);
@@ -385,9 +413,8 @@ async function handleOpportunity(opp) {
     else cooldownUntil.set(key, Date.now() + 30 * 1000);
   } catch (e) {
     stats.failed++;
-    const msg = e.message || "";
-    console.warn(`[実行] 失敗: ${msg.slice(0, 120)}`);
-    noteExecutionFailure(opp, msg);
+    console.warn(`[実行] 失敗: ${(e.message || "").slice(0, 120)}`);
+    noteExecutionFailure(opp, e);
   } finally {
     executing.delete(key);
   }
@@ -426,7 +453,7 @@ async function fullScanOnce() {
     for (const chain of Object.keys(CHAIN_CONFIG)) {
       const opportunities = scanAllPairs({
         chain, capUsd: getCurrentTradeCapUsd(),
-        gasCostUsd: getGasCost(chain, "2step"), isBorrowable,
+        gasCostUsd: getGasCost(chain, "2step"), gasCostUsd3: getGasCost(chain, "3step"), isBorrowable,
       });
       for (const opp of opportunities.slice(0, 3)) await handleOpportunity(opp);
     }
@@ -468,7 +495,7 @@ function heartbeat() {
   stats.lastHeartbeat = new Date().toISOString();
   const rpc = getRpcStatus();
   const queued = Object.entries(rpc).filter(([, v]) => v.queued > 0).map(([c, v]) => `${c}:${v.queued}`).join(" ");
-  console.log(`[生存] スキャン${stats.scans} 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 罠${stats.trapsRejected} 無効${stats.disabled} Sync一致${stats.syncMatched}/未知${stats.syncUnknown} 取込${stats.adopted} 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}]`);
+  console.log(`[生存] スキャン${stats.scans} 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 罠${stats.trapsRejected} 税${stats.taxTokensRejected} 無効${stats.disabled} Sync一致${stats.syncMatched}/未知${stats.syncUnknown} 取込${stats.adopted} 手数料${stats.feeProbed} 行列[${queued || "空"}]`);
 }
 
 // ===== ダッシュボード =====
@@ -522,15 +549,15 @@ function renderPage() {
 <div><div class="v">$${getCurrentTradeCapUsd()}</div><div class="l">取引上限</div></div>
 <div><div class="v" style="color:${isLive?'#2ecc71':'#888'}">${isLive?'稼働中':'停止中'}</div><div class="l">自動売買</div></div></div>
 <table><thead><tr><th>日時</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table>
-<div class="note">投入額はプールの準備量から利益が最大になる値を自動計算します。送信の可否は、実際のガス見積もりを差し引いた利益が$${MIN_PROFIT_USD}を超えるかで判断します。</div></div>
+<div class="note">投入額はプールの準備量から利益が最大になる値を自動計算します。送信可否は実際のガス見積もりを引いた利益が$${MIN_PROFIT_USD}を超えるかで判断します。</div></div>
 
 <div class="card"><h2>🎯 黒字の機会</h2>
 <div class="stat"><div><div class="v" style="color:${stats.profitableFound>0?'#2ecc71':'#888'}">${stats.profitableFound}</div><div class="l">黒字検出</div></div>
 <div><div class="v">${stats.executed}</div><div class="l">実行成功</div></div>
 <div><div class="v" style="color:${stats.failed>0?'#e74c3c':'#888'}">${stats.failed}</div><div class="l">実行失敗</div></div>
-<div><div class="v" style="color:${stats.trapsRejected>0?'#e8a33d':'#888'}">${stats.trapsRejected}</div><div class="l">罠を回避</div></div></div>
+<div><div class="v" style="color:${stats.taxTokensRejected>0?'#e8a33d':'#888'}">${stats.taxTokensRejected}</div><div class="l">税トークン除外</div></div></div>
 <table><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table>
-<div class="note">精査した経路${stats.examined.toLocaleString()}件のうち黒字だったもの。リターンが投入額の${(MAX_SANE_RETURN_RATIO*100).toFixed(0)}%を超える案件は、売れない詐欺トークンとみなして無効化します。無効化プール: ${stats.disabled}件</div></div>
+<div class="note">精査した経路${stats.examined.toLocaleString()}件のうち黒字だったもの。実測手数料が${TAX_TOKEN_FEE_BPS}bps(1%)を超えるプールは「送金時に税を取るトークン」として恒久的に除外します(正常なDEXにこの水準は存在しません)。罠${stats.trapsRejected}件 / 無効化${stats.disabled}件</div></div>
 
 <div class="card"><h2>🔭 活発なプールの自動発見</h2>
 <div class="stat"><div><div class="v" style="color:#2ecc71">${stats.adopted.toLocaleString()}</div><div class="l">新たに取り込んだ</div></div>
@@ -544,7 +571,7 @@ function renderPage() {
 <div><div class="v">${stats.syncMatched.toLocaleString()}</div><div class="l">監視対象の更新</div></div>
 <div><div class="v">${lat != null ? lat + 'ms' : '-'}</div><div class="l">判定時間</div></div>
 <div><div class="v">${stats.feeProbed.toLocaleString()}</div><div class="l">手数料実測済み</div></div></div>
-<div class="note">${syncLine}<br>実測ガス代(2step): ${gasLine}<br>手数料の未実測: 残${stats.feeProbePending.toLocaleString()}プール<br>待ち行列: ${Object.entries(rpc).map(([c, v]) => `${c}:${v.queued}`).join(' / ')}</div></div>
+<div class="note">${syncLine}<br>実測ガス代(2step): ${gasLine}<br>待ち行列: ${Object.entries(rpc).map(([c, v]) => `${c}:${v.queued}`).join(' / ')}</div></div>
 
 <div class="card"><h2>🗺️ プール地図(メモリ上)</h2>
 <div class="stat"><div><div class="v">${s.totalPools.toLocaleString()}</div><div class="l">プール</div></div>
@@ -561,9 +588,9 @@ function renderAbout() {
 <h1>📊 仕組み</h1>
 <div class="card"><h2>① プール地図</h2><div class="note">実在が確認できているプールからファクトリーを逆算し、全プールを列挙します。地図はファイルに保存し、再起動時は数秒で復元します。準備量は毎回全件を取得し直します。</div></div>
 <div class="card"><h2>② 活発なプールの自動発見</h2><div class="note">Syncイベントが届いた未知のプールは、取引が起きている証拠なので自動的に取り込みます。</div></div>
-<div class="card"><h2>③ 投入額の最適化</h2><div class="note">各プールの準備量(x·y=k)から、利益が最大になる投入額を計算します。フラッシュローンなのでいくらでも借りられますが、プールの深さが利益の上限を決めます。</div></div>
-<div class="card"><h2>④ ガス代の実測</h2><div class="note">送信直前に実際のガス使用量を見積もり(estimateGas)、その値でガス代を計算します。この見積もりが失敗すればプールに拒否されているので、送信せずに済み、ガス代を1円も失いません。</div></div>
-<div class="card"><h2>⑤ 罠の回避</h2><div class="note">「投入$2で利益$24」のような異常なリターンは、売れない詐欺トークンが作る見せかけの価格差です。本物の裁定は0.1〜5%程度。異常な案件は送信せずにプールを無効化します。</div></div>
+<div class="card"><h2>③ 手数料の実測</h2><div class="note">Uniswap V2形式のプールには手数料を問い合わせる関数がありません。そこでガス見積もり(無料)の拒否理由を使って実測します。「K」は想定が低すぎる合図、「not profitable」は想定が正しい合図です。脚ごとに1段ずつ上げることで、正常なプールに誤った値を記録しないようにしています。</div></div>
+<div class="card"><h2>④ 税トークンの除外</h2><div class="note">正常なDEXの手数料は最大でも1%です。実測が1%を超えるのは「送金時に税を取るトークン」であり、送った量の一部が徴収されるため構造上裁定できません。該当するプールは恒久的に除外します。</div></div>
+<div class="card"><h2>⑤ 実行</h2><div class="note">送信直前に実際のガス使用量を見積もり、その値でガス代を計算します。見積もりが失敗すればプールに拒否されているので、送信せずに済み、ガス代を1円も失いません。Aaveのフラッシュローンを使うため、利益が出なければ取引全体が無効化されます。</div></div>
 <div class="footerlink"><a href="/">← 戻る</a></div></body></html>`;
 }
 
