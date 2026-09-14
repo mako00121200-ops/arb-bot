@@ -1,14 +1,20 @@
 // scripts/opportunity-scanner.js
 //
 // メモリ上のプール地図から、裁定機会を探す。
-//
-// [設計の要点]
-// RPCへの問い合わせを一切行わない。全てメモリ上の計算で完結するため、
+// RPCへの問い合わせを一切行わず、全てメモリ上の計算で完結するため、
 // Syncイベントが届いた瞬間(ミリ秒単位)に判定できる。
 //
-// [修正] 三角裁定(3段)は2段よりガス使用量が多いため、経路の種類に応じた
-// ガス代を使う。以前は2段用の値を3段にも当てており、ガス代を過小に見て
-// 実際には赤字の案件を黒字と判定していた。
+// [修正1] 全件スキャンが2ステップしか見ていなかった。Syncが届かない
+// チェーン(Base・Arbitrum・Avalanche)では三角裁定が一度も評価されず、
+// 機会の大半を見逃していた。全件スキャンでも三角を評価する。
+//
+// [修正2] 三角裁定は2段よりガス使用量が多いため、経路の種類に応じた
+// ガス代を使う(以前は2段用を流用し、ガス代を過小に見ていた)。
+//
+// [修正3] 手数料が未実測のプールは既定30bpsとして扱われるが、実測すると
+// それより高いことが多く、幻の黒字が生まれていた。未実測のプールには
+// 保守的な値(UNPROBED_FEE_BPS)を当て、実測済みになってから本来の値で
+// 判定する。
 
 import {
   getPoolsForPair, getPoolsForToken, getArbitragablePairs,
@@ -16,8 +22,14 @@ import {
 } from "./pool-registry.js";
 
 const AAVE_PREMIUM_BPS = 5n;
-// 投入額の下限(USD)。0なら制限なし。準備量から最適化した値をそのまま使う。
 const MIN_TRADE_USD = parseFloat(process.env.MIN_TRADE_USD || "0");
+// 手数料が未実測のプールに当てる想定値。実測すると30bpsより高いことが
+// 多いため、楽観的な30bpsではなく少し高めに見る。
+const UNPROBED_FEE_BPS = parseInt(process.env.UNPROBED_FEE_BPS || "45", 10);
+
+function effectiveFeeBps(pool) {
+  return pool.feeProbed ? pool.feeBps : Math.max(pool.feeBps, UNPROBED_FEE_BPS);
+}
 
 function getAmountOut(amountIn, reserveIn, reserveOut, feeBps) {
   if (amountIn <= 0n || reserveIn <= 0n || reserveOut <= 0n) return 0n;
@@ -115,8 +127,7 @@ export function scanTwoStep({ chain, tokenA, tokenB, pools, capUsd, gasCostUsd, 
     const maxAmountIn = maxAmountFromUsd(chain, borrow, capUsd);
     if (!maxAmountIn) continue;
 
-    // 価格順に並べ、最も有利に買えるプールと売れるプールの組だけを見る
-    // (全組み合わせを試すとSyncのたびに処理が詰まるため)。
+    // 価格順に並べ、最も有利に買えるプールと売れるプールの組だけを見る。
     const priced = [];
     for (const p of pools) {
       const o = orient(p, borrow);
@@ -133,8 +144,8 @@ export function scanTwoStep({ chain, tokenA, tokenB, pools, capUsd, gasCostUsd, 
     if (leg2.tokenOut !== borrow.toLowerCase()) continue;
 
     const legs = [
-      { ...buySide.orientation, feeBps: buySide.pool.feeBps },
-      { ...leg2, feeBps: sellSide.pool.feeBps },
+      { ...buySide.orientation, feeBps: effectiveFeeBps(buySide.pool) },
+      { ...leg2, feeBps: effectiveFeeBps(sellSide.pool) },
     ];
     const result = finalize({
       chain, tokenA: borrow, legs, maxAmountIn, gasCostUsd, kind: "2step",
@@ -177,9 +188,9 @@ export function scanTrianglesForPool({ chain, pool, capUsd, gasCostUsd, isBorrow
         if (examined > maxRoutes) break;
 
         const legs = [
-          { ...leg1, feeBps: pool.feeBps },
-          { ...leg2, feeBps: pool2.feeBps },
-          { ...leg3, feeBps: pool3.feeBps },
+          { ...leg1, feeBps: effectiveFeeBps(pool) },
+          { ...leg2, feeBps: effectiveFeeBps(pool2) },
+          { ...leg3, feeBps: effectiveFeeBps(pool3) },
         ];
         const result = finalize({
           chain, tokenA, legs, maxAmountIn, gasCostUsd, kind: "3step",
@@ -196,7 +207,6 @@ export function scanTrianglesForPool({ chain, pool, capUsd, gasCostUsd, isBorrow
 }
 
 /// 変化したプールを起点に、2ステップと三角の両方を調べて最良のものを返す。
-/// gasCostUsd は2段用、gasCostUsd3 は3段用(未指定なら2段用の1.35倍で概算)。
 export function scanForChangedPool({ chain, poolAddress, capUsd, gasCostUsd, gasCostUsd3, isBorrowable }) {
   const pool = getPool(chain, poolAddress);
   if (!pool) return null;
@@ -218,15 +228,38 @@ export function scanForChangedPool({ chain, poolAddress, capUsd, gasCostUsd, gas
   return found[0];
 }
 
-export function scanAllPairs({ chain, capUsd, gasCostUsd, isBorrowable }) {
+/// 全件スキャン。2ステップに加えて三角も評価する。
+/// Syncが届かないチェーンでは、これが唯一の判定機会になるため、
+/// 三角を省くと機会の大半を見逃す。
+/// maxTrianglePools は1回あたりに三角の起点として調べるプール数の上限
+/// (全プールを起点にすると計算量が膨大になるため)。
+export function scanAllPairs({ chain, capUsd, gasCostUsd, gasCostUsd3, isBorrowable, maxTrianglePools = 400 }) {
   const results = [];
+  const seenPools = new Set();
+
   for (const entry of getArbitragablePairs(chain)) {
     const r = scanTwoStep({
       chain: entry.chain, tokenA: entry.token0, tokenB: entry.token1,
       pools: entry.pools, capUsd, gasCostUsd, isBorrowable,
     });
     if (r) results.push(r);
+    for (const p of entry.pools) seenPools.add(p.address.toLowerCase());
   }
+
+  // 三角の起点は「複数プールを持つペア」に含まれるプールから選ぶ。
+  // 取引が活発で、裁定の対象になりやすいため。
+  const triGas = gasCostUsd3 ?? gasCostUsd * 1.35;
+  let count = 0;
+  for (const entry of getArbitragablePairs(chain)) {
+    for (const pool of entry.pools) {
+      if (count >= maxTrianglePools) break;
+      count++;
+      const t = scanTrianglesForPool({ chain, pool, capUsd, gasCostUsd: triGas, isBorrowable, maxRoutes: 20 });
+      if (t) results.push(t);
+    }
+    if (count >= maxTrianglePools) break;
+  }
+
   results.sort((a, b) => b.netProfitUsd - a.netProfitUsd);
   return results;
 }
