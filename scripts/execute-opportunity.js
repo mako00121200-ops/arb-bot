@@ -2,20 +2,19 @@
 //
 // 検出した機会(2ステップ・三角の両方)を実際に送信する。
 //
-// [修正1] ガス代を「実際の estimateGas 結果」で計算する。
-// 以前はデプロイ時の90万ガスで見積もっており、実際(35〜50万)の2.5倍を
-// 引いていたため、黒字の案件を赤字と誤判定していた。
+// [手数料の自己学習]
+// Uniswap V2形式のプールには手数料を問い合わせる関数が無い。しかしPolygonの
+// DEXは手数料がバラバラで(ApeSwap 0.2%、JetSwap 0.1%等)、既定の0.3%で
+// 計算すると実際より多くを要求してしまい、プールに "UniswapV2: K" で
+// 拒否される。
+// そこで、ガス見積もり(無料)が「K」で失敗したら手数料の想定を上げて
+// 再挑戦し、成功した値をそのプールの手数料として記録する。
+// 見積もり段階なのでガス代は一切かからず、未知のDEXにも自動で対応できる。
 //
-// [修正2] 受取量の余裕を0.1%→0.05%に縮小。各段で積み重なると$10の取引で
-// $0.02〜0.03を捨てることになり、利益と同じ規模になっていた。
-// Syncで準備量が新鮮なため、この幅でも拒否されにくい。
-//
-// [修正3] 各段の入力には「前の段で実際に要求する量」を使う。プールは要求量
-// しか渡さないため、見積もり前の量で繋ぐと次段で不足し「K」で拒否される。
-//
-// [送信失敗の扱い]
-// 失敗は必ず ExecutionError として投げ直す。呼び出し側がプールの無効化や
-// 再試行の抑制に使う(握りつぶすと同じ失敗を無限に繰り返す)。
+// [その他の要点]
+//   ・各段の入力には「前の段で実際に要求する量」を使う(余裕を正しく連鎖)
+//   ・ガス代は送信直前の estimateGas 実測値で計算する
+//   ・失敗は必ず ExecutionError として投げ直す(握りつぶすと無限再試行になる)
 
 import { ethers } from "ethers";
 import { getChainConfig } from "../chain-config.js";
@@ -23,7 +22,7 @@ import { getProviderForChain, callWithRpc } from "./onchain-reserves.js";
 import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
 import { recordRealExecution } from "./real-execution-log.js";
 import { estimateGasCostUsd, gasUnitsToUsd } from "./gas-cost.js";
-import { getTokenDecimals, getTokenPriceUsd } from "./pool-registry.js";
+import { getTokenDecimals, getTokenPriceUsd, setPoolFee, getPool } from "./pool-registry.js";
 
 const CONTRACT_ABI = [
   "function executeArb(address asset, uint256 amount, (address poolCheap, address poolExpensive, address tokenX, address tokenY, uint256 amountOutStep1, uint256 amountOutStep2) params) external",
@@ -35,9 +34,9 @@ const POOL_QUOTE_ABI = ["function getAmountOut(uint256 amountIn, address tokenIn
 
 const AAVE_PREMIUM_BPS = 5n;
 const MIN_PROFIT_USD = parseFloat(process.env.MIN_PROFIT_USD || "0.01");
-// 受取量に持たせる余裕(0.05%)。小さすぎると正常な変動で拒否され、
-// 大きすぎると利益をそのまま捨てることになる。
 const SAFETY_MARGIN_BPS = 5n;
+// 「K」で拒否されたときに試す手数料(bps)。低い順に試し、成功した値を記録する。
+const FEE_LADDER = [30, 40, 50, 60, 80, 100, 150, 200, 300];
 
 export class ExecutionError extends Error {
   constructor(message, { reverted = false } = {}) {
@@ -46,26 +45,52 @@ export class ExecutionError extends Error {
   }
 }
 
+function isKRevert(message) {
+  return /UniswapV2: K|\bK\b/.test(message || "");
+}
+
 function getAmountOutCalc(amountIn, reserveIn, reserveOut, feeBps) {
   const amountInWithFee = amountIn * (10000n - BigInt(feeBps));
   const denominator = reserveIn * 10000n + amountInWithFee;
   return denominator === 0n ? 0n : (amountInWithFee * reserveOut) / denominator;
 }
 
+/// プール自身に聞ける形式(Solidly系)ならその値を、無ければ指定の手数料で計算する。
 async function quoteOut({ chain, pool, amountIn, tokenIn, reserveIn, reserveOut, feeBps }) {
   try {
     const out = await callWithRpc(chain, (p) =>
       new ethers.Contract(ethers.getAddress(pool), POOL_QUOTE_ABI, p)
         .getAmountOut(amountIn, ethers.getAddress(tokenIn)));
-    if (out > 0n) return out;
+    if (out > 0n) return { amountOut: out, fromPool: true };
   } catch (e) { /* この形式のプールではない */ }
-  return getAmountOutCalc(amountIn, reserveIn, reserveOut, feeBps);
+  return { amountOut: getAmountOutCalc(amountIn, reserveIn, reserveOut, feeBps), fromPool: false };
 }
 
 function buildTokenPath(opp) {
   const path = [opp.tokenA];
   for (const leg of opp.legs) path.push(leg.tokenOut);
   return path;
+}
+
+/// 指定した手数料の想定で、各段の要求量を組み立てる。
+async function buildRequestedAmounts({ chain, opp, tokenPath, amountIn, feeBpsList }) {
+  const requested = [];
+  const fromPool = [];
+  let amount = amountIn;
+  for (let i = 0; i < opp.legs.length; i++) {
+    const leg = opp.legs[i];
+    const q = await quoteOut({
+      chain, pool: opp.poolAddresses[i], amountIn: amount, tokenIn: tokenPath[i],
+      reserveIn: leg.reserveIn, reserveOut: leg.reserveOut, feeBps: feeBpsList[i],
+    });
+    if (q.amountOut <= 0n) return null;
+    const req = (q.amountOut * (10000n - SAFETY_MARGIN_BPS)) / 10000n;
+    if (req <= 0n) return null;
+    requested.push(req);
+    fromPool.push(q.fromPool);
+    amount = req;
+  }
+  return { requested, fromPool };
 }
 
 export async function executeOpportunity(opp) {
@@ -87,90 +112,103 @@ export async function executeOpportunity(opp) {
   }
   if (amountIn <= 0n) return false;
 
-  // 各段の受取量をプール自身に問い合わせて確定させる。
-  // 次の段の入力には「実際に要求する量(余裕を引いた後)」を使う。
   const tokenPath = buildTokenPath(opp);
-  const requested = [];
-  let amount = amountIn;
-  for (let i = 0; i < opp.legs.length; i++) {
-    const leg = opp.legs[i];
-    const out = await quoteOut({
-      chain, pool: opp.poolAddresses[i], amountIn: amount, tokenIn: tokenPath[i],
-      reserveIn: leg.reserveIn, reserveOut: leg.reserveOut, feeBps: leg.feeBps,
-    });
-    if (out <= 0n) return false;
-    const req = (out * (10000n - SAFETY_MARGIN_BPS)) / 10000n;
-    if (req <= 0n) return false;
-    requested.push(req);
-    amount = req;
-  }
-
-  const finalOut = requested[requested.length - 1];
-  const amountOwed = amountIn + (amountIn * AAVE_PREMIUM_BPS) / 10000n;
-  if (finalOut <= amountOwed) {
-    console.log(`[実行] ${opp.label}: 送信直前の再計算で返済額に届かず見送り`);
-    return false;
-  }
-
+  const tradeUsd = (Number(amountIn) / Math.pow(10, decimals)) * priceUsd;
   const privateKey = process.env.MAINNET_BOT_PRIVATE_KEY;
   const dryRun = process.env.DRY_RUN !== "false";
-  const grossTokens = Number(finalOut - amountOwed) / Math.pow(10, decimals);
-  const grossProfitUsd = grossTokens * priceUsd;
-  const tradeUsd = (Number(amountIn) / Math.pow(10, decimals)) * priceUsd;
 
   if (dryRun || !privateKey) {
-    const approxGas = await estimateGasCostUsd(chain, opp.kind);
-    console.log(`[実行] ${opp.kind} ${chain} ${opp.label}: 投入$${tradeUsd.toFixed(2)} 粗利$${grossProfitUsd.toFixed(4)} 概算ガス$${approxGas.toFixed(4)} DRY_RUN=${dryRun}`);
+    console.log(`[実行] ${opp.kind} ${chain} ${opp.label}: 投入$${tradeUsd.toFixed(2)} DRY_RUN=${dryRun}`);
     return false;
   }
 
   const wallet = new ethers.Wallet(privateKey, getProviderForChain(chain));
   const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, wallet);
 
-  // 送信に使う引数を組み立てる。
-  const callArgs = opp.kind === "3step"
-    ? ["executeTriArb", opp.tokenA, amountIn, {
-        pool1: opp.poolAddresses[0], pool2: opp.poolAddresses[1], pool3: opp.poolAddresses[2],
-        tokenA: tokenPath[0], tokenB: tokenPath[1], tokenC: tokenPath[2],
-        amountOut1: requested[0], amountOut2: requested[1], amountOut3: requested[2],
-      }]
-    : ["executeArb", opp.tokenA, amountIn, {
-        poolCheap: opp.poolAddresses[0], poolExpensive: opp.poolAddresses[1],
-        tokenX: tokenPath[1], tokenY: tokenPath[0],
-        amountOutStep1: requested[0], amountOutStep2: requested[1],
-      }];
+  // 手数料の想定を段階的に上げながら、ガス見積もりが通る組み合わせを探す。
+  // 見積もりは無料なので、失敗してもガス代はかからない。
+  let feeBpsList = opp.legs.map((l) => l.feeBps);
+  let requested = null, gasUnits = null, lastError = "";
+  let ladderIndex = 0;
 
-  // 実際のガス使用量を見積もる。ここで失敗すればプールに拒否されているので
-  // 送信せずに済む(ガス代を1円も失わない)。
-  let gasUnits;
-  try {
-    gasUnits = await contract[callArgs[0]].estimateGas(callArgs[1], callArgs[2], callArgs[3]);
-  } catch (e) {
-    const msg = e.message || "";
-    const reverted = msg.includes("execution reverted") || msg.includes("CALL_EXCEPTION");
-    throw new ExecutionError(msg.slice(0, 160), { reverted });
+  for (let attempt = 0; attempt < FEE_LADDER.length; attempt++) {
+    const built = await buildRequestedAmounts({ chain, opp, tokenPath, amountIn, feeBpsList });
+    if (!built) return false;
+
+    const finalOut = built.requested[built.requested.length - 1];
+    const amountOwed = amountIn + (amountIn * AAVE_PREMIUM_BPS) / 10000n;
+    if (finalOut <= amountOwed) {
+      console.log(`[実行] ${opp.label}: 手数料${feeBpsList.join("/")}bpsでは返済額に届かず見送り`);
+      return false;
+    }
+
+    const callArgs = opp.kind === "3step"
+      ? ["executeTriArb", opp.tokenA, amountIn, {
+          pool1: opp.poolAddresses[0], pool2: opp.poolAddresses[1], pool3: opp.poolAddresses[2],
+          tokenA: tokenPath[0], tokenB: tokenPath[1], tokenC: tokenPath[2],
+          amountOut1: built.requested[0], amountOut2: built.requested[1], amountOut3: built.requested[2],
+        }]
+      : ["executeArb", opp.tokenA, amountIn, {
+          poolCheap: opp.poolAddresses[0], poolExpensive: opp.poolAddresses[1],
+          tokenX: tokenPath[1], tokenY: tokenPath[0],
+          amountOutStep1: built.requested[0], amountOutStep2: built.requested[1],
+        }];
+
+    try {
+      gasUnits = await contract[callArgs[0]].estimateGas(callArgs[1], callArgs[2], callArgs[3]);
+      requested = { ...built, callArgs, amountOwed, finalOut };
+      // 成功した手数料を、プール自身に聞けなかったプールだけ記録する。
+      for (let i = 0; i < opp.poolAddresses.length; i++) {
+        if (built.fromPool[i]) continue;
+        const pool = getPool(chain, opp.poolAddresses[i]);
+        if (pool && pool.feeBps !== feeBpsList[i]) {
+          setPoolFee(chain, opp.poolAddresses[i], feeBpsList[i]);
+          pool.feeProbed = true;
+          console.log(`[手数料学習] ${chain} ${opp.poolAddresses[i].slice(0, 10)}…: ${feeBpsList[i]}bpsと判明`);
+        }
+      }
+      break;
+    } catch (e) {
+      lastError = e.message || "";
+      if (!isKRevert(lastError)) {
+        // 「K」以外の拒否(詐欺トークン等)は、手数料を変えても解決しない。
+        throw new ExecutionError(lastError.slice(0, 160), { reverted: true });
+      }
+      // 手数料の想定を1段上げて再挑戦する。
+      ladderIndex++;
+      if (ladderIndex >= FEE_LADDER.length) break;
+      const nextFee = FEE_LADDER[ladderIndex];
+      feeBpsList = opp.legs.map((l, i) => (built.fromPool[i] ? l.feeBps : Math.max(l.feeBps, nextFee)));
+    }
   }
 
-  // 見積もりに2割の余裕を持たせた値でガス代を計算する。
+  if (!requested || gasUnits == null) {
+    throw new ExecutionError(`手数料を${FEE_LADDER[FEE_LADDER.length - 1]}bpsまで上げても拒否: ${lastError.slice(0, 100)}`, { reverted: true });
+  }
+
+  // 実際のガス使用量から、ガス代を計算する。
   const gasWithBuffer = (gasUnits * 120n) / 100n;
   let gasCostUsd = await gasUnitsToUsd(chain, gasWithBuffer);
   if (gasCostUsd == null) gasCostUsd = await estimateGasCostUsd(chain, opp.kind);
 
+  const grossTokens = Number(requested.finalOut - requested.amountOwed) / Math.pow(10, decimals);
+  const grossProfitUsd = grossTokens * priceUsd;
   const finalProfitUsd = grossProfitUsd - gasCostUsd;
+
   if (finalProfitUsd < MIN_PROFIT_USD) {
-    console.log(`[実行] ${opp.label}: ガス代差引後$${finalProfitUsd.toFixed(4)}が下限$${MIN_PROFIT_USD}未満のため見送り(粗利$${grossProfitUsd.toFixed(4)} ガス$${gasCostUsd.toFixed(4)}/${gasUnits})`);
+    console.log(`[実行] ${opp.label}: ガス代差引後$${finalProfitUsd.toFixed(4)}が下限$${MIN_PROFIT_USD}未満のため見送り(粗利$${grossProfitUsd.toFixed(4)} ガス$${gasCostUsd.toFixed(4)}/${gasUnits} 手数料${feeBpsList.join("/")}bps)`);
     return false;
   }
 
-  console.log(`[実行] ${opp.kind} ${chain} ${opp.label}: 送信します(投入$${tradeUsd.toFixed(2)} 純利益$${finalProfitUsd.toFixed(4)} ガス$${gasCostUsd.toFixed(4)}/${gasUnits})`);
+  console.log(`[実行] ${opp.kind} ${chain} ${opp.label}: 送信します(投入$${tradeUsd.toFixed(2)} 純利益$${finalProfitUsd.toFixed(4)} ガス$${gasCostUsd.toFixed(4)}/${gasUnits} 手数料${feeBpsList.join("/")}bps)`);
 
+  const { callArgs } = requested;
   let tx;
   try {
     tx = await contract[callArgs[0]](callArgs[1], callArgs[2], callArgs[3], { gasLimit: gasWithBuffer });
   } catch (e) {
     const msg = e.message || "";
-    const reverted = msg.includes("execution reverted") || msg.includes("CALL_EXCEPTION");
-    throw new ExecutionError(msg.slice(0, 160), { reverted });
+    throw new ExecutionError(msg.slice(0, 160), { reverted: msg.includes("execution reverted") });
   }
 
   console.log(`[実行] 送信: ${tx.hash}`);
