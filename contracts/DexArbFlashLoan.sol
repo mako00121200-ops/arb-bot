@@ -22,10 +22,9 @@ interface IERC20 {
 }
 
 // AMMプールの低レベルインターフェース。
-// Uniswap V2形式もSolidly形式(Aerodrome/Velodrome)も、この swap と
-// token0 は全く同じ形式で実装されている。ルーターはこれを呼び出す
-// 「便利な窓口」にすぎないため、プールを直接呼べばルーターアドレスの
-// 事前調査が一切不要になる。
+// Uniswap V2形式もSolidly形式も、この swap と token0 は同じ形式で実装されて
+// いる。ルーターはこれを呼ぶ「便利な窓口」にすぎないため、プールを直接呼べば
+// ルーターアドレスの事前調査が一切不要になる。
 interface IAmmPool {
     function swap(uint amount0Out, uint amount1Out, address to, bytes calldata data) external;
     function token0() external view returns (address);
@@ -38,10 +37,7 @@ interface IAmmPool {
 ///
 ///         2種類の裁定に対応する:
 ///           executeArb     … 2ステップ。同じペアの価格差を2つのプールで取る。
-///           executeTriArb  … 3ステップ(三角裁定)。A→B→C→Aと巡回して、
-///                            トークン間の相対価格の歪みを取る。同じDEX内で
-///                            完結するため機会の母数が桁違いに多く、専業botとの
-///                            競合も比較的少ない。
+///           executeTriArb  … 3ステップ(三角裁定)。A→B→C→Aと巡回する。
 contract DexArbFlashLoan {
     IPoolAddressesProvider public immutable ADDRESSES_PROVIDER;
     IPool public immutable POOL;
@@ -58,7 +54,6 @@ contract DexArbFlashLoan {
         _;
     }
 
-    /// @dev 2ステップ裁定のパラメータ。
     struct ArbParams {
         address poolCheap;
         address poolExpensive;
@@ -68,9 +63,6 @@ contract DexArbFlashLoan {
         uint256 amountOutStep2;
     }
 
-    /// @dev 3ステップ(三角)裁定のパラメータ。
-    /// tokenA(借りる通貨) → tokenB → tokenC → tokenA と巡回する。
-    /// pools[i] は i番目のスワップに使うプール。
     struct TriArbParams {
         address pool1;
         address pool2;
@@ -85,18 +77,16 @@ contract DexArbFlashLoan {
 
     event ArbExecuted(address indexed tokenY, uint256 amountBorrowed, uint256 profit);
     event TriArbExecuted(address indexed tokenA, uint256 amountBorrowed, uint256 profit);
+    event Withdrawn(address indexed token, uint256 amount);
 
-    /// @dev フラッシュローンのコールバックで、どちらの処理を行うかの目印。
     uint8 private constant MODE_TWO_STEP = 1;
     uint8 private constant MODE_THREE_STEP = 2;
 
-    /// @notice 2ステップ裁定のエントリーポイント。
     function executeArb(address asset, uint256 amount, ArbParams calldata params) external onlyOwner {
         require(asset == params.tokenY, "DexArbFlashLoan: asset must equal tokenY");
         POOL.flashLoanSimple(address(this), asset, amount, abi.encode(MODE_TWO_STEP, abi.encode(params)), 0);
     }
 
-    /// @notice 3ステップ(三角)裁定のエントリーポイント。
     function executeTriArb(address asset, uint256 amount, TriArbParams calldata params) external onlyOwner {
         require(asset == params.tokenA, "DexArbFlashLoan: asset must equal tokenA");
         POOL.flashLoanSimple(address(this), asset, amount, abi.encode(MODE_THREE_STEP, abi.encode(params)), 0);
@@ -121,7 +111,6 @@ contract DexArbFlashLoan {
         IAmmPool(pool).swap(amount0Out, amount1Out, address(this), new bytes(0));
     }
 
-    /// @notice Aave Poolから呼び戻されるコールバック。
     function executeOperation(
         address asset,
         uint256 amount,
@@ -171,10 +160,34 @@ contract DexArbFlashLoan {
         _swapDirect(p.pool3, p.tokenC, balanceC, p.amountOut3);
     }
 
+    /// @notice 蓄積した利益の残高を確認する(誰でも呼べる読み取り専用)。
+    /// 引き出し前に、いくら溜まっているかを外から確認できるようにする。
+    function balanceOfToken(address token) external view returns (uint256) {
+        return IERC20(token).balanceOf(address(this));
+    }
+
+    /// @notice 複数トークンの残高をまとめて確認する。
+    function balancesOf(address[] calldata tokens) external view returns (uint256[] memory) {
+        uint256[] memory out = new uint256[](tokens.length);
+        for (uint256 i = 0; i < tokens.length; i++) {
+            out[i] = IERC20(tokens[i]).balanceOf(address(this));
+        }
+        return out;
+    }
+
     /// @notice 蓄積した利益をownerのウォレットへ引き出す。
     function withdraw(address token) external onlyOwner {
         uint256 balance = IERC20(token).balanceOf(address(this));
         require(balance > 0, "DexArbFlashLoan: nothing to withdraw");
         IERC20(token).transfer(owner, balance);
+        emit Withdrawn(token, balance);
+    }
+
+    /// @notice 金額を指定して引き出す(動作確認や一部引き出し用)。
+    function withdrawAmount(address token, uint256 amount) external onlyOwner {
+        require(amount > 0, "DexArbFlashLoan: amount must be positive");
+        require(IERC20(token).balanceOf(address(this)) >= amount, "DexArbFlashLoan: insufficient balance");
+        IERC20(token).transfer(owner, amount);
+        emit Withdrawn(token, amount);
     }
 }
