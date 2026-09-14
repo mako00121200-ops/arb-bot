@@ -2,11 +2,16 @@
 //
 // 検出した機会(2ステップ・三角の両方)を実際に送信する。
 //
-// [修正: 各段の見積もりの繋ぎ方]
-// 以前は「1段目の見積もり(余裕を引く前)」を2段目の入力として使っていた。
-// しかしプールは要求した量(=余裕を引いた後)しか渡さないため、2段目には
-// 想定より少ない量しか届かず、要求量に届かずに「K」で拒否されていた。
-// 各段の入力には「前の段で実際に要求する量」を使い、余裕を正しく連鎖させる。
+// [修正1] ガス代を「実際の estimateGas 結果」で計算する。
+// 以前はデプロイ時の90万ガスで見積もっており、実際(35〜50万)の2.5倍を
+// 引いていたため、黒字の案件を赤字と誤判定していた。
+//
+// [修正2] 受取量の余裕を0.1%→0.05%に縮小。各段で積み重なると$10の取引で
+// $0.02〜0.03を捨てることになり、利益と同じ規模になっていた。
+// Syncで準備量が新鮮なため、この幅でも拒否されにくい。
+//
+// [修正3] 各段の入力には「前の段で実際に要求する量」を使う。プールは要求量
+// しか渡さないため、見積もり前の量で繋ぐと次段で不足し「K」で拒否される。
 //
 // [送信失敗の扱い]
 // 失敗は必ず ExecutionError として投げ直す。呼び出し側がプールの無効化や
@@ -17,7 +22,7 @@ import { getChainConfig } from "../chain-config.js";
 import { getProviderForChain, callWithRpc } from "./onchain-reserves.js";
 import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
 import { recordRealExecution } from "./real-execution-log.js";
-import { estimateGasCostUsd } from "./gas-cost.js";
+import { estimateGasCostUsd, gasUnitsToUsd } from "./gas-cost.js";
 import { getTokenDecimals, getTokenPriceUsd } from "./pool-registry.js";
 
 const CONTRACT_ABI = [
@@ -29,9 +34,10 @@ const CONTRACT_ABI = [
 const POOL_QUOTE_ABI = ["function getAmountOut(uint256 amountIn, address tokenIn) view returns (uint256)"];
 
 const AAVE_PREMIUM_BPS = 5n;
-const MIN_PROFIT_USD = parseFloat(process.env.MIN_PROFIT_USD || "0.05");
-const SAFETY_MARGIN_BPS = 10n;
-const GAS_MULTIPLIER = { "2step": 1.0, "3step": 1.35 };
+const MIN_PROFIT_USD = parseFloat(process.env.MIN_PROFIT_USD || "0.01");
+// 受取量に持たせる余裕(0.05%)。小さすぎると正常な変動で拒否され、
+// 大きすぎると利益をそのまま捨てることになる。
+const SAFETY_MARGIN_BPS = 5n;
 
 export class ExecutionError extends Error {
   constructor(message, { reverted = false } = {}) {
@@ -81,7 +87,7 @@ export async function executeOpportunity(opp) {
   }
   if (amountIn <= 0n) return false;
 
-  // 各段の受取量を、プール自身に問い合わせて確定させる。
+  // 各段の受取量をプール自身に問い合わせて確定させる。
   // 次の段の入力には「実際に要求する量(余裕を引いた後)」を使う。
   const tokenPath = buildTokenPath(opp);
   const requested = [];
@@ -106,42 +112,61 @@ export async function executeOpportunity(opp) {
     return false;
   }
 
-  let gasCostUsd = 0.02;
-  try { gasCostUsd = (await estimateGasCostUsd(chain)) * (GAS_MULTIPLIER[opp.kind] ?? 1.0); } catch (e) {}
+  const privateKey = process.env.MAINNET_BOT_PRIVATE_KEY;
+  const dryRun = process.env.DRY_RUN !== "false";
+  const grossTokens = Number(finalOut - amountOwed) / Math.pow(10, decimals);
+  const grossProfitUsd = grossTokens * priceUsd;
+  const tradeUsd = (Number(amountIn) / Math.pow(10, decimals)) * priceUsd;
 
-  const netTokens = Number(finalOut - amountOwed) / Math.pow(10, decimals);
-  const finalProfitUsd = netTokens * priceUsd - gasCostUsd;
-  if (finalProfitUsd < MIN_PROFIT_USD) {
-    console.log(`[実行] ${opp.label}: ガス代差引後$${finalProfitUsd.toFixed(4)}が下限未満のため見送り`);
+  if (dryRun || !privateKey) {
+    const approxGas = await estimateGasCostUsd(chain, opp.kind);
+    console.log(`[実行] ${opp.kind} ${chain} ${opp.label}: 投入$${tradeUsd.toFixed(2)} 粗利$${grossProfitUsd.toFixed(4)} 概算ガス$${approxGas.toFixed(4)} DRY_RUN=${dryRun}`);
     return false;
   }
-
-  const dryRun = process.env.DRY_RUN !== "false";
-  const tradeUsd = (Number(amountIn) / Math.pow(10, decimals)) * priceUsd;
-  console.log(`[実行] ${opp.kind} ${chain} ${opp.label}: 送信条件を満たしました(投入$${tradeUsd.toFixed(2)} 純利益$${finalProfitUsd.toFixed(4)} ガス$${gasCostUsd.toFixed(4)}) DRY_RUN=${dryRun}`);
-  if (dryRun) return false;
-
-  const privateKey = process.env.MAINNET_BOT_PRIVATE_KEY;
-  if (!privateKey) return false;
 
   const wallet = new ethers.Wallet(privateKey, getProviderForChain(chain));
   const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, wallet);
 
-  let tx;
-  try {
-    if (opp.kind === "3step") {
-      tx = await contract.executeTriArb(opp.tokenA, amountIn, {
+  // 送信に使う引数を組み立てる。
+  const callArgs = opp.kind === "3step"
+    ? ["executeTriArb", opp.tokenA, amountIn, {
         pool1: opp.poolAddresses[0], pool2: opp.poolAddresses[1], pool3: opp.poolAddresses[2],
         tokenA: tokenPath[0], tokenB: tokenPath[1], tokenC: tokenPath[2],
         amountOut1: requested[0], amountOut2: requested[1], amountOut3: requested[2],
-      });
-    } else {
-      tx = await contract.executeArb(opp.tokenA, amountIn, {
+      }]
+    : ["executeArb", opp.tokenA, amountIn, {
         poolCheap: opp.poolAddresses[0], poolExpensive: opp.poolAddresses[1],
         tokenX: tokenPath[1], tokenY: tokenPath[0],
         amountOutStep1: requested[0], amountOutStep2: requested[1],
-      });
-    }
+      }];
+
+  // 実際のガス使用量を見積もる。ここで失敗すればプールに拒否されているので
+  // 送信せずに済む(ガス代を1円も失わない)。
+  let gasUnits;
+  try {
+    gasUnits = await contract[callArgs[0]].estimateGas(callArgs[1], callArgs[2], callArgs[3]);
+  } catch (e) {
+    const msg = e.message || "";
+    const reverted = msg.includes("execution reverted") || msg.includes("CALL_EXCEPTION");
+    throw new ExecutionError(msg.slice(0, 160), { reverted });
+  }
+
+  // 見積もりに2割の余裕を持たせた値でガス代を計算する。
+  const gasWithBuffer = (gasUnits * 120n) / 100n;
+  let gasCostUsd = await gasUnitsToUsd(chain, gasWithBuffer);
+  if (gasCostUsd == null) gasCostUsd = await estimateGasCostUsd(chain, opp.kind);
+
+  const finalProfitUsd = grossProfitUsd - gasCostUsd;
+  if (finalProfitUsd < MIN_PROFIT_USD) {
+    console.log(`[実行] ${opp.label}: ガス代差引後$${finalProfitUsd.toFixed(4)}が下限$${MIN_PROFIT_USD}未満のため見送り(粗利$${grossProfitUsd.toFixed(4)} ガス$${gasCostUsd.toFixed(4)}/${gasUnits})`);
+    return false;
+  }
+
+  console.log(`[実行] ${opp.kind} ${chain} ${opp.label}: 送信します(投入$${tradeUsd.toFixed(2)} 純利益$${finalProfitUsd.toFixed(4)} ガス$${gasCostUsd.toFixed(4)}/${gasUnits})`);
+
+  let tx;
+  try {
+    tx = await contract[callArgs[0]](callArgs[1], callArgs[2], callArgs[3], { gasLimit: gasWithBuffer });
   } catch (e) {
     const msg = e.message || "";
     const reverted = msg.includes("execution reverted") || msg.includes("CALL_EXCEPTION");
