@@ -3,17 +3,22 @@
 // 検出した機会(2ステップ・三角の両方)を実際に送信する。
 //
 // [手数料の実測と学習]
-// Uniswap V2形式のプールには手数料を問い合わせる関数が無い。しかしPolygonの
-// DEXは手数料がバラバラで(ApeSwap 0.2%、JetSwap 0.1%等)、既定の0.3%で
-// 計算すると実際より多くを要求してしまい "UniswapV2: K" で拒否される。
-//
-// コントラクトの拒否理由で、想定が正しいかを見分けられる:
-//   "UniswapV2: K"   … 手数料の想定が低すぎる → 想定を上げて再挑戦
-//   "not profitable" … 手数料の想定は正しい(スワップ自体は通った)→ 記録
+// Uniswap V2形式のプールには手数料を問い合わせる関数が無いため、
+// コントラクトの拒否理由を使って実測する:
+//   "UniswapV2: K"   … 要求量が多すぎる → 想定を上げて再挑戦
+//   "not profitable" … スワップは通った = 想定が正しい → 記録
 // ガス見積もりは無料なので、何度試してもガス代はかからない。
-// 「K」が出なくなるまで階段を上り、そこで判明した手数料を必ず記録する。
-// これにより幻の機会(手数料を低く見積もったことによる見かけの黒字)が
-// 二度と検出されなくなる。
+//
+// [脚ごとに学習する]
+// 以前は全ての脚に同じ想定値を当てていたため、正常なプール(0.3%)が
+// 税トークンのプールと組んだだけで「1.5%」と誤記録され、そのプールの
+// 本物の機会まで見逃すようになっていた。脚を1つずつ上げて、どの脚が
+// 原因かを切り分ける。
+//
+// [税トークンの判定]
+// 正常なDEXの手数料は最大でも1%(Aerodrome等)。実測が1%を超えるのは
+// 手数料ではなく「送金時に税を取るトークン」であり、構造上裁定できない。
+// TAX_TOKEN_FEE_BPS を超えた時点で、そのプールを恒久的に除外する。
 
 import { ethers } from "ethers";
 import { getChainConfig } from "../chain-config.js";
@@ -35,23 +40,21 @@ const AAVE_PREMIUM_BPS = 5n;
 const MIN_PROFIT_USD = parseFloat(process.env.MIN_PROFIT_USD || "0.01");
 const SAFETY_MARGIN_BPS = 5n;
 // 「K」で拒否されたときに試す手数料(bps)。低い順に試す。
-const FEE_LADDER = [30, 35, 40, 45, 50, 60, 70, 80, 100, 120, 150, 200, 250, 300];
+const FEE_LADDER = [30, 35, 40, 45, 50, 60, 70, 80, 90, 100];
+// これを超える実測値は手数料ではなく「税トークン」。裁定に使えない。
+export const TAX_TOKEN_FEE_BPS = parseInt(process.env.TAX_TOKEN_FEE_BPS || "100", 10);
 
 export class ExecutionError extends Error {
-  constructor(message, { reverted = false, learnedFee = false } = {}) {
+  constructor(message, { reverted = false, taxToken = false, taxPools = [] } = {}) {
     super(message);
     this.reverted = reverted;
-    this.learnedFee = learnedFee;
+    this.taxToken = taxToken;
+    this.taxPools = taxPools;
   }
 }
 
-function isKRevert(message) {
-  return /UniswapV2: K/.test(message || "");
-}
-/// 「利益が出ない」という拒否 = スワップ自体は通った = 手数料の想定が正しい。
-function isNotProfitableRevert(message) {
-  return /not profitable/i.test(message || "");
-}
+function isKRevert(message) { return /UniswapV2: K/.test(message || ""); }
+function isNotProfitableRevert(message) { return /not profitable/i.test(message || ""); }
 
 function getAmountOutCalc(amountIn, reserveIn, reserveOut, feeBps) {
   const amountInWithFee = amountIn * (10000n - BigInt(feeBps));
@@ -94,11 +97,10 @@ async function buildRequestedAmounts({ chain, opp, tokenPath, amountIn, feeBpsLi
   return { requested, fromPool };
 }
 
-/// 判明した手数料をプールに記録する。以後の判定がこの値で行われる。
 function recordLearnedFees(chain, opp, feeBpsList, fromPool) {
   const learned = [];
   for (let i = 0; i < opp.poolAddresses.length; i++) {
-    if (fromPool[i]) continue; // プール自身に聞けた分は既に正確
+    if (fromPool[i]) continue;
     const pool = getPool(chain, opp.poolAddresses[i]);
     if (!pool || pool.feeBps === feeBpsList[i]) continue;
     setPoolFee(chain, opp.poolAddresses[i], feeBpsList[i]);
@@ -155,12 +157,17 @@ export async function executeOpportunity(opp) {
   const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, wallet);
   const amountOwed = amountIn + (amountIn * AAVE_PREMIUM_BPS) / 10000n;
 
-  // 手数料の想定を段階的に上げ、「K」が出なくなるまで試す。
-  // 途中で利益が消えても中断せず、必ず手数料を突き止めてから判断する。
-  let feeBpsList = opp.legs.map((l) => l.feeBps);
+  // 脚ごとに手数料の想定を上げていく。
+  // 全ての脚を同時に上げると、正常なプールまで高い値で記録してしまうため、
+  // 1脚ずつ順番に上げて、どの脚が原因かを切り分ける。
+  const legCount = opp.legs.length;
+  const feeIndex = opp.legs.map(() => 0);       // 各脚が今どの段にいるか
+  let feeBpsList = opp.legs.map((l) => Math.max(l.feeBps, FEE_LADDER[0]));
   let success = null, lastError = "", lastFromPool = null;
+  let cursor = 0; // 次に上げる脚
 
-  for (let step = 0; step < FEE_LADDER.length; step++) {
+  const MAX_ATTEMPTS = FEE_LADDER.length * legCount + 2;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const built = await buildRequestedAmounts({ chain, opp, tokenPath, amountIn, feeBpsList });
     if (!built) return false;
     lastFromPool = built.fromPool;
@@ -175,30 +182,42 @@ export async function executeOpportunity(opp) {
       lastError = e.message || "";
 
       if (isNotProfitableRevert(lastError)) {
-        // スワップは通った = 手数料の想定が正しい。記録して見送る。
+        // スワップは全段通った = 手数料の想定が正しい。記録して見送る。
         recordLearnedFees(chain, opp, feeBpsList, built.fromPool);
         console.log(`[実行] ${opp.label}: 実測手数料${feeBpsList.join("/")}bpsでは利益が出ないため見送り`);
         return false;
       }
       if (!isKRevert(lastError)) {
-        // 詐欺トークン等。手数料を変えても解決しない。
         throw new ExecutionError(lastError.slice(0, 160), { reverted: true });
       }
 
-      // 「K」= 手数料の想定が低すぎる。次の段へ上げる。
-      const nextFee = FEE_LADDER.find((f) => f > Math.max(...feeBpsList.filter((_, i) => !built.fromPool[i])));
-      if (nextFee == null) break;
-      feeBpsList = opp.legs.map((l, i) => (built.fromPool[i] ? l.feeBps : nextFee));
+      // 「K」= どこかの脚の想定が低い。プール自身に聞けない脚を順に1段上げる。
+      let advanced = false;
+      for (let tried = 0; tried < legCount; tried++) {
+        const i = (cursor + tried) % legCount;
+        if (built.fromPool[i]) continue;                 // 正確な値が分かっている脚は触らない
+        if (feeIndex[i] >= FEE_LADDER.length - 1) continue;
+        feeIndex[i]++;
+        feeBpsList[i] = FEE_LADDER[feeIndex[i]];
+        cursor = (i + 1) % legCount;
+        advanced = true;
+        break;
+      }
+      if (!advanced) break; // 全ての脚が上限に達した
     }
   }
 
   if (!success) {
-    // 上限まで上げても「K」が出続けた。通常のプールではない可能性が高い。
-    if (lastFromPool) {
-      const maxFee = FEE_LADDER[FEE_LADDER.length - 1];
-      recordLearnedFees(chain, opp, opp.legs.map((l, i) => (lastFromPool[i] ? l.feeBps : maxFee)), lastFromPool);
+    // 上限(=正常なDEXの最大手数料)まで上げても通らない = 税トークン。
+    const taxPools = [];
+    for (let i = 0; i < opp.poolAddresses.length; i++) {
+      if (lastFromPool && lastFromPool[i]) continue;
+      if (feeIndex[i] >= FEE_LADDER.length - 1) taxPools.push(opp.poolAddresses[i]);
     }
-    throw new ExecutionError(`手数料を上限まで上げても拒否: ${lastError.slice(0, 100)}`, { reverted: true });
+    throw new ExecutionError(
+      `手数料${TAX_TOKEN_FEE_BPS}bpsまで上げても拒否(送金時に税を取るトークンの可能性)`,
+      { reverted: true, taxToken: true, taxPools }
+    );
   }
 
   const { built, callArgs, gasUnits } = success;
