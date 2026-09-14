@@ -2,20 +2,19 @@
 //
 // 全プールの準備量をメモリ上に保持する「プール地図」。
 //
-// [なぜ必要か]
-// 判定のたびにRPCへ問い合わせると1ペアあたり数百ミリ秒〜1秒かかる。
-// メモリ上に持ち、Syncイベントで差分更新すれば、判定はミリ秒で完了する。
+// 判定のたびにRPCへ問い合わせると1ペアあたり数百ミリ秒かかる。メモリ上に
+// 持ち、Syncイベントで差分更新すれば、判定はミリ秒で完了する。
 //
 // [永続化]
-// 地図の構築(ファクトリーからの全列挙)には約50分かかる。再デプロイのたびに
-// やり直すのは非現実的なので、「アドレス・トークン・実測手数料」だけを
-// ファイルに保存し、次回起動時はそれを読み込んで準備量だけ再取得する。
-// 準備量は保存しない(古い値で判定しないため)。
+// 地図の構築(ファクトリーからの全列挙)には約50分かかるため、
+// 「アドレス・トークン・実測手数料」だけをファイルに保存し、次回起動時は
+// それを読み込んで準備量だけ再取得する。準備量は保存しない(古い値で
+// 判定しないため)。
 //
-// [構造]
-//   pools:   "chain::address" → { token0, token1, raw0, raw1, feeBps, dexId, ... }
-//   byPair:  "chain::tokenA|tokenB" → そのペアを扱うプールの一覧
-//   byToken: "chain::token" → そのトークンを含むプールの一覧(三角裁定用)
+// [大口取引の検知]
+// 本物の裁定機会は「常にある価格差」ではなく、大きな取引が起きた直後の
+// 数秒間に生まれる。Syncで準備量がどれだけ動いたかを記録し、変化の
+// 大きいプールを優先して処理できるようにする。
 
 import fs from "fs";
 
@@ -44,6 +43,7 @@ export function registerPool({ chain, address, dexId, factory, token0, token1, r
     feeBps: existing?.feeBps ?? feeBps,
     feeProbed: existing?.feeProbed || feeProbed,
     updatedAt: Date.now(),
+    lastMovePct: existing?.lastMovePct ?? 0,
   });
   if (!existing) {
     const pk = pairKey(chain, token0, token1);
@@ -57,12 +57,26 @@ export function registerPool({ chain, address, dexId, factory, token0, token1, r
   }
 }
 
+/// Syncで届いた準備量を反映し、どれだけ動いたか(%)も記録する。
+/// 戻り値にmovePctを含めるので、呼び出し側が「大口取引かどうか」を判断できる。
 export function updateReservesFromSync(chain, address, raw0, raw1) {
   const pool = pools.get(poolKey(chain, address));
   if (!pool) return null;
+
+  // 価格(raw1/raw0)がどれだけ動いたかを求める。
+  let movePct = 0;
+  if (pool.raw0 > 0n && pool.raw1 > 0n && raw0 > 0n && raw1 > 0n) {
+    const before = Number(pool.raw1) / Number(pool.raw0);
+    const after = Number(raw1) / Number(raw0);
+    if (isFinite(before) && before > 0 && isFinite(after)) {
+      movePct = Math.abs((after - before) / before) * 100;
+    }
+  }
+
   pool.raw0 = raw0;
   pool.raw1 = raw1;
   pool.updatedAt = Date.now();
+  pool.lastMovePct = movePct;
   return pool;
 }
 
@@ -131,7 +145,6 @@ export function getStalePools(chain, olderThanMs) {
 
 // ===== 永続化 =====
 
-/// 地図をファイルに保存する(準備量は含めない)。
 export function savePoolMap() {
   const entries = [];
   for (const p of pools.values()) {
@@ -148,8 +161,6 @@ export function savePoolMap() {
   }
 }
 
-/// ファイルから地図を読み込む。準備量は0のまま登録されるため、
-/// 呼び出し側で必ず全件の再取得を行うこと。
 export function loadPoolMap() {
   try {
     if (!fs.existsSync(POOL_MAP_FILE)) return { count: 0, savedAt: null };
