@@ -6,10 +6,9 @@
 // RPCへの問い合わせを一切行わない。全てメモリ上の計算で完結するため、
 // Syncイベントが届いた瞬間(ミリ秒単位)に判定できる。
 //
-// [最低投入額]
-// 投入$5〜17の極小プールで検出した機会は、送信すると「K」や理由なしの
-// revertで拒否された。極小プールは送金に税がかかるトークンや非標準の
-// 挙動が多く、成功率が低い。一定額未満の案件は最初から除外する。
+// [修正] 三角裁定(3段)は2段よりガス使用量が多いため、経路の種類に応じた
+// ガス代を使う。以前は2段用の値を3段にも当てており、ガス代を過小に見て
+// 実際には赤字の案件を黒字と判定していた。
 
 import {
   getPoolsForPair, getPoolsForToken, getArbitragablePairs,
@@ -17,8 +16,8 @@ import {
 } from "./pool-registry.js";
 
 const AAVE_PREMIUM_BPS = 5n;
-// この額未満の投入にしかならない案件は、極小プールとみなして除外する。
-const MIN_TRADE_USD = parseFloat(process.env.MIN_TRADE_USD || "50");
+// 投入額の下限(USD)。0なら制限なし。準備量から最適化した値をそのまま使う。
+const MIN_TRADE_USD = parseFloat(process.env.MIN_TRADE_USD || "0");
 
 function getAmountOut(amountIn, reserveIn, reserveOut, feeBps) {
   if (amountIn <= 0n || reserveIn <= 0n || reserveOut <= 0n) return 0n;
@@ -91,8 +90,7 @@ function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, p
 
   const toNumber = (v) => Number(v) / Math.pow(10, decimals);
   const tradeAmountUsd = toNumber(best.amountIn) * priceUsd;
-  // 極小プールの案件は除外する(成功率が低く、利益も僅か)。
-  if (tradeAmountUsd < MIN_TRADE_USD) return null;
+  if (MIN_TRADE_USD > 0 && tradeAmountUsd < MIN_TRADE_USD) return null;
 
   const grossProfitUsd = toNumber(best.amountOut - amountOwed) * priceUsd;
   const netProfitUsd = grossProfitUsd - gasCostUsd;
@@ -117,6 +115,8 @@ export function scanTwoStep({ chain, tokenA, tokenB, pools, capUsd, gasCostUsd, 
     const maxAmountIn = maxAmountFromUsd(chain, borrow, capUsd);
     if (!maxAmountIn) continue;
 
+    // 価格順に並べ、最も有利に買えるプールと売れるプールの組だけを見る
+    // (全組み合わせを試すとSyncのたびに処理が詰まるため)。
     const priced = [];
     for (const p of pools) {
       const o = orient(p, borrow);
@@ -195,7 +195,9 @@ export function scanTrianglesForPool({ chain, pool, capUsd, gasCostUsd, isBorrow
   return results[0];
 }
 
-export function scanForChangedPool({ chain, poolAddress, capUsd, gasCostUsd, isBorrowable }) {
+/// 変化したプールを起点に、2ステップと三角の両方を調べて最良のものを返す。
+/// gasCostUsd は2段用、gasCostUsd3 は3段用(未指定なら2段用の1.35倍で概算)。
+export function scanForChangedPool({ chain, poolAddress, capUsd, gasCostUsd, gasCostUsd3, isBorrowable }) {
   const pool = getPool(chain, poolAddress);
   if (!pool) return null;
   const found = [];
@@ -205,7 +207,11 @@ export function scanForChangedPool({ chain, poolAddress, capUsd, gasCostUsd, isB
     capUsd, gasCostUsd, isBorrowable,
   });
   if (twoStep) found.push(twoStep);
-  const three = scanTrianglesForPool({ chain, pool, capUsd, gasCostUsd, isBorrowable });
+  const three = scanTrianglesForPool({
+    chain, pool, capUsd,
+    gasCostUsd: gasCostUsd3 ?? gasCostUsd * 1.35,
+    isBorrowable,
+  });
   if (three) found.push(three);
   if (found.length === 0) return null;
   found.sort((a, b) => b.netProfitUsd - a.netProfitUsd);
