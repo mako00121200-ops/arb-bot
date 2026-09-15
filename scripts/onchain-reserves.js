@@ -2,21 +2,17 @@
 //
 // チェーンから直接データを読むための共通処理。
 //
-// [修正: 待ち行列の凍結]
-// 全RPC呼び出しを1本の待ち行列で順番に流していたが、タイムアウトが無かった
-// ため、応答の返らない呼び出しが1件あると後ろ全てが永遠に止まった。
-// 実際に14時間の凍結が起き、検出した機会の実行も凍結に巻き込まれた。
-//   → 全ての呼び出しに8秒のタイムアウトを付ける
-//   → 待ち行列をチェーンごとに分け、1チェーンの障害が他に波及しないようにする
+// [待ち行列の設計]
+// 全ての呼び出しを1列に並べていたため、実行に必要な問い合わせが手数料実測や
+// プール取込の後ろで待たされ、Baseでは87,000件が滞留して実行が制限時間切れに
+// なった(2026年9月15日)。
+//   → 優先列(実行用)と通常列(背景作業)の2段にし、優先列を常に先に処理する
+//   → 通常列に上限を設け、溢れたら古いものから捨てる(自己回復させる)
+//   → 呼び出しには8秒のタイムアウト(1件の無応答で全体が止まらないように)
 //
 // [RPCの自動切り替え]
-// 公開RPCは利用上限・障害で突然使えなくなるため、チェーンごとに候補を
-// 順に持ち、一定回数連続で失敗したら次の候補へ自動的に切り替える。
+// 一定回数連続で失敗したら次の候補URLへ切り替える。ただし
 // "missing revert data" 等のコントラクト側の正当な応答は障害ではない。
-//
-// [手数料の実測]
-// Solidly系プールは手数料がプールごとに違う。プール自身の getAmountOut に
-// 極小額を問い合わせ、実際の手数料を逆算する。
 
 import { ethers } from "ethers";
 import { getChainConfig, CHAIN_CONFIG } from "../chain-config.js";
@@ -28,14 +24,20 @@ const PAIR_ABI = [
 ];
 const ERC20_DECIMALS_ABI = ["function decimals() view returns (uint8)"];
 
-const MIN_REQUEST_INTERVAL_MS = 60;
+const MIN_REQUEST_INTERVAL_MS = 40;
 const FAILURES_BEFORE_ROTATE = 3;
-// 1回の呼び出しがこれ以上かかったら諦める。凍結防止の要。
 const RPC_CALL_TIMEOUT_MS = parseInt(process.env.RPC_CALL_TIMEOUT_MS || "8000", 10);
+// 通常列の上限。これを超えたら古い要求から捨てる。
+const NORMAL_QUEUE_LIMIT = parseInt(process.env.NORMAL_QUEUE_LIMIT || "300", 10);
 
-// チェーンごとの待ち行列。RPCはチェーンごとに別なので、直列化する理由が無い。
-const requestChains = new Map();
-const queueDepth = new Map();
+// チェーンごとの待ち行列。優先列と通常列を分ける。
+const queues = new Map(); // chain -> { priority: [], normal: [], running: bool, dropped: number }
+
+function getQueue(chain) {
+  const key = (chain || "").toLowerCase();
+  if (!queues.has(key)) queues.set(key, { priority: [], normal: [], running: false, dropped: 0 });
+  return queues.get(key);
+}
 
 function withTimeout(promise, ms, label) {
   let timer;
@@ -45,18 +47,45 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-function scheduleRpcCall(chain, fn) {
-  const key = (chain || "").toLowerCase();
-  const prev = requestChains.get(key) ?? Promise.resolve();
-  queueDepth.set(key, (queueDepth.get(key) || 0) + 1);
+/// 待ち行列を1件ずつ処理する。優先列が空になるまで通常列には進まない。
+async function pump(chain) {
+  const q = getQueue(chain);
+  if (q.running) return;
+  q.running = true;
+  try {
+    while (q.priority.length > 0 || q.normal.length > 0) {
+      const job = q.priority.length > 0 ? q.priority.shift() : q.normal.shift();
+      try {
+        const result = await withTimeout(Promise.resolve().then(job.fn), RPC_CALL_TIMEOUT_MS, chain);
+        job.resolve(result);
+      } catch (e) {
+        job.reject(e);
+      }
+      await new Promise((r) => setTimeout(r, MIN_REQUEST_INTERVAL_MS));
+    }
+  } finally {
+    q.running = false;
+  }
+}
 
-  const result = prev.then(() => withTimeout(Promise.resolve().then(fn), RPC_CALL_TIMEOUT_MS, key));
-  // 成功・失敗・タイムアウトのいずれでも、必ず次へ進む。
-  requestChains.set(key, result
-    .catch(() => {})
-    .then(() => new Promise((r) => setTimeout(r, MIN_REQUEST_INTERVAL_MS)))
-    .finally(() => queueDepth.set(key, Math.max(0, (queueDepth.get(key) || 1) - 1))));
-  return result;
+/// 呼び出しを待ち行列に登録する。priority=true なら優先列へ。
+function scheduleRpcCall(chain, fn, priority = false) {
+  const q = getQueue(chain);
+  return new Promise((resolve, reject) => {
+    const job = { fn, resolve, reject };
+    if (priority) {
+      q.priority.push(job);
+    } else {
+      // 通常列が溢れていたら、古い要求を捨てる(背景作業なので取りこぼしてよい)。
+      while (q.normal.length >= NORMAL_QUEUE_LIMIT) {
+        const dropped = q.normal.shift();
+        q.dropped++;
+        dropped.reject(new Error("待ち行列が上限に達したため破棄"));
+      }
+      q.normal.push(job);
+    }
+    pump(chain);
+  });
 }
 
 const rpcState = new Map();
@@ -91,12 +120,14 @@ function recordRpcFailure(chain, message) {
   const oldUrl = config.rpcUrls[state.index % config.rpcUrls.length];
   state.index = (state.index + 1) % config.rpcUrls.length;
   state.failures = 0;
-  console.log(`[RPC切替] ${chain}: 続けて失敗したため次の候補に切り替えます(${oldUrl.slice(0, 40)} → ${config.rpcUrls[state.index].slice(0, 40)} / 理由: ${(message || "").slice(0, 70)})`);
+  console.log(`[RPC切替] ${chain}: 続けて失敗したため次の候補へ(${oldUrl.slice(0, 40)} → ${config.rpcUrls[state.index].slice(0, 40)} / 理由: ${(message || "").slice(0, 70)})`);
 }
 
-export async function callWithRpc(chain, fn) {
+/// RPC呼び出しの共通入口。
+/// priority=true は「実行に直結する問い合わせ」に使い、背景作業より先に処理する。
+export async function callWithRpc(chain, fn, priority = false) {
   try {
-    const result = await scheduleRpcCall(chain, () => fn(getProviderForChain(chain)));
+    const result = await scheduleRpcCall(chain, () => fn(getProviderForChain(chain)), priority);
     getState(chain).failures = 0;
     return result;
   } catch (e) {
@@ -104,17 +135,18 @@ export async function callWithRpc(chain, fn) {
     const isContractLevel = msg.includes("execution reverted")
       || msg.includes("could not decode result data")
       || msg.includes("missing revert data")
-      || msg.includes("CALL_EXCEPTION");
+      || msg.includes("CALL_EXCEPTION")
+      || msg.includes("待ち行列が上限");
     if (!isContractLevel) recordRpcFailure(chain, msg);
     throw e;
   }
 }
 
-export async function fetchOnchainReserves({ chain, pairAddress, tokenXAddress, decimalsX, decimalsY }) {
+export async function fetchOnchainReserves({ chain, pairAddress, tokenXAddress, decimalsX, decimalsY, priority = false }) {
   if (!ethers.isAddress(pairAddress)) throw new Error(`プールアドレスの形式が不正: ${pairAddress}`);
   const addr = ethers.getAddress(pairAddress);
-  const reserves = await callWithRpc(chain, (p) => new ethers.Contract(addr, PAIR_ABI, p).getReserves());
-  const token0 = await callWithRpc(chain, (p) => new ethers.Contract(addr, PAIR_ABI, p).token0());
+  const reserves = await callWithRpc(chain, (p) => new ethers.Contract(addr, PAIR_ABI, p).getReserves(), priority);
+  const token0 = await callWithRpc(chain, (p) => new ethers.Contract(addr, PAIR_ABI, p).token0(), priority);
   const isToken0X = token0.toLowerCase() === ethers.getAddress(tokenXAddress).toLowerCase();
   const rawX = isToken0X ? reserves[0] : reserves[1];
   const rawY = isToken0X ? reserves[1] : reserves[0];
@@ -126,7 +158,6 @@ export async function fetchOnchainReserves({ chain, pairAddress, tokenXAddress, 
 }
 
 /// プール自身の getAmountOut に極小額を問い合わせ、実際の手数料(bps)を逆算する。
-/// getAmountOut を持たないプール(Uniswap V2等)は null を返す。
 export async function probePoolFeeBps({ chain, pairAddress, tokenInAddress, reserveIn, reserveOut }) {
   if (reserveIn <= 0n || reserveOut <= 0n) return null;
   const addr = ethers.getAddress(pairAddress);
@@ -164,10 +195,14 @@ export function getRpcStatus() {
   const out = {};
   for (const [chain, config] of Object.entries(CHAIN_CONFIG)) {
     const state = getState(chain);
+    const q = getQueue(chain);
     out[chain] = {
       url: config.rpcUrls[state.index % config.rpcUrls.length].replace(/\/[a-f0-9]{20,}/i, "/***"),
       index: state.index + 1, total: config.rpcUrls.length,
-      failures: state.failures, queued: queueDepth.get(chain) || 0,
+      failures: state.failures,
+      queued: q.priority.length + q.normal.length,
+      priorityQueued: q.priority.length,
+      dropped: q.dropped,
     };
   }
   return out;
