@@ -5,23 +5,21 @@
 // [V2との違い]
 // V2は「準備量が2つ」だけで価格が決まるが、V3は価格帯ごとに流動性が分かれて
 // おり、正確な受取量の計算にはティック構造をたどる必要がある。自前で実装すると
-// 間違いが起きやすいので、見積もりはUniswap公式の QuoterV2 コントラクトに
-// 任せる(送信直前の1回だけ呼ぶ)。
+// 間違いが起きやすいので、見積もりはUniswap公式の QuoterV2 に任せる。
 //
-// [大まかな価格の把握]
+// [概算と正確な値]
 // 常時の判定にQuoterを呼ぶとRPCが持たないため、slot0(現在価格)と liquidity
-// (現在の価格帯の流動性)をメモリに持ち、まず概算で絞り込む。
-// 概算で有望なものだけ、Quoterで正確に確認する。
+// (現在の価格帯の流動性)から概算して絞り込み、送信直前だけQuoterで確定する。
+// 概算が過大だと「幻の機会」が生まれ、正常なプールを罠として誤って無効化して
+// しまうため、両者を比較して誤差を測る仕組みを用意している(verifyV3Estimate)。
 //
-// [対応する形式]
-// Uniswap V3 / PancakeSwap V3 / Aerodrome Slipstream は同じ関数構成。
-// Algebra(QuickSwap V3等)は slot0 の名前が globalState なので別途対応する。
+// [流動性の変化]
+// V3の流動性はSwapだけでなく Mint(追加)/ Burn(削除)でも変わる。
+// これらのイベントも購読して、古い流動性で計算しないようにする。
 
 import { ethers } from "ethers";
 import { callWithRpc } from "./onchain-reserves.js";
 
-// QuoterV2 は「実際にスワップを試して結果だけ返す」コントラクト。
-// 状態を変えないので eth_call で安全に呼べる。
 export const QUOTER_V2_ADDRESS = {
   polygon: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
   base: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
@@ -30,7 +28,6 @@ export const QUOTER_V2_ADDRESS = {
   avalanche: "0xbe0F5544EC67e9B3b2D979aaA43f18Fd87E6257F",
 };
 
-// V3ファクトリー(手数料ごとにプールが分かれる)。
 export const V3_FACTORIES = {
   polygon: [
     { address: "0x1F98431c8aD98523631AE4a59f267346ea31F984", dexId: "uniswap-v3", style: "uniswap" },
@@ -49,7 +46,6 @@ export const V3_FACTORIES = {
   ],
 };
 
-// V3で一般的な手数料区分(100=0.01%, 500=0.05%, 3000=0.3%, 10000=1%)。
 export const V3_FEE_TIERS = [100, 500, 3000, 10000];
 
 export const V3_POOL_ABI = [
@@ -68,15 +64,15 @@ const QUOTER_V2_ABI = [
   "function quoteExactInputSingle((address tokenIn, address tokenOut, uint256 amountIn, uint24 fee, uint160 sqrtPriceLimitX96)) returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)",
 ];
 
-// Uniswap V3のSwapイベント。V2のSyncに相当する「価格が動いた」合図。
 // keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)")
 export const V3_SWAP_TOPIC = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
+// keccak256("Mint(address,address,int24,int24,uint128,uint256,uint256)")
+export const V3_MINT_TOPIC = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde";
+// keccak256("Burn(address,int24,int24,uint128,uint256,uint256)")
+export const V3_BURN_TOPIC = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c";
 
 const Q96 = 2n ** 96n;
 
-/// Swapイベントのデータから、更新後の価格・流動性・ティックを取り出す。
-/// データは (int256 amount0, int256 amount1, uint160 sqrtPriceX96,
-///           uint128 liquidity, int24 tick) の順で詰まっている。
 export function decodeV3SwapData(dataHex) {
   const data = dataHex.startsWith("0x") ? dataHex.slice(2) : dataHex;
   if (data.length < 320) return null;
@@ -90,8 +86,6 @@ export function decodeV3SwapData(dataHex) {
   }
 }
 
-/// 指定したトークン組・手数料区分のV3プールアドレスを問い合わせる。
-/// 存在しなければゼロアドレスが返るので、それは除く。
 export async function findV3Pool(chain, factory, tokenA, tokenB, fee) {
   try {
     const address = await callWithRpc(chain, (p) =>
@@ -103,12 +97,13 @@ export async function findV3Pool(chain, factory, tokenA, tokenB, fee) {
   }
 }
 
-/// V3プールの現在の状態(価格・流動性)を読む。
 export async function readV3State(chain, poolAddress, priority = false) {
   try {
     const contract = (p) => new ethers.Contract(ethers.getAddress(poolAddress), V3_POOL_ABI, p);
-    const slot0 = await callWithRpc(chain, (p) => contract(p).slot0(), priority);
-    const liquidity = await callWithRpc(chain, (p) => contract(p).liquidity(), priority);
+    const [slot0, liquidity] = await Promise.all([
+      callWithRpc(chain, (p) => contract(p).slot0(), priority),
+      callWithRpc(chain, (p) => contract(p).liquidity(), priority),
+    ]);
     if (slot0[0] <= 0n) return null;
     return { sqrtPriceX96: slot0[0], tick: Number(slot0[1]), liquidity };
   } catch (e) {
@@ -116,16 +111,13 @@ export async function readV3State(chain, poolAddress, priority = false) {
   }
 }
 
-/// 現在価格での「1単位あたりの交換比率」を求める(概算用)。
-/// sqrtPriceX96 は token1/token0 の平方根を 2^96 倍した値。
 export function priceFromSqrtX96(sqrtPriceX96) {
   const ratio = Number(sqrtPriceX96) / Number(Q96);
   return ratio * ratio; // token1 / token0
 }
 
 /// 集中流動性の近似式で受取量を概算する。
-/// 価格帯をまたがない範囲でのみ正確。あくまで絞り込み用で、
-/// 送信前には必ず quoteExactInput で確認する。
+/// 価格帯をまたがない範囲でのみ正確。絞り込み用で、送信前には必ずQuoterで確認する。
 export function estimateV3AmountOut({ amountIn, sqrtPriceX96, liquidity, feeBps, zeroForOne }) {
   if (amountIn <= 0n || liquidity <= 0n || sqrtPriceX96 <= 0n) return 0n;
   const amountInAfterFee = (amountIn * (10000n - BigInt(feeBps))) / 10000n;
@@ -154,8 +146,7 @@ export function estimateV3AmountOut({ amountIn, sqrtPriceX96, liquidity, feeBps,
   }
 }
 
-/// 送信直前の正確な見積もり。Uniswap公式の QuoterV2 に実際の計算をさせる。
-/// 状態を変えないので eth_call(staticCall)で呼べる。
+/// 送信直前の正確な見積もり。Uniswap公式の QuoterV2 に計算させる。
 export async function quoteV3Exact({ chain, tokenIn, tokenOut, amountIn, feeTier }) {
   const quoter = QUOTER_V2_ADDRESS[chain];
   if (!quoter) return null;
@@ -175,8 +166,32 @@ export async function quoteV3Exact({ chain, tokenIn, tokenOut, amountIn, feeTier
   }
 }
 
-/// V3の手数料区分(100/500/3000/10000)をbpsに直す。
-/// 区分の単位は「100万分率」なので、100で割るとbpsになる。
+/// 概算と公式Quoterの値を比べ、誤差を返す。
+/// 概算が過大なら「幻の機会」が生まれ、正常なプールを罠として誤って
+/// 無効化してしまうため、定期的にこれで確かめる。
+/// 戻り値: { estimated, exact, diffPercent } または null
+export async function verifyV3Estimate({ chain, pool, amountIn, zeroForOne }) {
+  if (!pool || pool.sqrtPriceX96 <= 0n || pool.liquidity <= 0n) return null;
+  const tokenIn = zeroForOne ? pool.token0 : pool.token1;
+  const tokenOut = zeroForOne ? pool.token1 : pool.token0;
+
+  const estimated = estimateV3AmountOut({
+    amountIn,
+    sqrtPriceX96: pool.sqrtPriceX96,
+    liquidity: pool.liquidity,
+    feeBps: pool.feeBps,
+    zeroForOne,
+  });
+  if (estimated <= 0n) return null;
+
+  const exact = await quoteV3Exact({ chain, tokenIn, tokenOut, amountIn, feeTier: pool.feeTier });
+  if (!exact || exact <= 0n) return null;
+
+  // 概算が正確な値より何%大きいか(正なら過大評価)。
+  const diffPercent = (Number(estimated - exact) / Number(exact)) * 100;
+  return { estimated, exact, diffPercent };
+}
+
 export function feeTierToBps(feeTier) {
   return Math.round(Number(feeTier) / 100);
 }
