@@ -10,6 +10,11 @@
 //   → 通常列に上限を設け、溢れたら古いものから捨てる(自己回復させる)
 //   → 呼び出しには8秒のタイムアウト(1件の無応答で全体が止まらないように)
 //
+// [送信間隔]
+// RPCの秒間上限を超えると、同じ接続のWebSocketごと切断される。
+// QuickNodeの無料枠は毎秒15回で、40ミリ秒間隔(毎秒25回)にしたところ
+// Baseの購読が1秒ごとに切断される事態になった。チェーンごとに間隔を設ける。
+//
 // [RPCの自動切り替え]
 // 一定回数連続で失敗したら次の候補URLへ切り替える。ただし
 // "missing revert data" 等のコントラクト側の正当な応答は障害ではない。
@@ -24,14 +29,23 @@ const PAIR_ABI = [
 ];
 const ERC20_DECIMALS_ABI = ["function decimals() view returns (uint8)"];
 
-const MIN_REQUEST_INTERVAL_MS = 40;
+// チェーンごとの送信間隔(ミリ秒)。RPCの秒間上限に合わせる。
+const MIN_INTERVAL_BY_CHAIN = {
+  base: parseInt(process.env.BASE_MIN_INTERVAL_MS || "75", 10),       // 毎秒13回(QuickNode無料枠は15回)
+  polygon: parseInt(process.env.POLYGON_MIN_INTERVAL_MS || "45", 10), // 毎秒22回(Chainstackは25回)
+};
+const DEFAULT_MIN_INTERVAL_MS = parseInt(process.env.MIN_REQUEST_INTERVAL_MS || "60", 10);
+function minIntervalFor(chain) {
+  return MIN_INTERVAL_BY_CHAIN[chain] ?? DEFAULT_MIN_INTERVAL_MS;
+}
+
 const FAILURES_BEFORE_ROTATE = 3;
 const RPC_CALL_TIMEOUT_MS = parseInt(process.env.RPC_CALL_TIMEOUT_MS || "8000", 10);
 // 通常列の上限。これを超えたら古い要求から捨てる。
 const NORMAL_QUEUE_LIMIT = parseInt(process.env.NORMAL_QUEUE_LIMIT || "300", 10);
 
 // チェーンごとの待ち行列。優先列と通常列を分ける。
-const queues = new Map(); // chain -> { priority: [], normal: [], running: bool, dropped: number }
+const queues = new Map();
 
 function getQueue(chain) {
   const key = (chain || "").toLowerCase();
@@ -61,7 +75,7 @@ async function pump(chain) {
       } catch (e) {
         job.reject(e);
       }
-      await new Promise((r) => setTimeout(r, MIN_REQUEST_INTERVAL_MS));
+      await new Promise((r) => setTimeout(r, minIntervalFor(chain)));
     }
   } finally {
     q.running = false;
@@ -203,6 +217,7 @@ export function getRpcStatus() {
       queued: q.priority.length + q.normal.length,
       priorityQueued: q.priority.length,
       dropped: q.dropped,
+      intervalMs: minIntervalFor(chain),
     };
   }
   return out;
