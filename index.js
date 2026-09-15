@@ -2,13 +2,19 @@
 //
 // [設計] イベント駆動型のDEXアービトラージbot。V2形式とV3形式の両方を扱う。
 //
-// ①起動時: プール地図を読み込み、V3プールを借りる通貨の組から発見する。
+// ①起動時: プール地図を読み込み、V3プールをファクトリーへ問い合わせて発見。
 //          状態(V2の準備量 / V3の価格と流動性)は必ず全件を取り直す。
 // ②常時:   V2のSyncとV3のSwapを1つの購読で受け取り、変化した経路だけを
 //          メモリ上で即座に再計算する(判定はミリ秒)。
 // ③発見:   Syncが届いた未知のV2プールは自動的に取り込む。
 // ④除外:   税トークン・ハニーポット・価格が信用できないプールを恒久除外。
-// ⑤実行:   送信直前に状態を取り直し、V3は公式Quoterで受取量を確定させる。
+// ⑤実行:   送信直前に状態を同時取得し、V3は公式Quoterで受取量を確定させる。
+//
+// [今回の修正]
+//   ・手数料実測が0件のまま進まない問題: 定期読み直しが通常列を埋め尽くし、
+//     実測の要求が常に破棄されていた。読み直しの量を抑え、実測に枠を残す。
+//   ・黒字なのに実行に至らなかった理由を、段階ごとに記録して画面に出す。
+//   ・起動直後の無効化件数の内訳(過去の記録からの復元か、今回の判定か)を出す。
 
 import http from "http";
 import { ethers } from "ethers";
@@ -39,16 +45,19 @@ import { CHAIN_CONFIG } from "./chain-config.js";
 const MIN_PROFIT_USD = parseFloat(process.env.MIN_PROFIT_USD || "0.01");
 const FULL_SCAN_INTERVAL_SEC = parseInt(process.env.FULL_SCAN_INTERVAL_SEC || "30", 10);
 const REFRESH_STALE_SEC = parseInt(process.env.REFRESH_STALE_SEC || "60", 10);
-const REFRESH_BATCH_SIZE = parseInt(process.env.REFRESH_BATCH_SIZE || "2000", 10);
-const V3_REFRESH_PER_TICK = parseInt(process.env.V3_REFRESH_PER_TICK || "40", 10);
-const FEE_PROBE_PER_TICK = parseInt(process.env.FEE_PROBE_PER_TICK || "5", 10);
+// 1回の定期読み直しで扱うプール数。大きすぎると通常列を埋め尽くし、
+// 手数料実測の要求が常に破棄される(2026年9月15日に実測0件の原因と判明)。
+const REFRESH_BATCH_SIZE = parseInt(process.env.REFRESH_BATCH_SIZE || "600", 10);
+const V3_REFRESH_PER_TICK = parseInt(process.env.V3_REFRESH_PER_TICK || "30", 10);
+const FEE_PROBE_PER_TICK = parseInt(process.env.FEE_PROBE_PER_TICK || "4", 10);
 const FEE_PROBE_INTERVAL_MS = 1000;
 const SAVE_MAP_INTERVAL_MS = 5 * 60 * 1000;
 const MAP_REBUILD_AFTER_HOURS = parseInt(process.env.MAP_REBUILD_AFTER_HOURS || "168", 10);
 const HEARTBEAT_INTERVAL_MS = 60 * 1000;
-const EXECUTION_TIMEOUT_MS = 60 * 1000;
+// 実行の制限時間。古い機会を追い続けても取れないため短くする。
+const EXECUTION_TIMEOUT_MS = parseInt(process.env.EXECUTION_TIMEOUT_MS || "20000", 10);
 const ADOPT_INTERVAL_MS = 5000;
-const ADOPT_PER_TICK = 60;
+const ADOPT_PER_TICK = 40;
 const FAILURE_COOLDOWN_MS = 10 * 60 * 1000;
 const DISABLE_AFTER_FAILURES = 3;
 const MAX_SANE_RETURN_RATIO = parseFloat(process.env.MAX_SANE_RETURN_RATIO || "0.20");
@@ -56,7 +65,6 @@ const BIG_MOVE_PCT = parseFloat(process.env.BIG_MOVE_PCT || "0.5");
 const SCAM_REVERT_PATTERNS = [/blacklist/i, /not allowed/i, /forbidden/i, /trading (is )?not (enabled|open)/i, /cooldown/i, /max ?tx/i, /max ?wallet/i, /antiwhale/i];
 
 // ===== ガス代 =====
-// V3はティックをまたぐ分だけV2より多く使う。
 const FALLBACK_GAS = { base: 0.010, arbitrum: 0.035, optimism: 0.005, polygon: 0.014, avalanche: 0.001 };
 const gasCostCache = new Map();
 function getGasCost(chain, kind = "2step") {
@@ -71,10 +79,18 @@ async function refreshGasCosts() {
 }
 
 // ===== 統計 =====
+// 黒字と判定された案件が、どの段階で止まったかを数える。
+const reasons = {
+  disabled: 0, taxToken: 0, cooldown: 0, trap: 0,
+  belowMin: 0, executing: 0, notSent: 0, failed: 0, success: 0,
+};
+const failStages = {}; // 実行時の失敗を段階別に数える
+
 const stats = {
   scans: 0, profitableFound: 0, examined: 0, executed: 0, failed: 0,
   skippedCooldown: 0, trapsRejected: 0, taxTokensRejected: 0, staleRejected: 0, bigMoves: 0,
   v3Found: 0, v3Matched: 0, v3Opportunities: 0,
+  disabledFromFile: 0, disabledRuntime: 0,
   lastOpportunity: null, recent: [], syncMatched: 0, syncUnknown: 0, adopted: 0, disabled: 0,
   latencies: [], ready: false, refreshCycles: 0, mapSource: "-", mapSavedAt: null,
   feeProbed: 0, feeProbePending: 0, lastHeartbeat: null, reservesLoaded: 0, journalLoaded: 0,
@@ -87,14 +103,17 @@ const disabledPools = new Set();
 
 function poolKeyOf(chain, address) { return `${chain}::${address.toLowerCase()}`; }
 
-function disablePool(chain, address, reason) {
+function disablePool(chain, address, reason, fromFile = false) {
   const key = poolKeyOf(chain, address);
   if (disabledPools.has(key)) return;
   disabledPools.add(key);
   stats.disabled++;
+  if (fromFile) stats.disabledFromFile++; else stats.disabledRuntime++;
   clearPoolState(getPool(chain, address));
-  recordIncompatiblePool(chain, address, reason);
-  console.log(`[無効化] ${chain} ${address.slice(0, 10)}…: ${reason.slice(0, 70)}`);
+  if (!fromFile) {
+    recordIncompatiblePool(chain, address, reason);
+    console.log(`[無効化] ${chain} ${address.slice(0, 10)}…: ${reason.slice(0, 70)}`);
+  }
 }
 
 function isScamRevert(message) {
@@ -103,6 +122,8 @@ function isScamRevert(message) {
 
 function noteExecutionFailure(opp, error) {
   const reason = error?.message || String(error);
+  const stage = error instanceof ExecutionError ? error.stage : "unknown";
+  failStages[stage] = (failStages[stage] || 0) + 1;
   cooldownUntil.set(opp.poolAddresses.join("|").toLowerCase(), Date.now() + FAILURE_COOLDOWN_MS);
 
   if (error instanceof ExecutionError && error.taxToken) {
@@ -115,7 +136,7 @@ function noteExecutionFailure(opp, error) {
   }
   if (error instanceof ExecutionError && error.staleReserves) {
     stats.staleRejected++;
-    return;
+    return; // RPCが遅かっただけ。プールのせいではない
   }
 
   const scam = isScamRevert(reason);
@@ -209,15 +230,12 @@ async function adoptPendingPools() {
 }
 
 // ===== V3プールの発見 =====
-// 借りられる通貨どうしの組を、手数料区分ごとにファクトリーへ問い合わせる。
-// 存在するものだけが返るので、推測でアドレスを置くことがない。
 async function discoverV3Pools() {
   let found = 0;
   for (const [chain, factories] of Object.entries(V3_FACTORIES)) {
     if (!CHAIN_CONFIG[chain]) continue;
     const borrowables = Object.keys(getBorrowableTokens(chain));
     if (borrowables.length < 2) continue;
-
     for (const factory of factories) {
       for (let i = 0; i < borrowables.length; i++) {
         for (let j = i + 1; j < borrowables.length; j++) {
@@ -235,13 +253,11 @@ async function discoverV3Pools() {
         }
       }
     }
-    console.log(`[V3発見] ${chain}: 累計${found}プール`);
   }
   stats.v3Found = found;
   console.log(`[V3発見] 完了: ${found}プールを登録しました`);
 }
 
-/// V3プールの状態(価格・流動性)を読み込む。個別呼び出しなので件数を絞る。
 async function loadV3States() {
   let loaded = 0;
   for (const chain of Object.keys(CHAIN_CONFIG)) {
@@ -257,7 +273,6 @@ async function loadV3States() {
   console.log(`[V3] 状態を${loaded}プール分取得しました`);
 }
 
-/// 古くなったV3プールの状態を少しずつ読み直す。
 let v3RefreshCursor = 0;
 async function refreshV3States() {
   if (!stats.ready) return;
@@ -357,21 +372,24 @@ async function preparePoolMap() {
     await buildPoolMapFromFactories();
   }
 
-  // V3プールは毎回確認する(件数が少なく、新設も多いため)。
   await discoverV3Pools();
   savePoolMap();
   stats.mapSavedAt = new Date().toISOString();
 
+  // 過去に「使えない」と判明した記録を復元する。これは新たな判定ではなく、
+  // これまでの累積を読み込んでいるだけ(起動直後に件数が一気に増える理由)。
   for (const [chain, addresses] of Object.entries(getAllPoolAddressesByChain())) {
     for (const address of addresses) {
       const pool = getPool(chain, address);
       const isTax = pool && pool.kind === KIND_V2 && pool.feeProbed && pool.feeBps > TAX_TOKEN_FEE_BPS;
-      if (isKnownIncompatiblePool(chain, address) || isTax) {
-        disabledPools.add(poolKeyOf(chain, address));
-        clearPoolState(pool);
+      if (isKnownIncompatiblePool(chain, address)) {
+        disablePool(chain, address, "過去の記録から復元", true);
+      } else if (isTax) {
+        disablePool(chain, address, `実測手数料${pool.feeBps}bps(税トークン)`);
       }
     }
   }
+  console.log(`[無効化] 過去の記録から${stats.disabledFromFile}件を復元しました(今回の判定によるものではありません)`);
 
   await loadAllReserves();
   await loadV3States();
@@ -380,7 +398,6 @@ async function preparePoolMap() {
     const [chain, address] = key.split("::");
     clearPoolState(getPool(chain, address));
   }
-  stats.disabled = disabledPools.size;
 
   const s = getStats();
   console.log(`[プール地図] 準備完了: V2 ${s.byKind.v2}件 / V3 ${s.byKind.v3}件 / 裁定候補${s.arbitragablePairs}ペア(うちV2とV3が共存${s.mixedPairs}件) / 無効化${disabledPools.size}件`);
@@ -436,28 +453,28 @@ function prepareBorrowableTokens() {
 }
 
 // ===== V2の手数料の実測 =====
+// 裁定候補のプールだけを対象にする。全プールを対象にすると、いつまでも
+// 候補に辿り着けず、肝心の判定が45bps仮定のまま進んでしまう。
 let feeProbeQueue = [];
+let feeProbeFailed = 0;
 async function probeFeesGradually() {
   if (!stats.ready) return;
   if (feeProbeQueue.length === 0) {
-    const priority = [], rest = [];
-    const inCandidate = new Set();
+    const pending = [];
+    const seen = new Set();
     for (const entry of getArbitragablePairs()) {
-      for (const p of entry.pools) inCandidate.add(poolKeyOf(p.chain, p.address));
-    }
-    for (const [chain, addresses] of Object.entries(getAllPoolAddressesByChain(KIND_V2))) {
-      for (const address of addresses) {
-        const key = poolKeyOf(chain, address);
-        if (disabledPools.has(key)) continue;
-        const pool = getPool(chain, address);
-        if (!pool || pool.feeProbed) continue;
-        (inCandidate.has(key) ? priority : rest).push({ chain, address });
+      for (const p of entry.pools) {
+        if (p.kind === KIND_V3 || p.feeProbed) continue;
+        const key = poolKeyOf(p.chain, p.address);
+        if (disabledPools.has(key) || seen.has(key)) continue;
+        seen.add(key);
+        pending.push({ chain: p.chain, address: p.address });
       }
     }
-    feeProbeQueue = priority.concat(rest);
+    feeProbeQueue = pending;
     stats.feeProbePending = feeProbeQueue.length;
     if (feeProbeQueue.length === 0) return;
-    console.log(`[手数料実測] 未実測${feeProbeQueue.length}プール(うち裁定候補${priority.length}件を優先)`);
+    console.log(`[手数料実測] 裁定候補のうち未実測${feeProbeQueue.length}プールを確認します`);
   }
   const batch = feeProbeQueue.splice(0, FEE_PROBE_PER_TICK);
   stats.feeProbePending = feeProbeQueue.length;
@@ -475,7 +492,10 @@ async function probeFeesGradually() {
           disablePool(chain, address, `実測手数料${fee}bps(税トークン)`);
         }
       }
-    } catch (e) {}
+      // getAmountOutを持たないV2プールはnullが返る。実行時の学習に委ねる。
+    } catch (e) {
+      feeProbeFailed++;
+    }
   }));
 }
 
@@ -483,14 +503,14 @@ async function probeFeesGradually() {
 const executing = new Set();
 async function handleOpportunity(opp, meta = {}) {
   stats.examined++;
-  if (hasDisabledPool(opp)) return;
-  if (pruneTaxTokenPools(opp)) { record(opp, "tax_token"); return; }
+  if (hasDisabledPool(opp)) { reasons.disabled++; return; }
+  if (pruneTaxTokenPools(opp)) { reasons.taxToken++; record(opp, "tax_token"); return; }
 
   const key = opp.poolAddresses.join("|").toLowerCase();
   const until = cooldownUntil.get(key);
-  if (until && Date.now() < until) { stats.skippedCooldown++; return; }
+  if (until && Date.now() < until) { reasons.cooldown++; stats.skippedCooldown++; return; }
 
-  if (rejectIfTrap(opp)) { record(opp, "trap"); return; }
+  if (rejectIfTrap(opp)) { reasons.trap++; record(opp, "trap"); return; }
   if (!opp.profitable) return;
 
   stats.profitableFound++;
@@ -498,35 +518,38 @@ async function handleOpportunity(opp, meta = {}) {
   stats.lastOpportunity = new Date().toISOString();
   stats.recent = [{ ...opp, at: new Date().toISOString(), ...meta }, ...stats.recent.filter((r) => r.label !== opp.label)].slice(0, 20);
 
-  if (opp.netProfitUsd < MIN_PROFIT_USD) { record(opp, "below_min", meta); return; }
-  if (executing.has(key)) return;
+  if (opp.netProfitUsd < MIN_PROFIT_USD) { reasons.belowMin++; record(opp, "below_min", meta); return; }
+  if (executing.has(key)) { reasons.executing++; return; }
   executing.add(key);
   try {
     console.log(`[機会] ${opp.kind} ${opp.chain} ${opp.label}: 純利益+$${opp.netProfitUsd.toFixed(4)}(投入$${opp.tradeAmountUsd.toFixed(2)} 壁${opp.feeWallPercent.toFixed(2)}%${opp.hasV3 ? " V3含む" : ""})`);
     const ok = await Promise.race([
       executeOpportunity(opp),
-      new Promise((_, reject) => setTimeout(() => reject(new ExecutionError("実行が制限時間を超えました")), EXECUTION_TIMEOUT_MS)),
+      new Promise((_, reject) => setTimeout(() => reject(new ExecutionError("実行が制限時間を超えました", { stage: "timeout" })), EXECUTION_TIMEOUT_MS)),
     ]);
     if (ok) {
       stats.executed++;
+      reasons.success++;
       cooldownUntil.delete(key);
       record(opp, "success", meta);
     } else {
+      reasons.notSent++;
       cooldownUntil.set(key, Date.now() + 30 * 1000);
       record(opp, "not_sent", meta);
     }
   } catch (e) {
     stats.failed++;
+    reasons.failed++;
     const msg = (e.message || "").slice(0, 120);
-    console.warn(`[実行] 失敗: ${msg}`);
+    const stage = e instanceof ExecutionError ? e.stage : "unknown";
+    console.warn(`[実行] 失敗(${stage}): ${msg}`);
     noteExecutionFailure(opp, e);
-    record(opp, "failed", { ...meta, error: msg });
+    record(opp, "failed", { ...meta, error: msg, stage });
   } finally {
     executing.delete(key);
   }
 }
 
-/// 変化したプールから経路を再計算する(V2・V3共通)。
 function reactToPoolChange(chain, poolAddress, pool, receivedAt, source) {
   if (!stats.ready) return;
   const movePct = pool.lastMovePct || 0;
@@ -543,7 +566,6 @@ function reactToPoolChange(chain, poolAddress, pool, receivedAt, source) {
   } catch (e) {}
 }
 
-// ===== V2のSyncイベント受信 =====
 function handleSync(chain, poolAddress, reserve0, reserve1, receivedAt) {
   if (disabledPools.has(poolKeyOf(chain, poolAddress))) return false;
   const pool = updateReservesFromSync(chain, poolAddress, reserve0, reserve1);
@@ -557,11 +579,10 @@ function handleSync(chain, poolAddress, reserve0, reserve1, receivedAt) {
   return true;
 }
 
-// ===== V3のSwapイベント受信 =====
 function handleV3Swap(chain, poolAddress, sqrtPriceX96, liquidity, receivedAt) {
   if (disabledPools.has(poolKeyOf(chain, poolAddress))) return false;
   const pool = updateV3FromSwap(chain, poolAddress, sqrtPriceX96, liquidity);
-  if (!pool) return false; // 監視対象外のV3プール
+  if (!pool) return false;
   stats.v3Matched++;
   reactToPoolChange(chain, poolAddress, pool, receivedAt, "v3swap");
   return true;
@@ -596,6 +617,8 @@ async function refreshStaleReserves() {
   try {
     for (const chain of Object.keys(CHAIN_CONFIG)) {
       if (isChainWsEnabled(chain) && isChainHealthy(chain)) continue;
+      // 裁定候補のプールを優先して読み直す。全件を追うと通常列が埋まり、
+      // 手数料実測が進まなくなる。
       const stale = getStalePools(chain, REFRESH_STALE_SEC * 1000, KIND_V2)
         .filter((p) => !disabledPools.has(poolKeyOf(chain, p.address)))
         .slice(0, REFRESH_BATCH_SIZE);
@@ -646,8 +669,9 @@ async function refreshContractBalances() {
 function heartbeat() {
   stats.lastHeartbeat = new Date().toISOString();
   const rpc = getRpcStatus();
-  const queued = Object.entries(rpc).filter(([, v]) => v.queued > 0).map(([c, v]) => `${c}:${v.queued}`).join(" ");
-  console.log(`[生存] スキャン${stats.scans} 精査${stats.examined} 黒字${stats.profitableFound}(V3含む${stats.v3Opportunities}) 実行${stats.executed}/${stats.failed} 罠${stats.trapsRejected} 税${stats.taxTokensRejected} 無効${stats.disabled} V2一致${stats.syncMatched} V3一致${stats.v3Matched} 取込${stats.adopted} 手数料${stats.feeProbed} 行列[${queued || "空"}]`);
+  const queued = Object.entries(rpc).filter(([, v]) => v.queued > 0).map(([c, v]) => `${c}:${v.priorityQueued}+${v.normalQueued}`).join(" ");
+  const stageLine = Object.entries(failStages).map(([k, v]) => `${k}:${v}`).join(" ") || "なし";
+  console.log(`[生存] スキャン${stats.scans} 精査${stats.examined} 黒字${stats.profitableFound}(V3含む${stats.v3Opportunities}) 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 見送${reasons.notSent}] 失敗段階[${stageLine}] 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}]`);
 }
 
 // ===== ダッシュボード =====
@@ -665,9 +689,15 @@ td{padding:6px 3px;border-bottom:1px solid #1c1c1c}
 .stat .v{font-size:17px;font-weight:600}.stat .l{font-size:8.5px;color:#888;margin-top:2px}
 a{color:#6fae62}.footerlink{margin-top:18px;font-size:11px}`;
 
-const OUTCOME_LABEL = {
-  success: "送信成功", failed: "送信失敗", not_sent: "条件を満たさず見送り",
-  below_min: "最低利益未満", trap: "罠(ハニーポット)", tax_token: "税トークン",
+const REASON_LABEL = {
+  disabled: "無効化済みのプールを含む", taxToken: "税トークン", cooldown: "冷却中(直近に失敗)",
+  trap: "罠(ハニーポット)", belowMin: `最低利益$${MIN_PROFIT_USD}未満`, executing: "実行中で重複",
+  notSent: "送信条件を満たさず", failed: "送信に失敗", success: "送信成功",
+};
+const STAGE_LABEL = {
+  state: "状態取得に失敗(RPCが遅い)", quote: "受取量の確定に失敗", estimateGas: "ガス見積もりで拒否",
+  feeLadder: "手数料を上げても拒否", send: "送信時のエラー", wait: "確定待ちで失敗",
+  timeout: "制限時間超過", unknown: "不明",
 };
 
 function renderPage() {
@@ -687,14 +717,17 @@ function renderPage() {
     <td style="text-align:right;color:#2ecc71;font-weight:600">${e.actualProfitUsd != null ? `+$${e.actualProfitUsd.toFixed(4)}` : '-'}</td>
     <td><a href="${e.explorerUrl}" target="_blank">確認</a></td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ実際の取引はありません</td></tr>`;
 
-  const oppRows = stats.recent.slice(0, 12).map((o, i) => `<tr><td>${i+1}</td>
+  const oppRows = stats.recent.slice(0, 10).map((o, i) => `<tr><td>${i+1}</td>
     <td style="font-size:9px">${o.kind} ${o.chain}${o.hasV3 ? ' <span style="color:#6fae62">V3</span>' : ''}<br>${o.label}</td>
     <td style="text-align:right">${o.feeWallPercent.toFixed(2)}%</td>
     <td style="text-align:right">$${o.tradeAmountUsd.toFixed(2)}</td>
     <td style="text-align:right;color:#2ecc71;font-weight:600">+$${o.netProfitUsd.toFixed(4)}</td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ黒字の機会が見つかっていません</td></tr>`;
 
-  const outcomeRows = Object.entries(sum.byOutcome).sort((a,b)=>b[1]-a[1]).map(([k, v]) =>
-    `<tr><td>${OUTCOME_LABEL[k] || k}</td><td style="text-align:right">${v.toLocaleString()}件</td></tr>`).join('') || `<tr><td colspan="2" style="color:#888">記録がありません</td></tr>`;
+  const reasonRows = Object.entries(reasons).filter(([, v]) => v > 0).sort((a,b)=>b[1]-a[1]).map(([k, v]) =>
+    `<tr><td>${REASON_LABEL[k] || k}</td><td style="text-align:right">${v.toLocaleString()}件</td></tr>`).join('') || `<tr><td colspan="2" style="color:#888">まだ記録がありません</td></tr>`;
+
+  const stageRows = Object.entries(failStages).sort((a,b)=>b[1]-a[1]).map(([k, v]) =>
+    `<tr><td>${STAGE_LABEL[k] || k}</td><td style="text-align:right">${v.toLocaleString()}件</td></tr>`).join('') || `<tr><td colspan="2" style="color:#888">送信の失敗はありません</td></tr>`;
 
   const balanceLine = Object.entries(contractBalances).map(([c, held]) =>
     `${c}: ${held.map((h) => `${h.symbol} ${h.amount.toFixed(4)}($${h.usd.toFixed(2)})`).join(" / ")}`).join('<br>') || '残高なし';
@@ -704,7 +737,7 @@ function renderPage() {
   ).join('<br>') || 'WebSocket未設定';
 
   const queueLine = Object.entries(rpc).map(([c, v]) =>
-    `${c}:${v.queued}${v.dropped > 0 ? ` 破棄${v.dropped}` : ''}`).join(' / ');
+    `${c}: 優先${v.priorityQueued}/通常${v.normalQueued}${v.dropped > 0 ? ` 破棄${v.dropped}` : ''}`).join('<br>');
   const gasLine = Object.entries(gas).map(([c, g]) => `${c}: $${g.costUsd}`).join(' / ') || '取得中';
 
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="refresh" content="20">
@@ -719,34 +752,38 @@ function renderPage() {
 <table><thead><tr><th>日時</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table>
 <div class="note">コントラクトに溜まっている利益: ${balanceLine}</div></div>
 
+<div class="card"><h2>🔎 機会がどこで止まっているか</h2>
+<div class="stat"><div><div class="v">${stats.examined.toLocaleString()}</div><div class="l">精査した経路</div></div>
+<div><div class="v" style="color:${stats.profitableFound>0?'#2ecc71':'#888'}">${stats.profitableFound}</div><div class="l">黒字と判定</div></div>
+<div><div class="v" style="color:${stats.executed>0?'#2ecc71':'#888'}">${stats.executed}</div><div class="l">送信成功</div></div>
+<div><div class="v" style="color:${stats.failed>0?'#e74c3c':'#888'}">${stats.failed}</div><div class="l">送信失敗</div></div></div>
+<table><thead><tr><th>止まった理由</th><th style="text-align:right">件数</th></tr></thead><tbody>${reasonRows}</tbody></table>
+<div class="note"><strong>送信に失敗した段階</strong></div>
+<table><thead><tr><th>段階</th><th style="text-align:right">件数</th></tr></thead><tbody>${stageRows}</tbody></table></div>
+
 <div class="card"><h2>🆕 V3(集中流動性)</h2>
 <div class="stat"><div><div class="v" style="color:#6fae62">${s.byKind.v3.toLocaleString()}</div><div class="l">V3プール</div></div>
 <div><div class="v">${s.mixedPairs.toLocaleString()}</div><div class="l">V2とV3が共存</div></div>
 <div><div class="v">${stats.v3Matched.toLocaleString()}</div><div class="l">V3の価格更新</div></div>
 <div><div class="v" style="color:${stats.v3Opportunities>0?'#2ecc71':'#888'}">${stats.v3Opportunities}</div><div class="l">V3を含む機会</div></div></div>
-<div class="note">V3は価格帯ごとに流動性が分かれるため、判定は概算で絞り込み、送信直前にUniswap公式のQuoterで正確に確定させます。同じペアにV2とV3が共存している組み合わせが、最も機会が生まれやすい場所です。</div></div>
+<div class="note">V3は判定を概算で絞り込み、送信直前にUniswap公式のQuoterで正確に確定させます。</div></div>
 
 <div class="card"><h2>🩺 システムの健全性</h2>
 <div class="stat"><div><div class="v" style="color:${hbAge != null && hbAge < 120 ? '#2ecc71' : '#e74c3c'}">${hbAge != null ? hbAge + '秒前' : '-'}</div><div class="l">最終生存確認</div></div>
-<div><div class="v" style="color:${maxQueue > 1000 ? '#e74c3c' : maxQueue > 100 ? '#e8a33d' : '#2ecc71'}">${maxQueue.toLocaleString()}</div><div class="l">待ち行列(最大)</div></div>
+<div><div class="v" style="color:${maxQueue > 1000 ? '#e74c3c' : maxQueue > 200 ? '#e8a33d' : '#2ecc71'}">${maxQueue.toLocaleString()}</div><div class="l">待ち行列(最大)</div></div>
 <div><div class="v">${lat != null ? lat + 'ms' : '-'}</div><div class="l">判定時間</div></div>
 <div><div class="v">${stats.feeProbed.toLocaleString()}</div><div class="l">手数料実測済み</div></div></div>
-<div class="note">${syncLine}<br>待ち行列: ${queueLine}<br>実測ガス代(2step): ${gasLine}</div></div>
+<div class="note">${syncLine}<br>${queueLine}<br>実測ガス代(2step): ${gasLine}<br>
+手数料の未実測(裁定候補のみ): 残${stats.feeProbePending.toLocaleString()}プール<br>
+無効化${stats.disabled}件(うち過去の記録から復元${stats.disabledFromFile}件 / 今回の判定${stats.disabledRuntime}件)<br>
+実行に必要な問い合わせは専用の処理装置で、背景作業を待たずに処理されます。</div></div>
 
 <div class="card"><h2>📒 24時間の記録簿</h2>
 <div class="stat"><div><div class="v">${sum.count.toLocaleString()}</div><div class="l">記録件数</div></div>
 <div><div class="v" style="color:#e8a33d">+$${sum.profitableUsd.toFixed(3)}</div><div class="l">黒字判定の合計</div></div>
 <div><div class="v" style="color:#2ecc71">+$${sum.realizedUsd.toFixed(4)}</div><div class="l">実際に得た利益</div></div>
 <div><div class="v">${stats.bigMoves.toLocaleString()}</div><div class="l">大口取引の検知</div></div></div>
-<table><thead><tr><th>結果</th><th style="text-align:right">件数</th></tr></thead><tbody>${outcomeRows}</tbody></table></div>
-
-<div class="card"><h2>🎯 黒字の機会</h2>
-<div class="stat"><div><div class="v" style="color:${stats.profitableFound>0?'#2ecc71':'#888'}">${stats.profitableFound}</div><div class="l">黒字検出</div></div>
-<div><div class="v">${stats.executed}</div><div class="l">実行成功</div></div>
-<div><div class="v" style="color:${stats.failed>0?'#e74c3c':'#888'}">${stats.failed}</div><div class="l">実行失敗</div></div>
-<div><div class="v" style="color:${stats.taxTokensRejected>0?'#e8a33d':'#888'}">${stats.taxTokensRejected}</div><div class="l">税トークン除外</div></div></div>
-<table><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table>
-<div class="note">精査${stats.examined.toLocaleString()}件。罠${stats.trapsRejected}件 / 状態が古く見送り${stats.staleRejected}件 / 無効化${stats.disabled}件</div></div>
+<table><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table></div>
 
 <div class="card"><h2>🗺️ プール地図(メモリ上)</h2>
 <div class="stat"><div><div class="v">${s.totalPools.toLocaleString()}</div><div class="l">プール合計</div></div>
@@ -761,11 +798,11 @@ function renderPage() {
 function renderAbout() {
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>仕組み</title><style>${STYLE}</style></head><body>
 <h1>📊 仕組み</h1>
-<div class="card"><h2>① V2形式とV3形式</h2><div class="note">V2は準備量が2つだけで価格が決まります。V3は価格帯ごとに流動性が分かれており、同じペアでも手数料区分(0.01%/0.05%/0.3%/1%)ごとに別のプールが存在します。両方を同じ経路に混ぜて組めるようにしてあります。</div></div>
-<div class="card"><h2>② プールの発見</h2><div class="note">V2は実在が確認できているプールからファクトリーを逆算して列挙します。V3は借りられる通貨の組を手数料区分ごとにファクトリーへ問い合わせ、存在するものだけを登録します。推測でアドレスを置くことはありません。</div></div>
-<div class="card"><h2>③ 即時判定</h2><div class="note">V2のSyncとV3のSwapを1つの購読で受け取り、変化した経路だけをメモリ上で再計算します。RPCを使わないためミリ秒で完了します。</div></div>
-<div class="card"><h2>④ 送信直前の確定</h2><div class="note">V3の正確な受取量はティック構造をたどる必要があるため、Uniswap公式のQuoterに計算させます。V2はプール自身に問い合わせるか、拒否理由から手数料を実測します。</div></div>
-<div class="card"><h2>⑤ 安全策</h2><div class="note">ガス見積もりが失敗すればプールに拒否されているので、送信せずに済みガス代を失いません。異常なリターンの案件、手数料1%超の税トークン、3回連続で失敗したプールは恒久的に除外します。</div></div>
+<div class="card"><h2>① V2形式とV3形式</h2><div class="note">V2は準備量が2つだけで価格が決まります。V3は価格帯ごとに流動性が分かれ、手数料区分ごとに別のプールが存在します。両方を同じ経路に混ぜて組めます。</div></div>
+<div class="card"><h2>② 待ち行列の分離</h2><div class="note">実行に必要な問い合わせは専用の処理装置で、間隔を空けずに処理します。手数料実測やプール取込といった背景作業は別の装置で間隔を守るため、実行が背景作業に待たされることはありません。</div></div>
+<div class="card"><h2>③ 手数料の実測</h2><div class="note">V3は手数料が区分で確定しています。V2は問い合わせる関数が無いため、ガス見積もりの拒否理由から実測します。対象は裁定候補のプールに絞り、判定に直結する分から埋めます。</div></div>
+<div class="card"><h2>④ 無効化の内訳</h2><div class="note">起動直後に無効化の件数が一気に増えるのは、過去に「使えない」と判明した記録を復元しているためで、新たな判定ではありません。画面では復元分と今回の判定分を分けて表示しています。</div></div>
+<div class="card"><h2>⑤ 送信直前の確定</h2><div class="note">全段の状態を同時に取り直し、V3はUniswap公式のQuoterで受取量を確定させます。ガス見積もりが失敗すればプールに拒否されているので、送信せずに済みガス代を失いません。</div></div>
 <div class="footerlink"><a href="/">← 戻る</a></div></body></html>`;
 }
 
