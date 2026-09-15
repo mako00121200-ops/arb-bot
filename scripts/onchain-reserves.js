@@ -2,14 +2,17 @@
 //
 // チェーンから直接データを読むための共通処理。
 //
-// [優先列と通常列を完全に分離する]
-// 以前は優先列と通常列を1本の処理装置で順に見ていたため、通常列の1件を
-// 処理している間は優先列が待たされ、さらに全ての呼び出しに送信間隔
-// (Baseは75ミリ秒)が適用されていた。V3経路の状態取得は6〜8回の問い合わせを
-// 要するため、これだけで8秒の上限を超えて実行が失敗した(2026年9月15日)。
-//   → 優先列は専用の処理装置で、間隔を空けずに連続処理する
-//   → 通常列(手数料実測・プール取込・定期読み直し)だけが間隔を守る
-//   → 通常列には上限を設け、溢れたら古いものから捨てる
+// [実行用は待ち行列を通さない]
+// 待ち行列は「大量に発生する背景作業」がRPCの秒間上限を超えないようにする
+// ための仕組みで、1件ずつ順番に処理する。実行用の問い合わせをこれに通すと、
+// 同時に投げたつもりの6回が直列化し、Baseの公開RPC(1件約1.4秒)では
+// 8.4秒かかって上限を超えた(2026年9月15日)。
+// 実行用は1回あたり6〜8件しか出ず頻度も低いため、待ち行列を迂回して
+// そのまま同時に投げる。
+//
+// [通常列(背景作業)]
+// 手数料実測・プール取込・定期読み直しはここを通る。チェーンごとの間隔を
+// 守り、上限を超えたら古い要求から捨てて自己回復する。
 //
 // [RPCの自動切り替え]
 // 一定回数連続で失敗したら次の候補URLへ切り替える。ただし
@@ -35,23 +38,23 @@ function minIntervalFor(chain) {
   return MIN_INTERVAL_BY_CHAIN[chain] ?? DEFAULT_MIN_INTERVAL_MS;
 }
 
-// 優先列は間隔をほぼ空けない。実行は一瞬で終わらせる必要がある。
-const PRIORITY_INTERVAL_MS = parseInt(process.env.PRIORITY_INTERVAL_MS || "5", 10);
-
 const FAILURES_BEFORE_ROTATE = 3;
 const RPC_CALL_TIMEOUT_MS = parseInt(process.env.RPC_CALL_TIMEOUT_MS || "8000", 10);
+// 実行用は待ち行列を通さない代わりに、同時に出せる数に上限を設ける。
+// 経路は最大4段なので、余裕を見てこの値で足りる。
+const MAX_CONCURRENT_PRIORITY = parseInt(process.env.MAX_CONCURRENT_PRIORITY || "12", 10);
 const NORMAL_QUEUE_LIMIT = parseInt(process.env.NORMAL_QUEUE_LIMIT || "300", 10);
 
-// チェーンごとの待ち行列。優先と通常でそれぞれ独立した処理装置を持つ。
 const queues = new Map();
 
 function getQueue(chain) {
   const key = (chain || "").toLowerCase();
   if (!queues.has(key)) {
     queues.set(key, {
-      priority: [], normal: [],
-      priorityRunning: false, normalRunning: false,
+      normal: [], normalRunning: false,
+      inflightPriority: 0, waitingPriority: [],
       dropped: 0, priorityDone: 0, normalDone: 0,
+      priorityMaxMs: 0,
     });
   }
   return queues.get(key);
@@ -65,33 +68,28 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-async function runJob(chain, job) {
-  try {
-    const result = await withTimeout(Promise.resolve().then(job.fn), RPC_CALL_TIMEOUT_MS, chain);
-    job.resolve(result);
-  } catch (e) {
-    job.reject(e);
-  }
-}
-
-/// 優先列の処理装置。通常列とは独立して回り、間隔もほぼ空けない。
-async function pumpPriority(chain) {
+/// 実行用: 待ち行列を通さず、そのまま同時に投げる。
+/// 同時数だけ上限を設け、超えた分は先に出た呼び出しが終わってから始める。
+async function runPriority(chain, fn) {
   const q = getQueue(chain);
-  if (q.priorityRunning) return;
-  q.priorityRunning = true;
+  if (q.inflightPriority >= MAX_CONCURRENT_PRIORITY) {
+    await new Promise((resolve) => q.waitingPriority.push(resolve));
+  }
+  q.inflightPriority++;
+  const startedAt = Date.now();
   try {
-    while (q.priority.length > 0) {
-      const job = q.priority.shift();
-      await runJob(chain, job);
-      q.priorityDone++;
-      if (q.priority.length > 0) await new Promise((r) => setTimeout(r, PRIORITY_INTERVAL_MS));
-    }
+    return await withTimeout(Promise.resolve().then(fn), RPC_CALL_TIMEOUT_MS, chain);
   } finally {
-    q.priorityRunning = false;
+    q.inflightPriority--;
+    q.priorityDone++;
+    const ms = Date.now() - startedAt;
+    if (ms > q.priorityMaxMs) q.priorityMaxMs = ms;
+    const next = q.waitingPriority.shift();
+    if (next) next();
   }
 }
 
-/// 通常列の処理装置。背景作業なので間隔を守り、RPCの上限を超えないようにする。
+/// 背景作業: 1件ずつ、間隔を守って処理する。
 async function pumpNormal(chain) {
   const q = getQueue(chain);
   if (q.normalRunning) return;
@@ -99,7 +97,12 @@ async function pumpNormal(chain) {
   try {
     while (q.normal.length > 0) {
       const job = q.normal.shift();
-      await runJob(chain, job);
+      try {
+        const result = await withTimeout(Promise.resolve().then(job.fn), RPC_CALL_TIMEOUT_MS, chain);
+        job.resolve(result);
+      } catch (e) {
+        job.reject(e);
+      }
       q.normalDone++;
       await new Promise((r) => setTimeout(r, minIntervalFor(chain)));
     }
@@ -108,22 +111,16 @@ async function pumpNormal(chain) {
   }
 }
 
-function scheduleRpcCall(chain, fn, priority = false) {
+function scheduleNormal(chain, fn) {
   const q = getQueue(chain);
   return new Promise((resolve, reject) => {
-    const job = { fn, resolve, reject };
-    if (priority) {
-      q.priority.push(job);
-      pumpPriority(chain);
-    } else {
-      while (q.normal.length >= NORMAL_QUEUE_LIMIT) {
-        const dropped = q.normal.shift();
-        q.dropped++;
-        dropped.reject(new Error("待ち行列が上限に達したため破棄"));
-      }
-      q.normal.push(job);
-      pumpNormal(chain);
+    while (q.normal.length >= NORMAL_QUEUE_LIMIT) {
+      const dropped = q.normal.shift();
+      q.dropped++;
+      dropped.reject(new Error("待ち行列が上限に達したため破棄"));
     }
+    q.normal.push({ fn, resolve, reject });
+    pumpNormal(chain);
   });
 }
 
@@ -163,11 +160,13 @@ function recordRpcFailure(chain, message) {
 }
 
 /// RPC呼び出しの共通入口。
-/// priority=true は「実行に直結する問い合わせ」に使い、専用の処理装置で
-/// 間隔を空けずに処理する。
+/// priority=true は「実行に直結する問い合わせ」で、待ち行列を通さず即座に投げる。
 export async function callWithRpc(chain, fn, priority = false) {
+  const call = () => fn(getProviderForChain(chain));
   try {
-    const result = await scheduleRpcCall(chain, () => fn(getProviderForChain(chain)), priority);
+    const result = priority
+      ? await runPriority(chain, call)
+      : await scheduleNormal(chain, call);
     getState(chain).failures = 0;
     return result;
   } catch (e) {
@@ -243,15 +242,14 @@ export function getRpcStatus() {
       url: config.rpcUrls[state.index % config.rpcUrls.length].replace(/\/[a-f0-9]{20,}/i, "/***"),
       index: state.index + 1, total: config.rpcUrls.length,
       failures: state.failures,
-      queued: q.priority.length + q.normal.length,
-      priorityQueued: q.priority.length,
+      queued: q.normal.length,
+      priorityQueued: q.inflightPriority,
       normalQueued: q.normal.length,
       dropped: q.dropped,
       priorityDone: q.priorityDone,
+      priorityMaxMs: q.priorityMaxMs,
       intervalMs: minIntervalFor(chain),
     };
   }
   return out;
 }
-
-export { scheduleRpcCall };
