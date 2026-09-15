@@ -1,31 +1,38 @@
 /**
  * オンチェーン イベント リアルタイム購読モジュール
  * ------------------------------------------------------------
- * 取引のたびに発行されるイベントをWebSocketで直接受け取る。
+ * 取引や流動性の変化をWebSocketで直接受け取る。
  *   V2形式 … Sync(準備量そのもの)
- *   V3形式 … Swap(更新後の価格と流動性)
- * どちらも「取引が起きた瞬間の正しい状態」を追加の問い合わせなしで得られる。
+ *   V3形式 … Swap(更新後の価格と流動性) / Mint・Burn(流動性の増減)
  *
- * [2種類を1接続で]
+ * [Mint・Burnも見る理由]
+ * V3の流動性はSwap以外でも変わる。誰かが価格帯に流動性を足したり抜いたり
+ * すると、Swapが起きていなくても受取量の計算結果が変わる。これを見ないと
+ * 古い流動性で計算し続け、幻の機会や見逃しが生まれる。
+ * Mint・Burnのデータには更新後の流動性が入っていないため、これらが届いた
+ * プールは「読み直しが必要」として呼び出し側に知らせる。
+ *
+ * [4種類を1接続で]
  * eth_subscribe の topics は配列の配列で「いずれか一致」を指定できる。
- * [[SYNC, SWAP]] と渡すことで、V2とV3の両方を1つの購読で受け取れる。
- * 接続数を増やさずに済むため、RPCの制限に当たりにくい。
+ * 4種類をまとめて1つの購読で受け取り、接続数を増やさない。
  *
  * [再接続の暴走を防ぐ]
- * 接続直後に切断される状態(RPCの秒間上限超過など)では、待ち時間を毎回
- * 1秒に戻していたため接続と切断を繰り返した。「一定時間つながり続けた」
- * ときだけ待ち時間を初期化する。
+ * 接続直後に切断される状態では待ち時間を毎回1秒に戻していたため、
+ * 接続と切断を繰り返した。一定時間つながり続けたときだけ初期化する。
  *
  * [健全性の判定]
  * 「接続はできるがイベントが届かない」状態では購読が有効とみなされ、
  * 定期読み直しがスキップされて価格が古いまま固定される危険がある。
- * 一定時間イベントが届かないチェーンは isChainHealthy() が false を返す。
  */
 
 // keccak256("Sync(uint112,uint112)") — Uniswap V2形式
 const SYNC_TOPIC = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1";
-// keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)") — Uniswap V3形式
+// keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)") — V3
 const V3_SWAP_TOPIC = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
+// keccak256("Mint(address,address,int24,int24,uint128,uint256,uint256)") — V3
+const V3_MINT_TOPIC = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde";
+// keccak256("Burn(address,int24,int24,uint128,uint256,uint256)") — V3
+const V3_BURN_TOPIC = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c";
 
 const CHAIN_WS_ENV_VARS = {
   base: "BASE_WSS_URL",
@@ -57,7 +64,6 @@ export function decodeSyncData(dataHex) {
 
 /// V3のSwapデータ: (int256 amount0, int256 amount1, uint160 sqrtPriceX96,
 ///                  uint128 liquidity, int24 tick)
-/// 必要なのは3番目と4番目。
 export function decodeV3SwapData(dataHex) {
   const data = dataHex.startsWith("0x") ? dataHex.slice(2) : dataHex;
   if (data.length < 320) return null;
@@ -81,20 +87,21 @@ const chainEnabled = new Set();
 const chainEventCounts = {};
 const chainV2Counts = {};
 const chainV3Counts = {};
+const chainLiquidityCounts = {};
 const chainMatchedCounts = {};
 const chainSubscribeErrors = {};
 const chainReconnects = {};
-let globalOnSync = null;   // V2用
-let globalOnV3Swap = null; // V3用
+let globalOnSync = null;        // V2用
+let globalOnV3Swap = null;      // V3のSwap用
+let globalOnV3Liquidity = null; // V3のMint・Burn用(読み直しが必要な合図)
 
 function sendSubscription(chainName) {
   const socket = chainSockets[chainName];
   if (!socket || socket.readyState !== 1) return;
   try {
-    // topics の1段目に配列を渡すと「いずれかに一致」の意味になる。
     socket.send(JSON.stringify({
       jsonrpc: "2.0", id: SUBSCRIBE_REQUEST_ID, method: "eth_subscribe",
-      params: ["logs", { topics: [[SYNC_TOPIC, V3_SWAP_TOPIC]] }],
+      params: ["logs", { topics: [[SYNC_TOPIC, V3_SWAP_TOPIC, V3_MINT_TOPIC, V3_BURN_TOPIC]] }],
     }));
   } catch (e) {}
 }
@@ -139,7 +146,7 @@ function connectChain(chainName, wsUrl) {
               console.warn(`[オンチェーン] ${chainName}: 購読が拒否されました: ${chainSubscribeErrors[chainName]}`);
             } else if (chainSubscribeErrors[chainName] !== null) {
               chainSubscribeErrors[chainName] = null;
-              console.log(`[オンチェーン] ${chainName}: V2のSyncとV3のSwapを1つの購読で受け取ります`);
+              console.log(`[オンチェーン] ${chainName}: V2のSyncとV3のSwap・Mint・Burnを1つの購読で受け取ります`);
             }
           }
           return;
@@ -166,6 +173,12 @@ function connectChain(chainName, wsUrl) {
           const decoded = decodeV3SwapData(log.data);
           if (decoded && globalOnV3Swap) {
             matched = globalOnV3Swap(chainName, address, decoded.sqrtPriceX96, decoded.liquidity, receivedAt);
+          }
+        } else if (topic === V3_MINT_TOPIC || topic === V3_BURN_TOPIC) {
+          // 流動性が変わった。データに更新後の値が無いため、読み直しを依頼する。
+          chainLiquidityCounts[chainName] = (chainLiquidityCounts[chainName] || 0) + 1;
+          if (globalOnV3Liquidity) {
+            matched = globalOnV3Liquidity(chainName, address, topic === V3_MINT_TOPIC ? "mint" : "burn");
           }
         }
 
@@ -212,15 +225,19 @@ function connectChain(chainName, wsUrl) {
   connect();
 }
 
-/// onSync   … V2のSync受信時 (chain, address, reserve0, reserve1, receivedAt)
-/// onV3Swap … V3のSwap受信時 (chain, address, sqrtPriceX96, liquidity, receivedAt)
+/// onSync        … V2のSync受信時 (chain, address, reserve0, reserve1, receivedAt)
+/// onV3Swap      … V3のSwap受信時 (chain, address, sqrtPriceX96, liquidity, receivedAt)
+/// onV3Liquidity … V3のMint・Burn受信時 (chain, address, "mint"|"burn")
 /// いずれも「監視対象だったか」を真偽値で返す。
-export function startOnchainFeeds(onSync, onV3Swap) {
+export function startOnchainFeeds(onSync, onV3Swap, onV3Liquidity) {
   globalOnSync = onSync;
   globalOnV3Swap = onV3Swap;
+  globalOnV3Liquidity = onV3Liquidity;
 
-  if (SYNC_TOPIC.length !== 66 || V3_SWAP_TOPIC.length !== 66) {
-    console.error("[オンチェーン] 致命的: イベント識別子の長さが不正です(66文字であるべき)");
+  for (const [name, topic] of [["Sync", SYNC_TOPIC], ["Swap", V3_SWAP_TOPIC], ["Mint", V3_MINT_TOPIC], ["Burn", V3_BURN_TOPIC]]) {
+    if (topic.length !== 66) {
+      console.error(`[オンチェーン] 致命的: ${name}の識別子の長さが不正です(${topic.length}文字、66文字であるべき)`);
+    }
   }
 
   let anyStarted = false;
@@ -262,6 +279,7 @@ export function getSyncStats() {
       received: chainEventCounts[chain] || 0,
       v2: chainV2Counts[chain] || 0,
       v3: chainV3Counts[chain] || 0,
+      liquidity: chainLiquidityCounts[chain] || 0,
       matched: chainMatchedCounts[chain] || 0,
       connected: chainSockets[chain]?.readyState === 1,
       healthy: isChainHealthy(chain),
