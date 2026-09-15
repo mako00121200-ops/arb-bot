@@ -6,16 +6,22 @@
 // ②常時:   チェーン上の全Syncイベントを1つの購読で受け取り、監視対象なら
 //          メモリ上で準備量を更新して、その経路だけを即座に再計算する。
 // ③発見:   Syncが届いた未知のプールは自動的に地図へ取り込む。
-// ④除外:   実測手数料が1%を超えるプールは「送金時に税を取るトークン」で
-//          あり、構造上裁定できないため恒久的に除外する。異常なリターンの
-//          案件(ハニーポット)も同様に除外する。
+// ④除外:   税トークン・ハニーポット・価格が信用できないプールを恒久除外。
+// ⑤記録:   検出から結果までを1件ずつ記録簿に残す。
+//
+// [今回の修正]
+//   ・WebSocketが「接続はあるがイベント不達」の場合を検知し、定期読み直しに
+//     自動で切り替える(以前は価格が古いまま固定される危険があった)
+//   ・実行に3回連続で失敗したプールを「価格が信用できない」として除外
+//   ・待ち行列の滞留・破棄をダッシュボードに表示
 
 import http from "http";
-import { startOnchainFeeds, getSyncStats, isChainWsEnabled } from "./dex-onchain-realtime.js";
+import { ethers } from "ethers";
+import { startOnchainFeeds, getSyncStats, isChainWsEnabled, isChainHealthy } from "./dex-onchain-realtime.js";
 import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
-import { probePoolFeeBps, getRpcStatus } from "./scripts/onchain-reserves.js";
+import { probePoolFeeBps, getRpcStatus, callWithRpc } from "./scripts/onchain-reserves.js";
 import { fetchReservesBatch, fetchPoolTokensBatch } from "./scripts/multicall-reserves.js";
 import { estimateGasCostUsd, getGasCostStatus } from "./scripts/gas-cost.js";
 import { discoverFactory, discoverPoolsFromFactory } from "./scripts/pool-discovery.js";
@@ -30,6 +36,7 @@ import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS } from "./scripts
 import { isBorrowable, getBorrowableTokens } from "./scripts/borrowable-tokens.js";
 import { getVerifiedPairs } from "./scripts/verified-pairs.js";
 import { isKnownIncompatiblePool, recordIncompatiblePool } from "./scripts/incompatible-pools.js";
+import { journal, loadJournal, trimJournalIfNeeded, summarize } from "./scripts/opportunity-journal.js";
 import { CHAIN_CONFIG } from "./chain-config.js";
 
 const MIN_PROFIT_USD = parseFloat(process.env.MIN_PROFIT_USD || "0.01");
@@ -47,10 +54,11 @@ const ADOPT_PER_TICK = 60;
 const FAILURE_COOLDOWN_MS = 10 * 60 * 1000;
 const DISABLE_AFTER_FAILURES = 3;
 const MAX_SANE_RETURN_RATIO = parseFloat(process.env.MAX_SANE_RETURN_RATIO || "0.20");
+const BIG_MOVE_PCT = parseFloat(process.env.BIG_MOVE_PCT || "0.5");
 const SCAM_REVERT_PATTERNS = [/blacklist/i, /not allowed/i, /forbidden/i, /trading (is )?not (enabled|open)/i, /cooldown/i, /max ?tx/i, /max ?wallet/i, /antiwhale/i];
 
 // ===== ガス代 =====
-const FALLBACK_GAS = { base: 0.010, arbitrum: 0.015, optimism: 0.005, polygon: 0.012, avalanche: 0.001 };
+const FALLBACK_GAS = { base: 0.010, arbitrum: 0.035, optimism: 0.005, polygon: 0.014, avalanche: 0.001 };
 const gasCostCache = new Map();
 function getGasCost(chain, kind = "2step") {
   return gasCostCache.get(`${chain}::${kind}`) ?? FALLBACK_GAS[chain] ?? 0.02;
@@ -66,10 +74,10 @@ async function refreshGasCosts() {
 // ===== 統計 =====
 const stats = {
   scans: 0, profitableFound: 0, examined: 0, executed: 0, failed: 0,
-  skippedCooldown: 0, trapsRejected: 0, taxTokensRejected: 0,
+  skippedCooldown: 0, trapsRejected: 0, taxTokensRejected: 0, staleRejected: 0, bigMoves: 0,
   lastOpportunity: null, recent: [], syncMatched: 0, syncUnknown: 0, adopted: 0, disabled: 0,
   latencies: [], ready: false, refreshCycles: 0, mapSource: "-", mapSavedAt: null,
-  feeProbed: 0, feeProbePending: 0, lastHeartbeat: null, reservesLoaded: 0,
+  feeProbed: 0, feeProbePending: 0, lastHeartbeat: null, reservesLoaded: 0, journalLoaded: 0,
 };
 
 // ===== 失敗の抑制と無効化 =====
@@ -98,7 +106,6 @@ function noteExecutionFailure(opp, error) {
   const reason = error?.message || String(error);
   cooldownUntil.set(opp.poolAddresses.join("|").toLowerCase(), Date.now() + FAILURE_COOLDOWN_MS);
 
-  // 税トークンと判明したプールは、原因が特定できているので即座に除外する。
   if (error instanceof ExecutionError && error.taxToken) {
     stats.taxTokensRejected++;
     const targets = error.taxPools?.length ? error.taxPools : opp.poolAddresses;
@@ -107,14 +114,21 @@ function noteExecutionFailure(opp, error) {
     }
     return;
   }
+  if (error instanceof ExecutionError && error.staleReserves) {
+    stats.staleRejected++;
+    return; // 一時的な読み取り失敗。プールのせいではない
+  }
 
   const scam = isScamRevert(reason);
   for (const address of opp.poolAddresses) {
     const key = poolKeyOf(opp.chain, address);
     const n = (poolFailures.get(key) || 0) + 1;
     poolFailures.set(key, n);
-    if (scam || n >= DISABLE_AFTER_FAILURES) {
-      disablePool(opp.chain, address, scam ? `詐欺トークン: ${reason}` : `送信失敗${n}回: ${reason}`);
+    if (scam) {
+      disablePool(opp.chain, address, `詐欺トークン: ${reason}`);
+    } else if (n >= DISABLE_AFTER_FAILURES) {
+      // 3回連続で送信に失敗するプールは、表示している価格が信用できない。
+      disablePool(opp.chain, address, `送信失敗${n}回(価格が信用できない): ${reason}`);
     }
   }
 }
@@ -123,7 +137,6 @@ function hasDisabledPool(opp) {
   return opp.poolAddresses.some((a) => disabledPools.has(poolKeyOf(opp.chain, a)));
 }
 
-/// 実測手数料が税トークンの水準に達したプールを除外する。
 function pruneTaxTokenPools(opp) {
   let found = false;
   for (const address of opp.poolAddresses) {
@@ -143,10 +156,22 @@ function rejectIfTrap(opp) {
   const ratio = opp.netProfitUsd / opp.tradeAmountUsd;
   if (ratio <= MAX_SANE_RETURN_RATIO) return false;
   stats.trapsRejected++;
-  const reason = `異常なリターン${(ratio * 100).toFixed(0)}%(投入$${opp.tradeAmountUsd.toFixed(2)}→利益$${opp.netProfitUsd.toFixed(2)})`;
-  console.log(`[罠] ${opp.kind} ${opp.chain} ${opp.label}: ${reason}。送信せずに無効化します`);
+  const reason = `異常なリターン${(ratio * 100).toFixed(0)}%`;
+  console.log(`[罠] ${opp.kind} ${opp.chain} ${opp.label}: ${reason}(投入$${opp.tradeAmountUsd.toFixed(2)}→利益$${opp.netProfitUsd.toFixed(2)})。無効化します`);
   for (const address of opp.poolAddresses) disablePool(opp.chain, address, reason);
   return true;
+}
+
+// ===== 記録簿 =====
+function record(opp, outcome, extra = {}) {
+  journal({
+    outcome, chain: opp.chain, kind: opp.kind, label: opp.label,
+    tradeAmountUsd: Number(opp.tradeAmountUsd?.toFixed?.(4) ?? 0),
+    netProfitUsd: Number(opp.netProfitUsd?.toFixed?.(6) ?? 0),
+    feeWallPercent: opp.feeWallPercent,
+    pools: opp.poolAddresses,
+    ...extra,
+  });
 }
 
 // ===== Syncで見つかった未知のプールを取り込む =====
@@ -265,8 +290,6 @@ async function preparePoolMap() {
     savePoolMap();
     stats.mapSavedAt = new Date().toISOString();
   }
-  // 過去に非対応と判明したプール、および実測手数料が税トークン水準の
-  // プールを、判定対象から外す。
   for (const [chain, addresses] of Object.entries(getAllPoolAddressesByChain())) {
     for (const address of addresses) {
       const pool = getPool(chain, address);
@@ -337,7 +360,7 @@ function prepareBorrowableTokens() {
   console.log(`[価格実測] ${prices.join(" ") || "なし"}`);
 }
 
-// ===== 手数料の実測(Solidly系のみ。V2形式は実行時に学習する) =====
+// ===== 手数料の実測 =====
 let feeProbeQueue = [];
 async function probeFeesGradually() {
   if (!stats.ready) return;
@@ -383,38 +406,45 @@ async function probeFeesGradually() {
 
 // ===== 機会が見つかった時の処理 =====
 const executing = new Set();
-async function handleOpportunity(opp) {
+async function handleOpportunity(opp, meta = {}) {
   stats.examined++;
   if (hasDisabledPool(opp)) return;
-  // 実測済みで税トークン水準のプールが含まれていれば、ここで除外する。
-  if (pruneTaxTokenPools(opp)) return;
+  if (pruneTaxTokenPools(opp)) { record(opp, "tax_token"); return; }
 
   const key = opp.poolAddresses.join("|").toLowerCase();
   const until = cooldownUntil.get(key);
   if (until && Date.now() < until) { stats.skippedCooldown++; return; }
 
-  if (rejectIfTrap(opp)) return;
+  if (rejectIfTrap(opp)) { record(opp, "trap"); return; }
   if (!opp.profitable) return;
 
   stats.profitableFound++;
   stats.lastOpportunity = new Date().toISOString();
-  stats.recent = [{ ...opp, at: new Date().toISOString() }, ...stats.recent.filter((r) => r.label !== opp.label)].slice(0, 20);
+  stats.recent = [{ ...opp, at: new Date().toISOString(), ...meta }, ...stats.recent.filter((r) => r.label !== opp.label)].slice(0, 20);
 
-  if (opp.netProfitUsd < MIN_PROFIT_USD) return;
+  if (opp.netProfitUsd < MIN_PROFIT_USD) { record(opp, "below_min", meta); return; }
   if (executing.has(key)) return;
   executing.add(key);
   try {
-    console.log(`[機会] ${opp.kind} ${opp.chain} ${opp.label}: 純利益+$${opp.netProfitUsd.toFixed(4)}(投入$${opp.tradeAmountUsd.toFixed(2)} 壁${opp.feeWallPercent.toFixed(2)}%)`);
+    console.log(`[機会] ${opp.kind} ${opp.chain} ${opp.label}: 純利益+$${opp.netProfitUsd.toFixed(4)}(投入$${opp.tradeAmountUsd.toFixed(2)} 壁${opp.feeWallPercent.toFixed(2)}%${meta.movePct ? ` 変動${meta.movePct.toFixed(2)}%` : ""})`);
     const ok = await Promise.race([
       executeOpportunity(opp),
       new Promise((_, reject) => setTimeout(() => reject(new ExecutionError("実行が制限時間を超えました")), EXECUTION_TIMEOUT_MS)),
     ]);
-    if (ok) { stats.executed++; cooldownUntil.delete(key); }
-    else cooldownUntil.set(key, Date.now() + 30 * 1000);
+    if (ok) {
+      stats.executed++;
+      cooldownUntil.delete(key);
+      record(opp, "success", meta);
+    } else {
+      cooldownUntil.set(key, Date.now() + 30 * 1000);
+      record(opp, "not_sent", meta);
+    }
   } catch (e) {
     stats.failed++;
-    console.warn(`[実行] 失敗: ${(e.message || "").slice(0, 120)}`);
+    const msg = (e.message || "").slice(0, 120);
+    console.warn(`[実行] 失敗: ${msg}`);
     noteExecutionFailure(opp, e);
+    record(opp, "failed", { ...meta, error: msg });
   } finally {
     executing.delete(key);
   }
@@ -431,6 +461,10 @@ function handleSync(chain, poolAddress, reserve0, reserve1, receivedAt) {
   }
   stats.syncMatched++;
   if (!stats.ready) return true;
+
+  const movePct = pool.lastMovePct || 0;
+  if (movePct >= BIG_MOVE_PCT) stats.bigMoves++;
+
   try {
     const opp = scanForChangedPool({
       chain, poolAddress, capUsd: getCurrentTradeCapUsd(),
@@ -439,7 +473,7 @@ function handleSync(chain, poolAddress, reserve0, reserve1, receivedAt) {
     const latency = Date.now() - receivedAt;
     stats.latencies.push(latency);
     if (stats.latencies.length > 200) stats.latencies.shift();
-    if (opp) handleOpportunity(opp).catch(() => {});
+    if (opp) handleOpportunity(opp, { source: "sync", movePct }).catch(() => {});
   } catch (e) {}
   return true;
 }
@@ -455,7 +489,7 @@ async function fullScanOnce() {
         chain, capUsd: getCurrentTradeCapUsd(),
         gasCostUsd: getGasCost(chain, "2step"), gasCostUsd3: getGasCost(chain, "3step"), isBorrowable,
       });
-      for (const opp of opportunities.slice(0, 3)) await handleOpportunity(opp);
+      for (const opp of opportunities.slice(0, 3)) await handleOpportunity(opp, { source: "scan" });
     }
     stats.scans++;
   } catch (e) {
@@ -465,14 +499,17 @@ async function fullScanOnce() {
   }
 }
 
-// ===== 準備量の読み直し(Syncが届かないチェーンのみ) =====
+// ===== 準備量の読み直し =====
+// Syncが「健全に届いている」チェーンだけ読み直しを省く。
+// 接続はあるがイベントが来ないチェーンは、価格が古いまま固定されるため
+// 必ず読み直す。
 let refreshRunning = false;
 async function refreshStaleReserves() {
   if (refreshRunning || !stats.ready) return;
   refreshRunning = true;
   try {
     for (const chain of Object.keys(CHAIN_CONFIG)) {
-      if (isChainWsEnabled(chain)) continue;
+      if (isChainWsEnabled(chain) && isChainHealthy(chain)) continue;
       const stale = getStalePools(chain, REFRESH_STALE_SEC * 1000)
         .filter((p) => !disabledPools.has(poolKeyOf(chain, p.address)))
         .slice(0, REFRESH_BATCH_SIZE);
@@ -490,12 +527,42 @@ async function refreshStaleReserves() {
   }
 }
 
+// ===== コントラクトに溜まった利益の確認 =====
+const BALANCE_ABI = ["function balancesOf(address[] tokens) view returns (uint256[])"];
+let contractBalances = {};
+async function refreshContractBalances() {
+  if (!stats.ready) return;
+  const out = {};
+  for (const [chain, config] of Object.entries(CHAIN_CONFIG)) {
+    const address = process.env[config.contractAddressEnvVar];
+    if (!address) continue;
+    const tokens = Object.entries(getBorrowableTokens(chain));
+    if (tokens.length === 0) continue;
+    try {
+      const amounts = await callWithRpc(chain, (p) =>
+        new ethers.Contract(address, BALANCE_ABI, p).balancesOf(tokens.map(([a]) => a)));
+      const held = [];
+      for (let i = 0; i < tokens.length; i++) {
+        const [, info] = tokens[i];
+        if (amounts[i] > 0n) {
+          const amount = Number(amounts[i]) / Math.pow(10, info.decimals);
+          const usd = amount * (getTokenPriceUsd(chain, tokens[i][0]) ?? 0);
+          held.push({ symbol: info.symbol, amount, usd });
+        }
+      }
+      if (held.length > 0) out[chain] = held;
+    } catch (e) {}
+  }
+  contractBalances = out;
+}
+
 // ===== 生存確認 =====
 function heartbeat() {
   stats.lastHeartbeat = new Date().toISOString();
   const rpc = getRpcStatus();
   const queued = Object.entries(rpc).filter(([, v]) => v.queued > 0).map(([c, v]) => `${c}:${v.queued}`).join(" ");
-  console.log(`[生存] スキャン${stats.scans} 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 罠${stats.trapsRejected} 税${stats.taxTokensRejected} 無効${stats.disabled} Sync一致${stats.syncMatched}/未知${stats.syncUnknown} 取込${stats.adopted} 手数料${stats.feeProbed} 行列[${queued || "空"}]`);
+  const dropped = Object.entries(rpc).filter(([, v]) => v.dropped > 0).map(([c, v]) => `${c}:${v.dropped}`).join(" ");
+  console.log(`[生存] スキャン${stats.scans} 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 罠${stats.trapsRejected} 税${stats.taxTokensRejected} 古${stats.staleRejected} 無効${stats.disabled} Sync一致${stats.syncMatched}/未知${stats.syncUnknown} 取込${stats.adopted} 手数料${stats.feeProbed} 行列[${queued || "空"}] 破棄[${dropped || "0"}]`);
 }
 
 // ===== ダッシュボード =====
@@ -513,6 +580,11 @@ td{padding:6px 3px;border-bottom:1px solid #1c1c1c}
 .stat .v{font-size:17px;font-weight:600}.stat .l{font-size:8.5px;color:#888;margin-top:2px}
 a{color:#6fae62}.footerlink{margin-top:18px;font-size:11px}`;
 
+const OUTCOME_LABEL = {
+  success: "送信成功", failed: "送信失敗", not_sent: "条件を満たさず見送り",
+  below_min: "最低利益未満", trap: "罠(ハニーポット)", tax_token: "税トークン",
+};
+
 function renderPage() {
   const s = getStats();
   const real = getRealExecutionStats();
@@ -524,19 +596,32 @@ function renderPage() {
   const hbAge = stats.lastHeartbeat ? Math.round((Date.now() - new Date(stats.lastHeartbeat).getTime()) / 1000) : null;
   const total = stats.syncMatched + stats.syncUnknown;
   const matchRate = total > 0 ? (stats.syncMatched / total * 100).toFixed(1) : "0.0";
+  const sum = summarize(24);
+  const maxQueue = Math.max(0, ...Object.values(rpc).map((v) => v.queued));
 
   const realRows = real.recent.map((e) => `<tr><td>${new Date(e.timestamp).toLocaleString('ja-JP')}</td><td style="font-size:9px">${e.pairLabel}</td>
     <td style="text-align:right">$${e.tradeAmountUsd.toFixed(2)}</td>
     <td style="text-align:right;color:#2ecc71;font-weight:600">${e.actualProfitUsd != null ? `+$${e.actualProfitUsd.toFixed(4)}` : '-'}</td>
     <td><a href="${e.explorerUrl}" target="_blank">確認</a></td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ実際の取引はありません</td></tr>`;
 
-  const oppRows = stats.recent.slice(0, 15).map((o, i) => `<tr><td>${i+1}</td>
+  const oppRows = stats.recent.slice(0, 12).map((o, i) => `<tr><td>${i+1}</td>
     <td style="font-size:9px">${o.kind} ${o.chain}<br>${o.label}</td>
     <td style="text-align:right">${o.feeWallPercent.toFixed(2)}%</td>
     <td style="text-align:right">$${o.tradeAmountUsd.toFixed(2)}</td>
     <td style="text-align:right;color:#2ecc71;font-weight:600">+$${o.netProfitUsd.toFixed(4)}</td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ黒字の機会が見つかっていません</td></tr>`;
 
-  const syncLine = Object.entries(syncStats).map(([c, v]) => `${c}: 受信${v.received.toLocaleString()}件${v.connected ? '' : ' <span style="color:#e74c3c">(切断中)</span>'}`).join('<br>') || 'WebSocket未設定';
+  const outcomeRows = Object.entries(sum.byOutcome).sort((a,b)=>b[1]-a[1]).map(([k, v]) =>
+    `<tr><td>${OUTCOME_LABEL[k] || k}</td><td style="text-align:right">${v.toLocaleString()}件</td></tr>`).join('') || `<tr><td colspan="2" style="color:#888">記録がありません</td></tr>`;
+
+  const balanceLine = Object.entries(contractBalances).map(([c, held]) =>
+    `${c}: ${held.map((h) => `${h.symbol} ${h.amount.toFixed(4)}($${h.usd.toFixed(2)})`).join(" / ")}`).join('<br>') || '残高なし';
+
+  const syncLine = Object.entries(syncStats).map(([c, v]) =>
+    `${c}: 受信${v.received.toLocaleString()}件 ${v.healthy ? '<span style="color:#2ecc71">正常</span>' : `<span style="color:#e74c3c">不達(${v.lastEventAgoSec ?? '?'}秒前が最後)→定期読み直しに切替中</span>`}`
+  ).join('<br>') || 'WebSocket未設定';
+
+  const queueLine = Object.entries(rpc).map(([c, v]) =>
+    `${c}:${v.queued}${v.priorityQueued > 0 ? `(優先${v.priorityQueued})` : ''}${v.dropped > 0 ? ` 破棄${v.dropped}` : ''}`).join(' / ');
   const gasLine = Object.entries(gas).map(([c, g]) => `${c}: $${g.costUsd}`).join(' / ') || '取得中';
 
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="refresh" content="20">
@@ -549,7 +634,22 @@ function renderPage() {
 <div><div class="v">$${getCurrentTradeCapUsd()}</div><div class="l">取引上限</div></div>
 <div><div class="v" style="color:${isLive?'#2ecc71':'#888'}">${isLive?'稼働中':'停止中'}</div><div class="l">自動売買</div></div></div>
 <table><thead><tr><th>日時</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table>
-<div class="note">投入額はプールの準備量から利益が最大になる値を自動計算します。送信可否は実際のガス見積もりを引いた利益が$${MIN_PROFIT_USD}を超えるかで判断します。</div></div>
+<div class="note">コントラクトに溜まっている利益: ${balanceLine}</div></div>
+
+<div class="card"><h2>🩺 システムの健全性</h2>
+<div class="stat"><div><div class="v" style="color:${hbAge != null && hbAge < 120 ? '#2ecc71' : '#e74c3c'}">${hbAge != null ? hbAge + '秒前' : '-'}</div><div class="l">最終生存確認</div></div>
+<div><div class="v" style="color:${maxQueue > 1000 ? '#e74c3c' : maxQueue > 100 ? '#e8a33d' : '#2ecc71'}">${maxQueue.toLocaleString()}</div><div class="l">待ち行列(最大)</div></div>
+<div><div class="v">${lat != null ? lat + 'ms' : '-'}</div><div class="l">判定時間</div></div>
+<div><div class="v">${stats.feeProbed.toLocaleString()}</div><div class="l">手数料実測済み</div></div></div>
+<div class="note">${syncLine}<br>待ち行列: ${queueLine}<br>実測ガス代(2step): ${gasLine}<br>
+実行に必要な問い合わせは優先列で処理され、背景作業(手数料実測・プール取込)より先に進みます。通常列が上限を超えた分は破棄され、次回に回されます。</div></div>
+
+<div class="card"><h2>📒 24時間の記録簿</h2>
+<div class="stat"><div><div class="v">${sum.count.toLocaleString()}</div><div class="l">記録件数</div></div>
+<div><div class="v" style="color:#e8a33d">+$${sum.profitableUsd.toFixed(3)}</div><div class="l">黒字判定の合計</div></div>
+<div><div class="v" style="color:#2ecc71">+$${sum.realizedUsd.toFixed(4)}</div><div class="l">実際に得た利益</div></div>
+<div><div class="v">${stats.bigMoves.toLocaleString()}</div><div class="l">大口取引の検知</div></div></div>
+<table><thead><tr><th>結果</th><th style="text-align:right">件数</th></tr></thead><tbody>${outcomeRows}</tbody></table></div>
 
 <div class="card"><h2>🎯 黒字の機会</h2>
 <div class="stat"><div><div class="v" style="color:${stats.profitableFound>0?'#2ecc71':'#888'}">${stats.profitableFound}</div><div class="l">黒字検出</div></div>
@@ -557,27 +657,13 @@ function renderPage() {
 <div><div class="v" style="color:${stats.failed>0?'#e74c3c':'#888'}">${stats.failed}</div><div class="l">実行失敗</div></div>
 <div><div class="v" style="color:${stats.taxTokensRejected>0?'#e8a33d':'#888'}">${stats.taxTokensRejected}</div><div class="l">税トークン除外</div></div></div>
 <table><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table>
-<div class="note">精査した経路${stats.examined.toLocaleString()}件のうち黒字だったもの。実測手数料が${TAX_TOKEN_FEE_BPS}bps(1%)を超えるプールは「送金時に税を取るトークン」として恒久的に除外します(正常なDEXにこの水準は存在しません)。罠${stats.trapsRejected}件 / 無効化${stats.disabled}件</div></div>
-
-<div class="card"><h2>🔭 活発なプールの自動発見</h2>
-<div class="stat"><div><div class="v" style="color:#2ecc71">${stats.adopted.toLocaleString()}</div><div class="l">新たに取り込んだ</div></div>
-<div><div class="v">${matchRate}%</div><div class="l">取引の捕捉率</div></div>
-<div><div class="v">${stats.syncUnknown.toLocaleString()}</div><div class="l">未知プールの取引</div></div>
-<div><div class="v">${pendingAdoption.size.toLocaleString()}</div><div class="l">取り込み待ち</div></div></div>
-<div class="note">Syncイベントが届いた未知のプールは、取引が起きている証拠なので自動的に取り込みます(stable型は除外)。</div></div>
-
-<div class="card"><h2>🩺 システムの生存確認</h2>
-<div class="stat"><div><div class="v" style="color:${hbAge != null && hbAge < 120 ? '#2ecc71' : '#e74c3c'}">${hbAge != null ? hbAge + '秒前' : '-'}</div><div class="l">最終生存確認</div></div>
-<div><div class="v">${stats.syncMatched.toLocaleString()}</div><div class="l">監視対象の更新</div></div>
-<div><div class="v">${lat != null ? lat + 'ms' : '-'}</div><div class="l">判定時間</div></div>
-<div><div class="v">${stats.feeProbed.toLocaleString()}</div><div class="l">手数料実測済み</div></div></div>
-<div class="note">${syncLine}<br>実測ガス代(2step): ${gasLine}<br>待ち行列: ${Object.entries(rpc).map(([c, v]) => `${c}:${v.queued}`).join(' / ')}</div></div>
+<div class="note">精査${stats.examined.toLocaleString()}件。罠${stats.trapsRejected}件 / 価格が古く見送り${stats.staleRejected}件 / 無効化${stats.disabled}件。3回連続で送信に失敗したプールは「価格が信用できない」として恒久的に除外します。</div></div>
 
 <div class="card"><h2>🗺️ プール地図(メモリ上)</h2>
 <div class="stat"><div><div class="v">${s.totalPools.toLocaleString()}</div><div class="l">プール</div></div>
 <div><div class="v">${s.arbitragablePairs.toLocaleString()}</div><div class="l">裁定候補ペア</div></div>
-<div><div class="v">${s.totalTokens.toLocaleString()}</div><div class="l">トークン</div></div>
-<div><div class="v" style="font-size:11px">${stats.mapSource}</div><div class="l">地図の由来</div></div></div>
+<div><div class="v">${matchRate}%</div><div class="l">取引の捕捉率</div></div>
+<div><div class="v">${stats.adopted.toLocaleString()}</div><div class="l">自動発見</div></div></div>
 <div class="note">チェーン別: ${Object.entries(s.byChain).map(([c, n]) => `${c}:${n.toLocaleString()}`).join(' / ') || '構築中'}<br>${stats.mapSavedAt ? `最終保存: ${new Date(stats.mapSavedAt).toLocaleString('ja-JP')}` : ''}</div></div>
 
 <div class="footerlink"><a href="/about">→ 仕組みについて</a></div></body></html>`;
@@ -587,10 +673,10 @@ function renderAbout() {
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>仕組み</title><style>${STYLE}</style></head><body>
 <h1>📊 仕組み</h1>
 <div class="card"><h2>① プール地図</h2><div class="note">実在が確認できているプールからファクトリーを逆算し、全プールを列挙します。地図はファイルに保存し、再起動時は数秒で復元します。準備量は毎回全件を取得し直します。</div></div>
-<div class="card"><h2>② 活発なプールの自動発見</h2><div class="note">Syncイベントが届いた未知のプールは、取引が起きている証拠なので自動的に取り込みます。</div></div>
-<div class="card"><h2>③ 手数料の実測</h2><div class="note">Uniswap V2形式のプールには手数料を問い合わせる関数がありません。そこでガス見積もり(無料)の拒否理由を使って実測します。「K」は想定が低すぎる合図、「not profitable」は想定が正しい合図です。脚ごとに1段ずつ上げることで、正常なプールに誤った値を記録しないようにしています。</div></div>
-<div class="card"><h2>④ 税トークンの除外</h2><div class="note">正常なDEXの手数料は最大でも1%です。実測が1%を超えるのは「送金時に税を取るトークン」であり、送った量の一部が徴収されるため構造上裁定できません。該当するプールは恒久的に除外します。</div></div>
-<div class="card"><h2>⑤ 実行</h2><div class="note">送信直前に実際のガス使用量を見積もり、その値でガス代を計算します。見積もりが失敗すればプールに拒否されているので、送信せずに済み、ガス代を1円も失いません。Aaveのフラッシュローンを使うため、利益が出なければ取引全体が無効化されます。</div></div>
+<div class="card"><h2>② 待ち行列の優先度</h2><div class="note">実行に必要な問い合わせは優先列で処理し、手数料実測やプール取込といった背景作業より先に進めます。通常列には上限があり、溢れた分は破棄して自己回復します。</div></div>
+<div class="card"><h2>③ WebSocketの健全性</h2><div class="note">接続はあるがイベントが届かない状態を検知し、そのチェーンは定期読み直しに自動で切り替えます。これを見落とすと価格が古いまま固定されます。</div></div>
+<div class="card"><h2>④ 手数料の実測と税トークンの除外</h2><div class="note">ガス見積もりの拒否理由から手数料を実測します。正常なDEXの手数料は最大1%で、それを超えるのは「送金時に税を取るトークン」なので恒久的に除外します。</div></div>
+<div class="card"><h2>⑤ 実行</h2><div class="note">送信直前に全プールの準備量を取り直し、実際のガス使用量を見積もってから判断します。見積もりが失敗すればプールに拒否されているので、ガス代を1円も失いません。</div></div>
 <div class="footerlink"><a href="/">← 戻る</a></div></body></html>`;
 }
 
@@ -611,6 +697,9 @@ async function main() {
     try { await runMainnetDeploy(deployTarget); } catch (e) { console.error("[本番デプロイ] 失敗:", e.message); }
   }
 
+  stats.journalLoaded = loadJournal();
+  if (stats.journalLoaded > 0) console.log(`[記録簿] 直近${stats.journalLoaded}件を読み込みました`);
+
   setInterval(heartbeat, HEARTBEAT_INTERVAL_MS);
   await refreshGasCosts();
   setInterval(refreshGasCosts, 5 * 60 * 1000);
@@ -625,6 +714,9 @@ async function main() {
   setInterval(probeFeesGradually, FEE_PROBE_INTERVAL_MS);
   setInterval(refreshStaleReserves, REFRESH_STALE_SEC * 1000);
   setInterval(() => { savePoolMap(); stats.mapSavedAt = new Date().toISOString(); }, SAVE_MAP_INTERVAL_MS);
+  setInterval(trimJournalIfNeeded, 30 * 60 * 1000);
+  setTimeout(refreshContractBalances, 30000);
+  setInterval(refreshContractBalances, 10 * 60 * 1000);
   setTimeout(fullScanOnce, 10000);
   setInterval(fullScanOnce, FULL_SCAN_INTERVAL_SEC * 1000);
 
