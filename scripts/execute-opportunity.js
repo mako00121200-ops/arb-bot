@@ -2,8 +2,12 @@
 //
 // 検出した機会を実際に送信する。V2形式とV3形式が混在する経路に対応する。
 //
-// [送信直前の確定]
-// メモリ上の値は概算なので、送信前に各段の受取量を確定させる。
+// [送信直前の確定を速く]
+// 以前は各段の状態を順番に取っていたため、V3経路では6〜8回の問い合わせが
+// 直列になり、8秒の上限を超えて失敗した。全ての段を同時に取り、
+// 段ごとの問い合わせも同時に出す。
+//
+// [段の受取量の確定]
 //   V3 … Uniswap公式の QuoterV2 に問い合わせる(ティック計算を自前でやらない)
 //   V2 … プール自身の getAmountOut、無ければ準備量から計算
 // 前の段で「実際に要求する量」を次の段の入力にして、余裕を正しく連鎖させる。
@@ -14,10 +18,6 @@
 //   "UniswapV2: K"   … 要求量が多すぎる → 想定を上げて再挑戦
 //   "not profitable" … スワップは通った = 想定が正しい → 記録
 // ガス見積もりは無料なので、何度試してもガス代はかからない。
-// V3は手数料が区分で確定しているため、この学習は不要。
-//
-// [優先処理]
-// ここから出すRPC呼び出しは全て優先列で発行し、背景作業に待たされないようにする。
 
 import { ethers } from "ethers";
 import { getChainConfig } from "../chain-config.js";
@@ -48,17 +48,17 @@ const SAFETY_MARGIN_BPS = 5n;
 const FEE_LADDER = [30, 35, 40, 45, 50, 60, 70, 80, 90, 100];
 export const TAX_TOKEN_FEE_BPS = parseInt(process.env.TAX_TOKEN_FEE_BPS || "100", 10);
 
-// コントラクト側の種別コード
 const CONTRACT_KIND_V2 = 0;
 const CONTRACT_KIND_V3 = 1;
 
 export class ExecutionError extends Error {
-  constructor(message, { reverted = false, taxToken = false, taxPools = [], staleReserves = false } = {}) {
+  constructor(message, { reverted = false, taxToken = false, taxPools = [], staleReserves = false, stage = "unknown" } = {}) {
     super(message);
     this.reverted = reverted;
     this.taxToken = taxToken;
     this.taxPools = taxPools;
     this.staleReserves = staleReserves;
+    this.stage = stage;
   }
 }
 
@@ -77,54 +77,50 @@ function buildTokenPath(opp) {
   return path;
 }
 
-/// 経路上の全プールの状態を、送信直前に取り直す。
-/// V2は準備量、V3は価格と流動性。ここで機会が消えていれば、
-/// メモリ上の値が古かったということ。
-async function refreshLegState(chain, opp, tokenPath) {
-  const legs = [];
-  for (let i = 0; i < opp.legs.length; i++) {
-    const src = opp.legs[i];
-    const addr = ethers.getAddress(opp.poolAddresses[i]);
-    const tokenIn = tokenPath[i].toLowerCase();
-
-    if (src.kind === KIND_V3) {
-      try {
-        const slot0 = await callWithRpc(chain, (p) => new ethers.Contract(addr, V3_STATE_ABI, p).slot0(), true);
-        const liquidity = await callWithRpc(chain, (p) => new ethers.Contract(addr, V3_STATE_ABI, p).liquidity(), true);
-        if (slot0[0] <= 0n || liquidity <= 0n) return null;
-        legs.push({ ...src, tokenIn, sqrtPriceX96: slot0[0], liquidity });
-      } catch (e) {
-        return null;
-      }
-    } else {
-      try {
-        const reserves = await callWithRpc(chain, (p) => new ethers.Contract(addr, PAIR_RESERVES_ABI, p).getReserves(), true);
-        const token0 = await callWithRpc(chain, (p) => new ethers.Contract(addr, PAIR_RESERVES_ABI, p).token0(), true);
-        const isToken0In = token0.toLowerCase() === tokenIn;
-        const reserveIn = isToken0In ? reserves[0] : reserves[1];
-        const reserveOut = isToken0In ? reserves[1] : reserves[0];
-        if (reserveIn <= 0n || reserveOut <= 0n) return null;
-        legs.push({ ...src, tokenIn, reserveIn, reserveOut });
-      } catch (e) {
-        return null;
-      }
-    }
+/// 1段の状態を取る。V2は準備量、V3は価格と流動性。問い合わせは同時に出す。
+async function fetchLegState(chain, src, poolAddress, tokenIn) {
+  const addr = ethers.getAddress(poolAddress);
+  if (src.kind === KIND_V3) {
+    const c = (p) => new ethers.Contract(addr, V3_STATE_ABI, p);
+    const [slot0, liquidity] = await Promise.all([
+      callWithRpc(chain, (p) => c(p).slot0(), true),
+      callWithRpc(chain, (p) => c(p).liquidity(), true),
+    ]);
+    if (slot0[0] <= 0n || liquidity <= 0n) return null;
+    return { ...src, tokenIn, sqrtPriceX96: slot0[0], liquidity };
   }
-  return legs;
+  const c = (p) => new ethers.Contract(addr, PAIR_RESERVES_ABI, p);
+  const [reserves, token0] = await Promise.all([
+    callWithRpc(chain, (p) => c(p).getReserves(), true),
+    callWithRpc(chain, (p) => c(p).token0(), true),
+  ]);
+  const isToken0In = token0.toLowerCase() === tokenIn;
+  const reserveIn = isToken0In ? reserves[0] : reserves[1];
+  const reserveOut = isToken0In ? reserves[1] : reserves[0];
+  if (reserveIn <= 0n || reserveOut <= 0n) return null;
+  return { ...src, tokenIn, reserveIn, reserveOut };
 }
 
-/// 1段の受取量を確定させる。V3は公式のQuoter、V2はプール自身か計算式。
-/// fromPool は「プール自身から正確な値を得られたか」。V2の手数料学習で使う。
+/// 経路上の全段の状態を、送信直前に同時に取り直す。
+async function refreshLegState(chain, opp, tokenPath) {
+  try {
+    const legs = await Promise.all(
+      opp.legs.map((src, i) => fetchLegState(chain, src, opp.poolAddresses[i], tokenPath[i].toLowerCase()))
+    );
+    return legs.every(Boolean) ? legs : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function quoteLeg({ chain, leg, amountIn, feeBpsOverride }) {
   if (leg.kind === KIND_V3) {
     const exact = await quoteV3Exact({
       chain, tokenIn: leg.tokenIn, tokenOut: leg.tokenOut,
       amountIn, feeTier: leg.feeTier,
     });
-    // Quoterが答えれば正確。答えない場合はこの経路を諦める。
     return exact ? { amountOut: exact, fromPool: true } : null;
   }
-
   const feeBps = feeBpsOverride ?? leg.feeBps;
   try {
     const out = await callWithRpc(chain, (p) =>
@@ -153,8 +149,8 @@ async function buildRequestedAmounts({ chain, legs, amountIn, feeBpsList }) {
 function recordLearnedFees(chain, opp, legs, feeBpsList, fromPool) {
   const learned = [];
   for (let i = 0; i < opp.poolAddresses.length; i++) {
-    if (legs[i].kind === KIND_V3) continue; // V3は区分で確定済み
-    if (fromPool[i]) continue;              // プール自身から得られた分は正確
+    if (legs[i].kind === KIND_V3) continue;
+    if (fromPool[i]) continue;
     const pool = getPool(chain, opp.poolAddresses[i]);
     if (!pool || pool.feeBps === feeBpsList[i]) continue;
     setPoolFee(chain, opp.poolAddresses[i], feeBpsList[i]);
@@ -164,7 +160,6 @@ function recordLearnedFees(chain, opp, legs, feeBpsList, fromPool) {
   if (learned.length > 0) console.log(`[手数料実測] ${chain}: ${learned.join(" ")}`);
 }
 
-/// コントラクトに渡す経路を組み立てる。
 function buildLegArgs(legs, requested) {
   return legs.map((leg, i) => ({
     pool: ethers.getAddress(leg.pool),
@@ -176,6 +171,7 @@ function buildLegArgs(legs, requested) {
 }
 
 export async function executeOpportunity(opp) {
+  const startedAt = Date.now();
   const chain = opp.chain;
   const chainConfig = getChainConfig(chain);
   if (!chainConfig) return false;
@@ -205,15 +201,15 @@ export async function executeOpportunity(opp) {
   }
 
   const legs = await refreshLegState(chain, opp, tokenPath);
+  const stateMs = Date.now() - startedAt;
   if (!legs) {
-    throw new ExecutionError("送信直前の状態取得に失敗", { staleReserves: true });
+    throw new ExecutionError(`送信直前の状態取得に失敗(${stateMs}ms)`, { staleReserves: true, stage: "state" });
   }
 
   const wallet = new ethers.Wallet(privateKey, getProviderForChain(chain));
   const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, wallet);
   const amountOwed = amountIn + (amountIn * AAVE_PREMIUM_BPS) / 10000n;
 
-  // V2の脚だけ、手数料の想定を1つずつ上げながら通る組み合わせを探す。
   const legCount = legs.length;
   const feeIndex = legs.map(() => 0);
   let feeBpsList = legs.map((l) => (l.kind === KIND_V3 ? l.feeBps : Math.max(l.feeBps, FEE_LADDER[0])));
@@ -223,7 +219,9 @@ export async function executeOpportunity(opp) {
   const MAX_ATTEMPTS = FEE_LADDER.length * legCount + 2;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const built = await buildRequestedAmounts({ chain, legs, amountIn, feeBpsList });
-    if (!built) return false;
+    if (!built) {
+      throw new ExecutionError("受取量の確定に失敗(Quoterまたはプールが応答せず)", { staleReserves: true, stage: "quote" });
+    }
     lastFromPool = built.fromPool;
 
     const legArgs = buildLegArgs(legs, built.requested);
@@ -241,10 +239,9 @@ export async function executeOpportunity(opp) {
         return false;
       }
       if (!isKRevert(lastError)) {
-        throw new ExecutionError(lastError.slice(0, 160), { reverted: true });
+        throw new ExecutionError(lastError.slice(0, 160), { reverted: true, stage: "estimateGas" });
       }
 
-      // 「K」はV2形式のプールでしか出ない。V2の脚を1つずつ上げる。
       let advanced = false;
       for (let tried = 0; tried < legCount; tried++) {
         const i = (cursor + tried) % legCount;
@@ -270,7 +267,7 @@ export async function executeOpportunity(opp) {
     }
     throw new ExecutionError(
       `手数料${TAX_TOKEN_FEE_BPS}bpsまで上げても拒否(送金時に税を取るトークンの可能性)`,
-      { reverted: true, taxToken: true, taxPools }
+      { reverted: true, taxToken: true, taxPools, stage: "feeLadder" }
     );
   }
 
@@ -293,14 +290,15 @@ export async function executeOpportunity(opp) {
     return false;
   }
 
-  console.log(`[実行] ${opp.kind} ${chain} ${opp.label}: 送信します(投入$${tradeUsd.toFixed(2)} 純利益$${finalProfitUsd.toFixed(4)} ガス$${gasCostUsd.toFixed(4)}/${gasUnits})`);
+  const readyMs = Date.now() - startedAt;
+  console.log(`[実行] ${opp.kind} ${chain} ${opp.label}: 送信します(投入$${tradeUsd.toFixed(2)} 純利益$${finalProfitUsd.toFixed(4)} ガス$${gasCostUsd.toFixed(4)}/${gasUnits} 準備${readyMs}ms)`);
 
   let tx;
   try {
     tx = await contract.executeRoute(opp.tokenA, amountIn, legArgs, { gasLimit: gasWithBuffer });
   } catch (e) {
     const msg = e.message || "";
-    throw new ExecutionError(msg.slice(0, 160), { reverted: msg.includes("execution reverted") });
+    throw new ExecutionError(msg.slice(0, 160), { reverted: msg.includes("execution reverted"), stage: "send" });
   }
 
   console.log(`[実行] 送信: ${tx.hash}`);
@@ -308,7 +306,7 @@ export async function executeOpportunity(opp) {
   try {
     receipt = await tx.wait();
   } catch (e) {
-    throw new ExecutionError(`確定待ちで失敗: ${(e.message || "").slice(0, 120)}`, { reverted: true });
+    throw new ExecutionError(`確定待ちで失敗: ${(e.message || "").slice(0, 120)}`, { reverted: true, stage: "wait" });
   }
   console.log(`[実行] 完了: ブロック${receipt.blockNumber} ガス${receipt.gasUsed.toString()}`);
 
