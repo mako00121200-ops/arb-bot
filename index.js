@@ -1,19 +1,14 @@
 // index.js
 //
-// [設計] イベント駆動型のDEXアービトラージbot。
+// [設計] イベント駆動型のDEXアービトラージbot。V2形式とV3形式の両方を扱う。
 //
-// ①起動時: プール地図をファイルから読み込み、準備量は必ず全件を再取得する。
-// ②常時:   チェーン上の全Syncイベントを1つの購読で受け取り、監視対象なら
-//          メモリ上で準備量を更新して、その経路だけを即座に再計算する。
-// ③発見:   Syncが届いた未知のプールは自動的に地図へ取り込む。
+// ①起動時: プール地図を読み込み、V3プールを借りる通貨の組から発見する。
+//          状態(V2の準備量 / V3の価格と流動性)は必ず全件を取り直す。
+// ②常時:   V2のSyncとV3のSwapを1つの購読で受け取り、変化した経路だけを
+//          メモリ上で即座に再計算する(判定はミリ秒)。
+// ③発見:   Syncが届いた未知のV2プールは自動的に取り込む。
 // ④除外:   税トークン・ハニーポット・価格が信用できないプールを恒久除外。
-// ⑤記録:   検出から結果までを1件ずつ記録簿に残す。
-//
-// [今回の修正]
-//   ・WebSocketが「接続はあるがイベント不達」の場合を検知し、定期読み直しに
-//     自動で切り替える(以前は価格が古いまま固定される危険があった)
-//   ・実行に3回連続で失敗したプールを「価格が信用できない」として除外
-//   ・待ち行列の滞留・破棄をダッシュボードに表示
+// ⑤実行:   送信直前に状態を取り直し、V3は公式Quoterで受取量を確定させる。
 
 import http from "http";
 import { ethers } from "ethers";
@@ -26,10 +21,11 @@ import { fetchReservesBatch, fetchPoolTokensBatch } from "./scripts/multicall-re
 import { estimateGasCostUsd, getGasCostStatus } from "./scripts/gas-cost.js";
 import { discoverFactory, discoverPoolsFromFactory } from "./scripts/pool-discovery.js";
 import {
-  registerPool, updateReservesFromSync, setPoolFee, getPool, getStats,
+  registerPool, updateReservesFromSync, updateV3FromSwap, setPoolFee, getPool, getStats,
   setTokenDecimals, setTokenPriceUsd, getTokenPriceUsd,
-  getAllPoolAddressesByChain, getPoolsForToken, getStalePools,
-  getArbitragablePairs, savePoolMap, loadPoolMap,
+  getAllPoolAddressesByChain, getPoolsForToken, getStalePools, getPoolsByKind,
+  getArbitragablePairs, savePoolMap, loadPoolMap, hasUsableState, clearPoolState,
+  KIND_V2, KIND_V3,
 } from "./scripts/pool-registry.js";
 import { scanForChangedPool, scanAllPairs } from "./scripts/opportunity-scanner.js";
 import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS } from "./scripts/execute-opportunity.js";
@@ -37,12 +33,14 @@ import { isBorrowable, getBorrowableTokens } from "./scripts/borrowable-tokens.j
 import { getVerifiedPairs } from "./scripts/verified-pairs.js";
 import { isKnownIncompatiblePool, recordIncompatiblePool } from "./scripts/incompatible-pools.js";
 import { journal, loadJournal, trimJournalIfNeeded, summarize } from "./scripts/opportunity-journal.js";
+import { V3_FACTORIES, V3_FEE_TIERS, findV3Pool, readV3State, feeTierToBps } from "./scripts/v3-pools.js";
 import { CHAIN_CONFIG } from "./chain-config.js";
 
 const MIN_PROFIT_USD = parseFloat(process.env.MIN_PROFIT_USD || "0.01");
 const FULL_SCAN_INTERVAL_SEC = parseInt(process.env.FULL_SCAN_INTERVAL_SEC || "30", 10);
 const REFRESH_STALE_SEC = parseInt(process.env.REFRESH_STALE_SEC || "60", 10);
-const REFRESH_BATCH_SIZE = parseInt(process.env.REFRESH_BATCH_SIZE || "4000", 10);
+const REFRESH_BATCH_SIZE = parseInt(process.env.REFRESH_BATCH_SIZE || "2000", 10);
+const V3_REFRESH_PER_TICK = parseInt(process.env.V3_REFRESH_PER_TICK || "40", 10);
 const FEE_PROBE_PER_TICK = parseInt(process.env.FEE_PROBE_PER_TICK || "5", 10);
 const FEE_PROBE_INTERVAL_MS = 1000;
 const SAVE_MAP_INTERVAL_MS = 5 * 60 * 1000;
@@ -58,6 +56,7 @@ const BIG_MOVE_PCT = parseFloat(process.env.BIG_MOVE_PCT || "0.5");
 const SCAM_REVERT_PATTERNS = [/blacklist/i, /not allowed/i, /forbidden/i, /trading (is )?not (enabled|open)/i, /cooldown/i, /max ?tx/i, /max ?wallet/i, /antiwhale/i];
 
 // ===== ガス代 =====
+// V3はティックをまたぐ分だけV2より多く使う。
 const FALLBACK_GAS = { base: 0.010, arbitrum: 0.035, optimism: 0.005, polygon: 0.014, avalanche: 0.001 };
 const gasCostCache = new Map();
 function getGasCost(chain, kind = "2step") {
@@ -75,6 +74,7 @@ async function refreshGasCosts() {
 const stats = {
   scans: 0, profitableFound: 0, examined: 0, executed: 0, failed: 0,
   skippedCooldown: 0, trapsRejected: 0, taxTokensRejected: 0, staleRejected: 0, bigMoves: 0,
+  v3Found: 0, v3Matched: 0, v3Opportunities: 0,
   lastOpportunity: null, recent: [], syncMatched: 0, syncUnknown: 0, adopted: 0, disabled: 0,
   latencies: [], ready: false, refreshCycles: 0, mapSource: "-", mapSavedAt: null,
   feeProbed: 0, feeProbePending: 0, lastHeartbeat: null, reservesLoaded: 0, journalLoaded: 0,
@@ -92,8 +92,7 @@ function disablePool(chain, address, reason) {
   if (disabledPools.has(key)) return;
   disabledPools.add(key);
   stats.disabled++;
-  const pool = getPool(chain, address);
-  if (pool) { pool.raw0 = 0n; pool.raw1 = 0n; }
+  clearPoolState(getPool(chain, address));
   recordIncompatiblePool(chain, address, reason);
   console.log(`[無効化] ${chain} ${address.slice(0, 10)}…: ${reason.slice(0, 70)}`);
 }
@@ -116,7 +115,7 @@ function noteExecutionFailure(opp, error) {
   }
   if (error instanceof ExecutionError && error.staleReserves) {
     stats.staleRejected++;
-    return; // 一時的な読み取り失敗。プールのせいではない
+    return;
   }
 
   const scam = isScamRevert(reason);
@@ -127,7 +126,6 @@ function noteExecutionFailure(opp, error) {
     if (scam) {
       disablePool(opp.chain, address, `詐欺トークン: ${reason}`);
     } else if (n >= DISABLE_AFTER_FAILURES) {
-      // 3回連続で送信に失敗するプールは、表示している価格が信用できない。
       disablePool(opp.chain, address, `送信失敗${n}回(価格が信用できない): ${reason}`);
     }
   }
@@ -141,7 +139,7 @@ function pruneTaxTokenPools(opp) {
   let found = false;
   for (const address of opp.poolAddresses) {
     const pool = getPool(opp.chain, address);
-    if (!pool || !pool.feeProbed) continue;
+    if (!pool || pool.kind === KIND_V3 || !pool.feeProbed) continue;
     if (pool.feeBps > TAX_TOKEN_FEE_BPS) {
       stats.taxTokensRejected++;
       disablePool(opp.chain, address, `実測手数料${pool.feeBps}bps(税トークン)`);
@@ -165,7 +163,7 @@ function rejectIfTrap(opp) {
 // ===== 記録簿 =====
 function record(opp, outcome, extra = {}) {
   journal({
-    outcome, chain: opp.chain, kind: opp.kind, label: opp.label,
+    outcome, chain: opp.chain, kind: opp.kind, label: opp.label, hasV3: !!opp.hasV3,
     tradeAmountUsd: Number(opp.tradeAmountUsd?.toFixed?.(4) ?? 0),
     netProfitUsd: Number(opp.netProfitUsd?.toFixed?.(6) ?? 0),
     feeWallPercent: opp.feeWallPercent,
@@ -174,7 +172,7 @@ function record(opp, outcome, extra = {}) {
   });
 }
 
-// ===== Syncで見つかった未知のプールを取り込む =====
+// ===== Syncで見つかった未知のV2プールを取り込む =====
 const pendingAdoption = new Map();
 const rejectedPools = new Set();
 
@@ -201,12 +199,82 @@ async function adoptPendingPools() {
       for (const item of items) {
         const t = tokens.get(item.address.toLowerCase());
         if (!t) { rejectedPools.add(item.key); continue; }
-        registerPool({ chain, address: item.address, dexId: "sync発見", token0: t.token0, token1: t.token1, raw0: item.raw0, raw1: item.raw1 });
+        registerPool({ chain, address: item.address, dexId: "sync発見", kind: KIND_V2, token0: t.token0, token1: t.token1, raw0: item.raw0, raw1: item.raw1 });
         stats.adopted++;
       }
     } catch (e) {
       for (const item of items) pendingAdoption.set(item.key, item);
     }
+  }
+}
+
+// ===== V3プールの発見 =====
+// 借りられる通貨どうしの組を、手数料区分ごとにファクトリーへ問い合わせる。
+// 存在するものだけが返るので、推測でアドレスを置くことがない。
+async function discoverV3Pools() {
+  let found = 0;
+  for (const [chain, factories] of Object.entries(V3_FACTORIES)) {
+    if (!CHAIN_CONFIG[chain]) continue;
+    const borrowables = Object.keys(getBorrowableTokens(chain));
+    if (borrowables.length < 2) continue;
+
+    for (const factory of factories) {
+      for (let i = 0; i < borrowables.length; i++) {
+        for (let j = i + 1; j < borrowables.length; j++) {
+          for (const feeTier of V3_FEE_TIERS) {
+            const address = await findV3Pool(chain, factory.address, borrowables[i], borrowables[j], feeTier);
+            if (!address) continue;
+            if (isKnownIncompatiblePool(chain, address)) continue;
+            const [t0, t1] = [borrowables[i].toLowerCase(), borrowables[j].toLowerCase()].sort();
+            registerPool({
+              chain, address, dexId: factory.dexId, factory: factory.address, kind: KIND_V3,
+              token0: t0, token1: t1, feeTier, feeBps: feeTierToBps(feeTier),
+            });
+            found++;
+          }
+        }
+      }
+    }
+    console.log(`[V3発見] ${chain}: 累計${found}プール`);
+  }
+  stats.v3Found = found;
+  console.log(`[V3発見] 完了: ${found}プールを登録しました`);
+}
+
+/// V3プールの状態(価格・流動性)を読み込む。個別呼び出しなので件数を絞る。
+async function loadV3States() {
+  let loaded = 0;
+  for (const chain of Object.keys(CHAIN_CONFIG)) {
+    for (const pool of getPoolsByKind(chain, KIND_V3)) {
+      if (disabledPools.has(poolKeyOf(chain, pool.address))) continue;
+      const state = await readV3State(chain, pool.address);
+      if (state) {
+        updateV3FromSwap(chain, pool.address, state.sqrtPriceX96, state.liquidity);
+        loaded++;
+      }
+    }
+  }
+  console.log(`[V3] 状態を${loaded}プール分取得しました`);
+}
+
+/// 古くなったV3プールの状態を少しずつ読み直す。
+let v3RefreshCursor = 0;
+async function refreshV3States() {
+  if (!stats.ready) return;
+  const targets = [];
+  for (const chain of Object.keys(CHAIN_CONFIG)) {
+    if (isChainWsEnabled(chain) && isChainHealthy(chain)) continue;
+    for (const pool of getPoolsByKind(chain, KIND_V3)) {
+      if (disabledPools.has(poolKeyOf(chain, pool.address))) continue;
+      targets.push(pool);
+    }
+  }
+  if (targets.length === 0) return;
+  for (let n = 0; n < Math.min(V3_REFRESH_PER_TICK, targets.length); n++) {
+    const pool = targets[v3RefreshCursor % targets.length];
+    v3RefreshCursor++;
+    const state = await readV3State(pool.chain, pool.address);
+    if (state) updateV3FromSwap(pool.chain, pool.address, state.sqrtPriceX96, state.liquidity);
   }
 }
 
@@ -230,7 +298,7 @@ async function buildPoolMapFromFactories() {
   const seedsByChain = collectSeedPools();
   const totalSeeds = Object.values(seedsByChain).reduce((s, m) => s + m.size, 0);
   if (totalSeeds === 0) return;
-  console.log(`[プール地図] 種プール${totalSeeds}件からファクトリーを逆算します(約50分)`);
+  console.log(`[プール地図] 種プール${totalSeeds}件からファクトリーを逆算します`);
   for (const [chain, dexMap] of Object.entries(seedsByChain)) {
     for (const [dexId, address] of dexMap.entries()) {
       try {
@@ -242,7 +310,7 @@ async function buildPoolMapFromFactories() {
         const pools = await discoverPoolsFromFactory(chain, factory, dexId);
         for (const p of pools) {
           if (isKnownIncompatiblePool(chain, p.address)) continue;
-          registerPool(p);
+          registerPool({ ...p, kind: KIND_V2 });
         }
       } catch (e) {
         console.warn(`[プール発見] ${dexId} on ${chain}: 失敗 ${e.message.slice(0, 70)}`);
@@ -253,7 +321,7 @@ async function buildPoolMapFromFactories() {
 
 async function loadAllReserves() {
   let loaded = 0;
-  await Promise.all(Object.entries(getAllPoolAddressesByChain()).map(async ([chain, addresses]) => {
+  await Promise.all(Object.entries(getAllPoolAddressesByChain(KIND_V2)).map(async ([chain, addresses]) => {
     const CHUNK = 2000;
     for (let i = 0; i < addresses.length; i += CHUNK) {
       const chunk = addresses.slice(i, i + CHUNK);
@@ -269,9 +337,9 @@ async function loadAllReserves() {
         }
       } catch (e) {}
     }
-    console.log(`[プール地図] ${chain}の準備量を取得完了`);
+    console.log(`[プール地図] ${chain}のV2準備量を取得完了`);
   }));
-  console.log(`[プール地図] 準備量の取得完了: ${loaded}プール`);
+  console.log(`[プール地図] V2準備量の取得完了: ${loaded}プール`);
 }
 
 async function preparePoolMap() {
@@ -287,29 +355,35 @@ async function preparePoolMap() {
   if (needBuild) {
     stats.mapSource = saved.count > 0 ? "保存済み+再構築" : "新規構築";
     await buildPoolMapFromFactories();
-    savePoolMap();
-    stats.mapSavedAt = new Date().toISOString();
   }
+
+  // V3プールは毎回確認する(件数が少なく、新設も多いため)。
+  await discoverV3Pools();
+  savePoolMap();
+  stats.mapSavedAt = new Date().toISOString();
+
   for (const [chain, addresses] of Object.entries(getAllPoolAddressesByChain())) {
     for (const address of addresses) {
       const pool = getPool(chain, address);
-      const isTax = pool && pool.feeProbed && pool.feeBps > TAX_TOKEN_FEE_BPS;
+      const isTax = pool && pool.kind === KIND_V2 && pool.feeProbed && pool.feeBps > TAX_TOKEN_FEE_BPS;
       if (isKnownIncompatiblePool(chain, address) || isTax) {
         disabledPools.add(poolKeyOf(chain, address));
-        if (pool) { pool.raw0 = 0n; pool.raw1 = 0n; }
+        clearPoolState(pool);
       }
     }
   }
+
   await loadAllReserves();
+  await loadV3States();
+
   for (const key of disabledPools) {
     const [chain, address] = key.split("::");
-    const pool = getPool(chain, address);
-    if (pool) { pool.raw0 = 0n; pool.raw1 = 0n; }
+    clearPoolState(getPool(chain, address));
   }
   stats.disabled = disabledPools.size;
+
   const s = getStats();
-  console.log(`[プール地図] 準備完了: ${s.totalPools}プール / 裁定候補${s.arbitragablePairs}ペア / 無効化${disabledPools.size}件`);
-  console.log(`[プール地図] チェーン別: ${Object.entries(s.byChain).map(([c, n]) => `${c}:${n}`).join(" / ") || "なし"}`);
+  console.log(`[プール地図] 準備完了: V2 ${s.byKind.v2}件 / V3 ${s.byKind.v3}件 / 裁定候補${s.arbitragablePairs}ペア(うちV2とV3が共存${s.mixedPairs}件) / 無効化${disabledPools.size}件`);
 }
 
 // ===== 借りる通貨 =====
@@ -317,6 +391,7 @@ function derivePriceFromPools(chain, token, decimals) {
   const borrowables = getBorrowableTokens(chain);
   let best = null, bestLiquidity = 0n;
   for (const pool of getPoolsForToken(chain, token)) {
+    if (pool.kind !== KIND_V2) continue;
     const other = pool.token0 === token.toLowerCase() ? pool.token1 : pool.token0;
     const otherInfo = borrowables[other];
     if (!otherInfo || !otherInfo.stable) continue;
@@ -360,7 +435,7 @@ function prepareBorrowableTokens() {
   console.log(`[価格実測] ${prices.join(" ") || "なし"}`);
 }
 
-// ===== 手数料の実測 =====
+// ===== V2の手数料の実測 =====
 let feeProbeQueue = [];
 async function probeFeesGradually() {
   if (!stats.ready) return;
@@ -370,7 +445,7 @@ async function probeFeesGradually() {
     for (const entry of getArbitragablePairs()) {
       for (const p of entry.pools) inCandidate.add(poolKeyOf(p.chain, p.address));
     }
-    for (const [chain, addresses] of Object.entries(getAllPoolAddressesByChain())) {
+    for (const [chain, addresses] of Object.entries(getAllPoolAddressesByChain(KIND_V2))) {
       for (const address of addresses) {
         const key = poolKeyOf(chain, address);
         if (disabledPools.has(key)) continue;
@@ -419,6 +494,7 @@ async function handleOpportunity(opp, meta = {}) {
   if (!opp.profitable) return;
 
   stats.profitableFound++;
+  if (opp.hasV3) stats.v3Opportunities++;
   stats.lastOpportunity = new Date().toISOString();
   stats.recent = [{ ...opp, at: new Date().toISOString(), ...meta }, ...stats.recent.filter((r) => r.label !== opp.label)].slice(0, 20);
 
@@ -426,7 +502,7 @@ async function handleOpportunity(opp, meta = {}) {
   if (executing.has(key)) return;
   executing.add(key);
   try {
-    console.log(`[機会] ${opp.kind} ${opp.chain} ${opp.label}: 純利益+$${opp.netProfitUsd.toFixed(4)}(投入$${opp.tradeAmountUsd.toFixed(2)} 壁${opp.feeWallPercent.toFixed(2)}%${meta.movePct ? ` 変動${meta.movePct.toFixed(2)}%` : ""})`);
+    console.log(`[機会] ${opp.kind} ${opp.chain} ${opp.label}: 純利益+$${opp.netProfitUsd.toFixed(4)}(投入$${opp.tradeAmountUsd.toFixed(2)} 壁${opp.feeWallPercent.toFixed(2)}%${opp.hasV3 ? " V3含む" : ""})`);
     const ok = await Promise.race([
       executeOpportunity(opp),
       new Promise((_, reject) => setTimeout(() => reject(new ExecutionError("実行が制限時間を超えました")), EXECUTION_TIMEOUT_MS)),
@@ -450,7 +526,24 @@ async function handleOpportunity(opp, meta = {}) {
   }
 }
 
-// ===== Syncイベント受信 =====
+/// 変化したプールから経路を再計算する(V2・V3共通)。
+function reactToPoolChange(chain, poolAddress, pool, receivedAt, source) {
+  if (!stats.ready) return;
+  const movePct = pool.lastMovePct || 0;
+  if (movePct >= BIG_MOVE_PCT) stats.bigMoves++;
+  try {
+    const opp = scanForChangedPool({
+      chain, poolAddress, capUsd: getCurrentTradeCapUsd(),
+      gasCostUsd: getGasCost(chain, "2step"), gasCostUsd3: getGasCost(chain, "3step"), isBorrowable,
+    });
+    const latency = Date.now() - receivedAt;
+    stats.latencies.push(latency);
+    if (stats.latencies.length > 200) stats.latencies.shift();
+    if (opp) handleOpportunity(opp, { source, movePct }).catch(() => {});
+  } catch (e) {}
+}
+
+// ===== V2のSyncイベント受信 =====
 function handleSync(chain, poolAddress, reserve0, reserve1, receivedAt) {
   if (disabledPools.has(poolKeyOf(chain, poolAddress))) return false;
   const pool = updateReservesFromSync(chain, poolAddress, reserve0, reserve1);
@@ -460,21 +553,17 @@ function handleSync(chain, poolAddress, reserve0, reserve1, receivedAt) {
     return false;
   }
   stats.syncMatched++;
-  if (!stats.ready) return true;
+  reactToPoolChange(chain, poolAddress, pool, receivedAt, "sync");
+  return true;
+}
 
-  const movePct = pool.lastMovePct || 0;
-  if (movePct >= BIG_MOVE_PCT) stats.bigMoves++;
-
-  try {
-    const opp = scanForChangedPool({
-      chain, poolAddress, capUsd: getCurrentTradeCapUsd(),
-      gasCostUsd: getGasCost(chain, "2step"), gasCostUsd3: getGasCost(chain, "3step"), isBorrowable,
-    });
-    const latency = Date.now() - receivedAt;
-    stats.latencies.push(latency);
-    if (stats.latencies.length > 200) stats.latencies.shift();
-    if (opp) handleOpportunity(opp, { source: "sync", movePct }).catch(() => {});
-  } catch (e) {}
+// ===== V3のSwapイベント受信 =====
+function handleV3Swap(chain, poolAddress, sqrtPriceX96, liquidity, receivedAt) {
+  if (disabledPools.has(poolKeyOf(chain, poolAddress))) return false;
+  const pool = updateV3FromSwap(chain, poolAddress, sqrtPriceX96, liquidity);
+  if (!pool) return false; // 監視対象外のV3プール
+  stats.v3Matched++;
+  reactToPoolChange(chain, poolAddress, pool, receivedAt, "v3swap");
   return true;
 }
 
@@ -499,10 +588,7 @@ async function fullScanOnce() {
   }
 }
 
-// ===== 準備量の読み直し =====
-// Syncが「健全に届いている」チェーンだけ読み直しを省く。
-// 接続はあるがイベントが来ないチェーンは、価格が古いまま固定されるため
-// 必ず読み直す。
+// ===== V2準備量の読み直し =====
 let refreshRunning = false;
 async function refreshStaleReserves() {
   if (refreshRunning || !stats.ready) return;
@@ -510,7 +596,7 @@ async function refreshStaleReserves() {
   try {
     for (const chain of Object.keys(CHAIN_CONFIG)) {
       if (isChainWsEnabled(chain) && isChainHealthy(chain)) continue;
-      const stale = getStalePools(chain, REFRESH_STALE_SEC * 1000)
+      const stale = getStalePools(chain, REFRESH_STALE_SEC * 1000, KIND_V2)
         .filter((p) => !disabledPools.has(poolKeyOf(chain, p.address)))
         .slice(0, REFRESH_BATCH_SIZE);
       if (stale.length === 0) continue;
@@ -527,7 +613,7 @@ async function refreshStaleReserves() {
   }
 }
 
-// ===== コントラクトに溜まった利益の確認 =====
+// ===== コントラクトに溜まった利益 =====
 const BALANCE_ABI = ["function balancesOf(address[] tokens) view returns (uint256[])"];
 let contractBalances = {};
 async function refreshContractBalances() {
@@ -561,8 +647,7 @@ function heartbeat() {
   stats.lastHeartbeat = new Date().toISOString();
   const rpc = getRpcStatus();
   const queued = Object.entries(rpc).filter(([, v]) => v.queued > 0).map(([c, v]) => `${c}:${v.queued}`).join(" ");
-  const dropped = Object.entries(rpc).filter(([, v]) => v.dropped > 0).map(([c, v]) => `${c}:${v.dropped}`).join(" ");
-  console.log(`[生存] スキャン${stats.scans} 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 罠${stats.trapsRejected} 税${stats.taxTokensRejected} 古${stats.staleRejected} 無効${stats.disabled} Sync一致${stats.syncMatched}/未知${stats.syncUnknown} 取込${stats.adopted} 手数料${stats.feeProbed} 行列[${queued || "空"}] 破棄[${dropped || "0"}]`);
+  console.log(`[生存] スキャン${stats.scans} 精査${stats.examined} 黒字${stats.profitableFound}(V3含む${stats.v3Opportunities}) 実行${stats.executed}/${stats.failed} 罠${stats.trapsRejected} 税${stats.taxTokensRejected} 無効${stats.disabled} V2一致${stats.syncMatched} V3一致${stats.v3Matched} 取込${stats.adopted} 手数料${stats.feeProbed} 行列[${queued || "空"}]`);
 }
 
 // ===== ダッシュボード =====
@@ -594,8 +679,6 @@ function renderPage() {
   const rpc = getRpcStatus();
   const gas = getGasCostStatus();
   const hbAge = stats.lastHeartbeat ? Math.round((Date.now() - new Date(stats.lastHeartbeat).getTime()) / 1000) : null;
-  const total = stats.syncMatched + stats.syncUnknown;
-  const matchRate = total > 0 ? (stats.syncMatched / total * 100).toFixed(1) : "0.0";
   const sum = summarize(24);
   const maxQueue = Math.max(0, ...Object.values(rpc).map((v) => v.queued));
 
@@ -605,7 +688,7 @@ function renderPage() {
     <td><a href="${e.explorerUrl}" target="_blank">確認</a></td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ実際の取引はありません</td></tr>`;
 
   const oppRows = stats.recent.slice(0, 12).map((o, i) => `<tr><td>${i+1}</td>
-    <td style="font-size:9px">${o.kind} ${o.chain}<br>${o.label}</td>
+    <td style="font-size:9px">${o.kind} ${o.chain}${o.hasV3 ? ' <span style="color:#6fae62">V3</span>' : ''}<br>${o.label}</td>
     <td style="text-align:right">${o.feeWallPercent.toFixed(2)}%</td>
     <td style="text-align:right">$${o.tradeAmountUsd.toFixed(2)}</td>
     <td style="text-align:right;color:#2ecc71;font-weight:600">+$${o.netProfitUsd.toFixed(4)}</td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ黒字の機会が見つかっていません</td></tr>`;
@@ -617,16 +700,16 @@ function renderPage() {
     `${c}: ${held.map((h) => `${h.symbol} ${h.amount.toFixed(4)}($${h.usd.toFixed(2)})`).join(" / ")}`).join('<br>') || '残高なし';
 
   const syncLine = Object.entries(syncStats).map(([c, v]) =>
-    `${c}: 受信${v.received.toLocaleString()}件 ${v.healthy ? '<span style="color:#2ecc71">正常</span>' : `<span style="color:#e74c3c">不達(${v.lastEventAgoSec ?? '?'}秒前が最後)→定期読み直しに切替中</span>`}`
+    `${c}: V2 ${v.v2.toLocaleString()}件 / V3 ${v.v3.toLocaleString()}件 ${v.healthy ? '<span style="color:#2ecc71">正常</span>' : `<span style="color:#e74c3c">不達→定期読み直しに切替中</span>`}`
   ).join('<br>') || 'WebSocket未設定';
 
   const queueLine = Object.entries(rpc).map(([c, v]) =>
-    `${c}:${v.queued}${v.priorityQueued > 0 ? `(優先${v.priorityQueued})` : ''}${v.dropped > 0 ? ` 破棄${v.dropped}` : ''}`).join(' / ');
+    `${c}:${v.queued}${v.dropped > 0 ? ` 破棄${v.dropped}` : ''}`).join(' / ');
   const gasLine = Object.entries(gas).map(([c, g]) => `${c}: $${g.costUsd}`).join(' / ') || '取得中';
 
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="refresh" content="20">
 <title>DEXアービトラージ</title><style>${STYLE}</style></head><body>
-<h1>🔍 DEXアービトラージ</h1><div class="sub">イベント駆動型 / スキャン${stats.scans}回${stats.ready ? '' : ' / <span style="color:#e8a33d">準備中…</span>'}</div>
+<h1>🔍 DEXアービトラージ</h1><div class="sub">V2 + V3 対応 / スキャン${stats.scans}回${stats.ready ? '' : ' / <span style="color:#e8a33d">準備中…</span>'}</div>
 
 <div class="card real"><h2>💰 実際の取引結果</h2>
 <div class="stat"><div><div class="v">${real.count}</div><div class="l">実行回数</div></div>
@@ -636,13 +719,19 @@ function renderPage() {
 <table><thead><tr><th>日時</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table>
 <div class="note">コントラクトに溜まっている利益: ${balanceLine}</div></div>
 
+<div class="card"><h2>🆕 V3(集中流動性)</h2>
+<div class="stat"><div><div class="v" style="color:#6fae62">${s.byKind.v3.toLocaleString()}</div><div class="l">V3プール</div></div>
+<div><div class="v">${s.mixedPairs.toLocaleString()}</div><div class="l">V2とV3が共存</div></div>
+<div><div class="v">${stats.v3Matched.toLocaleString()}</div><div class="l">V3の価格更新</div></div>
+<div><div class="v" style="color:${stats.v3Opportunities>0?'#2ecc71':'#888'}">${stats.v3Opportunities}</div><div class="l">V3を含む機会</div></div></div>
+<div class="note">V3は価格帯ごとに流動性が分かれるため、判定は概算で絞り込み、送信直前にUniswap公式のQuoterで正確に確定させます。同じペアにV2とV3が共存している組み合わせが、最も機会が生まれやすい場所です。</div></div>
+
 <div class="card"><h2>🩺 システムの健全性</h2>
 <div class="stat"><div><div class="v" style="color:${hbAge != null && hbAge < 120 ? '#2ecc71' : '#e74c3c'}">${hbAge != null ? hbAge + '秒前' : '-'}</div><div class="l">最終生存確認</div></div>
 <div><div class="v" style="color:${maxQueue > 1000 ? '#e74c3c' : maxQueue > 100 ? '#e8a33d' : '#2ecc71'}">${maxQueue.toLocaleString()}</div><div class="l">待ち行列(最大)</div></div>
 <div><div class="v">${lat != null ? lat + 'ms' : '-'}</div><div class="l">判定時間</div></div>
 <div><div class="v">${stats.feeProbed.toLocaleString()}</div><div class="l">手数料実測済み</div></div></div>
-<div class="note">${syncLine}<br>待ち行列: ${queueLine}<br>実測ガス代(2step): ${gasLine}<br>
-実行に必要な問い合わせは優先列で処理され、背景作業(手数料実測・プール取込)より先に進みます。通常列が上限を超えた分は破棄され、次回に回されます。</div></div>
+<div class="note">${syncLine}<br>待ち行列: ${queueLine}<br>実測ガス代(2step): ${gasLine}</div></div>
 
 <div class="card"><h2>📒 24時間の記録簿</h2>
 <div class="stat"><div><div class="v">${sum.count.toLocaleString()}</div><div class="l">記録件数</div></div>
@@ -657,13 +746,13 @@ function renderPage() {
 <div><div class="v" style="color:${stats.failed>0?'#e74c3c':'#888'}">${stats.failed}</div><div class="l">実行失敗</div></div>
 <div><div class="v" style="color:${stats.taxTokensRejected>0?'#e8a33d':'#888'}">${stats.taxTokensRejected}</div><div class="l">税トークン除外</div></div></div>
 <table><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table>
-<div class="note">精査${stats.examined.toLocaleString()}件。罠${stats.trapsRejected}件 / 価格が古く見送り${stats.staleRejected}件 / 無効化${stats.disabled}件。3回連続で送信に失敗したプールは「価格が信用できない」として恒久的に除外します。</div></div>
+<div class="note">精査${stats.examined.toLocaleString()}件。罠${stats.trapsRejected}件 / 状態が古く見送り${stats.staleRejected}件 / 無効化${stats.disabled}件</div></div>
 
 <div class="card"><h2>🗺️ プール地図(メモリ上)</h2>
-<div class="stat"><div><div class="v">${s.totalPools.toLocaleString()}</div><div class="l">プール</div></div>
-<div><div class="v">${s.arbitragablePairs.toLocaleString()}</div><div class="l">裁定候補ペア</div></div>
-<div><div class="v">${matchRate}%</div><div class="l">取引の捕捉率</div></div>
-<div><div class="v">${stats.adopted.toLocaleString()}</div><div class="l">自動発見</div></div></div>
+<div class="stat"><div><div class="v">${s.totalPools.toLocaleString()}</div><div class="l">プール合計</div></div>
+<div><div class="v">${s.byKind.v2.toLocaleString()}</div><div class="l">V2形式</div></div>
+<div><div class="v">${s.byKind.v3.toLocaleString()}</div><div class="l">V3形式</div></div>
+<div><div class="v">${s.arbitragablePairs.toLocaleString()}</div><div class="l">裁定候補ペア</div></div></div>
 <div class="note">チェーン別: ${Object.entries(s.byChain).map(([c, n]) => `${c}:${n.toLocaleString()}`).join(' / ') || '構築中'}<br>${stats.mapSavedAt ? `最終保存: ${new Date(stats.mapSavedAt).toLocaleString('ja-JP')}` : ''}</div></div>
 
 <div class="footerlink"><a href="/about">→ 仕組みについて</a></div></body></html>`;
@@ -672,11 +761,11 @@ function renderPage() {
 function renderAbout() {
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>仕組み</title><style>${STYLE}</style></head><body>
 <h1>📊 仕組み</h1>
-<div class="card"><h2>① プール地図</h2><div class="note">実在が確認できているプールからファクトリーを逆算し、全プールを列挙します。地図はファイルに保存し、再起動時は数秒で復元します。準備量は毎回全件を取得し直します。</div></div>
-<div class="card"><h2>② 待ち行列の優先度</h2><div class="note">実行に必要な問い合わせは優先列で処理し、手数料実測やプール取込といった背景作業より先に進めます。通常列には上限があり、溢れた分は破棄して自己回復します。</div></div>
-<div class="card"><h2>③ WebSocketの健全性</h2><div class="note">接続はあるがイベントが届かない状態を検知し、そのチェーンは定期読み直しに自動で切り替えます。これを見落とすと価格が古いまま固定されます。</div></div>
-<div class="card"><h2>④ 手数料の実測と税トークンの除外</h2><div class="note">ガス見積もりの拒否理由から手数料を実測します。正常なDEXの手数料は最大1%で、それを超えるのは「送金時に税を取るトークン」なので恒久的に除外します。</div></div>
-<div class="card"><h2>⑤ 実行</h2><div class="note">送信直前に全プールの準備量を取り直し、実際のガス使用量を見積もってから判断します。見積もりが失敗すればプールに拒否されているので、ガス代を1円も失いません。</div></div>
+<div class="card"><h2>① V2形式とV3形式</h2><div class="note">V2は準備量が2つだけで価格が決まります。V3は価格帯ごとに流動性が分かれており、同じペアでも手数料区分(0.01%/0.05%/0.3%/1%)ごとに別のプールが存在します。両方を同じ経路に混ぜて組めるようにしてあります。</div></div>
+<div class="card"><h2>② プールの発見</h2><div class="note">V2は実在が確認できているプールからファクトリーを逆算して列挙します。V3は借りられる通貨の組を手数料区分ごとにファクトリーへ問い合わせ、存在するものだけを登録します。推測でアドレスを置くことはありません。</div></div>
+<div class="card"><h2>③ 即時判定</h2><div class="note">V2のSyncとV3のSwapを1つの購読で受け取り、変化した経路だけをメモリ上で再計算します。RPCを使わないためミリ秒で完了します。</div></div>
+<div class="card"><h2>④ 送信直前の確定</h2><div class="note">V3の正確な受取量はティック構造をたどる必要があるため、Uniswap公式のQuoterに計算させます。V2はプール自身に問い合わせるか、拒否理由から手数料を実測します。</div></div>
+<div class="card"><h2>⑤ 安全策</h2><div class="note">ガス見積もりが失敗すればプールに拒否されているので、送信せずに済みガス代を失いません。異常なリターンの案件、手数料1%超の税トークン、3回連続で失敗したプールは恒久的に除外します。</div></div>
 <div class="footerlink"><a href="/">← 戻る</a></div></body></html>`;
 }
 
@@ -689,7 +778,7 @@ function startServer() {
 }
 
 async function main() {
-  console.log("=== DEXアービトラージ(イベント駆動型) 起動 ===");
+  console.log("=== DEXアービトラージ(V2 + V3) 起動 ===");
   startServer();
 
   const deployTarget = process.env.RUN_MAINNET_DEPLOY;
@@ -704,7 +793,7 @@ async function main() {
   await refreshGasCosts();
   setInterval(refreshGasCosts, 5 * 60 * 1000);
 
-  startOnchainFeeds(handleSync);
+  startOnchainFeeds(handleSync, handleV3Swap);
 
   await preparePoolMap();
   prepareBorrowableTokens();
@@ -713,6 +802,7 @@ async function main() {
   setInterval(adoptPendingPools, ADOPT_INTERVAL_MS);
   setInterval(probeFeesGradually, FEE_PROBE_INTERVAL_MS);
   setInterval(refreshStaleReserves, REFRESH_STALE_SEC * 1000);
+  setInterval(refreshV3States, 20000);
   setInterval(() => { savePoolMap(); stats.mapSavedAt = new Date().toISOString(); }, SAVE_MAP_INTERVAL_MS);
   setInterval(trimJournalIfNeeded, 30 * 60 * 1000);
   setTimeout(refreshContractBalances, 30000);
