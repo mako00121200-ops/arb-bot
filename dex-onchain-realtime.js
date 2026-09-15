@@ -5,13 +5,17 @@
  * WebSocketで直接受け取る。追加の問い合わせなしで取引直後の正しい
  * 準備量が得られるため、検知から計算までの遅延をほぼゼロにできる。
  *
+ * [再接続の暴走を防ぐ]
+ * 接続直後に切断される状態(RPCの秒間上限超過など)では、待ち時間を
+ * 毎回1秒に戻していたため、1秒ごとに接続と切断を繰り返してクレジットを
+ * 無駄に消費した(2026年9月15日、QuickNodeで発生)。
+ * 「一定時間つながり続けた」ときだけ待ち時間を初期化する。
+ *
  * [健全性の判定]
- * AnkrのWSSでは「接続はできるがイベントが一切届かない」状態になった。
- * このとき購読が有効とみなされ、定期的な読み直しがスキップされるため、
- * 価格が古いまま固定される危険がある(2026年9月14日に確認)。
- * 一定時間イベントが届かないチェーンは「不健全」と判定し、
- * isChainHealthy() が false を返す。呼び出し側はこれを見て
- * 定期読み直しに切り替える。
+ * 「接続はできるがイベントが一切届かない」状態では、購読が有効とみなされ
+ * 定期読み直しがスキップされ、価格が古いまま固定される危険がある。
+ * 一定時間イベントが届かないチェーンは isChainHealthy() が false を返し、
+ * 呼び出し側が定期読み直しに切り替える。
  *
  * [1接続1購読]
  * アドレスを指定して購読すると数千件でRPC側の制限に当たるため、
@@ -39,6 +43,9 @@ const PING_REQUEST_ID = 999;
 const SUBSCRIBE_REQUEST_ID = 1;
 // この時間イベントが1件も届かなければ「不健全」とみなす。
 const HEALTHY_EVENT_WINDOW_MS = parseInt(process.env.HEALTHY_EVENT_WINDOW_MS || "120000", 10);
+// これだけつながり続けたら「安定した接続」とみなし、待ち時間を初期化する。
+const STABLE_CONNECTION_MS = 30 * 1000;
+const MAX_RECONNECT_DELAY_MS = 5 * 60 * 1000;
 
 export function decodeSyncData(dataHex) {
   const data = dataHex.startsWith("0x") ? dataHex.slice(2) : dataHex;
@@ -53,6 +60,7 @@ const chainSockets = {};
 const chainReconnectDelays = {};
 const chainLastDataAt = {};
 const chainLastEventAt = {};
+const chainConnectedAt = {};
 const chainWatchdogTimers = {};
 const chainPingTimers = {};
 const chainIntentionalClose = {};
@@ -60,6 +68,7 @@ const chainEnabled = new Set();
 const chainEventCounts = {};
 const chainMatchedCounts = {};
 const chainSubscribeErrors = {};
+const chainReconnects = {};
 let globalOnSync = null;
 
 function sendSubscription(chainName) {
@@ -70,7 +79,6 @@ function sendSubscription(chainName) {
       jsonrpc: "2.0", id: SUBSCRIBE_REQUEST_ID, method: "eth_subscribe",
       params: ["logs", { topics: [SYNC_TOPIC] }],
     }));
-    console.log(`[オンチェーン] ${chainName}: 全Syncイベントを購読しました(1接続1購読)`);
   } catch (e) {}
 }
 
@@ -95,9 +103,8 @@ function connectChain(chainName, wsUrl) {
     }
 
     socket.addEventListener("open", () => {
-      chainReconnectDelays[chainName] = 1000;
+      chainConnectedAt[chainName] = Date.now();
       chainLastDataAt[chainName] = Date.now();
-      console.log(`[オンチェーン] ${chainName}: WebSocket接続完了`);
       sendSubscription(chainName);
       if (chainPingTimers[chainName]) clearInterval(chainPingTimers[chainName]);
       chainPingTimers[chainName] = setInterval(() => sendPing(chainName), PING_INTERVAL_MS);
@@ -113,7 +120,7 @@ function connectChain(chainName, wsUrl) {
             if (msg.error) {
               chainSubscribeErrors[chainName] = JSON.stringify(msg.error).slice(0, 120);
               console.warn(`[オンチェーン] ${chainName}: 購読が拒否されました: ${chainSubscribeErrors[chainName]}`);
-            } else {
+            } else if (chainSubscribeErrors[chainName] !== null) {
               chainSubscribeErrors[chainName] = null;
               console.log(`[オンチェーン] ${chainName}: 購読が受理されました`);
             }
@@ -140,17 +147,25 @@ function connectChain(chainName, wsUrl) {
         chainIntentionalClose[chainName] = false;
         return;
       }
-      console.log(`[オンチェーン] ${chainName}: 切断。再接続します…`);
-      scheduleReconnect();
+      // つながっていた時間が短ければ、相手に拒まれている可能性が高い。
+      // 待ち時間を伸ばして、接続と切断の繰り返しを避ける。
+      const lived = Date.now() - (chainConnectedAt[chainName] || 0);
+      if (lived >= STABLE_CONNECTION_MS) chainReconnectDelays[chainName] = 1000;
+      scheduleReconnect(lived);
     });
 
     socket.addEventListener("error", () => {});
   }
 
-  function scheduleReconnect() {
+  function scheduleReconnect(lived = 0) {
     const delay = chainReconnectDelays[chainName] || 1000;
+    chainReconnects[chainName] = (chainReconnects[chainName] || 0) + 1;
+    // 短時間で切れ続けている間だけログを間引く(1秒ごとの大量出力を避ける)。
+    if (chainReconnects[chainName] <= 3 || chainReconnects[chainName] % 20 === 0) {
+      console.log(`[オンチェーン] ${chainName}: 切断(接続${Math.round(lived / 1000)}秒)。${Math.round(delay / 1000)}秒後に再接続します(通算${chainReconnects[chainName]}回)`);
+    }
     setTimeout(connect, delay);
-    chainReconnectDelays[chainName] = Math.min(delay * 1.5, 30000);
+    chainReconnectDelays[chainName] = Math.min(delay * 2, MAX_RECONNECT_DELAY_MS);
   }
 
   if (chainWatchdogTimers[chainName]) clearInterval(chainWatchdogTimers[chainName]);
@@ -179,16 +194,17 @@ export function startOnchainFeeds(onSync) {
   for (const [chainName, envVar] of Object.entries(CHAIN_WS_ENV_VARS)) {
     const wsUrl = process.env[envVar];
     if (!wsUrl) {
-      console.log(`[オンチェーン] ${chainName}: ${envVar} 未設定のためスキップ(定期スキャンのみで観測)`);
+      console.log(`[オンチェーン] ${chainName}: ${envVar} 未設定のためスキップ(定期読み直しで観測)`);
       continue;
     }
     chainEnabled.add(chainName);
     chainLastEventAt[chainName] = Date.now(); // 起動直後は猶予を与える
+    chainSubscribeErrors[chainName] = undefined;
     connectChain(chainName, wsUrl);
     anyStarted = true;
   }
   if (!anyStarted) {
-    console.log("[オンチェーン] WebSocket URLが1つも未設定。リアルタイム監視は無効(定期スキャンのみで動作)。");
+    console.log("[オンチェーン] WebSocket URLが1つも未設定。定期読み直しのみで動作します。");
   }
 }
 
@@ -218,6 +234,7 @@ export function getSyncStats() {
       connected: chainSockets[chain]?.readyState === 1,
       healthy: isChainHealthy(chain),
       lastEventAgoSec: last ? Math.round((Date.now() - last) / 1000) : null,
+      reconnects: chainReconnects[chain] || 0,
       error: chainSubscribeErrors[chain] || null,
     };
   }
