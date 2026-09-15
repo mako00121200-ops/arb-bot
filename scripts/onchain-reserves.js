@@ -2,18 +2,14 @@
 //
 // チェーンから直接データを読むための共通処理。
 //
-// [待ち行列の設計]
-// 全ての呼び出しを1列に並べていたため、実行に必要な問い合わせが手数料実測や
-// プール取込の後ろで待たされ、Baseでは87,000件が滞留して実行が制限時間切れに
-// なった(2026年9月15日)。
-//   → 優先列(実行用)と通常列(背景作業)の2段にし、優先列を常に先に処理する
-//   → 通常列に上限を設け、溢れたら古いものから捨てる(自己回復させる)
-//   → 呼び出しには8秒のタイムアウト(1件の無応答で全体が止まらないように)
-//
-// [送信間隔]
-// RPCの秒間上限を超えると、同じ接続のWebSocketごと切断される。
-// QuickNodeの無料枠は毎秒15回で、40ミリ秒間隔(毎秒25回)にしたところ
-// Baseの購読が1秒ごとに切断される事態になった。チェーンごとに間隔を設ける。
+// [優先列と通常列を完全に分離する]
+// 以前は優先列と通常列を1本の処理装置で順に見ていたため、通常列の1件を
+// 処理している間は優先列が待たされ、さらに全ての呼び出しに送信間隔
+// (Baseは75ミリ秒)が適用されていた。V3経路の状態取得は6〜8回の問い合わせを
+// 要するため、これだけで8秒の上限を超えて実行が失敗した(2026年9月15日)。
+//   → 優先列は専用の処理装置で、間隔を空けずに連続処理する
+//   → 通常列(手数料実測・プール取込・定期読み直し)だけが間隔を守る
+//   → 通常列には上限を設け、溢れたら古いものから捨てる
 //
 // [RPCの自動切り替え]
 // 一定回数連続で失敗したら次の候補URLへ切り替える。ただし
@@ -29,27 +25,35 @@ const PAIR_ABI = [
 ];
 const ERC20_DECIMALS_ABI = ["function decimals() view returns (uint8)"];
 
-// チェーンごとの送信間隔(ミリ秒)。RPCの秒間上限に合わせる。
+// 通常列(背景作業)の送信間隔。RPCの秒間上限に合わせる。
 const MIN_INTERVAL_BY_CHAIN = {
-  base: parseInt(process.env.BASE_MIN_INTERVAL_MS || "75", 10),       // 毎秒13回(QuickNode無料枠は15回)
-  polygon: parseInt(process.env.POLYGON_MIN_INTERVAL_MS || "45", 10), // 毎秒22回(Chainstackは25回)
+  base: parseInt(process.env.BASE_MIN_INTERVAL_MS || "90", 10),
+  polygon: parseInt(process.env.POLYGON_MIN_INTERVAL_MS || "45", 10),
 };
 const DEFAULT_MIN_INTERVAL_MS = parseInt(process.env.MIN_REQUEST_INTERVAL_MS || "60", 10);
 function minIntervalFor(chain) {
   return MIN_INTERVAL_BY_CHAIN[chain] ?? DEFAULT_MIN_INTERVAL_MS;
 }
 
+// 優先列は間隔をほぼ空けない。実行は一瞬で終わらせる必要がある。
+const PRIORITY_INTERVAL_MS = parseInt(process.env.PRIORITY_INTERVAL_MS || "5", 10);
+
 const FAILURES_BEFORE_ROTATE = 3;
 const RPC_CALL_TIMEOUT_MS = parseInt(process.env.RPC_CALL_TIMEOUT_MS || "8000", 10);
-// 通常列の上限。これを超えたら古い要求から捨てる。
 const NORMAL_QUEUE_LIMIT = parseInt(process.env.NORMAL_QUEUE_LIMIT || "300", 10);
 
-// チェーンごとの待ち行列。優先列と通常列を分ける。
+// チェーンごとの待ち行列。優先と通常でそれぞれ独立した処理装置を持つ。
 const queues = new Map();
 
 function getQueue(chain) {
   const key = (chain || "").toLowerCase();
-  if (!queues.has(key)) queues.set(key, { priority: [], normal: [], running: false, dropped: 0 });
+  if (!queues.has(key)) {
+    queues.set(key, {
+      priority: [], normal: [],
+      priorityRunning: false, normalRunning: false,
+      dropped: 0, priorityDone: 0, normalDone: 0,
+    });
+  }
   return queues.get(key);
 }
 
@@ -61,44 +65,65 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-/// 待ち行列を1件ずつ処理する。優先列が空になるまで通常列には進まない。
-async function pump(chain) {
-  const q = getQueue(chain);
-  if (q.running) return;
-  q.running = true;
+async function runJob(chain, job) {
   try {
-    while (q.priority.length > 0 || q.normal.length > 0) {
-      const job = q.priority.length > 0 ? q.priority.shift() : q.normal.shift();
-      try {
-        const result = await withTimeout(Promise.resolve().then(job.fn), RPC_CALL_TIMEOUT_MS, chain);
-        job.resolve(result);
-      } catch (e) {
-        job.reject(e);
-      }
-      await new Promise((r) => setTimeout(r, minIntervalFor(chain)));
-    }
-  } finally {
-    q.running = false;
+    const result = await withTimeout(Promise.resolve().then(job.fn), RPC_CALL_TIMEOUT_MS, chain);
+    job.resolve(result);
+  } catch (e) {
+    job.reject(e);
   }
 }
 
-/// 呼び出しを待ち行列に登録する。priority=true なら優先列へ。
+/// 優先列の処理装置。通常列とは独立して回り、間隔もほぼ空けない。
+async function pumpPriority(chain) {
+  const q = getQueue(chain);
+  if (q.priorityRunning) return;
+  q.priorityRunning = true;
+  try {
+    while (q.priority.length > 0) {
+      const job = q.priority.shift();
+      await runJob(chain, job);
+      q.priorityDone++;
+      if (q.priority.length > 0) await new Promise((r) => setTimeout(r, PRIORITY_INTERVAL_MS));
+    }
+  } finally {
+    q.priorityRunning = false;
+  }
+}
+
+/// 通常列の処理装置。背景作業なので間隔を守り、RPCの上限を超えないようにする。
+async function pumpNormal(chain) {
+  const q = getQueue(chain);
+  if (q.normalRunning) return;
+  q.normalRunning = true;
+  try {
+    while (q.normal.length > 0) {
+      const job = q.normal.shift();
+      await runJob(chain, job);
+      q.normalDone++;
+      await new Promise((r) => setTimeout(r, minIntervalFor(chain)));
+    }
+  } finally {
+    q.normalRunning = false;
+  }
+}
+
 function scheduleRpcCall(chain, fn, priority = false) {
   const q = getQueue(chain);
   return new Promise((resolve, reject) => {
     const job = { fn, resolve, reject };
     if (priority) {
       q.priority.push(job);
+      pumpPriority(chain);
     } else {
-      // 通常列が溢れていたら、古い要求を捨てる(背景作業なので取りこぼしてよい)。
       while (q.normal.length >= NORMAL_QUEUE_LIMIT) {
         const dropped = q.normal.shift();
         q.dropped++;
         dropped.reject(new Error("待ち行列が上限に達したため破棄"));
       }
       q.normal.push(job);
+      pumpNormal(chain);
     }
-    pump(chain);
   });
 }
 
@@ -138,7 +163,8 @@ function recordRpcFailure(chain, message) {
 }
 
 /// RPC呼び出しの共通入口。
-/// priority=true は「実行に直結する問い合わせ」に使い、背景作業より先に処理する。
+/// priority=true は「実行に直結する問い合わせ」に使い、専用の処理装置で
+/// 間隔を空けずに処理する。
 export async function callWithRpc(chain, fn, priority = false) {
   try {
     const result = await scheduleRpcCall(chain, () => fn(getProviderForChain(chain)), priority);
@@ -159,8 +185,11 @@ export async function callWithRpc(chain, fn, priority = false) {
 export async function fetchOnchainReserves({ chain, pairAddress, tokenXAddress, decimalsX, decimalsY, priority = false }) {
   if (!ethers.isAddress(pairAddress)) throw new Error(`プールアドレスの形式が不正: ${pairAddress}`);
   const addr = ethers.getAddress(pairAddress);
-  const reserves = await callWithRpc(chain, (p) => new ethers.Contract(addr, PAIR_ABI, p).getReserves(), priority);
-  const token0 = await callWithRpc(chain, (p) => new ethers.Contract(addr, PAIR_ABI, p).token0(), priority);
+  const contract = (p) => new ethers.Contract(addr, PAIR_ABI, p);
+  const [reserves, token0] = await Promise.all([
+    callWithRpc(chain, (p) => contract(p).getReserves(), priority),
+    callWithRpc(chain, (p) => contract(p).token0(), priority),
+  ]);
   const isToken0X = token0.toLowerCase() === ethers.getAddress(tokenXAddress).toLowerCase();
   const rawX = isToken0X ? reserves[0] : reserves[1];
   const rawY = isToken0X ? reserves[1] : reserves[0];
@@ -204,7 +233,7 @@ export function isOnchainReadAvailable(chain) {
   return getChainConfig(chain) !== null;
 }
 
-/// ダッシュボード表示用: 各チェーンのRPC状態と待ち行列の深さ。
+/// ダッシュボード表示用。
 export function getRpcStatus() {
   const out = {};
   for (const [chain, config] of Object.entries(CHAIN_CONFIG)) {
@@ -216,7 +245,9 @@ export function getRpcStatus() {
       failures: state.failures,
       queued: q.priority.length + q.normal.length,
       priorityQueued: q.priority.length,
+      normalQueued: q.normal.length,
       dropped: q.dropped,
+      priorityDone: q.priorityDone,
       intervalMs: minIntervalFor(chain),
     };
   }
