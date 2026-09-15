@@ -5,16 +5,18 @@
  *   V2形式 … Sync(準備量そのもの)
  *   V3形式 … Swap(更新後の価格と流動性) / Mint・Burn(流動性の増減)
  *
- * [Mint・Burnも見る理由]
- * V3の流動性はSwap以外でも変わる。誰かが価格帯に流動性を足したり抜いたり
- * すると、Swapが起きていなくても受取量の計算結果が変わる。これを見ないと
- * 古い流動性で計算し続け、幻の機会や見逃しが生まれる。
- * Mint・Burnのデータには更新後の流動性が入っていないため、これらが届いた
- * プールは「読み直しが必要」として呼び出し側に知らせる。
+ * [監視対象を指定して購読する]
+ * 以前はチェーン上の全イベントを購読していた。13,783件のアドレスを400件ずつ
+ * 35回に分けて購読したところRPC側の制限に当たったため、全件購読に切り替えた
+ * 経緯がある。しかし全件購読では月3,000〜5,000万件のイベントが届き、
+ * リクエスト単位で課金されるRPCでは月$200〜500かかってしまう。
+ * 監視対象を裁定候補(チェーンあたり数百〜千件)に絞れば、購読は1〜2回で済み
+ * 制限にも当たらず、イベント量も1/15になる。
  *
- * [4種類を1接続で]
+ * [1接続で4種類]
  * eth_subscribe の topics は配列の配列で「いずれか一致」を指定できる。
- * 4種類をまとめて1つの購読で受け取り、接続数を増やさない。
+ * address も配列で複数指定できるため、対象アドレス×4種類のイベントを
+ * 1つの購読でまとめて受け取れる。
  *
  * [再接続の暴走を防ぐ]
  * 接続直後に切断される状態では待ち時間を毎回1秒に戻していたため、
@@ -34,6 +36,8 @@ const V3_MINT_TOPIC = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae1
 // keccak256("Burn(address,int24,int24,uint128,uint256,uint256)") — V3
 const V3_BURN_TOPIC = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c";
 
+const ALL_TOPICS = [SYNC_TOPIC, V3_SWAP_TOPIC, V3_MINT_TOPIC, V3_BURN_TOPIC];
+
 const CHAIN_WS_ENV_VARS = {
   base: "BASE_WSS_URL",
   arbitrum: "ARBITRUM_WSS_URL",
@@ -42,15 +46,16 @@ const CHAIN_WS_ENV_VARS = {
   avalanche: "AVALANCHE_WSS_URL",
 };
 
-const DATA_TIMEOUT_MS = 60 * 1000;
+const DATA_TIMEOUT_MS = 120 * 1000;
 const PING_INTERVAL_MS = 20 * 1000;
 const PING_REQUEST_ID = 999;
-const SUBSCRIBE_REQUEST_ID = 1;
-const HEALTHY_EVENT_WINDOW_MS = parseInt(process.env.HEALTHY_EVENT_WINDOW_MS || "120000", 10);
+const SUBSCRIBE_REQUEST_ID_BASE = 100;
+const HEALTHY_EVENT_WINDOW_MS = parseInt(process.env.HEALTHY_EVENT_WINDOW_MS || "300000", 10);
 const STABLE_CONNECTION_MS = 30 * 1000;
 const MAX_RECONNECT_DELAY_MS = 5 * 60 * 1000;
+// 1回の購読に入れるアドレス数。多すぎるとRPCに拒否される。
+const ADDRESSES_PER_SUBSCRIPTION = parseInt(process.env.ADDRESSES_PER_SUBSCRIPTION || "800", 10);
 
-/// V2のSyncデータ: (uint112 reserve0, uint112 reserve1)
 export function decodeSyncData(dataHex) {
   const data = dataHex.startsWith("0x") ? dataHex.slice(2) : dataHex;
   if (data.length < 128) return null;
@@ -62,8 +67,6 @@ export function decodeSyncData(dataHex) {
   } catch (e) { return null; }
 }
 
-/// V3のSwapデータ: (int256 amount0, int256 amount1, uint160 sqrtPriceX96,
-///                  uint128 liquidity, int24 tick)
 export function decodeV3SwapData(dataHex) {
   const data = dataHex.startsWith("0x") ? dataHex.slice(2) : dataHex;
   if (data.length < 320) return null;
@@ -88,22 +91,42 @@ const chainEventCounts = {};
 const chainV2Counts = {};
 const chainV3Counts = {};
 const chainLiquidityCounts = {};
-const chainMatchedCounts = {};
 const chainSubscribeErrors = {};
 const chainReconnects = {};
-let globalOnSync = null;        // V2用
-let globalOnV3Swap = null;      // V3のSwap用
-let globalOnV3Liquidity = null; // V3のMint・Burn用(読み直しが必要な合図)
+const chainAddresses = {};      // チェーン→購読するアドレスの配列
+const chainSubCounts = {};      // チェーン→購読した回数
+let globalOnSync = null;
+let globalOnV3Swap = null;
+let globalOnV3Liquidity = null;
+
+/// 監視対象のアドレスを登録する。接続済みなら購読をやり直す。
+export function setWatchedAddresses(chain, addresses) {
+  chainAddresses[chain] = addresses.map((a) => a.toLowerCase());
+  const socket = chainSockets[chain];
+  if (socket && socket.readyState === 1) sendSubscription(chain);
+}
 
 function sendSubscription(chainName) {
   const socket = chainSockets[chainName];
   if (!socket || socket.readyState !== 1) return;
-  try {
-    socket.send(JSON.stringify({
-      jsonrpc: "2.0", id: SUBSCRIBE_REQUEST_ID, method: "eth_subscribe",
-      params: ["logs", { topics: [[SYNC_TOPIC, V3_SWAP_TOPIC, V3_MINT_TOPIC, V3_BURN_TOPIC]] }],
-    }));
-  } catch (e) {}
+  const addresses = chainAddresses[chainName] || [];
+  if (addresses.length === 0) {
+    console.log(`[オンチェーン] ${chainName}: 監視対象が0件のため購読しません`);
+    return;
+  }
+  let sent = 0;
+  for (let i = 0; i < addresses.length; i += ADDRESSES_PER_SUBSCRIPTION) {
+    const chunk = addresses.slice(i, i + ADDRESSES_PER_SUBSCRIPTION);
+    try {
+      socket.send(JSON.stringify({
+        jsonrpc: "2.0", id: SUBSCRIBE_REQUEST_ID_BASE + sent, method: "eth_subscribe",
+        params: ["logs", { address: chunk, topics: [ALL_TOPICS] }],
+      }));
+      sent++;
+    } catch (e) { break; }
+  }
+  chainSubCounts[chainName] = sent;
+  console.log(`[オンチェーン] ${chainName}: ${addresses.length}プールを${sent}回の購読で監視します`);
 }
 
 function sendPing(chainName) {
@@ -140,14 +163,9 @@ function connectChain(chainName, wsUrl) {
         const msg = JSON.parse(event.data);
         if (msg.id !== undefined) {
           chainLastDataAt[chainName] = receivedAt;
-          if (msg.id === SUBSCRIBE_REQUEST_ID) {
-            if (msg.error) {
-              chainSubscribeErrors[chainName] = JSON.stringify(msg.error).slice(0, 120);
-              console.warn(`[オンチェーン] ${chainName}: 購読が拒否されました: ${chainSubscribeErrors[chainName]}`);
-            } else if (chainSubscribeErrors[chainName] !== null) {
-              chainSubscribeErrors[chainName] = null;
-              console.log(`[オンチェーン] ${chainName}: V2のSyncとV3のSwap・Mint・Burnを1つの購読で受け取ります`);
-            }
+          if (msg.id >= SUBSCRIBE_REQUEST_ID_BASE && msg.error) {
+            chainSubscribeErrors[chainName] = JSON.stringify(msg.error).slice(0, 120);
+            console.warn(`[オンチェーン] ${chainName}: 購読が拒否されました: ${chainSubscribeErrors[chainName]}`);
           }
           return;
         }
@@ -160,29 +178,25 @@ function connectChain(chainName, wsUrl) {
         const log = msg.params.result;
         const topic = (log.topics && log.topics[0]) || "";
         const address = log.address.toLowerCase();
-        let matched = false;
 
         if (topic === SYNC_TOPIC) {
           chainV2Counts[chainName] = (chainV2Counts[chainName] || 0) + 1;
           const decoded = decodeSyncData(log.data);
           if (decoded && globalOnSync) {
-            matched = globalOnSync(chainName, address, decoded.reserve0, decoded.reserve1, receivedAt);
+            globalOnSync(chainName, address, decoded.reserve0, decoded.reserve1, receivedAt);
           }
         } else if (topic === V3_SWAP_TOPIC) {
           chainV3Counts[chainName] = (chainV3Counts[chainName] || 0) + 1;
           const decoded = decodeV3SwapData(log.data);
           if (decoded && globalOnV3Swap) {
-            matched = globalOnV3Swap(chainName, address, decoded.sqrtPriceX96, decoded.liquidity, receivedAt);
+            globalOnV3Swap(chainName, address, decoded.sqrtPriceX96, decoded.liquidity, receivedAt);
           }
         } else if (topic === V3_MINT_TOPIC || topic === V3_BURN_TOPIC) {
-          // 流動性が変わった。データに更新後の値が無いため、読み直しを依頼する。
           chainLiquidityCounts[chainName] = (chainLiquidityCounts[chainName] || 0) + 1;
           if (globalOnV3Liquidity) {
-            matched = globalOnV3Liquidity(chainName, address, topic === V3_MINT_TOPIC ? "mint" : "burn");
+            globalOnV3Liquidity(chainName, address, topic === V3_MINT_TOPIC ? "mint" : "burn");
           }
         }
-
-        if (matched) chainMatchedCounts[chainName] = (chainMatchedCounts[chainName] || 0) + 1;
       } catch (e) {}
     });
 
@@ -220,15 +234,12 @@ function connectChain(chainName, wsUrl) {
       chainLastDataAt[chainName] = Date.now();
       connect();
     }
-  }, 15000);
+  }, 20000);
 
   connect();
 }
 
-/// onSync        … V2のSync受信時 (chain, address, reserve0, reserve1, receivedAt)
-/// onV3Swap      … V3のSwap受信時 (chain, address, sqrtPriceX96, liquidity, receivedAt)
-/// onV3Liquidity … V3のMint・Burn受信時 (chain, address, "mint"|"burn")
-/// いずれも「監視対象だったか」を真偽値で返す。
+/// WebSocketを開始する。監視対象は後から setWatchedAddresses() で渡す。
 export function startOnchainFeeds(onSync, onV3Swap, onV3Liquidity) {
   globalOnSync = onSync;
   globalOnV3Swap = onV3Swap;
@@ -249,7 +260,6 @@ export function startOnchainFeeds(onSync, onV3Swap, onV3Liquidity) {
     }
     chainEnabled.add(chainName);
     chainLastEventAt[chainName] = Date.now();
-    chainSubscribeErrors[chainName] = undefined;
     connectChain(chainName, wsUrl);
     anyStarted = true;
   }
@@ -258,7 +268,7 @@ export function startOnchainFeeds(onSync, onV3Swap, onV3Liquidity) {
   }
 }
 
-export function updatePoolSubscriptions() { /* 全件購読のため何もしない */ }
+export function updatePoolSubscriptions() { /* setWatchedAddresses を使う */ }
 
 export function isChainWsEnabled(chainName) {
   return chainEnabled.has(chainName);
@@ -280,7 +290,8 @@ export function getSyncStats() {
       v2: chainV2Counts[chain] || 0,
       v3: chainV3Counts[chain] || 0,
       liquidity: chainLiquidityCounts[chain] || 0,
-      matched: chainMatchedCounts[chain] || 0,
+      watched: (chainAddresses[chain] || []).length,
+      subscriptions: chainSubCounts[chain] || 0,
       connected: chainSockets[chain]?.readyState === 1,
       healthy: isChainHealthy(chain),
       lastEventAgoSec: last ? Math.round((Date.now() - last) / 1000) : null,
