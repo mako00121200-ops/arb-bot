@@ -7,8 +7,7 @@
 // 回って投入通貨(asset)に戻し、それを最初のプールへ払う。
 // 返済額は「元々の投入額(amountIn)」そのもの。受取量が多すぎればプール側の
 // 検算で拒否されるため、こちらで手数料を計算する必要がない。
-// Aaveから借りないため手数料0.05%がかからず、投入$40の案件で約$0.02、
-// 利益$0.15の13%に相当する差になる。
+// Aaveから借りないため手数料0.05%がかからない。
 //
 // [各段の要求量]
 //   1段目 … 最初のプールから先に受け取る量(経路の入力)
@@ -17,9 +16,20 @@
 //
 // [V2の手数料の実測と学習]
 // コントラクトの拒否理由から実測する:
-//   "UniswapV2: K"   … 要求量が多すぎる → 想定を上げて再挑戦
+//   「量が足りない」系 … 要求量が多すぎる → 想定を上げて再挑戦
+//     ・"UniswapV2: K" / "Pancake: K" / "K"(Solidly)などのK検算
+//     ・"insufficient output"(コントラクトの受取量確認。税トークン等)
+//     ・"transfer amount exceeds balance"(送る量が手元に無い)
 //   "not profitable" … スワップは通った = 想定が正しい → 記録
 // ガス見積もりは無料なので、何度試してもガス代はかからない。
+// 以前は "UniswapV2: K" だけを見ていたため、フォーク独自の文言や
+// フラッシュスワップ方式で出る文言では段階確認が働かず、即座に失敗扱いに
+// なっていた(2026年9月16日に修正)。
+//
+// [手数料の初期値]
+// 取引記録などで実測済みのプールは、その値から段階確認を始める。
+// 以前は一律で30bps以上から始めていたため、20bpsのプールでも30bpsとして
+// 計算し、利益を過小に見積もっていた。
 
 import { ethers } from "ethers";
 import { getChainConfig } from "../chain-config.js";
@@ -63,7 +73,17 @@ export class ExecutionError extends Error {
   }
 }
 
-function isKRevert(message) { return /UniswapV2: K/.test(message || ""); }
+/// K検算による拒否。フォークごとに文言が違う("UniswapV2: K", "Pancake: K",
+/// Solidly系は "K" のみ)。": Kyber" 等を誤検出しないよう単語の境界で見る。
+function isKRevert(message) {
+  const m = message || "";
+  return /: K\b/.test(m) || /["']K["']/.test(m);
+}
+/// 受取量や手元の量が足りないことによる拒否。要求量が多すぎた(手数料の
+/// 過小見積もり、または税トークン)ことを示すので、K検算と同じく扱う。
+function isShortfallRevert(message) {
+  return /insufficient output|transfer amount exceeds balance|TRANSFER_FAILED|INSUFFICIENT_OUTPUT_AMOUNT|INSUFFICIENT_INPUT_AMOUNT/i.test(message || "");
+}
 function isNotProfitableRevert(message) { return /not profitable/i.test(message || ""); }
 
 function getAmountOutCalc(amountIn, reserveIn, reserveOut, feeBps) {
@@ -173,6 +193,29 @@ function buildLegArgs(legs, requested) {
   }));
 }
 
+/// V2の脚の手数料の初期値と、段階確認の現在位置を決める。
+/// 実測済みならその値から、未実測なら30bps以上から始める。
+function initialFees(chain, opp, legs) {
+  const feeBpsList = [], feeIndex = [];
+  for (let i = 0; i < legs.length; i++) {
+    const leg = legs[i];
+    if (leg.kind === KIND_V3) {
+      feeBpsList.push(leg.feeBps);
+      feeIndex.push(FEE_LADDER.length - 1);
+      continue;
+    }
+    const pool = getPool(chain, opp.poolAddresses[i]);
+    const start = pool && pool.feeProbed && Number.isFinite(pool.feeBps)
+      ? pool.feeBps
+      : Math.max(leg.feeBps ?? FEE_LADDER[0], FEE_LADDER[0]);
+    feeBpsList.push(start);
+    // 次に上げる時は「初期値より大きい最初の段」になるよう位置を合わせる
+    const next = FEE_LADDER.findIndex((v) => v > start);
+    feeIndex.push(next === -1 ? FEE_LADDER.length - 1 : next - 1);
+  }
+  return { feeBpsList, feeIndex };
+}
+
 export async function executeOpportunity(opp) {
   const startedAt = Date.now();
   const chain = opp.chain;
@@ -213,8 +256,7 @@ export async function executeOpportunity(opp) {
   const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, wallet);
 
   const legCount = legs.length;
-  const feeIndex = legs.map(() => 0);
-  let feeBpsList = legs.map((l) => (l.kind === KIND_V3 ? l.feeBps : Math.max(l.feeBps, FEE_LADDER[0])));
+  const { feeBpsList, feeIndex } = initialFees(chain, opp, legs);
   let success = null, lastError = "", lastFromPool = null;
   let cursor = 0;
 
@@ -240,11 +282,11 @@ export async function executeOpportunity(opp) {
         console.log(`[実行] ${opp.label}: 実測手数料${feeBpsList.join("/")}bpsでは利益が出ないため見送り`);
         return false;
       }
-      if (!isKRevert(lastError)) {
+      if (!isKRevert(lastError) && !isShortfallRevert(lastError)) {
         throw new ExecutionError(lastError.slice(0, 160), { reverted: true, stage: "estimateGas" });
       }
 
-      // 「K」はV2形式のプールでしか出ない。V2の脚を1つずつ上げる。
+      // 量が足りない。手数料を計算式で決めているV2の脚を1つずつ上げる。
       let advanced = false;
       for (let tried = 0; tried < legCount; tried++) {
         const i = (cursor + tried) % legCount;
@@ -267,6 +309,14 @@ export async function executeOpportunity(opp) {
       if (legs[i].kind === KIND_V3) continue;
       if (lastFromPool && lastFromPool[i]) continue;
       if (feeIndex[i] >= FEE_LADDER.length - 1) taxPools.push(opp.poolAddresses[i]);
+    }
+    if (taxPools.length === 0) {
+      // 上げられるV2の脚が無い(V3やプール自身が受取量を返す形式だけ)のに
+      // 量が足りない。価格が動いたか、税トークンが経路にある。
+      throw new ExecutionError(
+        `量が足りず拒否(手数料を上げられる脚なし): ${lastError.slice(0, 120)}`,
+        { reverted: true, staleReserves: true, stage: "shortfall" }
+      );
     }
     throw new ExecutionError(
       `手数料${TAX_TOKEN_FEE_BPS}bpsまで上げても拒否(送金時に税を取るトークンの可能性)`,
