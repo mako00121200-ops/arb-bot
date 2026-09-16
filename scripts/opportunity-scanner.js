@@ -19,6 +19,11 @@
 // 送信直前に赤字と確定した経路は、その時の各プールの状態(V2は準備量、V3は
 // 価格と流動性)を記録し、どれかが変わるまで判定から外す。
 //
+// [V2だけの経路は判定しない(2026年9月17日)]
+// V2だけで組んだ経路の黒字は、実測で全て税トークンか$2〜10の極小だった。
+// 送信直前まで進んだ機会は全てV3を含む経路だったため、V3を1段も含まない
+// 経路は計算しない。V2プールはV3を含む経路の片脚としてだけ使う。
+//
 // [フラッシュスワップ方式]
 // 経路の最初のプール自身から借りるため、借入手数料はかからない。
 //
@@ -232,6 +237,9 @@ function maxAmountFromUsd(chain, token, capUsd) {
 }
 
 function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, poolAddresses }) {
+  // V3を1段も含まない経路は判定しない。
+  if (!legs.some((l) => l.kind === KIND_V3)) return null;
+
   // 送信直前に赤字と確定し、その後どのプールも動いていない経路は計算しない。
   if (isSuppressed(chain, tokenA, poolAddresses)) return null;
 
@@ -289,19 +297,33 @@ export function scanTwoStep({ chain, tokenA, tokenB, pools, capUsd, gasCostUsd, 
     if (priced.length < 2) continue;
     priced.sort((a, b) => b.rate - a.rate);
 
-    const buySide = priced[0], sellSide = priced[priced.length - 1];
-    if (buySide.pool.address.toLowerCase() === sellSide.pool.address.toLowerCase()) continue;
-    const leg2 = orient(sellSide.pool, other);
-    if (leg2.tokenOut !== borrow.toLowerCase()) continue;
-    if (!legIsUsable(leg2)) continue;
+    // 最も高く売れるプールで買い、最も安いプールで戻すのが基本の組み合わせ。
+    // ただしV2だけの経路は判定しないので、両端がどちらもV2の場合は、
+    // V3を片側に入れた組み合わせも試す(共存ペアの機会を落とさないため)。
+    const top = priced[0], bottom = priced[priced.length - 1];
+    const combos = [[top, bottom]];
+    if (top.pool.kind !== KIND_V3 && bottom.pool.kind !== KIND_V3) {
+      const v3s = priced.filter((x) => x.pool.kind === KIND_V3);
+      if (v3s.length > 0) {
+        combos.push([top, v3s[v3s.length - 1]]);
+        combos.push([v3s[0], bottom]);
+      }
+    }
 
-    const legs = [buySide.leg, leg2];
-    const result = finalize({
-      chain, tokenA: borrow, legs, maxAmountIn, gasCostUsd, kind: "2step",
-      label: labelOf(legs),
-      poolAddresses: [buySide.pool.address, sellSide.pool.address],
-    });
-    if (result) candidates.push(result);
+    for (const [buySide, sellSide] of combos) {
+      if (buySide.pool.address.toLowerCase() === sellSide.pool.address.toLowerCase()) continue;
+      const leg2 = orient(sellSide.pool, other);
+      if (leg2.tokenOut !== borrow.toLowerCase()) continue;
+      if (!legIsUsable(leg2)) continue;
+
+      const legs = [buySide.leg, leg2];
+      const result = finalize({
+        chain, tokenA: borrow, legs, maxAmountIn, gasCostUsd, kind: "2step",
+        label: labelOf(legs),
+        poolAddresses: [buySide.pool.address, sellSide.pool.address],
+      });
+      if (result) candidates.push(result);
+    }
   }
   if (candidates.length === 0) return null;
   candidates.sort((a, b) => b.netProfitUsd - a.netProfitUsd);
