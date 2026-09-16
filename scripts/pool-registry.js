@@ -1,18 +1,18 @@
 // scripts/pool-registry.js
 //
 // 全プールの状態をメモリ上に保持する「プール地図」。V2形式とV3形式の両方を
-// 同じ索引で扱い、経路の探索では区別なく組み合わせられるようにする。
+// 同じ索引で扱う。
 //
-// [V2とV3の違い]
-//   V2: 準備量が2つ(raw0/raw1)だけで価格が決まる。
-//   V3: 価格(sqrtPriceX96)と現在の価格帯の流動性(liquidity)を持つ。
-//       手数料は生成時に区分で決まっている(100/500/3000/10000)。
-// どちらも kind で区別し、更新はそれぞれのイベント(Sync / Swap)で行う。
+// [監視対象の絞り込み]
+// 44,000プール全てを購読すると、月3,000〜5,000万件のイベントが届き、
+// リクエスト単位で課金されるRPCでは月$200〜500かかる。実際に2段の裁定が
+// 成立するのは「同じペアに2つ以上のプールがある」候補だけ(約3,000プール)
+// なので、起動時にそこへ絞る。絞った後は購読・読み直し・経路探索の全てが
+// この候補だけを対象にするため、消費量が1/15になる。
 //
 // [永続化]
-// 地図の構築には時間がかかるため、「アドレス・トークン・種別・手数料」だけを
-// ファイルに保存し、次回起動時は状態(準備量・価格)だけ取り直す。
-// 状態は保存しない(古い値で判定しないため)。
+// 地図の全体像(44,000件)はファイルに残し、次回の絞り込みの材料にする。
+// 状態(準備量・価格)は保存しない(古い値で判定しないため)。
 
 import fs from "fs";
 
@@ -34,7 +34,6 @@ function pairKey(chain, tokenA, tokenB) {
 function tokenKey(chain, token) { return `${chain}::${token.toLowerCase()}`; }
 function poolKey(chain, address) { return `${chain}::${address.toLowerCase()}`; }
 
-/// プールを登録する。kind省略時はV2として扱う(従来の呼び出しと互換)。
 export function registerPool({
   chain, address, dexId, factory, token0, token1,
   raw0 = 0n, raw1 = 0n, feeBps = 30, feeProbed = false,
@@ -45,13 +44,10 @@ export function registerPool({
   pools.set(key, {
     chain, address, dexId, factory, kind,
     token0: token0.toLowerCase(), token1: token1.toLowerCase(),
-    // V2の状態
     raw0, raw1,
-    // V3の状態
     sqrtPriceX96: sqrtPriceX96 || existing?.sqrtPriceX96 || 0n,
     liquidity: liquidity || existing?.liquidity || 0n,
     feeTier: feeTier ?? existing?.feeTier ?? null,
-    // 手数料。V3は区分から確定しているので実測不要。
     feeBps: existing?.feeBps ?? feeBps,
     feeProbed: kind === KIND_V3 ? true : (existing?.feeProbed || feeProbed),
     updatedAt: Date.now(),
@@ -69,11 +65,56 @@ export function registerPool({
   }
 }
 
-/// V2: Syncで届いた準備量を反映し、価格がどれだけ動いたか(%)も記録する。
+/// プールを地図から完全に外す(索引からも消す)。
+export function removePool(chain, address) {
+  const key = poolKey(chain, address);
+  const pool = pools.get(key);
+  if (!pool) return false;
+  pools.delete(key);
+  const pk = pairKey(chain, pool.token0, pool.token1);
+  byPair.get(pk)?.delete(key);
+  if (byPair.get(pk)?.size === 0) byPair.delete(pk);
+  for (const t of [pool.token0, pool.token1]) {
+    const tk = tokenKey(chain, t);
+    byToken.get(tk)?.delete(key);
+    if (byToken.get(tk)?.size === 0) byToken.delete(tk);
+  }
+  return true;
+}
+
+/// 裁定候補だけを残し、それ以外を地図から外す。
+/// 候補 = 「同じペアに2つ以上のプールがある」ペアに属するプール。
+/// V3プールは借りられる通貨の組で作られているため全て残す。
+export function pruneToCandidates() {
+  const keep = new Set();
+  for (const [, set] of byPair.entries()) {
+    if (set.size >= 2) for (const k of set) keep.add(k);
+  }
+  for (const [k, p] of pools.entries()) {
+    if (p.kind === KIND_V3) keep.add(k);
+  }
+  let removed = 0;
+  for (const k of [...pools.keys()]) {
+    if (keep.has(k)) continue;
+    const p = pools.get(k);
+    removePool(p.chain, p.address);
+    removed++;
+  }
+  return { kept: pools.size, removed };
+}
+
+/// 購読すべきプールのアドレス一覧(チェーン別)。
+export function getSubscribedAddresses(chain) {
+  const out = [];
+  for (const p of pools.values()) {
+    if (p.chain === chain) out.push(p.address);
+  }
+  return out;
+}
+
 export function updateReservesFromSync(chain, address, raw0, raw1) {
   const pool = pools.get(poolKey(chain, address));
   if (!pool || pool.kind !== KIND_V2) return null;
-
   let movePct = 0;
   if (pool.raw0 > 0n && pool.raw1 > 0n && raw0 > 0n && raw1 > 0n) {
     const before = Number(pool.raw1) / Number(pool.raw0);
@@ -82,7 +123,6 @@ export function updateReservesFromSync(chain, address, raw0, raw1) {
       movePct = Math.abs((after - before) / before) * 100;
     }
   }
-
   pool.raw0 = raw0;
   pool.raw1 = raw1;
   pool.updatedAt = Date.now();
@@ -90,21 +130,17 @@ export function updateReservesFromSync(chain, address, raw0, raw1) {
   return pool;
 }
 
-/// V3: Swapで届いた価格と流動性を反映する。
 export function updateV3FromSwap(chain, address, sqrtPriceX96, liquidity) {
   const pool = pools.get(poolKey(chain, address));
   if (!pool || pool.kind !== KIND_V3) return null;
-
   let movePct = 0;
   if (pool.sqrtPriceX96 > 0n && sqrtPriceX96 > 0n) {
     const before = Number(pool.sqrtPriceX96);
     const after = Number(sqrtPriceX96);
     if (isFinite(before) && before > 0 && isFinite(after)) {
-      // 価格は平方根なので、変化率はおよそ2倍になる。
       movePct = Math.abs((after - before) / before) * 200;
     }
   }
-
   pool.sqrtPriceX96 = sqrtPriceX96;
   if (liquidity > 0n) pool.liquidity = liquidity;
   pool.updatedAt = Date.now();
@@ -158,7 +194,6 @@ export function getAllPoolAddressesByChain(kind = null) {
   return byChain;
 }
 
-/// 種別を指定してプールの一覧を得る(V3の状態を一括更新する時などに使う)。
 export function getPoolsByKind(chain, kind) {
   const out = [];
   for (const pool of pools.values()) {
@@ -179,7 +214,6 @@ export function getStats() {
   for (const set of byPair.values()) {
     if (set.size < 2) continue;
     arbitragable++;
-    // V2とV3が同じペアに共存しているか(最も機会が生まれやすい組み合わせ)。
     const kinds = new Set([...set].map((k) => pools.get(k)?.kind).filter(Boolean));
     if (kinds.size > 1) mixedPairs++;
   }
@@ -201,14 +235,12 @@ export function getStalePools(chain, olderThanMs, kind = null) {
   return out;
 }
 
-/// そのプールが「判定に使える状態か」。V2は準備量、V3は価格と流動性を見る。
 export function hasUsableState(pool) {
   if (!pool) return false;
   if (pool.kind === KIND_V3) return pool.sqrtPriceX96 > 0n && pool.liquidity > 0n;
   return pool.raw0 > 0n && pool.raw1 > 0n;
 }
 
-/// プールを判定対象から外す(無効化)。種別ごとに状態を消す。
 export function clearPoolState(pool) {
   if (!pool) return;
   pool.raw0 = 0n;
@@ -218,10 +250,36 @@ export function clearPoolState(pool) {
 }
 
 // ===== 永続化 =====
+// 保存は「地図の全体像」を対象にするため、絞り込む前に snapshotFullMap() を
+// 呼んでおく。絞り込み後の状態だけを保存すると、次回の候補計算の材料が減る。
+
+let fullMapSnapshot = null;
+
+export function snapshotFullMap() {
+  fullMapSnapshot = [];
+  for (const p of pools.values()) {
+    fullMapSnapshot.push({
+      chain: p.chain, address: p.address, dexId: p.dexId, factory: p.factory,
+      token0: p.token0, token1: p.token1, feeBps: p.feeBps, feeProbed: !!p.feeProbed,
+      kind: p.kind, feeTier: p.feeTier,
+    });
+  }
+  return fullMapSnapshot.length;
+}
 
 export function savePoolMap() {
-  const entries = [];
+  const current = new Map();
+  for (const p of pools.values()) current.set(poolKey(p.chain, p.address), p);
+  // 全体像に、メモリ上の最新値(手数料の学習結果など)を反映する。
+  const entries = (fullMapSnapshot || []).map((e) => {
+    const live = current.get(poolKey(e.chain, e.address));
+    return live ? { ...e, feeBps: live.feeBps, feeProbed: !!live.feeProbed } : e;
+  });
+  // 絞り込み後に新しく登録されたプール(V3の再発見など)も加える。
+  const known = new Set(entries.map((e) => poolKey(e.chain, e.address)));
   for (const p of pools.values()) {
+    const k = poolKey(p.chain, p.address);
+    if (known.has(k)) continue;
     entries.push({
       chain: p.chain, address: p.address, dexId: p.dexId, factory: p.factory,
       token0: p.token0, token1: p.token1, feeBps: p.feeBps, feeProbed: !!p.feeProbed,
