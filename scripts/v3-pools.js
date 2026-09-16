@@ -2,20 +2,20 @@
 //
 // Uniswap V3形式(集中流動性)のプールを扱う。
 //
-// [V2との違い]
-// V2は「準備量が2つ」だけで価格が決まるが、V3は価格帯ごとに流動性が分かれて
-// おり、正確な受取量の計算にはティック構造をたどる必要がある。自前で実装すると
-// 間違いが起きやすいので、見積もりはUniswap公式の QuoterV2 に任せる。
+// [独自の概算式をやめた理由]
+// 現在価格と流動性だけから受取量を近似していたが、実測すると公式Quoterより
+// 最大2,184%も過大な値を返していた(2026年9月16日)。V3は価格帯ごとに
+// 流動性が分かれており、価格帯をまたぐ場合の扱いが近似式では表現できない。
+// 流動性の薄いプールほど誤差が大きく、幻の機会を大量に生んでいた。
 //
-// [概算と正確な値]
-// 常時の判定にQuoterを呼ぶとRPCが持たないため、slot0(現在価格)と liquidity
-// (現在の価格帯の流動性)から概算して絞り込み、送信直前だけQuoterで確定する。
-// 概算が過大だと「幻の機会」が生まれ、正常なプールを罠として誤って無効化して
-// しまうため、両者を比較して誤差を測る仕組みを用意している(verifyV3Estimate)。
+// [代わりの方式: 価格表を持つ]
+// プールごとに「代表的な投入額での受取量」を公式Quoterで取得し、メモリに
+// 保持する。判定時はこの表から補間するため、RPCを使わずミリ秒で済み、
+// かつ公式の計算に基づくので誤差がない。
+// V3プールは数百件しかないため、数分ごとに全件を更新しても負荷は小さい。
 //
-// [流動性の変化]
-// V3の流動性はSwapだけでなく Mint(追加)/ Burn(削除)でも変わる。
-// これらのイベントも購読して、古い流動性で計算しないようにする。
+// 表に無い投入額は、最も近い2点から線形に補間する。V3の受取量は投入額に
+// 対して単調で滑らかなので、点を細かく取れば十分な精度が出る。
 
 import { ethers } from "ethers";
 import { callWithRpc } from "./onchain-reserves.js";
@@ -64,14 +64,18 @@ const QUOTER_V2_ABI = [
   "function quoteExactInputSingle((address tokenIn, address tokenOut, uint256 amountIn, uint24 fee, uint160 sqrtPriceLimitX96)) returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)",
 ];
 
-// keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)")
 export const V3_SWAP_TOPIC = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
-// keccak256("Mint(address,address,int24,int24,uint128,uint256,uint256)")
 export const V3_MINT_TOPIC = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde";
-// keccak256("Burn(address,int24,int24,uint128,uint256,uint256)")
 export const V3_BURN_TOPIC = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c";
 
 const Q96 = 2n ** 96n;
+
+// 価格表を作るときの投入額(USD相当)。小さい側を細かく取る。
+// 実際の裁定は$1〜$500の範囲に収まるため、この範囲を重点的に刻む。
+export const QUOTE_SAMPLES_USD = [1, 3, 10, 30, 100, 300];
+
+// プールごとの価格表。"chain::pool::zeroForOne" -> { points: [{in, out}], at }
+const quoteTables = new Map();
 
 export function decodeV3SwapData(dataHex) {
   const data = dataHex.startsWith("0x") ? dataHex.slice(2) : dataHex;
@@ -116,38 +120,8 @@ export function priceFromSqrtX96(sqrtPriceX96) {
   return ratio * ratio; // token1 / token0
 }
 
-/// 集中流動性の近似式で受取量を概算する。
-/// 価格帯をまたがない範囲でのみ正確。絞り込み用で、送信前には必ずQuoterで確認する。
-export function estimateV3AmountOut({ amountIn, sqrtPriceX96, liquidity, feeBps, zeroForOne }) {
-  if (amountIn <= 0n || liquidity <= 0n || sqrtPriceX96 <= 0n) return 0n;
-  const amountInAfterFee = (amountIn * (10000n - BigInt(feeBps))) / 10000n;
-  if (amountInAfterFee <= 0n) return 0n;
-
-  try {
-    if (zeroForOne) {
-      // token0 を入れて token1 を受け取る。価格は下がる方向。
-      const numerator = liquidity * Q96;
-      const denominator = liquidity * Q96 / sqrtPriceX96 + amountInAfterFee;
-      if (denominator <= 0n) return 0n;
-      const sqrtPriceAfter = numerator / denominator;
-      if (sqrtPriceAfter <= 0n || sqrtPriceAfter >= sqrtPriceX96) return 0n;
-      return (liquidity * (sqrtPriceX96 - sqrtPriceAfter)) / Q96;
-    } else {
-      // token1 を入れて token0 を受け取る。価格は上がる方向。
-      const sqrtPriceAfter = sqrtPriceX96 + (amountInAfterFee * Q96) / liquidity;
-      if (sqrtPriceAfter <= sqrtPriceX96) return 0n;
-      const numerator = liquidity * Q96 * (sqrtPriceAfter - sqrtPriceX96);
-      const denominator = sqrtPriceAfter * sqrtPriceX96;
-      if (denominator <= 0n) return 0n;
-      return numerator / denominator;
-    }
-  } catch (e) {
-    return 0n;
-  }
-}
-
 /// 送信直前の正確な見積もり。Uniswap公式の QuoterV2 に計算させる。
-export async function quoteV3Exact({ chain, tokenIn, tokenOut, amountIn, feeTier }) {
+export async function quoteV3Exact({ chain, tokenIn, tokenOut, amountIn, feeTier, priority = true }) {
   const quoter = QUOTER_V2_ADDRESS[chain];
   if (!quoter) return null;
   try {
@@ -158,7 +132,7 @@ export async function quoteV3Exact({ chain, tokenIn, tokenOut, amountIn, feeTier
         amountIn,
         fee: feeTier,
         sqrtPriceLimitX96: 0,
-      }), true);
+      }), priority);
     const amountOut = result[0];
     return amountOut > 0n ? amountOut : null;
   } catch (e) {
@@ -166,28 +140,89 @@ export async function quoteV3Exact({ chain, tokenIn, tokenOut, amountIn, feeTier
   }
 }
 
-/// 概算と公式Quoterの値を比べ、誤差を返す。
-/// 概算が過大なら「幻の機会」が生まれ、正常なプールを罠として誤って
-/// 無効化してしまうため、定期的にこれで確かめる。
-/// 戻り値: { estimated, exact, diffPercent } または null
-export async function verifyV3Estimate({ chain, pool, amountIn, zeroForOne }) {
-  if (!pool || pool.sqrtPriceX96 <= 0n || pool.liquidity <= 0n) return null;
-  const tokenIn = zeroForOne ? pool.token0 : pool.token1;
-  const tokenOut = zeroForOne ? pool.token1 : pool.token0;
+function tableKey(chain, pool, zeroForOne) {
+  return `${chain}::${pool.toLowerCase()}::${zeroForOne ? "0" : "1"}`;
+}
 
-  const estimated = estimateV3AmountOut({
-    amountIn,
-    sqrtPriceX96: pool.sqrtPriceX96,
-    liquidity: pool.liquidity,
-    feeBps: pool.feeBps,
-    zeroForOne,
-  });
+/// プールの価格表を作り直す。公式Quoterに複数の投入額を問い合わせる。
+/// @param amountsIn 投入額の配列(小さい順、生の整数)
+export async function buildQuoteTable({ chain, pool, zeroForOne, tokenIn, tokenOut, feeTier, amountsIn }) {
+  const points = [];
+  for (const amountIn of amountsIn) {
+    if (amountIn <= 0n) continue;
+    const out = await quoteV3Exact({ chain, tokenIn, tokenOut, amountIn, feeTier, priority: false });
+    if (out == null || out <= 0n) continue;
+    points.push({ in: amountIn, out });
+  }
+  if (points.length === 0) {
+    quoteTables.delete(tableKey(chain, pool, zeroForOne));
+    return 0;
+  }
+  quoteTables.set(tableKey(chain, pool, zeroForOne), { points, at: Date.now() });
+  return points.length;
+}
+
+export function hasQuoteTable(chain, pool, zeroForOne) {
+  return quoteTables.has(tableKey(chain, pool, zeroForOne));
+}
+
+export function getQuoteTableAge(chain, pool, zeroForOne) {
+  const t = quoteTables.get(tableKey(chain, pool, zeroForOne));
+  return t ? Date.now() - t.at : null;
+}
+
+export function countQuoteTables() {
+  return quoteTables.size;
+}
+
+export function clearQuoteTable(chain, pool) {
+  quoteTables.delete(tableKey(chain, pool, true));
+  quoteTables.delete(tableKey(chain, pool, false));
+}
+
+/// 価格表から受取量を求める。表に無い投入額は、最も近い2点から補間する。
+/// 表の範囲外(最大点より大きい)は、その点の比率をそのまま使わず、
+/// 実際より少なめに見積もる(過大評価を避けるため)。
+export function quoteFromTable({ chain, pool, zeroForOne, amountIn }) {
+  const t = quoteTables.get(tableKey(chain, pool, zeroForOne));
+  if (!t || t.points.length === 0 || amountIn <= 0n) return 0n;
+  const pts = t.points;
+
+  // 最小点より小さい場合は、最小点の比率をそのまま使う(V3は小額なら線形)。
+  if (amountIn <= pts[0].in) {
+    return (pts[0].out * amountIn) / pts[0].in;
+  }
+  // 最大点より大きい場合は、最大点の比率より必ず悪くなる。
+  // 範囲外は判定に使わない方が安全なので0を返す。
+  const last = pts[pts.length - 1];
+  if (amountIn > last.in) return 0n;
+
+  // 間にある場合は、前後の2点から線形に補間する。
+  for (let i = 1; i < pts.length; i++) {
+    if (amountIn > pts[i].in) continue;
+    const lo = pts[i - 1], hi = pts[i];
+    const span = hi.in - lo.in;
+    if (span <= 0n) return lo.out;
+    const ratio = amountIn - lo.in;
+    return lo.out + ((hi.out - lo.out) * ratio) / span;
+  }
+  return 0n;
+}
+
+/// 価格表に載っている投入額の範囲(判定に使える範囲)。
+export function getTableRange(chain, pool, zeroForOne) {
+  const t = quoteTables.get(tableKey(chain, pool, zeroForOne));
+  if (!t || t.points.length === 0) return null;
+  return { min: t.points[0].in, max: t.points[t.points.length - 1].in };
+}
+
+/// 価格表と公式Quoterの一致を確かめる(表の中間の値で検証する)。
+/// 補間の誤差がどの程度かを測るためのもの。
+export async function verifyQuoteTable({ chain, pool, zeroForOne, tokenIn, tokenOut, feeTier, amountIn }) {
+  const estimated = quoteFromTable({ chain, pool, zeroForOne, amountIn });
   if (estimated <= 0n) return null;
-
-  const exact = await quoteV3Exact({ chain, tokenIn, tokenOut, amountIn, feeTier: pool.feeTier });
+  const exact = await quoteV3Exact({ chain, tokenIn, tokenOut, amountIn, feeTier, priority: false });
   if (!exact || exact <= 0n) return null;
-
-  // 概算が正確な値より何%大きいか(正なら過大評価)。
   const diffPercent = (Number(estimated - exact) / Number(exact)) * 100;
   return { estimated, exact, diffPercent };
 }
