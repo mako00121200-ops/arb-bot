@@ -12,13 +12,18 @@
 // プールごとに「代表的な投入額での受取量」を公式Quoterで取得し、メモリに
 // 保持する。判定時はこの表から補間するため、RPCを使わずミリ秒で済み、
 // かつ公式の計算に基づくので誤差がない。
-// V3プールは数百件しかないため、数分ごとに全件を更新しても負荷は小さい。
+//
+// [価格表はまとめて作る(2026年9月16日)]
+// 以前は投入額1つにつきQuoterを1回呼んでいた(1プールあたり12回)。
+// Chainstackは1回=1リクエスト単位で課金されるため、Multicall3で束ねて
+// 複数プール分の見積もりを1〜2回の呼び出しで済ませる。
 //
 // 表に無い投入額は、最も近い2点から線形に補間する。V3の受取量は投入額に
-// 対して単調で滑らかなので、点を細かく取れば十分な精度が出る。
+// 対して上に凸の曲線なので、直線で補間すると実際より少なめに出る(安全側)。
 
 import { ethers } from "ethers";
 import { callWithRpc } from "./onchain-reserves.js";
+import { quoteV3Batch } from "./multicall-reserves.js";
 
 export const QUOTER_V2_ADDRESS = {
   polygon: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
@@ -101,6 +106,8 @@ export async function findV3Pool(chain, factory, tokenA, tokenB, fee) {
   }
 }
 
+/// 1プールの状態を読む(単発用)。複数まとめて読むときは
+/// multicall-reserves.js の fetchV3StatesBatch を使う。
 export async function readV3State(chain, poolAddress, priority = false) {
   try {
     const contract = (p) => new ethers.Contract(ethers.getAddress(poolAddress), V3_POOL_ABI, p);
@@ -144,22 +151,54 @@ function tableKey(chain, pool, zeroForOne) {
   return `${chain}::${pool.toLowerCase()}::${zeroForOne ? "0" : "1"}`;
 }
 
-/// プールの価格表を作り直す。公式Quoterに複数の投入額を問い合わせる。
-/// @param amountsIn 投入額の配列(小さい順、生の整数)
-export async function buildQuoteTable({ chain, pool, zeroForOne, tokenIn, tokenOut, feeTier, amountsIn }) {
-  const points = [];
-  for (const amountIn of amountsIn) {
-    if (amountIn <= 0n) continue;
-    const out = await quoteV3Exact({ chain, tokenIn, tokenOut, amountIn, feeTier, priority: false });
+/// 複数プール・両方向の価格表をまとめて作る。
+/// @param jobs [{ pool, zeroForOne, tokenIn, tokenOut, feeTier, amountsIn }] の配列
+/// 戻り値: 作れた表の数(点が1つ以上あるもの)
+export async function buildQuoteTablesBatch(chain, jobs) {
+  const quoter = QUOTER_V2_ADDRESS[chain];
+  if (!quoter || jobs.length === 0) return 0;
+
+  const requests = [];
+  const owners = [];
+  for (let j = 0; j < jobs.length; j++) {
+    for (const amountIn of jobs[j].amountsIn) {
+      if (amountIn <= 0n) continue;
+      requests.push({ tokenIn: jobs[j].tokenIn, tokenOut: jobs[j].tokenOut, amountIn, feeTier: jobs[j].feeTier });
+      owners.push(j);
+    }
+  }
+  if (requests.length === 0) return 0;
+
+  const outs = await quoteV3Batch(chain, quoter, requests, false);
+
+  const pointsByJob = jobs.map(() => []);
+  for (let i = 0; i < requests.length; i++) {
+    const out = outs[i];
     if (out == null || out <= 0n) continue;
-    points.push({ in: amountIn, out });
+    pointsByJob[owners[i]].push({ in: requests[i].amountIn, out });
   }
-  if (points.length === 0) {
-    quoteTables.delete(tableKey(chain, pool, zeroForOne));
-    return 0;
+
+  let built = 0;
+  const now = Date.now();
+  for (let j = 0; j < jobs.length; j++) {
+    const key = tableKey(chain, jobs[j].pool, jobs[j].zeroForOne);
+    const points = pointsByJob[j].sort((a, b) => (a.in < b.in ? -1 : a.in > b.in ? 1 : 0));
+    if (points.length === 0) {
+      quoteTables.delete(key);
+      continue;
+    }
+    quoteTables.set(key, { points, at: now });
+    built++;
   }
-  quoteTables.set(tableKey(chain, pool, zeroForOne), { points, at: Date.now() });
-  return points.length;
+  return built;
+}
+
+/// 1プール1方向の価格表を作る(単発用。まとめて作るときは buildQuoteTablesBatch)。
+export async function buildQuoteTable({ chain, pool, zeroForOne, tokenIn, tokenOut, feeTier, amountsIn }) {
+  const built = await buildQuoteTablesBatch(chain, [{ pool, zeroForOne, tokenIn, tokenOut, feeTier, amountsIn }]);
+  if (built === 0) return 0;
+  const t = quoteTables.get(tableKey(chain, pool, zeroForOne));
+  return t ? t.points.length : 0;
 }
 
 export function hasQuoteTable(chain, pool, zeroForOne) {
@@ -181,8 +220,7 @@ export function clearQuoteTable(chain, pool) {
 }
 
 /// 価格表から受取量を求める。表に無い投入額は、最も近い2点から補間する。
-/// 表の範囲外(最大点より大きい)は、その点の比率をそのまま使わず、
-/// 実際より少なめに見積もる(過大評価を避けるため)。
+/// 表の範囲外(最大点より大きい)は判定に使わない(過大評価を避けるため)。
 export function quoteFromTable({ chain, pool, zeroForOne, amountIn }) {
   const t = quoteTables.get(tableKey(chain, pool, zeroForOne));
   if (!t || t.points.length === 0 || amountIn <= 0n) return 0n;
@@ -192,12 +230,9 @@ export function quoteFromTable({ chain, pool, zeroForOne, amountIn }) {
   if (amountIn <= pts[0].in) {
     return (pts[0].out * amountIn) / pts[0].in;
   }
-  // 最大点より大きい場合は、最大点の比率より必ず悪くなる。
-  // 範囲外は判定に使わない方が安全なので0を返す。
   const last = pts[pts.length - 1];
   if (amountIn > last.in) return 0n;
 
-  // 間にある場合は、前後の2点から線形に補間する。
   for (let i = 1; i < pts.length; i++) {
     if (amountIn > pts[i].in) continue;
     const lo = pts[i - 1], hi = pts[i];
@@ -217,7 +252,6 @@ export function getTableRange(chain, pool, zeroForOne) {
 }
 
 /// 価格表と公式Quoterの一致を確かめる(表の中間の値で検証する)。
-/// 補間の誤差がどの程度かを測るためのもの。
 export async function verifyQuoteTable({ chain, pool, zeroForOne, tokenIn, tokenOut, feeTier, amountIn }) {
   const estimated = quoteFromTable({ chain, pool, zeroForOne, amountIn });
   if (estimated <= 0n) return null;
