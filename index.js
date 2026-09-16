@@ -9,6 +9,17 @@
 // 判定時はそこから補間する。RPCを使わずミリ秒で済み、誤差もない。
 // 価格が動いたプールは表を作り直す。
 //
+// [問い合わせを束ねる(2026年9月16日)]
+// Chainstackは1回=1リクエスト単位で課金される。V3の状態読み(1プール2回)と
+// 価格表の作成(1プール12回)を個別に出していたため、Polygonだけで月約1,100万
+// 単位に達していた。どちらもMulticall3で束ね、複数プール分を1〜数回で済ませる。
+//
+// [WebSocketの無いチェーンでも価格表を作り直す(2026年9月16日)]
+// 価格表の作り直しは「WebSocketでSwapが届いた時」にしか予約されていなかった。
+// Optimism・Arbitrum・Avalancheは定期読み直しで価格だけが更新され、表は
+// 起動時のまま古くなり続けた。これが同じ経路を毎分「黒字」と誤判定し続けた
+// 原因。定期読み直しでも価格が動いていれば表を作り直す。
+//
 // [フラッシュスワップ方式]
 // 経路の最初のプール自身から先に受け取るため、借入手数料がかからず、
 // 桁数と価格が分かる通貨なら何でも始点にできる。
@@ -24,7 +35,10 @@ import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
 import { probePoolFeeBps, getRpcStatus, callWithRpc } from "./scripts/onchain-reserves.js";
-import { fetchReservesBatch, fetchPoolTokensBatch, fetchTokenDecimalsBatch } from "./scripts/multicall-reserves.js";
+import {
+  fetchReservesBatch, fetchPoolTokensBatch, fetchTokenDecimalsBatch,
+  fetchV3StatesBatch, getMulticallStats,
+} from "./scripts/multicall-reserves.js";
 import { estimateGasCostUsd, getGasCostStatus } from "./scripts/gas-cost.js";
 import { discoverFactory, discoverPoolsFromFactory } from "./scripts/pool-discovery.js";
 import {
@@ -45,8 +59,8 @@ import { getVerifiedPairs } from "./scripts/verified-pairs.js";
 import { isKnownIncompatiblePool, recordIncompatiblePool } from "./scripts/incompatible-pools.js";
 import { journal, loadJournal, trimJournalIfNeeded, summarize } from "./scripts/opportunity-journal.js";
 import {
-  V3_FACTORIES, V3_FEE_TIERS, findV3Pool, readV3State, feeTierToBps,
-  buildQuoteTable, hasQuoteTable, clearQuoteTable, countQuoteTables,
+  V3_FACTORIES, V3_FEE_TIERS, findV3Pool, feeTierToBps,
+  buildQuoteTablesBatch, hasQuoteTable, clearQuoteTable, countQuoteTables,
   verifyQuoteTable, QUOTE_SAMPLES_USD,
 } from "./scripts/v3-pools.js";
 import { CHAIN_CONFIG } from "./chain-config.js";
@@ -55,9 +69,10 @@ const MIN_PROFIT_USD = parseFloat(process.env.MIN_PROFIT_USD || "0.01");
 const FULL_SCAN_INTERVAL_SEC = parseInt(process.env.FULL_SCAN_INTERVAL_SEC || "30", 10);
 const REFRESH_STALE_SEC = parseInt(process.env.REFRESH_STALE_SEC || "60", 10);
 const REFRESH_BATCH_SIZE = parseInt(process.env.REFRESH_BATCH_SIZE || "600", 10);
-const V3_REFRESH_PER_TICK = parseInt(process.env.V3_REFRESH_PER_TICK || "30", 10);
-// 価格表を作り直す本数(1回あたり)。1本あたりQuoterを6回呼ぶ。
-const QUOTE_TABLE_PER_TICK = parseInt(process.env.QUOTE_TABLE_PER_TICK || "3", 10);
+// V3の状態を読み直す本数(20秒ごと)。束ねて読むので本数を増やしても1〜2回で済む。
+const V3_REFRESH_PER_TICK = parseInt(process.env.V3_REFRESH_PER_TICK || "120", 10);
+// 価格表を作り直すプール数(1回あたり)。束ねて問い合わせるので数回で済む。
+const QUOTE_TABLE_PER_TICK = parseInt(process.env.QUOTE_TABLE_PER_TICK || "6", 10);
 const QUOTE_TABLE_INTERVAL_MS = parseInt(process.env.QUOTE_TABLE_INTERVAL_MS || "5000", 10);
 // 価格が動いたV3プールは表を作り直す。この割合(%)以上動いたら対象。
 const QUOTE_REBUILD_MOVE_PCT = parseFloat(process.env.QUOTE_REBUILD_MOVE_PCT || "0.1");
@@ -98,7 +113,7 @@ const stats = {
   scans: 0, profitableFound: 0, examined: 0, executed: 0, failed: 0,
   skippedCooldown: 0, trapsRejected: 0, taxTokensRejected: 0, staleRejected: 0, bigMoves: 0,
   v3Found: 0, v3Matched: 0, v3Opportunities: 0, v3LiquidityEvents: 0,
-  quoteTablesBuilt: 0, quoteTablesPending: 0,
+  quoteTablesBuilt: 0, quoteTablesPending: 0, quoteRebuildsFromPolling: 0,
   v3VerifyCount: 0, v3VerifyWorst: null, v3VerifyRecent: [],
   disabledFromFile: 0, disabledRuntime: 0,
   prunedTotal: 0, prunedKept: 0,
@@ -322,10 +337,10 @@ function usdToAmount(chain, token, usd) {
   } catch (e) { return null; }
 }
 
-/// 1つのV3プールについて、両方向の価格表を作る。
-async function buildTablesForPool(pool) {
+/// 1つのV3プールについて、両方向の価格表の「作り方」を用意する(RPCは使わない)。
+function quoteJobsForPool(pool) {
   const chain = pool.chain;
-  let built = 0;
+  const jobs = [];
   for (const zeroForOne of [true, false]) {
     const tokenIn = zeroForOne ? pool.token0 : pool.token1;
     const tokenOut = zeroForOne ? pool.token1 : pool.token0;
@@ -335,54 +350,71 @@ async function buildTablesForPool(pool) {
       if (amount) amountsIn.push(amount);
     }
     if (amountsIn.length === 0) continue;
-    const n = await buildQuoteTable({
-      chain, pool: pool.address, zeroForOne, tokenIn, tokenOut,
-      feeTier: pool.feeTier, amountsIn,
-    });
-    if (n > 0) built++;
+    jobs.push({ pool: pool.address, zeroForOne, tokenIn, tokenOut, feeTier: pool.feeTier, amountsIn });
   }
+  return jobs;
+}
+
+/// 複数のV3プールの価格表を、チェーンごとにまとめて作る。
+async function buildTablesForPools(pools) {
+  const byChain = new Map();
+  for (const pool of pools) {
+    const jobs = quoteJobsForPool(pool);
+    if (jobs.length === 0) continue;
+    if (!byChain.has(pool.chain)) byChain.set(pool.chain, []);
+    byChain.get(pool.chain).push(...jobs);
+  }
+  let built = 0;
+  await Promise.all([...byChain.entries()].map(async ([chain, jobs]) => {
+    try { built += await buildQuoteTablesBatch(chain, jobs); } catch (e) {}
+  }));
   return built;
 }
 
 let quoteCursor = 0;
+let quoteRefreshRunning = false;
 async function refreshQuoteTables() {
-  if (!anyReady()) return;
+  if (!anyReady() || quoteRefreshRunning) return;
+  quoteRefreshRunning = true;
+  try {
+    const selected = [];
 
-  // 価格が動いたプールを優先して作り直す。
-  const urgent = [...quoteRebuildQueue].slice(0, QUOTE_TABLE_PER_TICK);
-  for (const key of urgent) {
-    quoteRebuildQueue.delete(key);
-    if (disabledPools.has(key)) continue;
-    const [chain, address] = key.split("::");
-    const pool = getPool(chain, address);
-    if (!pool || pool.kind !== KIND_V3) continue;
-    const n = await buildTablesForPool(pool);
-    if (n > 0) stats.quoteTablesBuilt++;
-  }
-  if (urgent.length >= QUOTE_TABLE_PER_TICK) {
-    stats.quoteTablesPending = quoteRebuildQueue.size;
-    return;
-  }
-
-  // 残り枠で、表がまだ無いプールを順に埋める。
-  const targets = [];
-  for (const chain of chainReady) {
-    for (const pool of getPoolsByKind(chain, KIND_V3)) {
-      if (disabledPools.has(poolKeyOf(chain, pool.address))) continue;
-      if (!hasUsableState(pool)) continue;
-      const done = hasQuoteTable(chain, pool.address, true) && hasQuoteTable(chain, pool.address, false);
-      if (!done) targets.push(pool);
+    // 価格が動いたプールを優先して作り直す。
+    const urgent = [...quoteRebuildQueue].slice(0, QUOTE_TABLE_PER_TICK);
+    for (const key of urgent) {
+      quoteRebuildQueue.delete(key);
+      if (disabledPools.has(key)) continue;
+      const [chain, address] = key.split("::");
+      const pool = getPool(chain, address);
+      if (!pool || pool.kind !== KIND_V3) continue;
+      selected.push(pool);
     }
-  }
-  stats.quoteTablesPending = targets.length + quoteRebuildQueue.size;
-  if (targets.length === 0) return;
 
-  const budget = QUOTE_TABLE_PER_TICK - urgent.length;
-  for (let i = 0; i < Math.min(budget, targets.length); i++) {
-    const pool = targets[quoteCursor % targets.length];
-    quoteCursor++;
-    const n = await buildTablesForPool(pool);
-    if (n > 0) stats.quoteTablesBuilt++;
+    // 残り枠で、表がまだ無いプール(破棄された表を含む)を順に埋める。
+    const budget = QUOTE_TABLE_PER_TICK - urgent.length;
+    if (budget > 0) {
+      const targets = [];
+      for (const chain of chainReady) {
+        for (const pool of getPoolsByKind(chain, KIND_V3)) {
+          if (disabledPools.has(poolKeyOf(chain, pool.address))) continue;
+          if (!hasUsableState(pool)) continue;
+          const done = hasQuoteTable(chain, pool.address, true) && hasQuoteTable(chain, pool.address, false);
+          if (!done) targets.push(pool);
+        }
+      }
+      stats.quoteTablesPending = targets.length + quoteRebuildQueue.size;
+      for (let i = 0; i < Math.min(budget, targets.length); i++) {
+        selected.push(targets[quoteCursor % targets.length]);
+        quoteCursor++;
+      }
+    } else {
+      stats.quoteTablesPending = quoteRebuildQueue.size;
+    }
+
+    if (selected.length === 0) return;
+    stats.quoteTablesBuilt += await buildTablesForPools(selected);
+  } finally {
+    quoteRefreshRunning = false;
   }
 }
 
@@ -454,50 +486,95 @@ async function discoverV3PoolsForChain(chain) {
 }
 
 async function loadV3StatesForChain(chain) {
+  const pools = getPoolsByKind(chain, KIND_V3).filter((p) => !disabledPools.has(poolKeyOf(chain, p.address)));
+  if (pools.length === 0) return 0;
+  let states;
+  try {
+    states = await fetchV3StatesBatch(chain, pools.map((p) => p.address));
+  } catch (e) {
+    return 0;
+  }
   let loaded = 0;
-  for (const pool of getPoolsByKind(chain, KIND_V3)) {
-    if (disabledPools.has(poolKeyOf(chain, pool.address))) continue;
-    const state = await readV3State(chain, pool.address);
-    if (state) {
-      updateV3FromSwap(chain, pool.address, state.sqrtPriceX96, state.liquidity);
-      loaded++;
-    }
+  for (const pool of pools) {
+    const s = states.get(pool.address.toLowerCase());
+    if (!s) continue;
+    updateV3FromSwap(chain, pool.address, s.sqrtPriceX96, s.liquidity);
+    loaded++;
   }
   return loaded;
 }
 
 const v3NeedsRefresh = new Set();
 let v3RefreshCursor = 0;
+let v3RefreshRunning = false;
 async function refreshV3States() {
-  if (!anyReady()) return;
-  const urgent = [...v3NeedsRefresh].slice(0, V3_REFRESH_PER_TICK);
-  for (const key of urgent) {
-    v3NeedsRefresh.delete(key);
-    const [chain, address] = key.split("::");
-    if (disabledPools.has(key)) continue;
-    const state = await readV3State(chain, address, true);
-    if (state) {
-      updateV3FromSwap(chain, address, state.sqrtPriceX96, state.liquidity);
-      queueQuoteRebuild(chain, address);
-    }
-  }
-  if (urgent.length >= V3_REFRESH_PER_TICK) return;
+  if (!anyReady() || v3RefreshRunning) return;
+  v3RefreshRunning = true;
+  try {
+    const urgentByChain = new Map();
+    const normalByChain = new Map();
+    const push = (map, chain, address) => {
+      if (!map.has(chain)) map.set(chain, []);
+      map.get(chain).push(address);
+    };
 
-  const targets = [];
-  for (const chain of chainReady) {
-    if (isChainWsEnabled(chain) && isChainHealthy(chain)) continue;
-    for (const pool of getPoolsByKind(chain, KIND_V3)) {
-      if (disabledPools.has(poolKeyOf(chain, pool.address))) continue;
-      targets.push(pool);
+    // 流動性が変わったプールを優先する。
+    const urgentKeys = [...v3NeedsRefresh].slice(0, V3_REFRESH_PER_TICK);
+    for (const key of urgentKeys) {
+      v3NeedsRefresh.delete(key);
+      if (disabledPools.has(key)) continue;
+      const [chain, address] = key.split("::");
+      push(urgentByChain, chain, address);
     }
-  }
-  if (targets.length === 0) return;
-  const budget = V3_REFRESH_PER_TICK - urgent.length;
-  for (let n = 0; n < Math.min(budget, targets.length); n++) {
-    const pool = targets[v3RefreshCursor % targets.length];
-    v3RefreshCursor++;
-    const state = await readV3State(pool.chain, pool.address);
-    if (state) updateV3FromSwap(pool.chain, pool.address, state.sqrtPriceX96, state.liquidity);
+
+    // 残り枠で、WebSocketが無い(または不達の)チェーンのV3を順に読み直す。
+    const budget = V3_REFRESH_PER_TICK - urgentKeys.length;
+    if (budget > 0) {
+      const targets = [];
+      for (const chain of chainReady) {
+        if (isChainWsEnabled(chain) && isChainHealthy(chain)) continue;
+        for (const pool of getPoolsByKind(chain, KIND_V3)) {
+          if (disabledPools.has(poolKeyOf(chain, pool.address))) continue;
+          targets.push(pool);
+        }
+      }
+      for (let n = 0; n < Math.min(budget, targets.length); n++) {
+        const pool = targets[v3RefreshCursor % targets.length];
+        v3RefreshCursor++;
+        push(normalByChain, pool.chain, pool.address);
+      }
+    }
+
+    const jobs = [];
+    for (const [chain, addresses] of urgentByChain) {
+      jobs.push((async () => {
+        const states = await fetchV3StatesBatch(chain, addresses, true);
+        for (const address of addresses) {
+          const s = states.get(address.toLowerCase());
+          if (!s) continue;
+          updateV3FromSwap(chain, address, s.sqrtPriceX96, s.liquidity);
+          queueQuoteRebuild(chain, address);
+        }
+      })());
+    }
+    for (const [chain, addresses] of normalByChain) {
+      jobs.push((async () => {
+        const states = await fetchV3StatesBatch(chain, addresses, false);
+        for (const address of addresses) {
+          const s = states.get(address.toLowerCase());
+          if (!s) continue;
+          const pool = updateV3FromSwap(chain, address, s.sqrtPriceX96, s.liquidity);
+          // 定期読み直しでも、価格が動いていれば表を作り直す。
+          if (pool && (pool.lastMovePct || 0) >= QUOTE_REBUILD_MOVE_PCT) {
+            queueQuoteRebuild(chain, address);
+            stats.quoteRebuildsFromPolling++;
+          }
+        }
+      })());
+    }
+    await Promise.all(jobs.map((j) => j.catch(() => {})));
+  } finally {
+    v3RefreshRunning = false;
   }
 }
 
@@ -620,7 +697,7 @@ async function preparePoolMap() {
 
   const priced = refreshTokenPrices();
   console.log(`[始点] 桁数と価格が揃い、経路の始点として使えるトークン: ${priced}件`);
-  console.log(`[V3価格表] 公式Quoterで作成を開始します(V3プール${s.byKind.v3}件 × 2方向)`);
+  console.log(`[V3価格表] 公式Quoterで作成を開始します(V3プール${s.byKind.v3}件 × 2方向、まとめて問い合わせ)`);
 
   savePoolMap();
   stats.mapSavedAt = new Date().toISOString();
@@ -846,7 +923,8 @@ function heartbeat() {
   const queued = Object.entries(rpc).filter(([, v]) => v.queued > 0).map(([c, v]) => `${c}:${v.normalQueued}`).join(" ");
   const stageLine = Object.entries(failStages).map(([k, v]) => `${k}:${v}`).join(" ") || "なし";
   const ev = Object.entries(getSyncStats()).map(([c, v]) => `${c}:${v.received}`).join(" ") || "なし";
-  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}(待${stats.quoteTablesPending}) スキャン${stats.scans} 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 見送${reasons.notSent}] 失敗段階[${stageLine}] 受信[${ev}] 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}]`);
+  const mc = getMulticallStats();
+  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}(待${stats.quoteTablesPending} 定期で作り直し${stats.quoteRebuildsFromPolling}) スキャン${stats.scans} 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 見送${reasons.notSent}] 失敗段階[${stageLine}] 受信[${ev}] 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]`);
 }
 
 // ===== ダッシュボード =====
@@ -871,7 +949,7 @@ const REASON_LABEL = {
 };
 const STAGE_LABEL = {
   state: "状態取得に失敗(RPCが遅い)", quote: "受取量の確定に失敗", estimateGas: "ガス見積もりで拒否",
-  feeLadder: "手数料を上げても拒否", send: "送信時のエラー", wait: "確定待ちで失敗",
+  feeLadder: "手数料を上げても拒否", shortfall: "量が足りず拒否", send: "送信時のエラー", wait: "確定待ちで失敗",
   timeout: "制限時間超過", unknown: "不明",
 };
 
@@ -887,6 +965,7 @@ function renderPage() {
   const sum = summarize(24);
   const maxQueue = Math.max(0, ...Object.values(rpc).map((v) => v.queued));
   const totalEvents = Object.values(syncStats).reduce((a, v) => a + v.received, 0);
+  const mc = getMulticallStats();
 
   const realRows = real.recent.map((e) => `<tr><td>${new Date(e.timestamp).toLocaleString('ja-JP')}</td><td style="font-size:9px">${e.pairLabel}</td>
     <td style="text-align:right">$${e.tradeAmountUsd.toFixed(2)}</td>
@@ -939,7 +1018,7 @@ function renderPage() {
 <div><div class="v" style="color:${stats.v3VerifyWorst && Math.abs(stats.v3VerifyWorst.diffPercent) > 5 ? '#e74c3c' : '#2ecc71'}">${stats.v3VerifyWorst ? stats.v3VerifyWorst.diffPercent.toFixed(2) + '%' : '-'}</div><div class="l">補間の最大誤差</div></div>
 <div><div class="v">${stats.v3Opportunities}</div><div class="l">V3を含む機会</div></div></div>
 <table><thead><tr><th>プール</th><th style="text-align:right">補間と公式の差</th></tr></thead><tbody>${verifyRows}</tbody></table>
-<div class="note">V3は価格帯ごとに流動性が分かれるため、独自の近似式では最大2,184%も過大な値になりました。今はプールごとに公式Quoterで「代表的な投入額での受取量」を取得して表にし、判定はそこから補間しています。価格が動いた表は作り直します。<br>表が無いV3プールは判定に使いません(幻の機会を防ぐため)。</div></div>
+<div class="note">V3は価格帯ごとに流動性が分かれるため、独自の近似式では最大2,184%も過大な値になりました。今はプールごとに公式Quoterで「代表的な投入額での受取量」を取得して表にし、判定はそこから補間しています。価格が動いた表は作り直します(WebSocketの無いチェーンでも、定期読み直しで価格の動きを検知して作り直します。これまでに${stats.quoteRebuildsFromPolling}回)。<br>表が無いV3プールは判定に使いません(幻の機会を防ぐため)。</div></div>
 
 <div class="card"><h2>🔎 機会がどこで止まっているか</h2>
 <div class="stat"><div><div class="v">${stats.examined.toLocaleString()}</div><div class="l">精査した経路</div></div>
@@ -963,6 +1042,7 @@ function renderPage() {
 <div><div class="v">${lat != null ? lat + 'ms' : '-'}</div><div class="l">判定時間</div></div>
 <div><div class="v">${stats.feeProbed.toLocaleString()}</div><div class="l">手数料実測済み</div></div></div>
 <div class="note">実測ガス代(2step): ${gasLine}<br>
+問い合わせの束ね: ${mc.calls.toLocaleString()}回の呼び出しで${mc.subcalls.toLocaleString()}件を処理(分割再試行${mc.splits}回)<br>
 プール: V2 ${s.byKind.v2.toLocaleString()} / V3 ${s.byKind.v3.toLocaleString()}(V2とV3が共存${s.mixedPairs}ペア)<br>
 チェーン別: ${Object.entries(s.byChain).map(([c, n]) => `${c}:${n.toLocaleString()}`).join(' / ') || '構築中'}<br>
 無効化${stats.disabled}件(過去の記録${stats.disabledFromFile} / 今回${stats.disabledRuntime})<br>
@@ -985,7 +1065,8 @@ function renderAbout() {
 <div class="card"><h2>② V3は公式Quoterの価格表で判定</h2><div class="note">V3は価格帯ごとに流動性が分かれるため、現在価格と流動性だけの近似式では正しく計算できません(実測で最大2,184%の過大)。プールごとに公式Quoterで代表的な投入額の受取量を取得して表にし、判定はそこから補間します。表が無いプールは判定に使いません。</div></div>
 <div class="card"><h2>③ 始点に使える通貨</h2><div class="note">桁数と価格が分かる通貨はすべて始点にできます。桁数はプールのトークンから一括取得し、価格は安定通貨と繋がるプールから逆算します。</div></div>
 <div class="card"><h2>④ 監視対象を絞る</h2><div class="note">2段の裁定は「同じペアに2つ以上のプールがある」時にしか成立しません。比べる相手のいないプールは監視してもイベント量が増えるだけなので、候補だけに絞っています。</div></div>
-<div class="card"><h2>⑤ 安全策</h2><div class="note">ガス見積もりが失敗すればプールに拒否されているので、送信せずに済みガス代を失いません。利益は実行前後の残高差分で判定するため、過去の利益が残っていても誤判定しません。</div></div>
+<div class="card"><h2>⑤ 問い合わせを束ねる</h2><div class="note">RPCは1回の呼び出しごとに課金されるため、V3の状態読みと価格表の作成はMulticall3で複数プール分をまとめて1回にしています。</div></div>
+<div class="card"><h2>⑥ 安全策</h2><div class="note">ガス見積もりが失敗すればプールに拒否されているので、送信せずに済みガス代を失いません。利益は実行前後の残高差分で判定するため、過去の利益が残っていても誤判定しません。</div></div>
 <div class="footerlink"><a href="/">← 戻る</a></div></body></html>`;
 }
 
