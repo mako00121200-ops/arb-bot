@@ -4,16 +4,16 @@
 // RPCへの問い合わせを一切行わず、全てメモリ上の計算で完結するため、
 // イベントが届いた瞬間(ミリ秒単位)に判定できる。
 //
+// [フラッシュスワップ方式]
+// 経路の最初のプール自身から借りるため、Aaveの手数料0.05%がかからなくなった。
+// 判定でもこの手数料を差し引かない。
+//
 // [V2とV3の混在]
-// 経路の各段は、V2形式でもV3形式でも構わない。同じペアにV2とV3が共存して
-// いる場合が最も機会が生まれやすいため、それらを優先して組み合わせる。
+// 経路の各段はV2形式でもV3形式でも構わない。同じペアにV2とV3が共存している
+// 場合が最も機会が生まれやすいため、それらを優先して組み合わせる。
 //   V2 … 準備量(x·y=k)から計算する。
 //   V3 … 現在価格と流動性から概算する(価格帯をまたぐと誤差が出るため、
 //        送信直前に公式のQuoterで正確に確認する)。
-//
-// [手数料]
-// V3は生成時の区分(100/500/3000/10000)で確定しているため実測不要。
-// V2は未実測なら保守的な値を当て、実行時の学習結果を待つ。
 
 import {
   getPoolsForPair, getPoolsForToken, getArbitragablePairs,
@@ -22,7 +22,6 @@ import {
 } from "./pool-registry.js";
 import { estimateV3AmountOut } from "./v3-pools.js";
 
-const AAVE_PREMIUM_BPS = 5n;
 const MIN_TRADE_USD = parseFloat(process.env.MIN_TRADE_USD || "0");
 // 手数料が未実測のV2プールに当てる想定値。30bpsは楽観的すぎることが多い。
 const UNPROBED_FEE_BPS = parseInt(process.env.UNPROBED_FEE_BPS || "45", 10);
@@ -41,7 +40,6 @@ function getAmountOutV2(amountIn, reserveIn, reserveOut, feeBps) {
   return denominator === 0n ? 0n : (amountInWithFee * reserveOut) / denominator;
 }
 
-/// 経路の1段を、種別に応じて計算する。
 function legAmountOut(leg, amountIn) {
   if (amountIn <= 0n) return 0n;
   if (leg.kind === KIND_V3) {
@@ -52,13 +50,11 @@ function legAmountOut(leg, amountIn) {
       feeBps: leg.feeBps,
       zeroForOne: leg.zeroForOne,
     });
-    // 価格帯をまたぐ分を見込んで割り引く(過大評価を避ける)。
     return (out * (10000n - BigInt(V3_ESTIMATE_DISCOUNT_BPS))) / 10000n;
   }
   return getAmountOutV2(amountIn, leg.reserveIn, leg.reserveOut, leg.feeBps);
 }
 
-/// プールを「tokenInを入れる向き」に整える。V2とV3で必要な値が違う。
 function orient(pool, tokenIn) {
   const inLower = tokenIn.toLowerCase();
   const isToken0In = pool.token0 === inLower;
@@ -82,12 +78,11 @@ function orient(pool, tokenIn) {
   };
 }
 
-/// そのプールの「現在の交換比率」を概算する(どちらが安いかの比較用)。
 function rateOf(leg) {
   if (leg.kind === KIND_V3) {
     if (leg.sqrtPriceX96 <= 0n) return 0;
     const r = Number(leg.sqrtPriceX96) / Number(2n ** 96n);
-    const price = r * r; // token1 / token0
+    const price = r * r;
     return leg.zeroForOne ? price : (price > 0 ? 1 / price : 0);
   }
   if (leg.reserveIn <= 0n) return 0;
@@ -140,9 +135,6 @@ function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, p
   const best = findBestAmount(maxAmountIn, legs);
   if (best.profit <= 0n) return null;
 
-  const amountOwed = best.amountIn + (best.amountIn * AAVE_PREMIUM_BPS) / 10000n;
-  if (best.amountOut <= amountOwed) return null;
-
   const decimals = getTokenDecimals(chain, tokenA);
   const priceUsd = getTokenPriceUsd(chain, tokenA);
   if (decimals == null || !priceUsd) return null;
@@ -151,16 +143,17 @@ function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, p
   const tradeAmountUsd = toNumber(best.amountIn) * priceUsd;
   if (MIN_TRADE_USD > 0 && tradeAmountUsd < MIN_TRADE_USD) return null;
 
-  const grossProfitUsd = toNumber(best.amountOut - amountOwed) * priceUsd;
+  // フラッシュスワップ方式のため、借入手数料は差し引かない。
+  const grossProfitUsd = toNumber(best.profit) * priceUsd;
   const netProfitUsd = grossProfitUsd - gasCostUsd;
-  const feeWallBps = legs.reduce((s, l) => s + l.feeBps, 0) + 5;
+  const feeWallBps = legs.reduce((s, l) => s + l.feeBps, 0);
   const hasV3 = legs.some((l) => l.kind === KIND_V3);
 
   return {
     kind, chain, tokenA, label, poolAddresses, legs, hasV3,
     amountIn: best.amountIn,
     amountOutEstimated: best.amountOut,
-    amountOwed,
+    amountOwed: best.amountIn,
     tradeAmountUsd, grossProfitUsd, netProfitUsd,
     feeWallPercent: feeWallBps / 100,
     profitable: netProfitUsd > 0,
@@ -171,7 +164,6 @@ function labelOf(legs) {
   return legs.map((l) => `${l.dexId}${l.kind === KIND_V3 ? `(${(l.feeBps / 100).toFixed(2)}%)` : ""}`).join("→");
 }
 
-/// 同じペアの2つのプールを行き来する2段の裁定。V2とV3の混在も対象。
 export function scanTwoStep({ chain, tokenA, tokenB, pools, capUsd, gasCostUsd, isBorrowable }) {
   const usable = pools.filter(hasUsableState);
   if (usable.length < 2) return null;
@@ -193,7 +185,6 @@ export function scanTwoStep({ chain, tokenA, tokenB, pools, capUsd, gasCostUsd, 
     if (priced.length < 2) continue;
     priced.sort((a, b) => b.rate - a.rate);
 
-    // 最も有利に買える側と、最も有利に売れる側の組。
     const buySide = priced[0], sellSide = priced[priced.length - 1];
     if (buySide.pool.address.toLowerCase() === sellSide.pool.address.toLowerCase()) continue;
     const leg2 = orient(sellSide.pool, other);
@@ -212,7 +203,6 @@ export function scanTwoStep({ chain, tokenA, tokenB, pools, capUsd, gasCostUsd, 
   return candidates[0];
 }
 
-/// 起点のプールから A→B→C→A と巡回する3段の裁定。
 export function scanTrianglesForPool({ chain, pool, capUsd, gasCostUsd, isBorrowable, maxRoutes = 60 }) {
   if (!hasUsableState(pool)) return null;
   const results = [];
@@ -257,7 +247,6 @@ export function scanTrianglesForPool({ chain, pool, capUsd, gasCostUsd, isBorrow
   return results[0];
 }
 
-/// 変化したプールを起点に、2段と3段の両方を調べて最良のものを返す。
 export function scanForChangedPool({ chain, poolAddress, capUsd, gasCostUsd, gasCostUsd3, isBorrowable }) {
   const pool = getPool(chain, poolAddress);
   if (!pool) return null;
@@ -282,12 +271,10 @@ export function scanForChangedPool({ chain, poolAddress, capUsd, gasCostUsd, gas
   return found[0];
 }
 
-/// 全件スキャン。V2とV3が共存するペアを優先して調べる。
 export function scanAllPairs({ chain, capUsd, gasCostUsd, gasCostUsd3, isBorrowable, maxTrianglePools = 400 }) {
   const results = [];
   const entries = getArbitragablePairs(chain);
 
-  // V2とV3が同じペアに共存しているものを先に見る(最も機会が生まれやすい)。
   entries.sort((a, b) => {
     const mixA = new Set(a.pools.map((p) => p.kind)).size > 1 ? 1 : 0;
     const mixB = new Set(b.pools.map((p) => p.kind)).size > 1 ? 1 : 0;
