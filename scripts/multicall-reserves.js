@@ -1,11 +1,11 @@
 // scripts/multicall-reserves.js
 //
 // Multicall3(対応チェーン全てに同一アドレスで存在する標準コントラクト)を
-// 使い、多数のプールのデータを「1回のRPC呼び出し」でまとめて読む。
+// 使い、多数のプールやトークンのデータを「1回のRPC呼び出し」でまとめて読む。
 //
-// RPCへの接続は onchain-reserves.js の callWithRpc を経由する。
-// これにより8秒のタイムアウトとチェーンごとの待ち行列、失敗時の
-// RPC自動切り替えがそのまま適用される。
+// 個別に問い合わせると数千件で何分もかかるため、一括取得が必須。
+// RPCへの接続は onchain-reserves.js の callWithRpc を経由するので、
+// タイムアウト・待ち行列・RPC自動切り替えがそのまま適用される。
 
 import { ethers } from "ethers";
 import { callWithRpc } from "./onchain-reserves.js";
@@ -21,12 +21,16 @@ const PAIR_IFACE = new ethers.Interface([
   "function token1() view returns (address)",
   "function stable() view returns (bool)",
 ]);
+const ERC20_IFACE = new ethers.Interface([
+  "function decimals() view returns (uint8)",
+]);
 
 const MAX_POOLS_PER_CALL = 40;
+const MAX_TOKENS_PER_CALL = 120;
 
-async function multicall(chain, calls) {
+async function multicall(chain, calls, priority = false) {
   return callWithRpc(chain, (provider) =>
-    new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider).aggregate3(calls));
+    new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider).aggregate3(calls), priority);
 }
 
 /// 複数プールの準備量とtoken0を一括で読む。
@@ -67,10 +71,39 @@ export async function fetchReservesBatch(chain, pools) {
   return result;
 }
 
+/// 複数トークンの桁数(decimals)を一括で読む。
+/// 経路の始点として使えるかの判断に必要。桁数が読めないトークンは
+/// 量の計算ができないため、始点にしない。
+/// 戻り値: Map<小文字アドレス, 数値>
+export async function fetchTokenDecimalsBatch(chain, addresses) {
+  const result = new Map();
+  for (let i = 0; i < addresses.length; i += MAX_TOKENS_PER_CALL) {
+    const chunk = addresses.slice(i, i + MAX_TOKENS_PER_CALL);
+    const calls = chunk.map((addr) => ({
+      target: ethers.getAddress(addr),
+      allowFailure: true,
+      callData: ERC20_IFACE.encodeFunctionData("decimals"),
+    }));
+    let returned;
+    try {
+      returned = await multicall(chain, calls);
+    } catch (e) {
+      continue;
+    }
+    for (let j = 0; j < chunk.length; j++) {
+      const r = returned[j];
+      if (!r?.success || r.returnData === "0x") continue;
+      try {
+        const decimals = Number(ERC20_IFACE.decodeFunctionResult("decimals", r.returnData)[0]);
+        if (decimals >= 0 && decimals <= 36) result.set(chunk[j].toLowerCase(), decimals);
+      } catch (e) {}
+    }
+  }
+  return result;
+}
+
 /// 複数プールの token0 / token1 / stable を一括で読む。
-/// Syncイベントで見つかった未知のプールを地図へ取り込む際に使う。
-/// stable型(x³y+y³x曲線)は計算式が違い、取り込むと送信が「K」で
-/// 拒否されるため、結果から除外する(戻り値に含めない)。
+/// stable型(x³y+y³x曲線)は計算式が違うため、結果から除外する。
 /// 戻り値: Map<小文字アドレス, { token0, token1 }>
 export async function fetchPoolTokensBatch(chain, addresses) {
   const result = new Map();
@@ -97,7 +130,6 @@ export async function fetchPoolTokensBatch(chain, addresses) {
         const token0 = PAIR_IFACE.decodeFunctionResult("token0", r0.returnData)[0];
         const token1 = PAIR_IFACE.decodeFunctionResult("token1", r1.returnData)[0];
         if (token0.toLowerCase() === token1.toLowerCase()) continue;
-        // stable() を持ち、かつ true を返すプールは除外する。
         if (rs?.success && rs.returnData !== "0x") {
           try {
             if (PAIR_IFACE.decodeFunctionResult("stable", rs.returnData)[0]) continue;
@@ -110,6 +142,7 @@ export async function fetchPoolTokensBatch(chain, addresses) {
   return result;
 }
 
+/// 1つの「実行可能ペア」について、全プールの準備量を一括で読む。
 export async function readVerifiedPairPools(pair) {
   const batch = await fetchReservesBatch(pair.chain, pair.pools);
   const tokenX = pair.tokenA.toLowerCase();
