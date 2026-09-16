@@ -4,12 +4,20 @@
 // RPCへの問い合わせを一切行わず、全てメモリ上の計算で完結するため、
 // イベントが届いた瞬間(ミリ秒単位)に判定できる。
 //
-// [V3の扱いを変更]
+// [V3の扱い]
 // 現在価格と流動性だけから受取量を近似していたが、公式Quoterより最大2,184%も
 // 過大な値を返していた(2026年9月16日)。V3は価格帯ごとに流動性が分かれており、
 // 近似式では表現できない。
 // 代わりに、プールごとに公式Quoterで作った「価格表」から補間する。
 // 表に載っていない範囲(極端に大きい投入額)は判定に使わない。
+//
+// [送信直前に赤字と確定した経路は、状態が変わるまで再判定しない(2026年9月16日)]
+// 同じ経路が毎分「黒字」と判定され、送信直前の正確な見積もりで毎回赤字と
+// 分かって見送る、という繰り返しが起きていた(Optimismの3経路で1時間に数十回)。
+// 黒字判定の件数が水増しされ、本物の機会が何件あるのか分からなくなるうえ、
+// 毎回Quoterとガス見積もりの問い合わせを浪費する。
+// 送信直前に赤字と確定した経路は、その時の各プールの状態(V2は準備量、V3は
+// 価格と流動性)を記録し、どれかが変わるまで判定から外す。
 //
 // [フラッシュスワップ方式]
 // 経路の最初のプール自身から借りるため、借入手数料はかからない。
@@ -28,6 +36,81 @@ import { quoteFromTable, hasQuoteTable, getTableRange } from "./v3-pools.js";
 const MIN_TRADE_USD = parseFloat(process.env.MIN_TRADE_USD || "0");
 // 手数料が未実測のV2プールに当てる想定値。30bpsは楽観的すぎることが多い。
 const UNPROBED_FEE_BPS = parseInt(process.env.UNPROBED_FEE_BPS || "45", 10);
+// 赤字と確定した経路の記録数の上限(メモリ保護)。
+const MAX_REJECTED_ROUTES = 5000;
+
+// ===== 送信直前の確認結果の記録 =====
+
+const rejectedRoutes = new Map(); // 経路 -> その時の状態の署名
+const routeCheckStats = { confirmed: 0, rejected: 0, suppressed: 0 };
+let lastRouteStatsLine = "";
+
+function routeKey(chain, tokenA, poolAddresses) {
+  return `${chain}:${(tokenA || "").toLowerCase()}:${poolAddresses.map((a) => a.toLowerCase()).join(">")}`;
+}
+
+/// 経路上の全プールの現在の状態をまとめた文字列。どれかが変われば別の値になる。
+function routeSignature(chain, poolAddresses) {
+  return poolAddresses.map((addr) => {
+    const p = getPool(chain, addr);
+    if (!p) return "none";
+    if (p.kind === KIND_V3) return `${p.sqrtPriceX96}:${p.liquidity}`;
+    return `${p.raw0}:${p.raw1}`;
+  }).join("|");
+}
+
+/// 送信直前の正確な見積もりで赤字と確定した経路を記録する。
+export function markRouteRejected(opp) {
+  if (!opp || !opp.poolAddresses) return;
+  if (rejectedRoutes.size >= MAX_REJECTED_ROUTES) {
+    const oldest = rejectedRoutes.keys().next().value;
+    rejectedRoutes.delete(oldest);
+  }
+  rejectedRoutes.set(routeKey(opp.chain, opp.tokenA, opp.poolAddresses), routeSignature(opp.chain, opp.poolAddresses));
+  routeCheckStats.rejected++;
+}
+
+/// 送信直前の正確な見積もりでも黒字だった経路を数える。
+export function markRouteConfirmed(opp) {
+  if (!opp || !opp.poolAddresses) return;
+  rejectedRoutes.delete(routeKey(opp.chain, opp.tokenA, opp.poolAddresses));
+  routeCheckStats.confirmed++;
+}
+
+/// 判定の精度(黒字判定のうち、送信直前でも黒字だった割合)。
+export function getRouteCheckStats() {
+  const checked = routeCheckStats.confirmed + routeCheckStats.rejected;
+  return {
+    ...routeCheckStats,
+    rejectedRoutesTracked: rejectedRoutes.size,
+    precisionPercent: checked > 0 ? (routeCheckStats.confirmed / checked) * 100 : null,
+  };
+}
+
+/// 赤字と確定した時から状態が変わっていない経路か。変わっていれば記録を消す。
+function isSuppressed(chain, tokenA, poolAddresses) {
+  const key = routeKey(chain, tokenA, poolAddresses);
+  const saved = rejectedRoutes.get(key);
+  if (saved == null) return false;
+  if (saved === routeSignature(chain, poolAddresses)) {
+    routeCheckStats.suppressed++;
+    return true;
+  }
+  rejectedRoutes.delete(key);
+  return false;
+}
+
+setInterval(() => {
+  const s = getRouteCheckStats();
+  const precision = s.precisionPercent == null ? "-" : `${s.precisionPercent.toFixed(0)}%`;
+  const line = `[判定の精度] 送信直前でも黒字 ${s.confirmed}件 / 赤字と確定 ${s.rejected}件(精度${precision}) / 状態が変わるまで再判定しない ${s.rejectedRoutesTracked}経路(抑止${s.suppressed}回)`;
+  if (line !== lastRouteStatsLine) {
+    console.log(line);
+    lastRouteStatsLine = line;
+  }
+}, 5 * 60 * 1000);
+
+// ===== 計算 =====
 
 function effectiveFeeBps(pool) {
   if (pool.kind === KIND_V3) return pool.feeBps;
@@ -149,6 +232,9 @@ function maxAmountFromUsd(chain, token, capUsd) {
 }
 
 function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, poolAddresses }) {
+  // 送信直前に赤字と確定し、その後どのプールも動いていない経路は計算しない。
+  if (isSuppressed(chain, tokenA, poolAddresses)) return null;
+
   const best = findBestAmount(maxAmountIn, legs);
   if (best.profit <= 0n) return null;
 
