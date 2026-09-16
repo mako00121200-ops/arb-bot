@@ -35,6 +35,12 @@
 // ・送信直前でも黒字だった経路は markRouteConfirmed で数え、判定の精度
 //   (黒字判定のうち本物だった割合)を5分ごとにログに出す。
 //
+// [誰が取ったか(2026年9月16日追加)]
+// 送信判定に入った全ての機会について、30秒後に経路上のプールで他者の裁定が
+// あったかを確認する(scripts/competitor-check.js)。送信直前の結果
+// (confirmed / rejected / failed_段階)を opp.sendResult に残し、確認結果と
+// 組み合わせて記録する。
+//
 // [手数料の初期値]
 // 取引記録などで実測済みのプールは、その値から段階確認を始める。
 // 以前は一律で30bps以上から始めていたため、20bpsのプールでも30bpsとして
@@ -49,6 +55,7 @@ import { estimateGasCostUsd, gasUnitsToUsd } from "./gas-cost.js";
 import { getTokenDecimals, getTokenPriceUsd, setPoolFee, getPool, KIND_V2, KIND_V3 } from "./pool-registry.js";
 import { quoteV3Exact, quoteFromTable, clearQuoteTable } from "./v3-pools.js";
 import { markRouteRejected, markRouteConfirmed } from "./opportunity-scanner.js";
+import { scheduleCompetitorCheck } from "./competitor-check.js";
 
 const CONTRACT_ABI = [
   "function executeRoute(address asset, uint256 amount, (address pool, address tokenIn, address tokenOut, uint8 kind, uint256 minOut)[] legs) external",
@@ -253,7 +260,22 @@ function initialFees(chain, opp, legs) {
   return { feeBpsList, feeIndex };
 }
 
+/// 送信判定の入口。「誰が取ったか」の確認を予約してから本体を実行し、
+/// 送信直前の結果を opp.sendResult に残す。
 export async function executeOpportunity(opp) {
+  scheduleCompetitorCheck(opp);
+  try {
+    const ok = await executeOpportunityInner(opp);
+    if (ok) opp.sendResult = "sent_success";
+    else if (!opp.sendResult) opp.sendResult = "skipped";
+    return ok;
+  } catch (e) {
+    opp.sendResult = `failed_${e instanceof ExecutionError ? e.stage : "unknown"}`;
+    throw e;
+  }
+}
+
+async function executeOpportunityInner(opp) {
   const startedAt = Date.now();
   const chain = opp.chain;
   const chainConfig = getChainConfig(chain);
@@ -318,6 +340,7 @@ export async function executeOpportunity(opp) {
         recordLearnedFees(chain, opp, legs, feeBpsList, built.fromPool);
         discardStaleV3Tables(chain, legs, built);
         markRouteRejected(opp);
+        opp.sendResult = "rejected";
         console.log(`[実行] ${opp.label}: 送信直前の正確な見積もりでは赤字(手数料${feeBpsList.join("/")}bps)。プールが動くまで再判定しません`);
         return false;
       }
@@ -368,6 +391,7 @@ export async function executeOpportunity(opp) {
   if (built.finalOut <= amountIn) {
     discardStaleV3Tables(chain, legs, built);
     markRouteRejected(opp);
+    opp.sendResult = "rejected";
     console.log(`[実行] ${opp.label}: 一周して得た量が返済額に届かず見送り。プールが動くまで再判定しません`);
     return false;
   }
@@ -381,11 +405,13 @@ export async function executeOpportunity(opp) {
 
   if (finalProfitUsd < MIN_PROFIT_USD) {
     markRouteRejected(opp);
+    opp.sendResult = "below_gas";
     console.log(`[実行] ${opp.label}: ガス代差引後$${finalProfitUsd.toFixed(4)}が下限$${MIN_PROFIT_USD}未満のため見送り(粗利$${grossProfitUsd.toFixed(4)} ガス$${gasCostUsd.toFixed(4)})`);
     return false;
   }
 
   markRouteConfirmed(opp);
+  opp.sendResult = "confirmed";
   const readyMs = Date.now() - startedAt;
   console.log(`[実行] ${opp.kind} ${chain} ${opp.label}: 送信します(投入$${tradeUsd.toFixed(2)} 純利益$${finalProfitUsd.toFixed(4)} ガス$${gasCostUsd.toFixed(4)}/${gasUnits} 準備${readyMs}ms)`);
 
