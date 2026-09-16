@@ -1,75 +1,55 @@
 // scripts/mainnet-deploy.js
 //
-// テストネットで検証済みの同じコントラクトを、実際のmainnetにデプロイする。
-// RUN_MAINNET_DEPLOY にチェーン名(base/polygon/optimism/avalanche)を
-// 設定した場合のみ、起動時に1回だけ実行される(index.js側のフックから
-// 呼び出される)。
+// 本番チェーンへコントラクトをデプロイする。
 //
-// bot専用ウォレット(取引資金ではなくガス代の備蓄のみを保有)から実行する。
-// 同じ秘密鍵をEVM互換の全チェーンで共通して使う。
+// [変更] フラッシュスワップ方式に変えたため、Aaveのアドレスを渡す必要が
+// なくなった。コンストラクタは引数なしになっている。
+//
+// 使い方: 環境変数 RUN_MAINNET_DEPLOY にチェーン名を入れて起動する。
+// デプロイ後、表示されたアドレスを MAINNET_CONTRACT_ADDRESS_<CHAIN> に
+// 設定し、RUN_MAINNET_DEPLOY を false に戻す。
 
 import { ethers } from "ethers";
-import { compileContract } from "./compile-contract.js";
 import { getChainConfig } from "../chain-config.js";
+import { compileContract } from "./compile-contract.js";
 
-export async function runMainnetDeploy(chainKey) {
+export async function runMainnetDeploy(chain) {
+  const chainKey = (chain || "").toLowerCase();
   const config = getChainConfig(chainKey);
   if (!config) {
-    console.error(`[本番デプロイ] 未対応のチェーン: ${chainKey}`);
-    return;
+    console.error(`[本番デプロイ] 未対応のチェーン: ${chain}`);
+    return null;
   }
-
-  console.log(`[本番デプロイ] 開始: ${chainKey} mainnetへのデプロイ`);
 
   const privateKey = process.env.MAINNET_BOT_PRIVATE_KEY;
   if (!privateKey) {
-    console.warn("[本番デプロイ] MAINNET_BOT_PRIVATE_KEYが未設定のためスキップします");
-    return;
+    console.error("[本番デプロイ] MAINNET_BOT_PRIVATE_KEY が未設定です");
+    return null;
   }
 
-  console.log("[本番デプロイ] コンパイル中...");
-  const { abi, bytecode } = compileContract();
-  console.log("[本番デプロイ] コンパイル成功");
+  console.log(`[本番デプロイ] ${chainKey} へのデプロイを開始します`);
 
-  const provider = new ethers.JsonRpcProvider(config.rpcUrl);
+  const { abi, bytecode } = await compileContract();
+  const provider = new ethers.JsonRpcProvider(config.rpcUrl, ethers.Network.from(config.chainId), {
+    staticNetwork: ethers.Network.from(config.chainId),
+  });
   const wallet = new ethers.Wallet(privateKey, provider);
 
   const balance = await provider.getBalance(wallet.address);
-  console.log(`[本番デプロイ] デプロイ用ウォレット: ${wallet.address} (残高: ${ethers.formatEther(balance)})`);
-
-  console.log(`[本番デプロイ] Aave PoolAddressesProvider: ${config.aavePoolAddressesProvider}`);
+  console.log(`[本番デプロイ] ウォレット ${wallet.address} の残高: ${ethers.formatEther(balance)}`);
+  if (balance === 0n) {
+    console.error("[本番デプロイ] 残高が0のためデプロイできません");
+    return null;
+  }
 
   const factory = new ethers.ContractFactory(abi, bytecode, wallet);
-  console.log("[本番デプロイ] デプロイ送信中...");
-  const contract = await factory.deploy(config.aavePoolAddressesProvider);
-  const deployTx = contract.deploymentTransaction();
-  console.log(`[本番デプロイ] トランザクション送信済み: ${deployTx.hash}`);
-
+  // フラッシュスワップ方式のため、コンストラクタに引数はない。
+  const contract = await factory.deploy();
+  console.log(`[本番デプロイ] 送信しました。確定を待っています…`);
   await contract.waitForDeployment();
-  const deployedAddress = await contract.getAddress();
-  const txReceipt = await provider.getTransactionReceipt(deployTx.hash);
 
-  console.log(`[本番デプロイ] デプロイ成功: ${deployedAddress}`);
-  console.log(`[本番デプロイ] 使用ガス: ${txReceipt.gasUsed.toString()} units`);
-  console.log(`[本番デプロイ] ガス代: ${ethers.formatEther(txReceipt.gasUsed * txReceipt.gasPrice)}`);
-  console.log(`[本番デプロイ] 確認用: ${config.explorerTxUrl(deployTx.hash)}`);
-
-  const retryDelaysMs = [1000, 2000, 4000];
-  let deployedPool = null;
-  for (const delayMs of retryDelaysMs) {
-    await new Promise((r) => setTimeout(r, delayMs));
-    try {
-      deployedPool = await contract.POOL();
-      break;
-    } catch (e) {
-      console.warn(`[本番デプロイ] POOL確認コール失敗(${delayMs}ms待機後)、再試行します:`, e.message);
-    }
-  }
-
-  if (deployedPool) {
-    console.log(`[本番デプロイ] コントラクトが認識しているAave Poolアドレス: ${deployedPool}`);
-  }
-
-  console.log(`[本番デプロイ] === 重要: 環境変数 ${config.contractAddressEnvVar} にこのアドレスを設定してください === ${deployedAddress}`);
-  console.log("[本番デプロイ] 完了");
+  const address = await contract.getAddress();
+  console.log(`[本番デプロイ] ${chainKey} 完了: ${address}`);
+  console.log(`[本番デプロイ] 環境変数 ${config.contractAddressEnvVar} に上記を設定し、RUN_MAINNET_DEPLOY を false に戻してください`);
+  return address;
 }
