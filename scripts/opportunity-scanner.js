@@ -4,29 +4,30 @@
 // RPCへの問い合わせを一切行わず、全てメモリ上の計算で完結するため、
 // イベントが届いた瞬間(ミリ秒単位)に判定できる。
 //
+// [V3の扱いを変更]
+// 現在価格と流動性だけから受取量を近似していたが、公式Quoterより最大2,184%も
+// 過大な値を返していた(2026年9月16日)。V3は価格帯ごとに流動性が分かれており、
+// 近似式では表現できない。
+// 代わりに、プールごとに公式Quoterで作った「価格表」から補間する。
+// 表に載っていない範囲(極端に大きい投入額)は判定に使わない。
+//
 // [フラッシュスワップ方式]
-// 経路の最初のプール自身から借りるため、Aaveの手数料0.05%がかからなくなった。
-// 判定でもこの手数料を差し引かない。
+// 経路の最初のプール自身から借りるため、借入手数料はかからない。
 //
 // [V2とV3の混在]
 // 経路の各段はV2形式でもV3形式でも構わない。同じペアにV2とV3が共存している
 // 場合が最も機会が生まれやすいため、それらを優先して組み合わせる。
-//   V2 … 準備量(x·y=k)から計算する。
-//   V3 … 現在価格と流動性から概算する(価格帯をまたぐと誤差が出るため、
-//        送信直前に公式のQuoterで正確に確認する)。
 
 import {
   getPoolsForPair, getPoolsForToken, getArbitragablePairs,
   getTokenDecimals, getTokenPriceUsd, getPool, hasUsableState,
   KIND_V2, KIND_V3,
 } from "./pool-registry.js";
-import { estimateV3AmountOut } from "./v3-pools.js";
+import { quoteFromTable, hasQuoteTable, getTableRange } from "./v3-pools.js";
 
 const MIN_TRADE_USD = parseFloat(process.env.MIN_TRADE_USD || "0");
 // 手数料が未実測のV2プールに当てる想定値。30bpsは楽観的すぎることが多い。
 const UNPROBED_FEE_BPS = parseInt(process.env.UNPROBED_FEE_BPS || "45", 10);
-// V3の概算は価格帯をまたぐと過大になるため、この割合だけ割り引いて見る。
-const V3_ESTIMATE_DISCOUNT_BPS = parseInt(process.env.V3_ESTIMATE_DISCOUNT_BPS || "15", 10);
 
 function effectiveFeeBps(pool) {
   if (pool.kind === KIND_V3) return pool.feeBps;
@@ -40,17 +41,13 @@ function getAmountOutV2(amountIn, reserveIn, reserveOut, feeBps) {
   return denominator === 0n ? 0n : (amountInWithFee * reserveOut) / denominator;
 }
 
+/// 1段の受取量。V3は公式Quoterで作った価格表から補間する。
 function legAmountOut(leg, amountIn) {
   if (amountIn <= 0n) return 0n;
   if (leg.kind === KIND_V3) {
-    const out = estimateV3AmountOut({
-      amountIn,
-      sqrtPriceX96: leg.sqrtPriceX96,
-      liquidity: leg.liquidity,
-      feeBps: leg.feeBps,
-      zeroForOne: leg.zeroForOne,
+    return quoteFromTable({
+      chain: leg.chain, pool: leg.pool, zeroForOne: leg.zeroForOne, amountIn,
     });
-    return (out * (10000n - BigInt(V3_ESTIMATE_DISCOUNT_BPS))) / 10000n;
   }
   return getAmountOutV2(amountIn, leg.reserveIn, leg.reserveOut, leg.feeBps);
 }
@@ -61,6 +58,7 @@ function orient(pool, tokenIn) {
   const tokenOut = isToken0In ? pool.token1 : pool.token0;
   const base = {
     kind: pool.kind,
+    chain: pool.chain,
     pool: pool.address,
     dexId: pool.dexId,
     tokenIn: inLower,
@@ -78,11 +76,18 @@ function orient(pool, tokenIn) {
   };
 }
 
+/// その段が判定に使える状態か。V3は価格表が必要。
+function legIsUsable(leg) {
+  if (leg.kind === KIND_V3) return hasQuoteTable(leg.chain, leg.pool, leg.zeroForOne);
+  return leg.reserveIn > 0n && leg.reserveOut > 0n;
+}
+
+/// 現在の交換比率の概算(どちらが安いかの比較用)。
 function rateOf(leg) {
   if (leg.kind === KIND_V3) {
     if (leg.sqrtPriceX96 <= 0n) return 0;
     const r = Number(leg.sqrtPriceX96) / Number(2n ** 96n);
-    const price = r * r;
+    const price = r * r; // token1 / token0
     return leg.zeroForOne ? price : (price > 0 ? 1 / price : 0);
   }
   if (leg.reserveIn <= 0n) return 0;
@@ -98,11 +103,23 @@ function simulateRoute(amountIn, legs) {
   return amount;
 }
 
+/// 経路全体で使える投入額の上限。V3の価格表の範囲を超える額は判定できない。
+function routeMaxAmountIn(maxAmountIn, legs) {
+  const first = legs[0];
+  if (first.kind !== KIND_V3) return maxAmountIn;
+  const range = getTableRange(first.chain, first.pool, first.zeroForOne);
+  if (!range) return 0n;
+  return maxAmountIn < range.max ? maxAmountIn : range.max;
+}
+
 function findBestAmount(maxAmountIn, legs) {
   let best = { amountIn: 0n, amountOut: 0n, profit: 0n };
-  const ratios = [0.005, 0.01, 0.02, 0.04, 0.07, 0.12, 0.2, 0.3, 0.45, 0.6, 0.8, 1.0];
+  const cap = routeMaxAmountIn(maxAmountIn, legs);
+  if (cap <= 0n) return best;
+
+  const ratios = [0.01, 0.02, 0.04, 0.07, 0.12, 0.2, 0.3, 0.45, 0.6, 0.8, 1.0];
   for (const r of ratios) {
-    const amountIn = (maxAmountIn * BigInt(Math.round(r * 100000))) / 100000n;
+    const amountIn = (cap * BigInt(Math.round(r * 100000))) / 100000n;
     if (amountIn <= 0n) continue;
     const amountOut = simulateRoute(amountIn, legs);
     const profit = amountOut - amountIn;
@@ -111,7 +128,7 @@ function findBestAmount(maxAmountIn, legs) {
   if (best.amountIn > 0n) {
     for (const r of [0.7, 0.85, 1.15, 1.3]) {
       const amountIn = (best.amountIn * BigInt(Math.round(r * 1000))) / 1000n;
-      if (amountIn <= 0n || amountIn > maxAmountIn) continue;
+      if (amountIn <= 0n || amountIn > cap) continue;
       const amountOut = simulateRoute(amountIn, legs);
       const profit = amountOut - amountIn;
       if (profit > best.profit) best = { amountIn, amountOut, profit };
@@ -178,6 +195,7 @@ export function scanTwoStep({ chain, tokenA, tokenB, pools, capUsd, gasCostUsd, 
     for (const p of usable) {
       const leg = orient(p, borrow);
       if (leg.tokenOut !== other.toLowerCase()) continue;
+      if (!legIsUsable(leg)) continue;
       const rate = rateOf(leg);
       if (!isFinite(rate) || rate <= 0) continue;
       priced.push({ pool: p, leg, rate });
@@ -189,6 +207,7 @@ export function scanTwoStep({ chain, tokenA, tokenB, pools, capUsd, gasCostUsd, 
     if (buySide.pool.address.toLowerCase() === sellSide.pool.address.toLowerCase()) continue;
     const leg2 = orient(sellSide.pool, other);
     if (leg2.tokenOut !== borrow.toLowerCase()) continue;
+    if (!legIsUsable(leg2)) continue;
 
     const legs = [buySide.leg, leg2];
     const result = finalize({
@@ -214,6 +233,7 @@ export function scanTrianglesForPool({ chain, pool, capUsd, gasCostUsd, isBorrow
     if (!maxAmountIn) continue;
     const leg1 = orient(pool, tokenA);
     if (leg1.tokenOut !== tokenB) continue;
+    if (!legIsUsable(leg1)) continue;
 
     for (const pool2 of getPoolsForToken(chain, tokenB)) {
       if (examined > maxRoutes) break;
@@ -222,6 +242,7 @@ export function scanTrianglesForPool({ chain, pool, capUsd, gasCostUsd, isBorrow
       const leg2 = orient(pool2, tokenB);
       const tokenC = leg2.tokenOut;
       if (tokenC === tokenA) continue;
+      if (!legIsUsable(leg2)) continue;
 
       for (const pool3 of getPoolsForPair(chain, tokenC, tokenA)) {
         const addr3 = pool3.address.toLowerCase();
@@ -229,6 +250,7 @@ export function scanTrianglesForPool({ chain, pool, capUsd, gasCostUsd, isBorrow
         if (!hasUsableState(pool3)) continue;
         const leg3 = orient(pool3, tokenC);
         if (leg3.tokenOut !== tokenA) continue;
+        if (!legIsUsable(leg3)) continue;
         examined++;
         if (examined > maxRoutes) break;
 
