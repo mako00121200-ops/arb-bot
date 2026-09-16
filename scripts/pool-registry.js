@@ -3,15 +3,19 @@
 // 全プールの状態をメモリ上に保持する「プール地図」。V2形式とV3形式の両方を
 // 同じ索引で扱う。
 //
-// [監視対象の絞り込み]
-// 44,000プール全てを購読すると、月3,000〜5,000万件のイベントが届き、
-// リクエスト単位で課金されるRPCでは月$200〜500かかる。実際に2段の裁定が
-// 成立するのは「同じペアに2つ以上のプールがある」候補だけ(約3,000プール)
-// なので、起動時にそこへ絞る。絞った後は購読・読み直し・経路探索の全てが
-// この候補だけを対象にするため、消費量が1/15になる。
+// [監視対象の絞り込み(2026年9月17日に変更)]
+// 以前は「同じペアに2つ以上のプールがある」V2プールを全て残していた
+// (Polygonだけで3,065件)。実測では、V2だけで組んだ経路の黒字は全て
+// 税トークンか$2〜10の極小で、送信直前まで進んだ機会は全てV3を含む経路
+// だった。V2だけの経路は判定しない(opportunity-scanner.js)ことにしたので、
+// V2プールは「V3を含む経路の片脚になれるもの」だけを残す。
+//   残す条件: V2プールの2つのトークンが、両方ともいずれかのV3プールに
+//            含まれている(=V3プールと同じペア、またはV3プールと三角形を作れる)
+// V3プールは主要な通貨の組で作られているため、この条件で長い尾の銘柄
+// (税トークンの温床)が外れ、イベント受信と判定の無駄が大きく減る。
 //
 // [永続化]
-// 地図の全体像(44,000件)はファイルに残し、次回の絞り込みの材料にする。
+// 地図の全体像はファイルに残し、次回の絞り込みの材料にする。
 // 状態(準備量・価格)は保存しない(古い値で判定しないため)。
 
 import fs from "fs";
@@ -82,25 +86,45 @@ export function removePool(chain, address) {
   return true;
 }
 
-/// 裁定候補だけを残し、それ以外を地図から外す。
-/// 候補 = 「同じペアに2つ以上のプールがある」ペアに属するプール。
-/// V3プールは借りられる通貨の組で作られているため全て残す。
+/// V3を含む経路の材料になるプールだけを残し、それ以外を地図から外す。
+/// V3プールは全て残す。V2プールは、2つのトークンが両方とも同じチェーンの
+/// いずれかのV3プールに含まれるものだけを残す。
 export function pruneToCandidates() {
+  const v3Tokens = new Set(); // "chain::token"
+  const chainsWithV3 = new Set();
+  for (const p of pools.values()) {
+    if (p.kind !== KIND_V3) continue;
+    chainsWithV3.add(p.chain);
+    v3Tokens.add(tokenKey(p.chain, p.token0));
+    v3Tokens.add(tokenKey(p.chain, p.token1));
+  }
+
   const keep = new Set();
-  for (const [, set] of byPair.entries()) {
-    if (set.size >= 2) for (const k of set) keep.add(k);
-  }
+  let keptV2 = 0, removedV2 = 0, removedOther = 0;
   for (const [k, p] of pools.entries()) {
-    if (p.kind === KIND_V3) keep.add(k);
+    if (p.kind === KIND_V3) { keep.add(k); continue; }
+    if (!chainsWithV3.has(p.chain)) {
+      // 保存済みの地図にV3がまだ無いチェーン(地図を作り直した直後など)は、
+      // V2を全て外してしまわないよう、従来の条件(同じペアに2つ以上)で残す。
+      if ((byPair.get(pairKey(p.chain, p.token0, p.token1))?.size || 0) >= 2) {
+        keep.add(k);
+        keptV2++;
+      }
+      continue;
+    }
+    if (v3Tokens.has(tokenKey(p.chain, p.token0)) && v3Tokens.has(tokenKey(p.chain, p.token1))) {
+      keep.add(k);
+      keptV2++;
+    }
   }
-  let removed = 0;
   for (const k of [...pools.keys()]) {
     if (keep.has(k)) continue;
     const p = pools.get(k);
+    if (p.kind === KIND_V2) removedV2++; else removedOther++;
     removePool(p.chain, p.address);
-    removed++;
   }
-  return { kept: pools.size, removed };
+  console.log(`[絞り込み] V2はV3と経路を組めるものだけ残します: V2 ${keptV2}件を残し、${removedV2}件を外しました`);
+  return { kept: pools.size, removed: removedV2 + removedOther };
 }
 
 /// 購読すべきプールのアドレス一覧(チェーン別)。
