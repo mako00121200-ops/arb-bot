@@ -26,6 +26,15 @@
 // フラッシュスワップ方式で出る文言では段階確認が働かず、即座に失敗扱いに
 // なっていた(2026年9月16日に修正)。
 //
+// [送信直前に赤字と分かった時(2026年9月16日追加)]
+// ・その経路は、経路上のプールの状態が変わるまで判定から外す
+//   (opportunity-scanner.js の markRouteRejected)。同じ経路を毎分判定して
+//   毎分見送る繰り返しを止め、「本物の黒字判定」の件数を正しく数える。
+// ・V3の段で、価格表の値が公式Quoterより高く出ていたら、その表は古いと
+//   みなして破棄し、作り直しに回す。幻の黒字の発生源を元から断つ。
+// ・送信直前でも黒字だった経路は markRouteConfirmed で数え、判定の精度
+//   (黒字判定のうち本物だった割合)を5分ごとにログに出す。
+//
 // [手数料の初期値]
 // 取引記録などで実測済みのプールは、その値から段階確認を始める。
 // 以前は一律で30bps以上から始めていたため、20bpsのプールでも30bpsとして
@@ -38,7 +47,8 @@ import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
 import { recordRealExecution } from "./real-execution-log.js";
 import { estimateGasCostUsd, gasUnitsToUsd } from "./gas-cost.js";
 import { getTokenDecimals, getTokenPriceUsd, setPoolFee, getPool, KIND_V2, KIND_V3 } from "./pool-registry.js";
-import { quoteV3Exact } from "./v3-pools.js";
+import { quoteV3Exact, quoteFromTable, clearQuoteTable } from "./v3-pools.js";
+import { markRouteRejected, markRouteConfirmed } from "./opportunity-scanner.js";
 
 const CONTRACT_ABI = [
   "function executeRoute(address asset, uint256 amount, (address pool, address tokenIn, address tokenOut, uint8 kind, uint256 minOut)[] legs) external",
@@ -58,6 +68,8 @@ const MIN_PROFIT_USD = parseFloat(process.env.MIN_PROFIT_USD || "0.01");
 const SAFETY_MARGIN_BPS = 5n;
 const FEE_LADDER = [30, 35, 40, 45, 50, 60, 70, 80, 90, 100];
 export const TAX_TOKEN_FEE_BPS = parseInt(process.env.TAX_TOKEN_FEE_BPS || "100", 10);
+// V3の価格表が公式Quoterよりこれ以上高く出ていたら、表を破棄して作り直す。
+const V3_TABLE_DRIFT_BPS = BigInt(parseInt(process.env.V3_TABLE_DRIFT_BPS || "10", 10));
 
 const CONTRACT_KIND_V2 = 0;
 const CONTRACT_KIND_V3 = 1;
@@ -155,18 +167,43 @@ async function quoteLeg({ chain, leg, amountIn, feeBpsOverride }) {
 /// 1段目は「最初のプールから先に受け取る量」で、これが経路の入力になる。
 /// 最後の段で得た量が amountIn(返済額)を上回れば利益が出る。
 async function buildRequestedAmounts({ chain, legs, amountIn, feeBpsList }) {
-  const requested = [], fromPool = [];
+  const requested = [], fromPool = [], inputs = [], quoted = [];
   let amount = amountIn;
   for (let i = 0; i < legs.length; i++) {
     const q = await quoteLeg({ chain, leg: legs[i], amountIn: amount, feeBpsOverride: feeBpsList[i] });
     if (!q || q.amountOut <= 0n) return null;
     const req = (q.amountOut * (10000n - SAFETY_MARGIN_BPS)) / 10000n;
     if (req <= 0n) return null;
+    inputs.push(amount);
+    quoted.push(q.amountOut);
     requested.push(req);
     fromPool.push(q.fromPool);
     amount = req;
   }
-  return { requested, fromPool, finalOut: amount };
+  return { requested, fromPool, inputs, quoted, finalOut: amount };
+}
+
+/// V3の段で、判定に使った価格表が公式Quoterより高く出ていたら表を破棄する。
+/// 破棄した表は作り直しの対象になり、それまでそのプールは判定に使われない。
+function discardStaleV3Tables(chain, legs, built) {
+  const discarded = [];
+  for (let i = 0; i < legs.length; i++) {
+    const leg = legs[i];
+    if (leg.kind !== KIND_V3) continue;
+    const input = built.inputs[i];
+    const exact = built.quoted[i];
+    if (!input || !exact || exact <= 0n) continue;
+    const estimated = quoteFromTable({ chain, pool: leg.pool, zeroForOne: leg.zeroForOne, amountIn: input });
+    if (estimated <= 0n) continue;
+    if (estimated * 10000n > exact * (10000n + V3_TABLE_DRIFT_BPS)) {
+      clearQuoteTable(chain, leg.pool);
+      const diffPercent = Number(((estimated - exact) * 100000n) / exact) / 1000;
+      discarded.push(`${leg.pool.slice(0, 10)}…(表が公式より+${diffPercent.toFixed(3)}%)`);
+    }
+  }
+  if (discarded.length > 0) {
+    console.log(`[V3価格表] ${chain}: 公式Quoterより高く出ていた表を破棄しました ${discarded.join(" ")}`);
+  }
 }
 
 function recordLearnedFees(chain, opp, legs, feeBpsList, fromPool) {
@@ -279,7 +316,9 @@ export async function executeOpportunity(opp) {
 
       if (isNotProfitableRevert(lastError)) {
         recordLearnedFees(chain, opp, legs, feeBpsList, built.fromPool);
-        console.log(`[実行] ${opp.label}: 実測手数料${feeBpsList.join("/")}bpsでは利益が出ないため見送り`);
+        discardStaleV3Tables(chain, legs, built);
+        markRouteRejected(opp);
+        console.log(`[実行] ${opp.label}: 送信直前の正確な見積もりでは赤字(手数料${feeBpsList.join("/")}bps)。プールが動くまで再判定しません`);
         return false;
       }
       if (!isKRevert(lastError) && !isShortfallRevert(lastError)) {
@@ -327,7 +366,9 @@ export async function executeOpportunity(opp) {
   const { built, legArgs, gasUnits } = success;
   // 返済額は投入額そのもの。一周して得た量がこれを上回れば利益。
   if (built.finalOut <= amountIn) {
-    console.log(`[実行] ${opp.label}: 一周して得た量が返済額に届かず見送り`);
+    discardStaleV3Tables(chain, legs, built);
+    markRouteRejected(opp);
+    console.log(`[実行] ${opp.label}: 一周して得た量が返済額に届かず見送り。プールが動くまで再判定しません`);
     return false;
   }
 
@@ -339,10 +380,12 @@ export async function executeOpportunity(opp) {
   const finalProfitUsd = grossProfitUsd - gasCostUsd;
 
   if (finalProfitUsd < MIN_PROFIT_USD) {
+    markRouteRejected(opp);
     console.log(`[実行] ${opp.label}: ガス代差引後$${finalProfitUsd.toFixed(4)}が下限$${MIN_PROFIT_USD}未満のため見送り(粗利$${grossProfitUsd.toFixed(4)} ガス$${gasCostUsd.toFixed(4)})`);
     return false;
   }
 
+  markRouteConfirmed(opp);
   const readyMs = Date.now() - startedAt;
   console.log(`[実行] ${opp.kind} ${chain} ${opp.label}: 送信します(投入$${tradeUsd.toFixed(2)} 純利益$${finalProfitUsd.toFixed(4)} ガス$${gasCostUsd.toFixed(4)}/${gasUnits} 準備${readyMs}ms)`);
 
