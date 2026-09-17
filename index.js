@@ -51,7 +51,7 @@ import {
   getArbitragablePairs, savePoolMap, loadPoolMap, snapshotFullMap,
   hasUsableState, clearPoolState, formatStateDiagnostics, KIND_V2, KIND_V3,
 } from "./scripts/pool-registry.js";
-import { scanForChangedPool, scanAllPairs } from "./scripts/opportunity-scanner.js";
+import { scanForChangedPool, scanAllPairs, getRouteCalcStats } from "./scripts/opportunity-scanner.js";
 import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS } from "./scripts/execute-opportunity.js";
 import {
   getKnownTokens, isStableToken, isBorrowable,
@@ -229,6 +229,14 @@ function record(opp, outcome, extra = {}) {
     netProfitUsd: Number(opp.netProfitUsd?.toFixed?.(6) ?? 0),
     feeWallPercent: opp.feeWallPercent,
     pools: opp.poolAddresses,
+    // 送信まで進んだ機会は、確定した実際の値も残す。これが無いと
+    // 記録簿の「実際に得た利益」が構造的に常に0になる。
+    ...(opp.actualProfitUsd != null ? { actualProfitUsd: opp.actualProfitUsd } : {}),
+    ...(opp.actualGasCostUsd != null ? { actualGasCostUsd: opp.actualGasCostUsd } : {}),
+    ...(opp.actualNetProfitUsd != null ? { actualNetProfitUsd: opp.actualNetProfitUsd } : {}),
+    // 送信直前の確認でどれだけ足りなかったか(赤字だった場合)。
+    ...(opp.shortfallBps != null ? { shortfallBps: opp.shortfallBps } : {}),
+    ...(opp.sendResult ? { sendResult: opp.sendResult } : {}),
     ...extra,
   });
 }
@@ -958,7 +966,12 @@ function heartbeat() {
   } catch (e) {
     usageLine = " 枠[計測できず: " + e.message + "]";
   }
-  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}(待${stats.quoteTablesPending} 定期で作り直し${stats.quoteRebuildsFromPolling}) スキャン${stats.scans} 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}] 失敗段階[${stageLine}] 受信[${ev}] 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}`);
+  // 価格表は「プール×方向」ごとに要る。分母が無いと揃っているように見えてしまう。
+  // V3の段は価格表が無いと使えないので、欠けている分はそのまま経路が組めない。
+  let v3Total = 0;
+  for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
+  const rc = getRouteCalcStats();
+  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 定期で作り直し${stats.quoteRebuildsFromPolling}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable} 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}] 失敗段階[${stageLine}] 受信[${ev}] 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}`);
 
   // 判定の手前で何件が脱落しているかを出す。スキャンは回っているのに経路が
   // 1本も評価されない状態が続いたため、どの段階で落ちているかを見えるようにする。
@@ -1018,6 +1031,25 @@ function renderPage() {
     <td style="text-align:right">$${e.tradeAmountUsd.toFixed(2)}</td>
     <td style="text-align:right;color:#2ecc71;font-weight:600">${netOf(e) != null ? `+$${netOf(e).toFixed(4)}` : '-'}<br><span style="color:#888;font-weight:400;font-size:9px">粗${e.actualProfitUsd != null ? `$${e.actualProfitUsd.toFixed(4)}` : '-'} ガス${gasOf(e) != null ? `$${gasOf(e).toFixed(4)}` : '-'}</span></td>
     <td><a href="${e.explorerUrl}" target="_blank">確認</a></td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ実際の取引はありません</td></tr>`;
+
+  // 記録簿の outcome を日本語にする。なぜ取れなかったかを一目で読めるように。
+  const OUTCOME_LABEL = {
+    success: "成功", not_sent: "送信直前に見送り", failed: "送信失敗",
+    below_min: "最低利益未満", trap: "罠の疑い", tax_token: "税トークン",
+    unprofitable: "赤字", skipped_cooldown: "冷却中", not_profitable_onchain: "実測で赤字",
+  };
+  const outcomeLine = Object.entries(sum.byOutcome)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, n]) => `${OUTCOME_LABEL[k] || k} ${n.toLocaleString()}`)
+    .join(' / ') || '記録なし';
+
+  // 黒字と判定したのに取れなかった上位。ここが改善の手がかりになる。
+  const missedRows = sum.topMissed.map((m, i) => `<tr><td>${i+1}</td>
+    <td style="font-size:9px">${m.kind || ''} ${m.chain || ''}${m.hasV3 ? ' <span style="color:#6fae62">V3</span>' : ''}<br>${m.label || ''}</td>
+    <td style="font-size:9px">${OUTCOME_LABEL[m.outcome] || m.outcome}${m.shortfallBps != null ? `<br><span style="color:#888">実測${m.shortfallBps.toFixed(1)}bps</span>` : ''}${m.stage ? `<br><span style="color:#888">${m.stage}</span>` : ''}</td>
+    <td style="text-align:right">$${(m.tradeAmountUsd ?? 0).toFixed(2)}</td>
+    <td style="text-align:right;color:#e8a33d;font-weight:600">+$${(m.netProfitUsd ?? 0).toFixed(4)}</td></tr>`).join('')
+    || `<tr><td colspan="5" style="color:#888">取り逃した黒字はありません</td></tr>`;
 
   const oppRows = stats.recent.slice(0, 10).map((o, i) => `<tr><td>${i+1}</td>
     <td style="font-size:9px">${o.kind} ${o.chain}${o.hasV3 ? ' <span style="color:#6fae62">V3</span>' : ''}<br>${o.label}</td>
@@ -1100,6 +1132,14 @@ function renderPage() {
 <div><div class="v" style="color:#e8a33d">+$${sum.profitableUsd.toFixed(3)}</div><div class="l">黒字判定の合計</div></div>
 <div><div class="v" style="color:#2ecc71">+$${sum.realizedUsd.toFixed(4)}</div><div class="l">実際に得た利益</div></div>
 <div><div class="v">${stats.bigMoves.toLocaleString()}</div><div class="l">大口取引の検知</div></div></div>
+<div class="note">なぜそうなったか: ${outcomeLine}<br>
+送信まで進んだ判定額: +$${sum.sentUsd.toFixed(4)}<br>
+<span style="color:#e8a33d">「黒字判定の合計」は同じ経路の再検知を何度も足した値で、送信直前の実測では赤字になる分も含みます。取り逃した金額ではありません。</span></div>
+
+<h2 style="margin-top:14px">黒字と判定したのに取れなかった上位</h2>
+<table><thead><tr><th>#</th><th>経路</th><th>理由</th><th style="text-align:right">投入</th><th style="text-align:right">判定額</th></tr></thead><tbody>${missedRows}</tbody></table>
+
+<h2 style="margin-top:14px">直近に検知した機会</h2>
 <table><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table></div>
 
 <div class="footerlink"><a href="/about">→ 仕組みについて</a></div></body></html>`;

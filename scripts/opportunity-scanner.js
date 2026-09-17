@@ -236,6 +236,17 @@ function maxAmountFromUsd(chain, token, capUsd) {
   } catch (e) { return null; }
 }
 
+/// 経路を何本計算し、そのうち何本が粗利プラスだったか。
+///
+/// [なぜ数えるか]
+/// 生存ログの「精査」は handleOpportunity に渡った件数、つまり
+/// 粗利がプラスだった件数であって、計算した経路の数ではない。
+/// この区別が無いために「判定が止まっている」と2度誤診した。
+/// 「計算はしているが機会が無い」のか「そもそも計算していない」のかを
+/// 見分けられるようにする。
+const routeCalcStats = { computed: 0, grossProfitable: 0 };
+export function getRouteCalcStats() { return { ...routeCalcStats }; }
+
 function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, poolAddresses }) {
   // V3を1段も含まない経路は判定しない。
   if (!legs.some((l) => l.kind === KIND_V3)) return null;
@@ -243,8 +254,12 @@ function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, p
   // 送信直前に赤字と確定し、その後どのプールも動いていない経路は計算しない。
   if (isSuppressed(chain, tokenA, poolAddresses)) return null;
 
+  routeCalcStats.computed++;
   const best = findBestAmount(maxAmountIn, legs);
+  // 粗利(ガス代を引く前)がプラスでなければ、そこで終わり。
+  // 裁定の機会が無い時はここで止まるのが正常。
   if (best.profit <= 0n) return null;
+  routeCalcStats.grossProfitable++;
 
   const decimals = getTokenDecimals(chain, tokenA);
   const priceUsd = getTokenPriceUsd(chain, tokenA);

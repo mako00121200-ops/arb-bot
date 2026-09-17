@@ -7,6 +7,14 @@
 // 「本来ならいくら取れたか」「なぜ取れなかったか」に根拠を持って答えるため。
 // ログだけでは流れてしまい、後から集計できなかった。
 //
+// [profitableUsd の読み方(誤解しやすい)]
+// 黒字と判定された記録の netProfitUsd を全部足しただけの値。同じ経路が
+// 再検知されるたびに加算されるので、同じ機会が何十回も計上される。
+// さらに、送信直前の実測では赤字になる「幻の黒字」も含む(2026年9月17日の
+// 実測で判定の精度は44%だった)。
+// 「取り逃した金額」ではないので、そのまま損失として読んではいけない。
+// 実際に何が起きたかは byOutcome と topMissed を見る。
+//
 // 1行1件のJSON(JSON Lines形式)で追記する。ファイルが大きくなったら
 // 古い行から切り捨てる。
 
@@ -77,7 +85,12 @@ export function summarize(hours = 24) {
     byChain[r.chain] = (byChain[r.chain] || 0) + 1;
     if (r.netProfitUsd > 0) profitableUsd += r.netProfitUsd;
     if (r.outcome === "sent" || r.outcome === "success") sentUsd += r.netProfitUsd || 0;
-    if (r.outcome === "success" && r.actualProfitUsd != null) realizedUsd += r.actualProfitUsd;
+    // 実際に手元に残った額。ガス代を引いた純利益があればそれを使い、
+    // 無ければ粗利からガス代を引いて補う(古い記録のため)。
+    if (r.outcome === "success") {
+      if (r.actualNetProfitUsd != null) realizedUsd += r.actualNetProfitUsd;
+      else if (r.actualProfitUsd != null) realizedUsd += r.actualProfitUsd - (r.actualGasCostUsd ?? 0);
+    }
     // 「黒字だったのに取れなかった」上位を控える。
     if (r.netProfitUsd > 0 && r.outcome !== "success") topMissed.push(r);
   }
