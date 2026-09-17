@@ -10,12 +10,14 @@
 // 設定し、RUN_MAINNET_DEPLOY を false に戻す。
 
 import { ethers } from "ethers";
-import { getChainConfig } from "../chain-config.js";
+import { getAnyChainConfig } from "../chain-config.js";
 import { compileContract } from "./compile-contract.js";
 
 export async function runMainnetDeploy(chain) {
   const chainKey = (chain || "").toLowerCase();
-  const config = getChainConfig(chainKey);
+  // 停止中(ACTIVE_CHAINS に入れていない)チェーンにもデプロイできるようにする。
+  // Base / Optimism は監視を止めたまま先にコントラクトだけ置く必要があるため。
+  const config = getAnyChainConfig(chainKey);
   if (!config) {
     console.error(`[本番デプロイ] 未対応のチェーン: ${chain}`);
     return null;

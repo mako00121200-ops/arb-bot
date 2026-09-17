@@ -61,7 +61,7 @@ import { getVerifiedPairs } from "./scripts/verified-pairs.js";
 import { isKnownIncompatiblePool, recordIncompatiblePool } from "./scripts/incompatible-pools.js";
 import { journal, loadJournal, trimJournalIfNeeded, summarize } from "./scripts/opportunity-journal.js";
 import {
-  V3_FACTORIES, V3_FEE_TIERS, findV3Pool, feeTierToBps,
+  activeV3Factories, isForkFactory, V3_FEE_TIERS, findV3Pool, feeTierToBps,
   buildQuoteTablesBatch, hasQuoteTable, clearQuoteTable, countQuoteTables,
   verifyQuoteTable, QUOTE_SAMPLES_USD,
 } from "./scripts/v3-pools.js";
@@ -361,7 +361,11 @@ function quoteJobsForPool(pool) {
       if (amount) amountsIn.push(amount);
     }
     if (amountsIn.length === 0) continue;
-    jobs.push({ pool: pool.address, zeroForOne, tokenIn, tokenOut, feeTier: pool.feeTier, amountsIn });
+    // フォークのプールは公式Quoterでは正しく見積もれないので、その旨を渡す。
+    jobs.push({
+      pool: pool.address, zeroForOne, tokenIn, tokenOut,
+      feeTier: pool.feeTier, amountsIn, fork: isForkFactory(chain, pool.factory),
+    });
   }
   return jobs;
 }
@@ -438,6 +442,8 @@ async function verifyV3Calculations() {
     for (const pool of getPoolsByKind(chain, KIND_V3)) {
       if (disabledPools.has(poolKeyOf(chain, pool.address))) continue;
       if (!hasQuoteTable(chain, pool.address, true)) continue;
+      // フォークのプールは公式Quoterで引けないため、この検証の対象外にする。
+      if (isForkFactory(chain, pool.factory)) continue;
       candidates.push(pool);
     }
   }
@@ -470,28 +476,44 @@ async function verifyV3Calculations() {
 }
 
 // ===== V3プールの発見と状態 =====
+// Algebra系のプールは手数料が動的なので、手数料帯という概念を持たない。
+// 実際の手数料は見積もり表(quote table)の結果に既に含まれているため、
+// ここの値は画面表示と記録に使うだけの目安で、損益の計算には使われない。
+const ALGEBRA_DISPLAY_FEE_BPS = 30;
+
 async function discoverV3PoolsForChain(chain) {
-  const factories = V3_FACTORIES[chain];
-  if (!factories) return 0;
+  // フォークのファクトリーは ENABLE_FORK_QUOTER に入れたチェーンでのみ対象になる。
+  const factories = activeV3Factories(chain);
+  if (factories.length === 0) return 0;
   const tokens = Object.keys(getKnownTokens(chain));
   if (tokens.length < 2) return 0;
   let found = 0;
   for (const factory of factories) {
+    // Algebra系は手数料帯の引数を取らないため、ペアごとに1回だけ問い合わせる。
+    const feeTiers = factory.style === "algebra" ? [null] : V3_FEE_TIERS;
+    let foundHere = 0;
     for (let i = 0; i < tokens.length; i++) {
       for (let j = i + 1; j < tokens.length; j++) {
-        for (const feeTier of V3_FEE_TIERS) {
-          const address = await findV3Pool(chain, factory.address, tokens[i], tokens[j], feeTier);
+        for (const feeTier of feeTiers) {
+          const address = await findV3Pool(chain, factory.address, tokens[i], tokens[j], feeTier, factory.style);
           if (!address) continue;
           if (isKnownIncompatiblePool(chain, address)) continue;
           const [t0, t1] = [tokens[i].toLowerCase(), tokens[j].toLowerCase()].sort();
           registerPool({
             chain, address, dexId: factory.dexId, factory: factory.address, kind: KIND_V3,
-            token0: t0, token1: t1, feeTier, feeBps: feeTierToBps(feeTier),
+            token0: t0, token1: t1, feeTier,
+            feeBps: feeTier == null ? ALGEBRA_DISPLAY_FEE_BPS : feeTierToBps(feeTier),
           });
-          found++;
+          foundHere++;
         }
       }
     }
+    // フォークは住所も呼び出し方式も未検証なので、件数を出して正否が分かるようにする。
+    // 0件が続く場合はアドレスか style(uniswap / algebra)の指定が誤っている。
+    if (factory.fork) {
+      console.log(`[発見] ${chain} ${factory.dexId}(${factory.style}): V3プール${foundHere}件`);
+    }
+    found += foundHere;
   }
   return found;
 }

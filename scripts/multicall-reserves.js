@@ -42,6 +42,14 @@ const QUOTER_IFACE = new ethers.Interface([
   "function quoteExactInputSingle((address tokenIn, address tokenOut, uint256 amountIn, uint24 fee, uint160 sqrtPriceLimitX96)) returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)",
 ]);
 
+/// 自前コントラクトの見積もり。プールのアドレスを直接渡すため、
+/// ファクトリーが何であっても使える(Uniswapのフォーク、Algebra系を含む)。
+/// QuoterV2 と同じで、結果は「わざと失敗させて」エラーとして返る。
+const FORK_QUOTER_IFACE = new ethers.Interface([
+  "function quoteV3(address pool, address tokenIn, uint256 amountIn)",
+  "error QuoteResult(uint256 amountOut)",
+]);
+
 const MAX_POOLS_PER_CALL = parseInt(process.env.MULTICALL_POOLS_PER_CALL || "100", 10);
 const MAX_TOKENS_PER_CALL = 120;
 const MAX_V3_POOLS_PER_CALL = parseInt(process.env.MULTICALL_V3_PER_CALL || "60", 10);
@@ -174,6 +182,58 @@ export async function quoteV3Batch(chain, quoterAddress, requests, priority = fa
 /// 経路の始点として使えるかの判断に必要。桁数が読めないトークンは
 /// 量の計算ができないため、始点にしない。
 /// 戻り値: Map<小文字アドレス, 数値>
+/// 自前コントラクトの quoteV3 で受取量をまとめて求める。
+///
+/// [なぜ要るか(2026年9月17日)]
+/// Uniswap公式の QuoterV2 は quoteExactInputSingle(tokenIn, tokenOut, fee) の形で、
+/// 引数にプールのアドレスが無い。中に固定されたファクトリーからアドレスを
+/// 計算するため、フォークのプールには一切届かない。
+/// 一方 legIsUsable() はV3の段に価格表を要求するので、価格表が作れない
+/// プールは経路に使えない。これが Polygon の RamsesX(V3 Swapの22%)も
+/// Optimism/Base の未監視ファクトリーも取れない根本原因だった。
+/// プールのアドレスを直接受け取る形にすれば、ファクトリーを問わず見積もれる。
+///
+/// [結果の受け取り方]
+/// QuoterV2 と同じで、スワップを実行してからわざと失敗させ、受取量を
+/// エラーとして返す。aggregate3 は allowFailure なら失敗した呼び出しの
+/// 戻りデータもそのまま返すので、そこから QuoteResult を読む。
+///
+/// @param requests [{ pool, tokenIn, amountIn }] の配列
+/// 戻り値: 同じ順番の配列。見積もれなかったものは null。
+export async function quoteV3ByPoolBatch(chain, contractAddress, requests, priority = false) {
+  const out = new Array(requests.length).fill(null);
+  if (!contractAddress || requests.length === 0) return out;
+  const target = ethers.getAddress(contractAddress);
+
+  for (let i = 0; i < requests.length; i += MAX_QUOTES_PER_CALL) {
+    const chunk = requests.slice(i, i + MAX_QUOTES_PER_CALL);
+    const calls = chunk.map((q) => ({
+      target, allowFailure: true,
+      callData: FORK_QUOTER_IFACE.encodeFunctionData("quoteV3", [
+        ethers.getAddress(q.pool), ethers.getAddress(q.tokenIn), q.amountIn,
+      ]),
+    }));
+    let returned;
+    try {
+      returned = await multicall(chain, calls, priority);
+    } catch (e) {
+      continue; // この塊は諦める。呼び出し側は null のまま扱う。
+    }
+    for (let j = 0; j < chunk.length; j++) {
+      const r = returned[j];
+      if (!r || !r.returnData || r.returnData === "0x") continue;
+      try {
+        const parsed = FORK_QUOTER_IFACE.parseError(r.returnData);
+        if (parsed && parsed.name === "QuoteResult") {
+          const amountOut = parsed.args.amountOut;
+          if (amountOut > 0n) out[i + j] = amountOut;
+        }
+      } catch (inner) {}
+    }
+  }
+  return out;
+}
+
 export async function fetchTokenDecimalsBatch(chain, addresses) {
   const result = new Map();
   for (let i = 0; i < addresses.length; i += MAX_TOKENS_PER_CALL) {

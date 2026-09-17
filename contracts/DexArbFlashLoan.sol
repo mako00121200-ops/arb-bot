@@ -84,11 +84,14 @@ contract DexArbFlashLoan {
     }
 
     error SimulationResult(uint256 returned, uint256 owed);
+    /// @dev quoteV3 の結果。QuoterV2 と同じで、わざと失敗させて値を返す。
+    error QuoteResult(uint256 amountOut);
 
     address private activePool;
     address private activePayToken;
     bool private inFlashSwap;
     bool private simulating;
+    bool private quoting;
 
     event RouteExecuted(address indexed asset, uint256 amountIn, uint256 profit, uint8 legCount);
     event Withdrawn(address indexed token, uint256 amount);
@@ -113,6 +116,37 @@ contract DexArbFlashLoan {
         simulating = true;
         _start(asset, amount, legs, 0);
         revert("DexArbFlashLoan: simulation did not finish");
+    }
+
+    /// @notice プールを指定して受取量を求める。eth_call 専用で、送信はしない。
+    ///
+    /// [なぜ要るか(2026年9月17日)]
+    /// Uniswap公式の QuoterV2 は quoteExactInputSingle(tokenIn, tokenOut, fee) の形で、
+    /// 引数にプールのアドレスが無い。中に固定されたファクトリーからアドレスを
+    /// 計算するため、フォークのプールには届かない。botの判定はV3の段に価格表を
+    /// 要求するので、価格表が作れないプールは経路に使えず、Polygonの RamsesX
+    /// (V3 Swapの22%)も Optimism/Base の未監視ファクトリーも取れなかった。
+    /// プールのアドレスを直接受け取れば、ファクトリーを問わず見積もれる。
+    /// コールバックは実行と同じものを使うので、対応済みの形式はそのまま扱える。
+    ///
+    /// onlyOwner は付けない。eth_call で値を読むだけで資産は動かず、
+    /// 価格表の作成は所有者以外の視点からも行えた方が扱いやすいため。
+    function quoteV3(address pool, address tokenIn, uint256 amountIn) external {
+        require(amountIn > 0, "DexArbFlashLoan: zero amount");
+        require(!inFlashSwap, "DexArbFlashLoan: reentrant");
+        quoting = true;
+        activePool = pool;
+        activePayToken = tokenIn;
+        bool zeroForOne = IAmmPoolV3(pool).token0() == tokenIn;
+        IAmmPoolV3(pool).swap(
+            address(this),
+            zeroForOne,
+            int256(amountIn),
+            zeroForOne ? MIN_SQRT_RATIO + 1 : MAX_SQRT_RATIO - 1,
+            new bytes(0)
+        );
+        // ここに来るのはプールが何も返さなかった時だけ。
+        revert("DexArbFlashLoan: quote did not finish");
     }
 
     function _start(address asset, uint256 amount, Leg[] calldata legs, uint256 minProfit) internal {
@@ -322,6 +356,12 @@ contract DexArbFlashLoan {
         uint256 owed = uint256(owedSigned);
 
         if (data.length == 0) {
+            // 見積もり中は支払わず、受け取れる量をそのまま返して取り消す。
+            // 受取側の差分(負のdelta)が受取量になる。
+            if (quoting) {
+                int256 receivedSigned = amount0Delta < 0 ? -amount0Delta : -amount1Delta;
+                revert QuoteResult(receivedSigned > 0 ? uint256(receivedSigned) : 0);
+            }
             _safeTransfer(activePayToken, msg.sender, owed);
             return;
         }
