@@ -35,7 +35,8 @@ import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
 import { runPoolSurvey } from "./scripts/pool-survey.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
-import { probePoolFeeBps, getRpcStatus, callWithRpc } from "./scripts/onchain-reserves.js";
+import { probePoolFeeBps, getRpcStatus, getRpcCallTotals, callWithRpc } from "./scripts/onchain-reserves.js";
+import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
 import {
   fetchReservesBatch, fetchPoolTokensBatch, fetchTokenDecimalsBatch,
   fetchV3StatesBatch, getMulticallStats,
@@ -923,9 +924,20 @@ function heartbeat() {
   const rpc = getRpcStatus();
   const queued = Object.entries(rpc).filter(([, v]) => v.queued > 0).map(([c, v]) => `${c}:${v.normalQueued}`).join(" ");
   const stageLine = Object.entries(failStages).map(([k, v]) => `${k}:${v}`).join(" ") || "なし";
-  const ev = Object.entries(getSyncStats()).map(([c, v]) => `${c}:${v.received}`).join(" ") || "なし";
+  const sync = getSyncStats();
+  const ev = Object.entries(sync).map(([c, v]) => `${c}:${v.received}`).join(" ") || "なし";
   const mc = getMulticallStats();
-  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}(待${stats.quoteTablesPending} 定期で作り直し${stats.quoteRebuildsFromPolling}) スキャン${stats.scans} 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 見送${reasons.notSent}] 失敗段階[${stageLine}] 受信[${ev}] 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]`);
+  // RPCの月間使用量を更新する。呼び出しとWebSocket受信の両方が枠を消費する。
+  // 生存ログは稼働の健全性を見る唯一の手段なので、使用量の計測が失敗しても
+  // ログ自体は必ず出るようにする。
+  let usageLine = "";
+  try {
+    const wsEvents = Object.values(sync).reduce((sum, v) => sum + (v.received || 0), 0);
+    usageLine = " " + formatRpcUsageLine(updateRpcUsage(getRpcCallTotals().total, wsEvents));
+  } catch (e) {
+    usageLine = " 枠[計測できず: " + e.message + "]";
+  }
+  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}(待${stats.quoteTablesPending} 定期で作り直し${stats.quoteRebuildsFromPolling}) スキャン${stats.scans} 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 見送${reasons.notSent}] 失敗段階[${stageLine}] 受信[${ev}] 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}`);
 }
 
 // ===== ダッシュボード =====
