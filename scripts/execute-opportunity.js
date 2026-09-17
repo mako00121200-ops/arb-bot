@@ -265,6 +265,12 @@ async function executeOpportunityInner(opp) {
     console.log(`[実行] 確定: 粗利+$${actualProfitUsd.toFixed(4)}(ガス代を確定できず)`);
   }
 
+  // 記録簿(opportunity-journal)にも確定値を載せるため opp に残す。
+  // これが無いと「実際に得た利益」が常に0のままになる。
+  opp.actualProfitUsd = actualProfitUsd;
+  opp.actualGasCostUsd = actualGasCostUsd;
+  opp.actualNetProfitUsd = actualNetProfitUsd;
+
   recordRealExecution({
     timestamp: new Date().toISOString(),
     pairLabel: `${opp.kind} ${chain} ${opp.label}`,

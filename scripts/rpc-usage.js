@@ -128,11 +128,6 @@ function summarize(data) {
   };
 }
 
-/// 保存済みの集計を、カウンタを更新せずに読む(ダッシュボード表示用)。
-export function getRpcUsageSummary() {
-  return summarize(load());
-}
-
 /// 生存ログ用の1行。枠に対する位置づけが一目で分かる形にする。
 export function formatRpcUsageLine(s) {
   const pct = s.percent.toFixed(2);
