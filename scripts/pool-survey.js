@@ -73,6 +73,20 @@ const SWAP_SIGNATURES = [
 ];
 const SWAP_TOPICS = SWAP_SIGNATURES.map((sig) => ethers.id(sig));
 
+/// V2形式(Uniswap V2 / Solidly系)は Sync で準備量の変化を知らせる。
+///
+/// [なぜV2も数えるか(2026年9月17日)]
+/// 実際に利益になった型は「V2でずれた直後にV3(0.05%)で戻す」で、手数料の壁は
+/// 0.35%だった。つまりV3だけ調べても足りず、相方になる低手数料のV2が
+/// そのチェーンに在るかどうかで成否が決まる。
+/// Base/Optimism は Aerodrome/Velodrome の手数料が約1%(実測)で、それしか
+/// 無ければ壁が1%を超えて成立しない。他のV2が在れば成立する。
+/// どちらなのかを決めるために、V2のファクトリーも数える。
+const SYNC_TOPIC = ethers.id("Sync(uint112,uint112)");
+
+/// ログ取得で拾う識別子。V2とV3の両方。
+const ALL_TOPICS = [...SWAP_TOPICS, SYNC_TOPIC];
+
 // ---- 呼び出しの型 ----
 
 const MULTICALL3_ABI = [
@@ -83,6 +97,7 @@ const POOL_IFACE = new ethers.Interface([
   "function token0() view returns (address)",
   "function token1() view returns (address)",
   "function fee() view returns (uint24)",
+  "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
 ]);
 /// 照会の関数名はDEXによって違う。決めつけず両方投げる。
 const FACTORY_IFACE = new ethers.Interface([
@@ -126,7 +141,7 @@ async function collectPoolsFromSwaps(chain) {
     let logs = null;
     try {
       requestsUsed++;
-      logs = await callWithRpc(chain, (p) => p.getLogs({ topics: [SWAP_TOPICS], fromBlock, toBlock }));
+      logs = await callWithRpc(chain, (p) => p.getLogs({ topics: [ALL_TOPICS], fromBlock, toBlock }));
     } catch (e) {
       // 幅が広すぎる/重すぎる場合は半分にして同じ区間をやり直す。
       if (chunk > MIN_CHUNK_BLOCKS) {
@@ -153,11 +168,15 @@ async function collectPoolsFromSwaps(chain) {
 
 // ---- 手順2: プールからファクトリーを逆算する ----
 
-/// factory() / token0() / token1() / fee() を一括で読む。
-/// fee() を持たないプール(Algebraは動的手数料)は null のままにする。
+/// factory() / token0() / token1() / fee() / getReserves() を一括で読み、
+/// プールの形式も判定する。
+///   fee() が返る          … V3のUniswap形式(手数料が固定帯)
+///   getReserves() が返る  … V2形式
+///   どちらも返らない      … V3のAlgebra形式(手数料が動的)
+/// 形式が分かると「低手数料のV2が在るか」を factory 単位で見られる。
 async function identifyPools(chain, addresses) {
-  const info = new Map(); // アドレス(小文字) -> { factory, token0, token1, fee }
-  const perChunk = Math.floor(BATCH_SIZE / 4);
+  const info = new Map(); // アドレス(小文字) -> { factory, token0, token1, fee, kind }
+  const perChunk = Math.floor(BATCH_SIZE / 5);
 
   for (let i = 0; i < addresses.length; i += perChunk) {
     if (budgetLeft() <= 0) {
@@ -172,6 +191,7 @@ async function identifyPools(chain, addresses) {
       calls.push({ target, allowFailure: true, callData: POOL_IFACE.encodeFunctionData("token0") });
       calls.push({ target, allowFailure: true, callData: POOL_IFACE.encodeFunctionData("token1") });
       calls.push({ target, allowFailure: true, callData: POOL_IFACE.encodeFunctionData("fee") });
+      calls.push({ target, allowFailure: true, callData: POOL_IFACE.encodeFunctionData("getReserves") });
     }
     let returned;
     try {
@@ -181,11 +201,14 @@ async function identifyPools(chain, addresses) {
       continue;
     }
     for (let j = 0; j < slice.length; j++) {
-      const [rf, r0, r1, rfee] = returned.slice(j * 4, j * 4 + 4);
+      const [rf, r0, r1, rfee, rres] = returned.slice(j * 5, j * 5 + 5);
       if (!rf?.success || rf.returnData === "0x") continue;
       try {
         const factory = POOL_IFACE.decodeFunctionResult("factory", rf.returnData)[0];
-        const entry = { factory: factory.toLowerCase(), token0: null, token1: null, fee: null };
+        const hasFee = !!(rfee?.success && rfee.returnData !== "0x");
+        const hasReserves = !!(rres?.success && rres.returnData !== "0x");
+        const kind = hasFee ? "V3(固定帯)" : hasReserves ? "V2" : "V3(動的)";
+        const entry = { factory: factory.toLowerCase(), token0: null, token1: null, fee: null, kind };
         if (r0?.success && r0.returnData !== "0x") {
           entry.token0 = POOL_IFACE.decodeFunctionResult("token0", r0.returnData)[0].toLowerCase();
         }
@@ -298,21 +321,21 @@ export async function runPoolSurvey(chain) {
 
   // 手順1
   const { swapCounts, latest, oldest, skipped } = await collectPoolsFromSwaps(chain);
-  console.log(`[プール調査] ブロック ${oldest}〜${latest} を走査 / V3型Swapを出したプール ${swapCounts.size} 件${skipped > 0 ? ` / 取得できず飛ばした区間 ${skipped} 件` : ""}`);
+  console.log(`[プール調査] ブロック ${oldest}〜${latest} を走査 / 動きのあったプール ${swapCounts.size} 件(V2のSyncとV3のSwap)${skipped > 0 ? ` / 取得できず飛ばした区間 ${skipped} 件` : ""}`);
   if (swapCounts.size === 0) {
-    console.warn("[プール調査] Swapが1件も拾えませんでした。SURVEY_BLOCKS を増やすか、RPCの状態を確認してください");
+    console.warn("[プール調査] イベントが1件も拾えませんでした。SURVEY_BLOCKS を増やすか、RPCの状態を確認してください");
     return;
   }
 
-  // Swapの多い順に絞る。取引の無いプールは裁定には使えない。
+  // 動きの多い順に絞る。取引の無いプールは裁定には使えない。
   const ranked = [...swapCounts.entries()].sort((a, b) => b[1] - a[1]);
   const targets = ranked.slice(0, MAX_POOLS_TO_IDENTIFY).map(([addr]) => addr);
 
   // 手順2
   const info = await identifyPools(chain, targets);
-  const byFactory = new Map(); // ファクトリー -> { pools:[], swaps:number }
+  const byFactory = new Map(); // ファクトリー -> { pools:[], swaps:number, kind }
   for (const [addr, entry] of info) {
-    if (!byFactory.has(entry.factory)) byFactory.set(entry.factory, { pools: [], swaps: 0 });
+    if (!byFactory.has(entry.factory)) byFactory.set(entry.factory, { pools: [], swaps: 0, kind: entry.kind });
     const bucket = byFactory.get(entry.factory);
     bucket.pools.push(addr);
     bucket.swaps += swapCounts.get(addr) || 0;
@@ -321,17 +344,26 @@ export async function runPoolSurvey(chain) {
   const known = new Set((V3_FACTORIES[chain] || []).map((f) => f.address.toLowerCase()));
   const sorted = [...byFactory.entries()].sort((a, b) => b[1].swaps - a[1].swaps);
 
+  // V2とV3で活動量を分けて出す。V3だけ在ってもV2の相方が無ければ
+  // 「V2でずれた直後にV3で戻す」型は組めない。
+  let v2Events = 0, v3Events = 0;
+  for (const [, b] of sorted) {
+    if (b.kind === "V2") v2Events += b.swaps; else v3Events += b.swaps;
+  }
   console.log("-".repeat(70));
-  console.log("[プール調査] ファクトリー別の内訳(Swapの多い順)");
+  console.log(`[プール調査] 形式別の活動量: V2 ${v2Events} 件 / V3 ${v3Events} 件`);
+  console.log("[プール調査] ファクトリー別の内訳(活動の多い順)");
   for (const [factory, bucket] of sorted) {
     const mark = known.has(factory) ? "監視中" : "未監視";
     const samples = bucket.pools.slice(0, SAMPLE_POOLS_PER_FACTORY).join(", ");
-    console.log(`  [${mark}] ${factory} : プール ${bucket.pools.length} 件 / Swap ${bucket.swaps} 回`);
+    console.log(`  [${mark}] ${bucket.kind} ${factory} : プール ${bucket.pools.length} 件 / 動き ${bucket.swaps} 回`);
     console.log(`           代表プール: ${samples}`);
   }
 
   // 手順3: 未監視のファクトリーだけ、監視中のペアがあるか確かめる。
-  const unknown = sorted.filter(([factory]) => !known.has(factory));
+  // V2形式のファクトリーは getPool/poolByPair を持たないので照会しない
+  // (上の内訳で活動量と代表プールは分かる)。
+  const unknown = sorted.filter(([factory, b]) => !known.has(factory) && b.kind !== "V2");
   if (unknown.length === 0) {
     console.log("[プール調査] 未監視のファクトリーは見つかりませんでした");
   }
