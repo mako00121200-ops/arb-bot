@@ -84,6 +84,7 @@ const SAVE_MAP_INTERVAL_MS = 5 * 60 * 1000;
 const MAP_REBUILD_AFTER_HOURS = parseInt(process.env.MAP_REBUILD_AFTER_HOURS || "168", 10);
 const HEARTBEAT_INTERVAL_MS = 60 * 1000;
 const EXECUTION_TIMEOUT_MS = parseInt(process.env.EXECUTION_TIMEOUT_MS || "20000", 10);
+const GAS_REFRESH_INTERVAL_MS = parseInt(process.env.GAS_REFRESH_INTERVAL_MS || "60000", 10);
 const FAILURE_COOLDOWN_MS = 10 * 60 * 1000;
 const DISABLE_AFTER_FAILURES = 3;
 const MAX_SANE_RETURN_RATIO = parseFloat(process.env.MAX_SANE_RETURN_RATIO || "0.20");
@@ -108,7 +109,7 @@ async function refreshGasCosts() {
 }
 
 // ===== 統計 =====
-const reasons = { disabled: 0, taxToken: 0, cooldown: 0, trap: 0, belowMin: 0, executing: 0, notSent: 0, failed: 0, success: 0 };
+const reasons = { disabled: 0, taxToken: 0, cooldown: 0, trap: 0, belowMin: 0, executing: 0, sendBusy: 0, notSent: 0, failed: 0, success: 0 };
 const failStages = {};
 
 const stats = {
@@ -748,7 +749,23 @@ async function probeFeesGradually() {
 }
 
 // ===== 機会が見つかった時の処理 =====
+/// 同じ経路を二重に送らないための印(経路ごと)。
 const executing = new Set();
+
+/// 送信中のチェーン。同じチェーンでは一度に1件だけ送る。
+///
+/// [なぜ要るか(2026年9月17日に実測)]
+/// 経路ごとの executing だけでは、別の経路どうしが並行して走れてしまう。
+/// WebSocketのイベントから呼ぶ経路(reactToPoolChange)は await していないため、
+/// 同じミリ秒に2件が送信に入ることが実際に起きた。両方が pending の nonce を
+/// 取るので同じ番号になり、片方が "replacement fee too low" で拒否され、
+/// もう片方も revert した。粗利$0.4155の機会を丸ごと失っている。
+///
+/// [待たずに見送る理由]
+/// 裁定の機会は数秒で消える。ロックが空くまで待ってから送ると、その時には
+/// 状態が変わっていて simulateRoute で赤字になるだけ。次のイベントで
+/// 同じ機会が改めて検知されるので、ここでは見送る方が無駄がない。
+const sendingChains = new Set();
 async function handleOpportunity(opp, meta = {}) {
   stats.examined++;
   if (hasDisabledPool(opp)) { reasons.disabled++; return; }
@@ -768,7 +785,10 @@ async function handleOpportunity(opp, meta = {}) {
 
   if (opp.netProfitUsd < MIN_PROFIT_USD) { reasons.belowMin++; record(opp, "below_min", meta); return; }
   if (executing.has(key)) { reasons.executing++; return; }
+  // 同じチェーンで別の送信が進行中なら見送る(nonceの取り合いを防ぐ)。
+  if (sendingChains.has(opp.chain)) { reasons.sendBusy++; return; }
   executing.add(key);
+  sendingChains.add(opp.chain);
   try {
     console.log(`[機会] ${opp.kind} ${opp.chain} ${opp.label}: 純利益+$${opp.netProfitUsd.toFixed(4)}(投入$${opp.tradeAmountUsd.toFixed(2)} 壁${opp.feeWallPercent.toFixed(2)}%${opp.hasV3 ? " V3含む" : ""})`);
     const ok = await Promise.race([
@@ -793,6 +813,7 @@ async function handleOpportunity(opp, meta = {}) {
     record(opp, "failed", { ...meta, error: msg, stage });
   } finally {
     executing.delete(key);
+    sendingChains.delete(opp.chain);
   }
 }
 
@@ -937,7 +958,7 @@ function heartbeat() {
   } catch (e) {
     usageLine = " 枠[計測できず: " + e.message + "]";
   }
-  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}(待${stats.quoteTablesPending} 定期で作り直し${stats.quoteRebuildsFromPolling}) スキャン${stats.scans} 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 見送${reasons.notSent}] 失敗段階[${stageLine}] 受信[${ev}] 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}`);
+  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}(待${stats.quoteTablesPending} 定期で作り直し${stats.quoteRebuildsFromPolling}) スキャン${stats.scans} 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}] 失敗段階[${stageLine}] 受信[${ev}] 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}`);
 
   // 判定の手前で何件が脱落しているかを出す。スキャンは回っているのに経路が
   // 1本も評価されない状態が続いたため、どの段階で落ちているかを見えるようにする。
@@ -1126,7 +1147,10 @@ async function main() {
 
   setInterval(heartbeat, HEARTBEAT_INTERVAL_MS);
   await refreshGasCosts();
-  setInterval(refreshGasCosts, 5 * 60 * 1000);
+  // 判定に使うガス代の更新。5分ごとだと、判定時のガス代が最大5分古くなる。
+  // Polygonの baseFee は数十秒で動くため、古い値のままだと薄い機会を
+  // 取り逃がす。RPCは3チェーン×2回で毎分6回(枠の1.3%)に収まる。
+  setInterval(refreshGasCosts, GAS_REFRESH_INTERVAL_MS);
 
   startOnchainFeeds(handleSync, handleV3Swap, handleV3Liquidity);
 
