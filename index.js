@@ -49,7 +49,7 @@ import {
   setTokenDecimals, getTokenDecimals, setTokenPriceUsd, getTokenPriceUsd,
   getAllPoolAddressesByChain, getPoolsForToken, getStalePools, getPoolsByKind,
   getArbitragablePairs, savePoolMap, loadPoolMap, snapshotFullMap,
-  hasUsableState, clearPoolState, KIND_V2, KIND_V3,
+  hasUsableState, clearPoolState, formatStateDiagnostics, KIND_V2, KIND_V3,
 } from "./scripts/pool-registry.js";
 import { scanForChangedPool, scanAllPairs } from "./scripts/opportunity-scanner.js";
 import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS } from "./scripts/execute-opportunity.js";
@@ -938,6 +938,12 @@ function heartbeat() {
     usageLine = " 枠[計測できず: " + e.message + "]";
   }
   console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}(待${stats.quoteTablesPending} 定期で作り直し${stats.quoteRebuildsFromPolling}) スキャン${stats.scans} 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 見送${reasons.notSent}] 失敗段階[${stageLine}] 受信[${ev}] 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}`);
+
+  // 判定の手前で何件が脱落しているかを出す。スキャンは回っているのに経路が
+  // 1本も評価されない状態が続いたため、どの段階で落ちているかを見えるようにする。
+  for (const chain of chainReady) {
+    try { console.log(formatStateDiagnostics(chain)); } catch (e) {}
+  }
 }
 
 // ===== ダッシュボード =====

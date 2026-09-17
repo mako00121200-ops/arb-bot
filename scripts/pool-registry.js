@@ -265,6 +265,63 @@ export function hasUsableState(pool) {
   return pool.raw0 > 0n && pool.raw1 > 0n;
 }
 
+/// 判定の手前で何件が脱落しているかを数える(診断用)。
+///
+/// [なぜ要るか]
+/// 2段経路を組むには「同じペアに、使える状態のプールが2つ以上」必要になる
+/// (opportunity-scanner.js の scanTwoStep)。ところが実測では、スキャンは
+/// 回っているのに経路が1本も評価されない時間帯が長く続いていた。
+/// 「状態が無くて脱落している」のか「経路は組めていて評価側で落ちている」のかを
+/// 区別できないと、当て推量で直すことになる。ここで手前の段階を数えて切り分ける。
+///
+/// V3は sqrtPriceX96 と liquidity の両方が正でないと使えない
+/// (hasUsableState)。価格帯に流動性が無いと liquidity が0になるため、
+/// 「価格はあるが流動性が0」を別に数えて、脱落の理由を見分けられるようにする。
+///
+/// 全てメモリ上の集計で、RPCは一切使わない。
+export function getStateDiagnostics(chain) {
+  let v2Total = 0, v2Usable = 0;
+  let v3Total = 0, v3Usable = 0, v3NoLiquidity = 0, v3NoPrice = 0;
+
+  for (const p of pools.values()) {
+    if (p.chain !== chain) continue;
+    if (p.kind === KIND_V3) {
+      v3Total++;
+      if (hasUsableState(p)) v3Usable++;
+      else if (p.sqrtPriceX96 > 0n) v3NoLiquidity++;
+      else v3NoPrice++;
+    } else {
+      v2Total++;
+      if (hasUsableState(p)) v2Usable++;
+    }
+  }
+
+  // 経路を組める見込みのあるペア数。プールが2つ以上あり、そのうち
+  // 2つ以上が使える状態のもの。
+  let pairsTotal = 0, pairsReady = 0;
+  for (const [pk, set] of byPair.entries()) {
+    if (!pk.startsWith(`${chain}::`)) continue;
+    if (set.size < 2) continue;
+    pairsTotal++;
+    let usable = 0;
+    for (const k of set) {
+      if (hasUsableState(pools.get(k))) usable++;
+      if (usable >= 2) break;
+    }
+    if (usable >= 2) pairsReady++;
+  }
+
+  return { v2Total, v2Usable, v3Total, v3Usable, v3NoLiquidity, v3NoPrice, pairsTotal, pairsReady };
+}
+
+/// 診断を1行にまとめる。
+export function formatStateDiagnostics(chain) {
+  const d = getStateDiagnostics(chain);
+  return `[状態] ${chain}: 判定可能ペア ${d.pairsReady}/${d.pairsTotal}`
+    + ` / 使えるプール V2 ${d.v2Usable}/${d.v2Total} V3 ${d.v3Usable}/${d.v3Total}`
+    + ` / V3の脱落[流動性0 ${d.v3NoLiquidity} 価格なし ${d.v3NoPrice}]`;
+}
+
 export function clearPoolState(pool) {
   if (!pool) return;
   pool.raw0 = 0n;
