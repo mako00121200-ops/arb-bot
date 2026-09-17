@@ -265,6 +265,24 @@ function feeKey(chain, address) {
   return `${(chain || "").toLowerCase()}:${address.toLowerCase()}`;
 }
 
+/// そのプールが今は実測しても無駄かどうか(手数料が判明済み、または再試行待ち)。
+///
+/// [なぜ必要か(2026年9月17日に本番ログで判明)]
+/// probePoolFeeBps は再試行待ちの間はRPCを呼ばずに null を返すが、呼び出し側は
+/// それを「まだ未実測」と見て毎秒キューに積み直していた。直近に取引が無く
+/// 手数料を逆算できないプールは24時間待つ設計なのに、待っている間ずっと
+/// 「未実測○プールを確認します」を2秒ごとに出し続け、1日約43,200行になって
+/// [生存] や [機会] の行を流していた。RPCは消費していないが、ログが読めない。
+export function isFeeProbeOnHold(chain, address) {
+  if (!address) return false;
+  let key;
+  try { key = feeKey(chain, ethers.getAddress(address)); } catch (e) { return false; }
+  const state = feeProbeState.get(key);
+  if (!state) return false;
+  if (state.fee != null) return true;
+  return state.retryAt != null && Date.now() < state.retryAt;
+}
+
 async function getLatestBlock(chain) {
   const cached = blockNumberCache.get(chain);
   if (cached && Date.now() - cached.at < 30_000) return cached.value;
