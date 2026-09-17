@@ -34,23 +34,68 @@ export const QUOTER_V2_ADDRESS = {
   avalanche: "0xbe0F5544EC67e9B3b2D979aaA43f18Fd87E6257F",
 };
 
+/// V3型プールのファクトリー。
+///
+/// [fork: true を付けたもの(2026年9月17日に調査で見つけた)]
+/// Uniswap公式のQuoterでは見積もれないファクトリー。自前コントラクトの
+/// quoteV3 が要るため、ENABLE_FORK_QUOTER でそのチェーンを有効にするまで
+/// 探索対象にしない。有効にせずに足すと、価格表が作れないプールを監視して
+/// イベントとRPCを捨てるだけになる。
+///
+/// アドレスは推測していない。チェーン上のSwap/Syncイベントから出てきた
+/// プールに factory() を呼んで逆算した(scripts/pool-survey.js)。
+///
+/// ただし style(uniswap / algebra)は未検証で、Swapイベントの引数の形からの
+/// 推定にすぎない。実物に getPool / poolByPair を投げて確かめてはいない。
+/// そのため discoverV3PoolsForChain は fork のファクトリーごとに発見件数を
+/// ログに出す。0件が続くなら style かアドレスが違うので、そこで直す。
 export const V3_FACTORIES = {
   polygon: [
     { address: "0x1F98431c8aD98523631AE4a59f267346ea31F984", dexId: "uniswap-v3", style: "uniswap" },
+    // 調査期間中のV3 Swapの22.4%を占めた、未監視で最大のファクトリー。
+    { address: "0x411b0fAcC3489691f28ad58c47006AF5E3Ab3A28", dexId: "algebra-a", style: "algebra", fork: true },
+    { address: "0x917933899c6a5F8E37F31E19f92CdBFF7e8FF0e2", dexId: "univ3-fork-a", style: "uniswap", fork: true },
+    { address: "0x91e1B99072f238352f59e58de875691e20Dc19c1", dexId: "univ3-fork-b", style: "uniswap", fork: true },
   ],
   base: [
     { address: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD", dexId: "uniswap-v3", style: "uniswap" },
+    // Baseは監視中ペアのV3プールが18件。その大半がこの2ファクトリー側にある。
+    { address: "0xc35DADB65012eC5796536bD9864eD8773aBc74C4", dexId: "univ3-fork-c", style: "uniswap", fork: true },
+    { address: "0x36077D39cdC65E1e3FB65810430E5b2c4D5fA29E", dexId: "algebra-b", style: "algebra", fork: true },
   ],
   arbitrum: [
     { address: "0x1F98431c8aD98523631AE4a59f267346ea31F984", dexId: "uniswap-v3", style: "uniswap" },
   ],
   optimism: [
     { address: "0x1F98431c8aD98523631AE4a59f267346ea31F984", dexId: "uniswap-v3", style: "uniswap" },
+    // Optimismは監視中ペアのV3プールが27件あり、手数料の壁が最小0.06%まで下がる。
+    { address: "0x9c6522117e2ed1fE5bdb72bb0eD5E3f2bdE7DBe0", dexId: "univ3-fork-d", style: "uniswap", fork: true },
   ],
   avalanche: [
     { address: "0x740b1c1de25031C31FF4fC9A62f554A55cdC1baD", dexId: "uniswap-v3", style: "uniswap" },
   ],
 };
+
+/// そのファクトリーがフォーク(公式Quoterで見積もれない)かどうか。
+/// 公式Quoterはプール住所を取らず、公式ファクトリーから住所を計算してしまうため、
+/// フォークのプールを公式Quoterに投げると「別のプールの価格」が返ってくる。
+/// それをそのプールの価格表として保存すると、存在しない利益機会を生む。
+export function isForkFactory(chain, factory) {
+  if (!factory) return false;
+  const target = factory.toLowerCase();
+  const list = V3_FACTORIES[(chain || "").toLowerCase()] || [];
+  const hit = list.find((f) => f.address.toLowerCase() === target);
+  // 一覧に無いファクトリーは公式と断定できないので、安全側(フォーク扱い)に倒す。
+  return hit ? hit.fork === true : true;
+}
+
+/// そのチェーンで探索してよいファクトリー。
+/// fork: true のものは ENABLE_FORK_QUOTER に入っているチェーンでだけ返す。
+export function activeV3Factories(chain) {
+  const all = V3_FACTORIES[chain] || [];
+  if (isForkQuoterEnabled(chain)) return all;
+  return all.filter((f) => !f.fork);
+}
 
 export const V3_FEE_TIERS = [100, 500, 3000, 10000];
 
@@ -64,6 +109,8 @@ export const V3_POOL_ABI = [
 
 const V3_FACTORY_ABI = [
   "function getPool(address tokenA, address tokenB, uint24 fee) view returns (address)",
+  // Algebra系は手数料が動的なので、手数料帯の引数を取らない。
+  "function poolByPair(address tokenA, address tokenB) view returns (address)",
 ];
 
 const QUOTER_V2_ABI = [
@@ -96,10 +143,15 @@ export function decodeV3SwapData(dataHex) {
   }
 }
 
-export async function findV3Pool(chain, factory, tokenA, tokenB, fee) {
+/// ファクトリーからプールを1つ探す。
+/// style が "algebra" の場合は手数料帯を取らない poolByPair を使う
+/// (2026年9月17日の調査で、どちらが通るかを実物で確かめた)。
+export async function findV3Pool(chain, factory, tokenA, tokenB, fee, style = "uniswap") {
   try {
-    const address = await callWithRpc(chain, (p) =>
-      new ethers.Contract(factory, V3_FACTORY_ABI, p).getPool(tokenA, tokenB, fee));
+    const address = await callWithRpc(chain, (p) => {
+      const c = new ethers.Contract(factory, V3_FACTORY_ABI, p);
+      return style === "algebra" ? c.poolByPair(tokenA, tokenB) : c.getPool(tokenA, tokenB, fee);
+    });
     if (!address || address === ethers.ZeroAddress) return null;
     return address;
   } catch (e) {
@@ -189,7 +241,7 @@ async function fillWithForkQuoter(chain, requests, results) {
 }
 
 /// 複数プール・両方向の価格表をまとめて作る。
-/// @param jobs [{ pool, zeroForOne, tokenIn, tokenOut, feeTier, amountsIn }] の配列
+/// @param jobs [{ pool, zeroForOne, tokenIn, tokenOut, feeTier, amountsIn, fork }] の配列
 /// 戻り値: 作れた表の数(点が1つ以上あるもの)
 export async function buildQuoteTablesBatch(chain, jobs) {
   if (jobs.length === 0) return 0;
@@ -203,26 +255,33 @@ export async function buildQuoteTablesBatch(chain, jobs) {
       requests.push({
         pool: jobs[j].pool,
         tokenIn: jobs[j].tokenIn, tokenOut: jobs[j].tokenOut,
-        amountIn, feeTier: jobs[j].feeTier,
+        amountIn, feeTier: jobs[j].feeTier, fork: jobs[j].fork === true,
       });
       owners.push(j);
     }
   }
   if (requests.length === 0) return 0;
 
-  // ① まず今までどおり公式のQuoterで求める。手数料帯を持つ
-  //    Uniswap形式のプールはここで全て揃うので、既存の動きは変わらない。
+  // ① まず今までどおり公式のQuoterで求める。公式ファクトリーのプールは
+  //    ここで全て揃うので、既存の動きは変わらない。
+  //
+  //    振り分けは「手数料帯の有無」ではなく「フォークかどうか」で行う。
+  //    フォークにも手数料帯を持つもの(Uniswap形式のフォーク)があり、
+  //    それを公式Quoterに投げると、公式側に同じペア・同じ手数料帯の
+  //    プールがある場合に「別プールの価格」が返り、それをフォークの
+  //    価格表として保存してしまうため。
+  const useOfficial = (r) => r.fork !== true && r.feeTier != null;
   const outs = quoter
-    ? await quoteV3Batch(chain, quoter, requests.filter((r) => r.feeTier != null), false)
+    ? await quoteV3Batch(chain, quoter, requests.filter(useOfficial), false)
     : [];
   // 公式に投げた分だけの配列なので、元の並びに戻す。
   const official = new Array(requests.length).fill(null);
   {
     let k = 0;
     for (let i = 0; i < requests.length; i++) {
-      if (requests[i].feeTier == null) continue;
+      if (!useOfficial(requests[i])) continue;
       official[i] = outs[k++] ?? null;
-      }
+    }
   }
 
   // ② 公式で求まらなかった分だけ、自前コントラクトで求め直す。
@@ -253,8 +312,8 @@ export async function buildQuoteTablesBatch(chain, jobs) {
 }
 
 /// 1プール1方向の価格表を作る(単発用。まとめて作るときは buildQuoteTablesBatch)。
-export async function buildQuoteTable({ chain, pool, zeroForOne, tokenIn, tokenOut, feeTier, amountsIn }) {
-  const built = await buildQuoteTablesBatch(chain, [{ pool, zeroForOne, tokenIn, tokenOut, feeTier, amountsIn }]);
+export async function buildQuoteTable({ chain, pool, zeroForOne, tokenIn, tokenOut, feeTier, amountsIn, fork = false }) {
+  const built = await buildQuoteTablesBatch(chain, [{ pool, zeroForOne, tokenIn, tokenOut, feeTier, amountsIn, fork }]);
   if (built === 0) return 0;
   const t = quoteTables.get(tableKey(chain, pool, zeroForOne));
   return t ? t.points.length : 0;

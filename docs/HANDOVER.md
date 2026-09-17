@@ -102,6 +102,26 @@ Uniswap公式の QuoterV2 は quoteExactInputSingle(tokenIn, tokenOut, fee) の�
 未設定なら自前の見積もりは一切走らない。コントラクトに quoteV3 を入れて
 再デプロイするまでは有効にしないこと。
 
+### 公式Quoterへの振り分けは「フォークかどうか」で決める
+
+当初この振り分けを「手数料帯を持つか」で書いていたが、これは危険な誤り
+だった。フォークにも手数料帯を持つもの(Uniswap形式のフォーク)があり、
+それを公式Quoterに投げると、公式側に同じペア・同じ手数料帯のプールが
+ある場合に **別のプールの価格が返ってくる**。それをフォークのプールの
+価格表として保存すると、存在しない価格差=幻の利益機会を作り出す。
+今は isForkFactory() でファクトリー単位に判定している。一覧に無い
+ファクトリーは公式と断定できないため、安全側(フォーク扱い)に倒す。
+
+### ファクトリーの style は未検証
+
+V3_FACTORIES の style(uniswap / algebra)は Swapイベントの引数の形からの
+推定で、実物に getPool / poolByPair を投げて確かめてはいない
+(作業用コンテナから外部RPCへ出られないため)。
+そのため discoverV3PoolsForChain は fork のファクトリーごとに発見件数を
+`[発見] polygon algebra-a(algebra): V3プール○件` の形でログに出す。
+**ENABLE_FORK_QUOTER を有効にした直後、この行が0件でないことを必ず確認する。**
+0件が続くなら style かアドレスが違うので、そこで直す。
+
 ## 過去の誤り(再発防止)
 - イベント識別子を手書きして1文字欠け、最初期から一度も受信できていなかった → ethers.id()で計算する
 - RPCにタイムアウトが無く14時間凍結 → 全呼び出しに上限を設けている
@@ -119,8 +139,11 @@ Uniswap公式の QuoterV2 は quoteExactInputSingle(tokenIn, tokenOut, fee) の�
    - 済: bot側で「公式で求まらなかった分だけ」自前に回す仕組み
    - 未: 再デプロイ。オーナーの立ち会いのもとで行う。デプロイ前に
      コントラクトの中身を確認し、旧コントラクトの利益を withdraw で回収する
-   - 未: 見つかったファクトリーを V3_FACTORIES に追加
-   - 未: ENABLE_FORK_QUOTER を1チェーンずつ有効化して効果を測る
+   - 済: 見つかったファクトリーを V3_FACTORIES に追加(fork: true 付き)。
+     Algebra系は手数料帯を取らないため poolByPair で探す。ENABLE_FORK_QUOTER
+     が未設定の間は探索対象にならないので、本番の動きは変わらない
+   - 未: ENABLE_FORK_QUOTER を1チェーンずつ有効化して効果を測る。
+     まず polygon。上の「ファクトリーの style は未検証」を必ず確認する
 3. 対象チェーンの優先順位は Polygon(31.5%が未監視)→ Optimism(ガス最安・
    壁0.06%・27プール)→ Base(活動量は最大だが主要DEXの出来高が対象外
    トークンに偏る)。Avalanche は Pharaoh 対応が前提で、WebSocketは繋がったが
