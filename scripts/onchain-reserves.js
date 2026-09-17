@@ -423,6 +423,18 @@ export function isOnchainReadAvailable(chain) {
   return getChainConfig(chain) !== null;
 }
 
+/// 全チェーン合計のRPC呼び出し数(プロセス起動からの通算)。
+/// 失敗した呼び出しも枠を消費するため、成否を問わず数える。
+/// Multicall3で束ねた場合は、束ねた1回が1リクエスト。
+export function getRpcCallTotals() {
+  let priority = 0, normal = 0;
+  for (const q of queues.values()) {
+    priority += q.priorityDone;
+    normal += q.normalDone;
+  }
+  return { priority, normal, total: priority + normal };
+}
+
 /// ダッシュボード表示用。
 export function getRpcStatus() {
   const out = {};
@@ -438,6 +450,7 @@ export function getRpcStatus() {
       normalQueued: q.normal.length,
       dropped: q.dropped,
       priorityDone: q.priorityDone,
+      normalDone: q.normalDone,
       priorityMaxMs: q.priorityMaxMs,
       intervalMs: minIntervalFor(chain),
     };
