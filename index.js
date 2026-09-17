@@ -32,6 +32,7 @@ import http from "http";
 import { ethers } from "ethers";
 import { startOnchainFeeds, getSyncStats, isChainWsEnabled, isChainHealthy, setWatchedAddresses } from "./dex-onchain-realtime.js";
 import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
+import { runPoolSurvey } from "./scripts/pool-survey.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
 import { probePoolFeeBps, getRpcStatus, callWithRpc } from "./scripts/onchain-reserves.js";
@@ -1085,6 +1086,14 @@ async function main() {
   const deployTarget = process.env.RUN_MAINNET_DEPLOY;
   if (deployTarget && deployTarget !== "false") {
     try { await runMainnetDeploy(deployTarget); } catch (e) { console.error("[本番デプロイ] 失敗:", e.message); }
+  }
+
+  // 環境変数 RUN_POOL_SURVEY にチェーン名を入れた時だけ、V3型プールの調査を一度だけ行う。
+  // 未監視のDEXに、いま取引しているペアのプールがあるかを確かめるための読み取り専用の処理。
+  // 終わったら RUN_POOL_SURVEY を false に戻すこと。
+  const surveyTarget = process.env.RUN_POOL_SURVEY;
+  if (surveyTarget && surveyTarget !== "false") {
+    try { await runPoolSurvey(surveyTarget); } catch (e) { console.error("[プール調査] 失敗:", e.message); }
   }
 
   stats.journalLoaded = loadJournal();
