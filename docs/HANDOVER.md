@@ -128,6 +128,44 @@ discoverV3PoolsForChain は fork のファクトリーごとに発見件数を
 なお作業用コンテナからは外部RPCへ出られない(ネットワークポリシーで遮断)ため、
 アドレスの実在確認はこのログか、Railway上での実行でしか行えない。
 
+## Avalanche の調査結果(2026年9月17日)
+
+3,000ブロック(約100分)を実測した。V2 797件 / V3 2,176件。
+
+- 監視中(Uniswap 0x740b1c1d…)は **387回、全体の17.8%** しかない。
+  **82%が未監視**で、Polygonの31.5%より深刻だった
+- 未監視の上位3社のうち、監視中ペアにプールを持つのは1社だけ
+  - `0x1128F23D…` Swap **924回**(42%)/ 監視中10ペアに **9プール**。
+    うち流動性があるのは USDC/USDT 0.01%、USDC/WAVAX 0.01%、
+    USDC/WAVAX 0.05% の3件。照会形式は getPool(Uniswap V3形式)
+  - `0x512EB749…` Swap 473回 / 監視中ペアにプール **なし**
+  - `0xAe6E5C62…` Swap 339回 / 監視中ペアにプール **なし**
+- `0x3e603C14…` は Swap 8回と静かだが、監視中ペアに **13プール**あり
+  流動性が厚い(DAI.e/WAVAX 0.3%、WAVAX/WETH.e 0.3% など)。
+  動きが遅いプールは価格が取り残されやすく、相手側として価値がある
+- したがって Avalanche で取れる上積みは、いま見ているペアのまま
+  **V3の活動量が約2.4倍(387→1,311回)** になる分
+
+## Algebra形式のプールは、まだ使えない(2026年9月17日に判明)
+
+PR #9 で algebra-a(Polygon、V3 Swapの22.4%)と algebra-b(Base)を
+V3_FACTORIES に足したが、**今のコードではこの2社のプールは必ず脱落する**。
+発見はできても、次の2つが Uniswap形式しか想定していないため。
+
+1. **状態の読み取り**: `fetchV3StatesBatch` は `slot0()` しか呼ばない。
+   Algebra は `globalState()` で、返り値の並びも版によって違う
+   (先頭の uint160 price と int24 tick は共通)
+2. **WebSocketの購読**: `dex-onchain-realtime.js` の ALL_TOPICS は
+   Uniswap V3 の Swap 識別子 `0xc42079f9…` だけ。手数料を含む
+   Algebra の Swap `0x121cb44e…` は受信できない
+
+Avalanche の調査で `0x5F1dddbf…`(Algebra形式)の流動性が
+「読めず」と出たのが、1つ目の実例。
+
+**この2点を直すまで、algebra を含むチェーンで ENABLE_FORK_QUOTER を
+有効にしても、そのプールは監視枠とRPCを使うだけで一度も使われない。**
+先に Uniswap形式のフォーク(univ3-fork-a〜f)だけで効果を測るのが安全。
+
 ## 過去の誤り(再発防止)
 - イベント識別子を手書きして1文字欠け、最初期から一度も受信できていなかった → ethers.id()で計算する
 - RPCにタイムアウトが無く14時間凍結 → 全呼び出しに上限を設けている
@@ -155,9 +193,10 @@ discoverV3PoolsForChain は fork のファクトリーごとに発見件数を
    - 未: ENABLE_FORK_QUOTER を1チェーンずつ有効化して効果を測る。
      まず polygon。上の「ファクトリーの style は未検証」を必ず確認する
 3. 対象チェーンの優先順位は Polygon(31.5%が未監視)→ Optimism(ガス最安・
-   壁0.06%・27プール)→ Base(活動量は最大だが主要DEXの出来高が対象外
-   トークンに偏る)。Avalanche は Pharaoh 対応が前提で、WebSocketは繋がったが
-   受信が非常に少ない(28プールしか監視していないため)
+   壁0.06%・27プール)→ Avalanche(82%が未監視。ガス$0.001で最安)→
+   Base(活動量は最大だが主要DEXの出来高が対象外トークンに偏る)
+4. Algebra対応(globalState と Swap識別子)。これを入れるまで
+   algebra-a / algebra-b は足しても使われない。上の節を参照
 
 ## 後回しにした対策
 - 速度: ガス見積もり省略、Arbitrumシーケンサー直結送信とフィード購読、RailwayをUS Eastへ、Chainstack Trader Node

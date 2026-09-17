@@ -76,6 +76,16 @@ export const V3_FACTORIES = {
   ],
   avalanche: [
     { address: "0x740b1c1de25031C31FF4fC9A62f554A55cdC1baD", dexId: "uniswap-v3", style: "uniswap" },
+    // 調査期間中のV3 Swap 2,176回のうち924回(42%)を占めた最大の未監視DEX。
+    // 監視中の10ペアに9プール。うち流動性があるのは USDC/USDT 0.01%、
+    // USDC/WAVAX 0.01%、USDC/WAVAX 0.05% の3件。
+    { address: "0x1128F23D0bc0A8396E9FBC3c0c68f5EA228B8256", dexId: "univ3-fork-e", style: "uniswap", fork: true },
+    // Swapは8回と少ないが、監視中ペアに13プールあり流動性が厚い。
+    // 動きが遅い=価格が取り残されやすいので、相手側として狙う価値がある。
+    { address: "0x3e603C14aF37EBdaD31709C4f848Fc6aD5BEc715", dexId: "univ3-fork-f", style: "uniswap", fork: true },
+    // 0x5F1dddbf…(Algebra形式、1プール)は、slot0ではなくglobalStateでしか
+    // 状態を読めず、調査でも「流動性=読めず」だった。globalState対応を
+    // 入れるまで足さない(足しても必ず脱落する)。
   ],
 };
 
