@@ -23,7 +23,8 @@
 
 import { ethers } from "ethers";
 import { callWithRpc } from "./onchain-reserves.js";
-import { quoteV3Batch } from "./multicall-reserves.js";
+import { quoteV3Batch, quoteV3ByPoolBatch } from "./multicall-reserves.js";
+import { getAnyChainConfig } from "../chain-config.js";
 
 export const QUOTER_V2_ADDRESS = {
   polygon: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
@@ -151,29 +152,87 @@ function tableKey(chain, pool, zeroForOne) {
   return `${chain}::${pool.toLowerCase()}::${zeroForOne ? "0" : "1"}`;
 }
 
+/// 自前コントラクトを使う見積もりを有効にするチェーン。
+/// コントラクトに quoteV3 を入れて再デプロイするまでは有効にしない
+/// (未対応のコントラクトに投げても失敗するだけでRPCを捨てるため)。
+/// 例: ENABLE_FORK_QUOTER=polygon,optimism
+const FORK_QUOTER_CHAINS = new Set(
+  (process.env.ENABLE_FORK_QUOTER || "").split(",").map((c) => c.trim().toLowerCase()).filter(Boolean)
+);
+
+export function isForkQuoterEnabled(chain) {
+  return FORK_QUOTER_CHAINS.has((chain || "").toLowerCase());
+}
+
+/// 公式のQuoterで求まらなかった分を、自前コントラクトで埋める。
+/// results は requests と同じ並びで、埋まっていない所だけを対象にする。
+async function fillWithForkQuoter(chain, requests, results) {
+  if (!isForkQuoterEnabled(chain)) return;
+  const config = getAnyChainConfig(chain);
+  const contractAddress = config && process.env[config.contractAddressEnvVar];
+  if (!contractAddress) return;
+
+  const pending = [];
+  const indexes = [];
+  for (let i = 0; i < requests.length; i++) {
+    if (results[i] != null) continue;
+    if (!requests[i].pool) continue;
+    pending.push({ pool: requests[i].pool, tokenIn: requests[i].tokenIn, amountIn: requests[i].amountIn });
+    indexes.push(i);
+  }
+  if (pending.length === 0) return;
+
+  const outs = await quoteV3ByPoolBatch(chain, contractAddress, pending, false);
+  for (let k = 0; k < indexes.length; k++) {
+    if (outs[k] != null && outs[k] > 0n) results[indexes[k]] = outs[k];
+  }
+}
+
 /// 複数プール・両方向の価格表をまとめて作る。
 /// @param jobs [{ pool, zeroForOne, tokenIn, tokenOut, feeTier, amountsIn }] の配列
 /// 戻り値: 作れた表の数(点が1つ以上あるもの)
 export async function buildQuoteTablesBatch(chain, jobs) {
+  if (jobs.length === 0) return 0;
   const quoter = QUOTER_V2_ADDRESS[chain];
-  if (!quoter || jobs.length === 0) return 0;
 
   const requests = [];
   const owners = [];
   for (let j = 0; j < jobs.length; j++) {
     for (const amountIn of jobs[j].amountsIn) {
       if (amountIn <= 0n) continue;
-      requests.push({ tokenIn: jobs[j].tokenIn, tokenOut: jobs[j].tokenOut, amountIn, feeTier: jobs[j].feeTier });
+      requests.push({
+        pool: jobs[j].pool,
+        tokenIn: jobs[j].tokenIn, tokenOut: jobs[j].tokenOut,
+        amountIn, feeTier: jobs[j].feeTier,
+      });
       owners.push(j);
     }
   }
   if (requests.length === 0) return 0;
 
-  const outs = await quoteV3Batch(chain, quoter, requests, false);
+  // ① まず今までどおり公式のQuoterで求める。手数料帯を持つ
+  //    Uniswap形式のプールはここで全て揃うので、既存の動きは変わらない。
+  const outs = quoter
+    ? await quoteV3Batch(chain, quoter, requests.filter((r) => r.feeTier != null), false)
+    : [];
+  // 公式に投げた分だけの配列なので、元の並びに戻す。
+  const official = new Array(requests.length).fill(null);
+  {
+    let k = 0;
+    for (let i = 0; i < requests.length; i++) {
+      if (requests[i].feeTier == null) continue;
+      official[i] = outs[k++] ?? null;
+      }
+  }
+
+  // ② 公式で求まらなかった分だけ、自前コントラクトで求め直す。
+  //    フォークのプールと、手数料が動的なAlgebra系がここに来る。
+  //    公式で足りている間は1件も投げないので、RPCは増えない。
+  await fillWithForkQuoter(chain, requests, official);
 
   const pointsByJob = jobs.map(() => []);
   for (let i = 0; i < requests.length; i++) {
-    const out = outs[i];
+    const out = official[i];
     if (out == null || out <= 0n) continue;
     pointsByJob[owners[i]].push({ in: requests[i].amountIn, out });
   }
