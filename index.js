@@ -986,9 +986,16 @@ function renderPage() {
   const totalEvents = Object.values(syncStats).reduce((a, v) => a + v.received, 0);
   const mc = getMulticallStats();
 
+  // 記録のガス代と純利益。古い記録は純利益を持たないので粗利から引いて補う。
+  const gasOf = (e) => e.actualGasCostUsd ?? e.gasCostUsd ?? null;
+  const netOf = (e) => {
+    if (e.actualNetProfitUsd != null) return e.actualNetProfitUsd;
+    if (e.actualProfitUsd == null) return null;
+    return e.actualProfitUsd - (gasOf(e) ?? 0);
+  };
   const realRows = real.recent.map((e) => `<tr><td>${new Date(e.timestamp).toLocaleString('ja-JP')}</td><td style="font-size:9px">${e.pairLabel}</td>
     <td style="text-align:right">$${e.tradeAmountUsd.toFixed(2)}</td>
-    <td style="text-align:right;color:#2ecc71;font-weight:600">${e.actualProfitUsd != null ? `+$${e.actualProfitUsd.toFixed(4)}` : '-'}</td>
+    <td style="text-align:right;color:#2ecc71;font-weight:600">${netOf(e) != null ? `+$${netOf(e).toFixed(4)}` : '-'}<br><span style="color:#888;font-weight:400;font-size:9px">粗${e.actualProfitUsd != null ? `$${e.actualProfitUsd.toFixed(4)}` : '-'} ガス${gasOf(e) != null ? `$${gasOf(e).toFixed(4)}` : '-'}</span></td>
     <td><a href="${e.explorerUrl}" target="_blank">確認</a></td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ実際の取引はありません</td></tr>`;
 
   const oppRows = stats.recent.slice(0, 10).map((o, i) => `<tr><td>${i+1}</td>
@@ -1025,11 +1032,11 @@ function renderPage() {
 
 <div class="card real"><h2>💰 実際の取引結果</h2>
 <div class="stat"><div><div class="v">${real.count}</div><div class="l">実行回数</div></div>
-<div><div class="v" style="color:#2ecc71">+$${real.totalProfitUsd.toFixed(4)}</div><div class="l">累積利益</div></div>
+<div><div class="v" style="color:#2ecc71">+$${real.totalProfitUsd.toFixed(4)}</div><div class="l">累積利益(ガス控除後)</div></div>
 <div><div class="v">$${getCurrentTradeCapUsd()}</div><div class="l">取引上限</div></div>
 <div><div class="v" style="color:${isLive?'#2ecc71':'#888'}">${isLive?'稼働中':'停止中'}</div><div class="l">自動売買</div></div></div>
-<table><thead><tr><th>日時</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table>
-<div class="note">経路の最初のプール自身から先に受け取るため、借入手数料はかかりません。<br>コントラクトに溜まっている利益: ${balanceLine}</div></div>
+<table><thead><tr><th>日時</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table>
+<div class="note">経路の最初のプール自身から先に受け取るため、借入手数料はかかりません。<br>累計の内訳: 粗利+$${real.totalGrossProfitUsd.toFixed(4)} − ガス代$${real.totalGasCostUsd.toFixed(4)}<br>コントラクトに溜まっている利益: ${balanceLine}</div></div>
 
 <div class="card"><h2>📐 V3の価格表(公式Quoter)</h2>
 <div class="stat"><div><div class="v" style="color:#6fae62">${countQuoteTables().toLocaleString()}</div><div class="l">作成済みの表</div></div>

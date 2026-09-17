@@ -2,12 +2,25 @@
 //
 // 実際にオンチェーンへ送信され、成功した実行だけを記録する専用ログ。
 // ダッシュボードの紙上シミュレーション統計とは完全に別物として扱う。
-// 利益額は、コントラクトが発するArbExecutedイベントから直接読み取った
+// 利益額は、コントラクトが発する RouteExecuted イベントから直接読み取った
 // 「本当に確定した金額」を使う(事前予測ではない)。
+//
+// [ガス代を引いた利益を記録する(2026年9月17日)]
+// これまで記録・表示していた actualProfitUsd は、コントラクトが返す
+// 「戻ってきた量 - 返済額」= ガス代を引く前の粗利だった。手元に残る額は
+// ここからガス代を引いた分なので、実際のガス代(receipt の gasUsed ×
+// 実効単価)と、それを引いた純利益もあわせて記録する。
+//
+// [実測ガス使用量を次の判定に使う]
+// 事前判定のガス代は想定値で計算していたが、実測があるならそちらが確か。
+// チェーンと段数(2step/3step)ごとに直近の平均を返し、gas-cost.js が
+// 事前判定に使う。想定値のずれが機会の取りこぼしに直結するため。
 
 import fs from "fs";
 
 const REAL_EXECUTION_LOG_FILE = process.env.REAL_EXECUTION_LOG_FILE || "/tmp/real-executions.json";
+/// 平均を取る対象の件数(直近から数える)。
+const GAS_AVERAGE_SAMPLES = 20;
 
 export function loadRealExecutions() {
   try {
@@ -29,13 +42,49 @@ export function recordRealExecution(entry) {
   }
 }
 
+/// 記録から段数を取り出す。古い記録は kind を持たないので、
+/// pairLabel の先頭("2step polygon …")から読む。
+function kindOf(entry) {
+  if (entry.kind) return entry.kind;
+  const head = (entry.pairLabel || "").split(" ")[0];
+  return head === "2step" || head === "3step" ? head : null;
+}
+
+/// そのチェーン・段数で実際に使われたガス量の平均(直近分)。
+/// 実測が無ければ null を返し、呼び出し側は想定値に戻る。
+export function getAverageGasUnits(chain, kind) {
+  const target = (chain || "").toLowerCase();
+  const samples = [];
+  const log = loadRealExecutions();
+  for (let i = log.length - 1; i >= 0 && samples.length < GAS_AVERAGE_SAMPLES; i--) {
+    const e = log[i];
+    if ((e.chain || "").toLowerCase() !== target) continue;
+    if (kindOf(e) !== kind) continue;
+    try {
+      const used = BigInt(e.gasUsed);
+      if (used > 0n) samples.push(used);
+    } catch (inner) {}
+  }
+  if (samples.length === 0) return null;
+  // 実行ごとの差(経路のプールの種類など)を吸収するため、平均に1割の余裕を足す。
+  const sum = samples.reduce((a, b) => a + b, 0n);
+  return (sum / BigInt(samples.length)) * 110n / 100n;
+}
+
 export function getRealExecutionStats() {
   const log = loadRealExecutions();
-  const totalProfitUsd = log.reduce((s, e) => s + (e.actualProfitUsd || 0), 0);
-  const totalGasCostUsd = log.reduce((s, e) => s + (e.gasCostUsd || 0), 0);
+  // 粗利(ガスを引く前)と、ガス代を引いた純利益の両方を出す。
+  // 古い記録には純利益が無いので、その場合は粗利からガス代を引いて補う。
+  const totalGrossProfitUsd = log.reduce((s, e) => s + (e.actualProfitUsd || 0), 0);
+  const totalGasCostUsd = log.reduce((s, e) => s + (e.actualGasCostUsd ?? e.gasCostUsd ?? 0), 0);
+  const totalNetProfitUsd = log.reduce((s, e) => {
+    if (e.actualNetProfitUsd != null) return s + e.actualNetProfitUsd;
+    return s + (e.actualProfitUsd || 0) - (e.actualGasCostUsd ?? e.gasCostUsd ?? 0);
+  }, 0);
   return {
     count: log.length,
-    totalProfitUsd,
+    totalProfitUsd: totalNetProfitUsd, // 表示の主役はガス代を引いた後の額
+    totalGrossProfitUsd,
     totalGasCostUsd,
     recent: [...log].reverse().slice(0, 15),
   };

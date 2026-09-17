@@ -31,7 +31,7 @@ import { getChainConfig } from "../chain-config.js";
 import { getProviderForChain, callWithRpc } from "./onchain-reserves.js";
 import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
 import { recordRealExecution } from "./real-execution-log.js";
-import { estimateGasCostUsd, gasUnitsToUsd } from "./gas-cost.js";
+import { estimateGasCostUsd, gasUnitsToUsd, weiToUsd } from "./gas-cost.js";
 import { getTokenDecimals, getTokenPriceUsd, getPool, KIND_V3 } from "./pool-registry.js";
 import { clearQuoteTable } from "./v3-pools.js";
 import { markRouteRejected, markRouteConfirmed } from "./opportunity-scanner.js";
@@ -248,15 +248,35 @@ async function executeOpportunityInner(opp) {
     } catch (inner) {}
   }
   const actualProfitUsd = actualProfitTokens != null ? actualProfitTokens * priceUsd : null;
-  if (actualProfitUsd != null) console.log(`[実行] 確定利益: +$${actualProfitUsd.toFixed(4)}`);
+
+  // 実際に払ったガス代。receipt.gasPrice は実効単価(ethers v6)。
+  // 事前の見積もりではなく、この確定値で手元に残る額を出す。
+  let actualGasCostUsd = null;
+  try {
+    actualGasCostUsd = await weiToUsd(chain, receipt.gasUsed * receipt.gasPrice);
+  } catch (e) {}
+  const actualNetProfitUsd = actualProfitUsd != null && actualGasCostUsd != null
+    ? actualProfitUsd - actualGasCostUsd
+    : null;
+
+  if (actualNetProfitUsd != null) {
+    console.log(`[実行] 確定: 粗利+$${actualProfitUsd.toFixed(4)} − ガス$${actualGasCostUsd.toFixed(4)} = 純利益+$${actualNetProfitUsd.toFixed(4)}(見積もりガス$${gasCostUsd.toFixed(4)})`);
+  } else if (actualProfitUsd != null) {
+    console.log(`[実行] 確定: 粗利+$${actualProfitUsd.toFixed(4)}(ガス代を確定できず)`);
+  }
 
   recordRealExecution({
     timestamp: new Date().toISOString(),
     pairLabel: `${opp.kind} ${chain} ${opp.label}`,
+    kind: opp.kind,
     chain, txHash: tx.hash, explorerUrl: chainConfig.explorerTxUrl(tx.hash),
     tradeAmountUsd: tradeUsd,
-    predictedProfitUsd: grossProfitUsd - gasCostUsd, actualProfitUsd,
-    gasUsed: receipt.gasUsed.toString(), gasCostUsd,
+    predictedProfitUsd: grossProfitUsd - gasCostUsd,
+    actualProfitUsd,
+    actualGasCostUsd,
+    actualNetProfitUsd,
+    gasUsed: receipt.gasUsed.toString(),
+    gasCostUsd,
   });
   recordExecutionSuccess();
   return true;
