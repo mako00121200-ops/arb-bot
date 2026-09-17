@@ -34,7 +34,13 @@ import { getAverageGasUnits } from "./real-execution-log.js";
 // 3段は2段の実測比で見積もった値(3段の成功例がまだ無いため)。
 export const ESTIMATED_GAS_UNITS = { "2step": 285_000n, "3step": 390_000n };
 
-const GAS_PRICE_CACHE_MS = 60 * 1000;
+// [キャッシュを短くした(2026年9月17日)]
+// 60秒にしていたが、実測すると見積もり$0.0114に対し実際は$0.0079で、
+// ガス使用量はほぼ的中(285,000 対 285,579)だったのに単価が1.44倍だった。
+// Polygonの baseFee は数十秒で大きく動くため、キャッシュの古さがそのまま
+// 過大な見積もりになり、薄い機会を取り逃がす。RPCの消費は増えるが、
+// 月2,000万の枠に対して9倍の余力があるので問題にならない。
+const GAS_PRICE_CACHE_MS = parseInt(process.env.GAS_PRICE_CACHE_MS || "15000", 10);
 const NATIVE_PRICE_CACHE_MS = 10 * 60 * 1000;
 
 // 各チェーンのネイティブトークン(ガス代の支払い通貨)の価格を調べる先。
