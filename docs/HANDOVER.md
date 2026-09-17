@@ -164,7 +164,10 @@ Avalanche の調査で `0x5F1dddbf…`(Algebra形式)の流動性が
 
 **この2点を直すまで、algebra を含むチェーンで ENABLE_FORK_QUOTER を
 有効にしても、そのプールは監視枠とRPCを使うだけで一度も使われない。**
-先に Uniswap形式のフォーク(univ3-fork-a〜f)だけで効果を測るのが安全。
+
+そのため v3-pools.js に `ALGEBRA_SUPPORTED = false` を置き、Algebra形式の
+ファクトリーは探索対象から外している。上の2点を直したら true にする。
+それまでは Uniswap形式のフォーク(univ3-fork-a〜f)だけで効果を測る。
 
 ## 過去の誤り(再発防止)
 - イベント識別子を手書きして1文字欠け、最初期から一度も受信できていなかった → ethers.id()で計算する

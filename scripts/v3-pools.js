@@ -102,12 +102,24 @@ export function isForkFactory(chain, factory) {
   return hit ? hit.fork === true : true;
 }
 
+/// Algebra形式のプールを実際に使えるかどうか。
+///
+/// 今は false。発見はできても、次の2つが Uniswap形式しか想定していないため、
+/// 見つけたプールは必ず脱落する。
+///   ① fetchV3StatesBatch が slot0() しか呼ばない(Algebraは globalState())
+///   ② dex-onchain-realtime.js の購読識別子が Uniswap の Swap だけで、
+///      手数料を含む Algebra の Swap(0x121cb44e…)を受信できない
+/// 足したまま有効にすると、使えないプールが監視枠とRPCを食うだけになる。
+/// 上の2点を直したら true にする。
+const ALGEBRA_SUPPORTED = false;
+
 /// そのチェーンで探索してよいファクトリー。
 /// fork: true のものは ENABLE_FORK_QUOTER に入っているチェーンでだけ返す。
 export function activeV3Factories(chain) {
   const all = V3_FACTORIES[chain] || [];
-  if (isForkQuoterEnabled(chain)) return all;
-  return all.filter((f) => !f.fork);
+  const usable = ALGEBRA_SUPPORTED ? all : all.filter((f) => f.style !== "algebra");
+  if (isForkQuoterEnabled(chain)) return usable;
+  return usable.filter((f) => !f.fork);
 }
 
 export const V3_FEE_TIERS = [100, 500, 3000, 10000];
