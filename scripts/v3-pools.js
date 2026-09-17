@@ -44,11 +44,14 @@ export const QUOTER_V2_ADDRESS = {
 ///
 /// アドレスは推測していない。チェーン上のSwap/Syncイベントから出てきた
 /// プールに factory() を呼んで逆算した(scripts/pool-survey.js)。
+/// style(uniswap / algebra)も推測ではない。調査は同じファクトリーに
+/// getPool と poolByPair の両方を allowFailure 付きで投げ、実際に住所を
+/// 返した方を採っている(pool-survey.js の probeFactoryForPairs)。
 ///
-/// ただし style(uniswap / algebra)は未検証で、Swapイベントの引数の形からの
-/// 推定にすぎない。実物に getPool / poolByPair を投げて確かめてはいない。
-/// そのため discoverV3PoolsForChain は fork のファクトリーごとに発見件数を
-/// ログに出す。0件が続くなら style かアドレスが違うので、そこで直す。
+/// 残る不確かさは「調査結果をここへ書き写す作業」だけ。実際にチェックサムの
+/// 大文字小文字を3件書き間違えていた。そのため discoverV3PoolsForChain は
+/// fork のファクトリーごとに発見件数をログに出す。0件が続くなら書き写しが
+/// 誤っているので、そこで直す。
 export const V3_FACTORIES = {
   polygon: [
     { address: "0x1F98431c8aD98523631AE4a59f267346ea31F984", dexId: "uniswap-v3", style: "uniswap" },

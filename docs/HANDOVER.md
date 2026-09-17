@@ -112,15 +112,21 @@ Uniswap公式の QuoterV2 は quoteExactInputSingle(tokenIn, tokenOut, fee) の�
 今は isForkFactory() でファクトリー単位に判定している。一覧に無い
 ファクトリーは公式と断定できないため、安全側(フォーク扱い)に倒す。
 
-### ファクトリーの style は未検証
+### ファクトリーの style は実測済み。確認すべきは書き写し
 
-V3_FACTORIES の style(uniswap / algebra)は Swapイベントの引数の形からの
-推定で、実物に getPool / poolByPair を投げて確かめてはいない
-(作業用コンテナから外部RPCへ出られないため)。
-そのため discoverV3PoolsForChain は fork のファクトリーごとに発見件数を
+一度「style は未検証」と書いたが、これは誤りだった。調査スクリプトは同じ
+ファクトリーに getPool と poolByPair の両方を allowFailure 付きで投げ、
+実際に住所を返した方を採っている(pool-survey.js の probeFactoryForPairs)。
+Base 18件 / Optimism 27件というプール数も、その反応から得た実データ。
+
+残る不確かさは「調査結果を V3_FACTORIES へ書き写す作業」だけで、実際に
+チェックサムの大文字小文字を3件書き間違えていた。そのため
+discoverV3PoolsForChain は fork のファクトリーごとに発見件数を
 `[発見] polygon algebra-a(algebra): V3プール○件` の形でログに出す。
 **ENABLE_FORK_QUOTER を有効にした直後、この行が0件でないことを必ず確認する。**
-0件が続くなら style かアドレスが違うので、そこで直す。
+
+なお作業用コンテナからは外部RPCへ出られない(ネットワークポリシーで遮断)ため、
+アドレスの実在確認はこのログか、Railway上での実行でしか行えない。
 
 ## 過去の誤り(再発防止)
 - イベント識別子を手書きして1文字欠け、最初期から一度も受信できていなかった → ethers.id()で計算する
