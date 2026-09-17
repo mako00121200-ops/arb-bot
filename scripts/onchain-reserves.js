@@ -33,7 +33,7 @@
 // (execute-opportunity.js)が引き続き担当する。
 
 import { ethers } from "ethers";
-import { getChainConfig, CHAIN_CONFIG } from "../chain-config.js";
+import { getChainConfig, getAnyChainConfig, CHAIN_CONFIG } from "../chain-config.js";
 
 const PAIR_ABI = [
   "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
@@ -147,8 +147,17 @@ function getState(chain) {
   return rpcState.get(key);
 }
 
+/// [停止中のチェーンも読めるようにする(2026年9月17日)]
+/// getChainConfig は ACTIVE_CHAINS にあるチェーンしか返さないため、
+/// 停止したチェーンはRPCで読むことすらできなかった。
+/// その結果「本当に機会が無いのか」を測る手段が無く、一度外したチェーンを
+/// データで見直せない状態になっていた(Base/Optimismの除外がこれに当たる)。
+/// ここは読み取りの入口なので、設定のあるチェーンは全て返す。
+/// 監視や売買を始めるかどうかは prepareChain / chainReady が決めており、
+/// そちらは CHAIN_CONFIG(稼働中のみ)を見るので、ここを緩めても
+/// 停止中のチェーンで勝手に取引が始まることはない。
 export function getProviderForChain(chain) {
-  const config = getChainConfig(chain);
+  const config = getAnyChainConfig(chain);
   if (!config) throw new Error(`未対応チェーン: ${chain}`);
   const key = (chain || "").toLowerCase();
   const state = getState(key);
@@ -162,7 +171,8 @@ export function getProviderForChain(chain) {
 }
 
 function recordRpcFailure(chain, message) {
-  const config = getChainConfig(chain);
+  // RPCの切り替えは読み取りに付随する処理なので、停止中のチェーンでも働かせる。
+  const config = getAnyChainConfig(chain);
   if (!config || config.rpcUrls.length < 2) return;
   const state = getState(chain);
   state.failures++;
