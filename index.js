@@ -55,7 +55,7 @@ import {
 import {
   scanForChangedPool, scanAllPairs, getRouteCalcStats,
   getNearMissStats, countIfWallDrops, getWallBreakdown, NEAR_MISS_REACHABLE_WALL_BPS,
-  getWhatIfProfit, getSpotScreenStats,
+  getWhatIfProfit, getSpotScreenStats, takeQuoteDemand, getQuoteDemandTotal,
 } from "./scripts/opportunity-scanner.js";
 import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS } from "./scripts/execute-opportunity.js";
 import {
@@ -86,6 +86,14 @@ const V3_REFRESH_PER_TICK = parseInt(process.env.V3_REFRESH_PER_TICK || "120", 1
 // 価格表を作り直すプール数(1回あたり)。束ねて問い合わせるので数回で済む。
 const QUOTE_TABLE_PER_TICK = parseInt(process.env.QUOTE_TABLE_PER_TICK || "6", 10);
 const QUOTE_TABLE_INTERVAL_MS = parseInt(process.env.QUOTE_TABLE_INTERVAL_MS || "5000", 10);
+/// 全V3プールの価格表を順ぐりに作り置きするか。
+///
+/// [これを false にすると「作り置き」をやめられる(2026年9月18日)]
+/// 作り置きは費用も鮮度もプール数に比例する(V3 5,000件で一巡69分)。
+/// false にすると、価格表は「ふるいを通った経路が要求した分」だけになり、
+/// **費用が候補の数に比例する**。実測では候補は毎分0〜22件しかない。
+/// 既定は true のまま。ふるいからの要求が実際に届くのを確認してから切り替える。
+const QUOTE_TABLE_FILL_ALL = (process.env.QUOTE_TABLE_FILL_ALL || "true").toLowerCase() !== "false";
 // 価格が動いたV3プールは表を作り直す。この割合(%)以上動いたら対象。
 /// 価格表を作り直す基準。**価格表を作った時からの累積のズレ**(%)。
 ///
@@ -138,7 +146,7 @@ const stats = {
   scans: 0, profitableFound: 0, examined: 0, executed: 0, failed: 0,
   skippedCooldown: 0, trapsRejected: 0, taxTokensRejected: 0, staleRejected: 0, bigMoves: 0,
   v3Found: 0, v3Matched: 0, v3Opportunities: 0, v3LiquidityEvents: 0,
-  quoteTablesBuilt: 0, quoteTablesPending: 0, quoteRebuildsFromPolling: 0,
+  quoteTablesBuilt: 0, quoteTablesPending: 0, quoteRebuildsFromPolling: 0, quoteTablesOnDemand: 0,
   v3VerifyCount: 0, v3VerifyWorst: null, v3VerifyRecent: [],
   disabledFromFile: 0, disabledRuntime: 0,
   prunedTotal: 0, prunedKept: 0,
@@ -435,6 +443,8 @@ function refreshTokenPrices() {
 // 判定はこの表から補間するため、RPCを使わずミリ秒で済み、誤差もない。
 
 const quoteRebuildQueue = new Set(); // "chain::pool" 作り直しが必要なプール
+// ふるいを通った経路が要求した価格表。作り置きより優先して作る。
+const quoteDemandQueue = new Set();
 
 function queueQuoteRebuild(chain, address) {
   quoteRebuildQueue.add(poolKeyOf(chain, address));
@@ -505,6 +515,24 @@ async function refreshQuoteTables() {
   quoteRefreshRunning = true;
   try {
     const selected = [];
+    const picked = new Set();
+
+    // ① ふるいを通った経路が要求した価格表。**最優先**。
+    //    ここが「候補が出てから見積もる」の実体。取り切れなかった分は
+    //    次の回に残す(要求そのものは消さない)。
+    for (const key of takeQuoteDemand()) quoteDemandQueue.add(key);
+    for (const key of [...quoteDemandQueue]) {
+      if (selected.length >= QUOTE_TABLE_PER_TICK) break;
+      quoteDemandQueue.delete(key);
+      if (disabledPools.has(key)) continue;
+      const [chain, address] = key.split("::");
+      const pool = getPool(chain, address);
+      if (!pool || pool.kind !== KIND_V3) continue;
+      if (picked.has(key)) continue;
+      picked.add(key);
+      selected.push(pool);
+      stats.quoteTablesOnDemand++;
+    }
 
     // 価格が動いたプールを優先して作り直す。
     //
@@ -518,9 +546,11 @@ async function refreshQuoteTables() {
       })
       .filter((x) => x.pool && x.pool.kind === KIND_V3)
       .sort((a, b) => (b.pool.quoteDriftPct || 0) - (a.pool.quoteDriftPct || 0))
-      .slice(0, QUOTE_TABLE_PER_TICK);
+      .slice(0, Math.max(0, QUOTE_TABLE_PER_TICK - selected.length));
     for (const { key, pool } of urgent) {
       quoteRebuildQueue.delete(key);
+      if (picked.has(key)) continue;
+      picked.add(key);
       selected.push(pool);
     }
     // 対象外(無効化済みなど)は待ち行列から外しておく。
@@ -529,7 +559,7 @@ async function refreshQuoteTables() {
     }
 
     // 残り枠で、表がまだ無いプール(破棄された表を含む)を順に埋める。
-    const budget = QUOTE_TABLE_PER_TICK - urgent.length;
+    const budget = QUOTE_TABLE_FILL_ALL ? QUOTE_TABLE_PER_TICK - selected.length : 0;
     if (budget > 0) {
       const targets = [];
       for (const chain of chainReady) {
@@ -546,7 +576,7 @@ async function refreshQuoteTables() {
         quoteCursor++;
       }
     } else {
-      stats.quoteTablesPending = quoteRebuildQueue.size;
+      stats.quoteTablesPending = quoteRebuildQueue.size + quoteDemandQueue.size;
     }
 
     if (selected.length === 0) return;
@@ -1308,7 +1338,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 定期で作り直し${stats.quoteRebuildsFromPolling}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}] 失敗段階[${stageLine}] 受信[${ev}] 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}`);
+  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}] 失敗段階[${stageLine}] 受信[${ev}] 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}`);
 
   // 現在価格によるふるいの通過率。
   //

@@ -612,6 +612,28 @@ function estimateNetUsd(chain, tokenA, legs, capUsd, gasCostUsd) {
   return isFinite(grossUsd) ? grossUsd - gasCostUsd : null;
 }
 
+// ふるいを通った経路が「判定するのに価格表が要る」と言っているプール。
+//
+// [これが作り置きをやめる要](2026年9月18日)
+// 今までは全V3プールの価格表を順ぐりに作っていたので、費用も鮮度も
+// プール数に比例していた(V3 5,000件なら一巡69分)。
+// ここに積まれるのは**金額の条件まで通った経路の段だけ**なので、
+// 費用が「プール数」ではなく「候補の数」に比例するようになる。
+// 実測では候補は毎分0〜22件しかない。
+const quoteDemand = new Set();
+const QUOTE_DEMAND_LIMIT = 500;
+let quoteDemandTotal = 0;
+
+/// 積まれた要求を取り出して空にする。index.js が最優先で作る。
+export function takeQuoteDemand() {
+  if (quoteDemand.size === 0) return [];
+  const out = [...quoteDemand];
+  quoteDemand.clear();
+  return out;
+}
+
+export function getQuoteDemandTotal() { return quoteDemandTotal; }
+
 /// 実物を確かめるための見本を残す(利益の大きい順に SPOT_SAMPLE_LIMIT 件)。
 function keepSample(sample) {
   const list = spotScreen.samples;
@@ -700,6 +722,16 @@ function measureSpotScreen(chain, tokenA, tokenB, pools, capUsd, gasCostUsd) {
           if (netUsd > SPOT_SCREEN_MIN_PROFIT_USD) {
             spotScreen.needQuote++;
             if (isFresh) spotScreen.freshNeedQuote++;
+
+            // 金額の条件まで通ったのに価格表が無くて判定できない段は、
+            // その場で作るよう要求する。ここが「候補が出てから見積もる」の入口。
+            for (const leg of legs) {
+              if (leg.kind !== KIND_V3 || legIsUsable(leg)) continue;
+              if (quoteDemand.size >= QUOTE_DEMAND_LIMIT) break;
+              if (quoteDemand.has(`${chain}::${leg.pool.toLowerCase()}`)) continue;
+              quoteDemand.add(`${chain}::${leg.pool.toLowerCase()}`);
+              quoteDemandTotal++;
+            }
             keepSample({
               key, chain, netUsd, edge,
               tokenIn: borrowLower,
