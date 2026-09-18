@@ -55,7 +55,7 @@ import {
 import {
   scanForChangedPool, scanAllPairs, getRouteCalcStats,
   getNearMissStats, countIfWallDrops, getWallBreakdown, NEAR_MISS_REACHABLE_WALL_BPS,
-  getWhatIfProfit,
+  getWhatIfProfit, getSpotScreenStats,
 } from "./scripts/opportunity-scanner.js";
 import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS } from "./scripts/execute-opportunity.js";
 import {
@@ -147,6 +147,10 @@ const stats = {
   latencies: [], refreshCycles: 0, mapSource: "-", mapSavedAt: null,
   feeProbed: 0, feeProbePending: 0, lastHeartbeat: null, reservesLoaded: 0, journalLoaded: 0,
 };
+
+// ふるいの計測の前回値(毎分の通過回数を出すため)。
+let lastSpotScreenPassed = [];
+let lastSpotScreenAt = null;
 
 const chainReady = new Set();
 function isReady(chain) { return chainReady.has(chain); }
@@ -1303,6 +1307,29 @@ function heartbeat() {
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
   console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 定期で作り直し${stats.quoteRebuildsFromPolling}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}] 失敗段階[${stageLine}] 受信[${ev}] 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}`);
+
+  // 現在価格によるふるいの通過率。
+  //
+  // [何のための数字か]
+  // 見積もりを「常時作り置き」から「候補が出てから」へ変える設計の前提。
+  // 切り替えると、ふるいを通った回数がそのまま見積もりの回数(=RPC)になる。
+  // **段ごとの毎分の通過回数が、切り替え後に必要なRPCの見積もりそのもの。**
+  // 「表あり」は、今の価格表でも判定できていた回数。ふるいの方が多ければ、
+  // その差が「価格表が無いせいで見えていなかった候補」になる。
+  try {
+    const ss = getSpotScreenStats();
+    if (ss.evaluated > 0) {
+      const elapsedMin = lastSpotScreenAt ? (Date.now() - lastSpotScreenAt) / 60000 : 0;
+      const perMin = (now, prev) => (elapsedMin > 0 ? Math.round((now - prev) / elapsedMin) : 0);
+      const steps = ss.edges
+        .map((e, i) => `${e}bps超:${ss.passed[i].toLocaleString()}(毎分${perMin(ss.passed[i], lastSpotScreenPassed[i] ?? 0)})`)
+        .join(" ");
+      const best = ss.bestBps == null ? "-" : `${ss.bestBps.toFixed(1)}bps`;
+      console.log(`[ふるい] 評価${ss.evaluated.toLocaleString()} 通過[${steps}] 別々の経路${ss.distinctRoutes.toLocaleString()} 表ありでの通過${ss.passedWithTable.toLocaleString()} 最良${best}`);
+      lastSpotScreenPassed = [...ss.passed];
+      lastSpotScreenAt = Date.now();
+    }
+  } catch (e) {}
 
   // 価格表の鮮度。作り直しが追いついているかを見る。
   // ズレ超過が減らない場合、閾値ではなく作り直しの処理能力
