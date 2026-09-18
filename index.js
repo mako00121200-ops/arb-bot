@@ -54,6 +54,7 @@ import {
 import {
   scanForChangedPool, scanAllPairs, getRouteCalcStats,
   getNearMissStats, countIfWallDrops, getWallBreakdown, NEAR_MISS_REACHABLE_WALL_BPS,
+  getWhatIfProfit,
 } from "./scripts/opportunity-scanner.js";
 import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS } from "./scripts/execute-opportunity.js";
 import {
@@ -1030,6 +1031,19 @@ function heartbeat() {
       console.log(`[惜しい] ${chain}: ${head} / 壁${W}bps以下の内訳 ${parts} / 壁が${WALL_DROP_BPS}bps下がれば+${countIfWallDrops(chain, WALL_DROP_BPS, W).toLocaleString()}本`);
     }
   } catch (e) {}
+
+  // 「壁が下がっていたら、いくら取れたか」。本数だけでは戦略の上限が
+  // 分からないため、ガス代を引いた後の金額で出す。必ず多めに出る
+  // (同じ価格差を複数の経路で重複して数えているため)。
+  try {
+    const wi = getWhatIfProfit();
+    for (const [chain, rows] of Object.entries(wi)) {
+      const parts = rows.map((r) =>
+        `壁-${r.drop}bps:${r.routes.toLocaleString()}本 $${r.totalUsd.toFixed(2)}(最大$${r.maxUsd.toFixed(4)}/投入$${r.maxTradeUsd.toFixed(0)})`
+      ).join(" ");
+      if (parts) console.log(`[試算] ${chain}: ${parts}`);
+    }
+  } catch (e) {}
 }
 
 // ===== ダッシュボード =====
@@ -1062,6 +1076,9 @@ th,td{overflow-wrap:anywhere;word-break:break-word}
 /* 惜しかった分布: 目盛り・棒・件数 */
 .t-miss th:nth-child(1),.t-miss td:nth-child(1){width:38%}
 .t-miss th:nth-child(3),.t-miss td:nth-child(3){width:22%}
+/* 壁を下げた試算 */
+.t-whatif th:nth-child(1),.t-whatif td:nth-child(1){width:26%}
+.t-whatif th:nth-child(2),.t-whatif td:nth-child(2){width:18%}
 /* 2列の表は左を広く */
 .t-two th:nth-child(2),.t-two td:nth-child(2){width:32%}
 .note{font-size:10px;color:#888;line-height:1.6;margin-top:9px;padding-top:9px;border-top:1px solid #222;overflow-wrap:anywhere}
@@ -1158,6 +1175,21 @@ function renderPage() {
       <td><div style="background:#222;border-radius:3px;height:8px;width:100%"><div style="background:${color};height:8px;border-radius:3px;width:${Math.min(100, Math.round((n / scale) * 100))}%"></div></div></td>
       <td style="text-align:right">${n.toLocaleString()}</td></tr>`;
 
+  // 「壁が下がっていたら、いくら取れたか」。戦略の上限を見るための試算。
+  const whatIf = getWhatIfProfit();
+  const whatIfRows = (chain) => {
+    const rows = whatIf[chain];
+    if (!rows || !rows.length) return '';
+    const body = rows.map((r) => `<tr>
+      <td>壁 −${r.drop}bps</td>
+      <td style="text-align:right">${r.routes.toLocaleString()}本</td>
+      <td style="text-align:right;color:${r.totalUsd > 0 ? '#e8a33d' : '#888'};font-weight:600">$${r.totalUsd.toFixed(2)}</td>
+      <td style="text-align:right;color:#888">$${r.maxUsd.toFixed(4)}<br><span style="font-size:9px">投入$${r.maxTradeUsd.toFixed(0)}</span></td></tr>`).join('');
+    return `<div class="note" style="border-top:none;padding-top:4px">壁が下がっていたら取れた金額(ガス代を引いた後):</div>
+<table class="t-whatif"><thead><tr><th></th><th style="text-align:right">経路</th><th style="text-align:right">合計</th><th style="text-align:right">最大の1本</th></tr></thead><tbody>${body}</tbody></table>
+<div class="note" style="border-top:none;padding-top:4px;color:#888">合計は<b>必ず多めに出ます</b>。同じ価格差を複数の経路で重複して数えており、実際には1つの価格差は1回しか取れません。自分が取れば価格も動きます。<b>期待できる金額ではなく、この戦略の天井</b>として見てください。</div>`;
+  };
+
   const nearMissBlocks = Object.entries(nmAll).filter(([, d]) => d.total > 0).map(([chain, d]) => {
     const w = walls[chain];
     const wScale = Math.max(...(w ? w.counts : [1]), 1);
@@ -1169,7 +1201,8 @@ function renderPage() {
       return `<h2 style="margin-top:14px">${chain}</h2>
 <div class="note" style="margin-top:0;border-top:none;padding-top:0">経路${d.total.toLocaleString()}本。壁の内訳:</div>
 <table class="t-miss"><tbody>${wallRows}</tbody></table>
-<div class="note">壁${W}bps以下の経路が1本もありません。手数料の高いプールしか無いため、価格がどれだけ動いても黒字になりません。</div>`;
+<div class="note">壁${W}bps以下の経路が1本もありません。手数料の高いプールしか無いため、価格がどれだけ動いても黒字になりません。</div>
+${whatIfRows(chain)}`;
     }
     // 棒の目盛りは最下段(-100bps未満)を除いた最大値に合わせる。
     // 大半がそこに入るため、そこを基準にすると判断に使う上の段が潰れて読めない。
@@ -1182,7 +1215,8 @@ function renderPage() {
 <table class="t-miss"><tbody>${wallRows}</tbody></table>
 <div class="note" style="border-top:none;padding-top:4px">このうち<b>壁${W}bps以下の${r.total.toLocaleString()}本</b>だけを取り出した、惜しさの分布:</div>
 <table class="t-miss"><tbody>${rows}</tbody></table>
-<div class="note">壁が${WALL_DROP_BPS}bps下がれば <b style="color:#e8a33d">+${gain.toLocaleString()}本</b> が粗利プラスに変わります(いま粗利プラスは${r.counts[0].toLocaleString()}本)。<br>段をまたぐ分は数えていないので、実際はこれより多くなります。</div>`;
+<div class="note">壁が${WALL_DROP_BPS}bps下がれば <b style="color:#e8a33d">+${gain.toLocaleString()}本</b> が粗利プラスに変わります(いま粗利プラスは${r.counts[0].toLocaleString()}本)。<br>段をまたぐ分は数えていないので、実際はこれより多くなります。</div>
+${whatIfRows(chain)}`;
   }).join('') || '<div class="note" style="color:#888">まだ経路を計算していません</div>';
 
   const reasonRows = Object.entries(reasons).filter(([, v]) => v > 0).sort((a,b)=>b[1]-a[1]).map(([k, v]) =>
