@@ -444,6 +444,36 @@ async function refreshQuoteTables() {
 
 /// 価格表の補間が公式Quoterとどれだけ一致するかを確かめる。
 let v3VerifyCursor = 0;
+/// 見積もりの誤差を測る投入額(USD)。
+///
+/// [なぜ複数の額で測るか]
+/// 以前は$20だけで測っていた。価格表の点は $1,3,10,30,100,300,1000,2000 で、
+/// $20は「$10〜$30」という狭い区間にあり、補間の誤差が最も小さい場所だった。
+/// 一方、実際に赤字と確定した取引は $102 と $276、つまり「$100〜$300」という
+/// 広い区間にある。**いちばん簡単な点だけを測っていた。**
+/// 区間の広さごとに誤差がどう変わるかを見るため、複数の額で測る。
+const VERIFY_AMOUNTS_USD = (process.env.VERIFY_AMOUNTS_USD || "20,200,700")
+  .split(",").map((v) => parseFloat(v.trim())).filter((v) => v > 0);
+
+/// 投入額ごとの誤差(bps)。狙う利幅は5〜50bpsなので、%ではなくbpsで見る。
+const verifyErrorByUsd = new Map(); // usd -> { count, sumAbsBps, worstBps, overCount }
+
+export function getVerifyErrorStats() {
+  const out = [];
+  for (const usd of VERIFY_AMOUNTS_USD) {
+    const e = verifyErrorByUsd.get(usd);
+    if (!e || !e.count) continue;
+    out.push({
+      usd,
+      count: e.count,
+      avgAbsBps: e.sumAbsBps / e.count,
+      worstBps: e.worstBps,
+      overRate: e.overCount / e.count,
+    });
+  }
+  return out;
+}
+
 async function verifyV3Calculations() {
   if (!anyReady()) return;
   const candidates = [];
@@ -460,27 +490,45 @@ async function verifyV3Calculations() {
   const pool = candidates[v3VerifyCursor % candidates.length];
   v3VerifyCursor++;
 
-  // 表の点と点の間の値で確かめる($20は表にない値)。
-  const amountIn = usdToAmount(pool.chain, pool.token0, 20);
-  if (!amountIn) return;
+  for (const usd of VERIFY_AMOUNTS_USD) {
+    // 表の点そのものではなく、点と点の間の値で確かめる。
+    const amountIn = usdToAmount(pool.chain, pool.token0, usd);
+    if (!amountIn) continue;
 
-  const result = await verifyQuoteTable({
-    chain: pool.chain, pool: pool.address, zeroForOne: true,
-    tokenIn: pool.token0, tokenOut: pool.token1, feeTier: pool.feeTier, amountIn,
-  });
-  if (!result) return;
+    let result;
+    try {
+      result = await verifyQuoteTable({
+        chain: pool.chain, pool: pool.address, zeroForOne: true,
+        tokenIn: pool.token0, tokenOut: pool.token1, feeTier: pool.feeTier, amountIn,
+      });
+    } catch (e) { continue; }
+    // 流動性が足りず公式Quoterが失敗した場合は測れない。その額は飛ばす。
+    if (!result) continue;
 
-  stats.v3VerifyCount++;
-  const entry = {
-    chain: pool.chain, address: pool.address, dexId: pool.dexId,
-    feeBps: pool.feeBps, diffPercent: result.diffPercent, at: new Date().toISOString(),
-  };
-  stats.v3VerifyRecent = [entry, ...stats.v3VerifyRecent].slice(0, 10);
-  if (!stats.v3VerifyWorst || Math.abs(result.diffPercent) > Math.abs(stats.v3VerifyWorst.diffPercent)) {
-    stats.v3VerifyWorst = entry;
-  }
-  if (Math.abs(result.diffPercent) > 1) {
-    console.log(`[V3検証] ${pool.chain} ${pool.address.slice(0, 10)}…(${(pool.feeBps / 100).toFixed(2)}%): 補間が公式より${result.diffPercent > 0 ? "過大" : "過小"}${Math.abs(result.diffPercent).toFixed(2)}%`);
+    const bps = result.diffPercent * 100;
+    if (!verifyErrorByUsd.has(usd)) {
+      verifyErrorByUsd.set(usd, { count: 0, sumAbsBps: 0, worstBps: 0, overCount: 0 });
+    }
+    const e = verifyErrorByUsd.get(usd);
+    e.count++;
+    e.sumAbsBps += Math.abs(bps);
+    if (Math.abs(bps) > Math.abs(e.worstBps)) e.worstBps = bps;
+    if (bps > 0) e.overCount++; // 補間が公式より過大だった回数
+
+    stats.v3VerifyCount++;
+    const entry = {
+      chain: pool.chain, address: pool.address, dexId: pool.dexId,
+      feeBps: pool.feeBps, diffPercent: result.diffPercent, tradeUsd: usd,
+      at: new Date().toISOString(),
+    };
+    stats.v3VerifyRecent = [entry, ...stats.v3VerifyRecent].slice(0, 10);
+    if (!stats.v3VerifyWorst || Math.abs(result.diffPercent) > Math.abs(stats.v3VerifyWorst.diffPercent)) {
+      stats.v3VerifyWorst = entry;
+    }
+    // 閾値は1%(100bps)では粗すぎた。狙う利幅が5〜50bpsなので20bpsで出す。
+    if (Math.abs(bps) > 20) {
+      console.log(`[V3検証] ${pool.chain} ${pool.address.slice(0, 10)}…(${(pool.feeBps / 100).toFixed(2)}%) 投入$${usd}: 補間が公式より${bps > 0 ? "過大" : "過小"}${Math.abs(bps).toFixed(1)}bps`);
+    }
   }
 }
 
@@ -1006,6 +1054,19 @@ function heartbeat() {
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
   console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 定期で作り直し${stats.quoteRebuildsFromPolling}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}] 失敗段階[${stageLine}] 受信[${ev}] 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}`);
+
+  // 見積もりの誤差。狙う利幅は5〜50bpsなので、誤差がそれを上回っていれば
+  // 「機会」ではなくノイズを拾っていることになる。投入額ごとに出すのは、
+  // 価格表の点の間隔が広いほど補間の誤差が大きくなるため。
+  try {
+    const ve = getVerifyErrorStats();
+    if (ve.length) {
+      const parts = ve.map((e) =>
+        `$${e.usd}:${e.count}件 平均±${e.avgAbsBps.toFixed(1)}bps 最悪${e.worstBps > 0 ? "+" : ""}${e.worstBps.toFixed(1)} 過大${(e.overRate * 100).toFixed(0)}%`
+      ).join(" / ");
+      console.log(`[見積もり誤差] ${parts}`);
+    }
+  } catch (e) {}
 
   // 判定の手前で何件が脱落しているかを出す。スキャンは回っているのに経路が
   // 1本も評価されない状態が続いたため、どの段階で落ちているかを見えるようにする。
