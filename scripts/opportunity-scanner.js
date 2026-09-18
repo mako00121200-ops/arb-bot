@@ -217,18 +217,39 @@ function routeMaxAmountIn(maxAmountIn, legs) {
 const routeCalcStats = { computed: 0, grossProfitable: 0, hitCap: 0 };
 export function getRouteCalcStats() { return { ...routeCalcStats }; }
 
+/// 「手数料の壁がこれだけ低かったら」を試算する幅(bps)。
+///
+/// [なぜ要るか]
+/// 「壁が29bps下がれば+17本」は本数しか答えず、いくら取れたのかが分からない。
+/// 実際に取れる金額まで出せば、この戦略の上限が分かる。100bpsは現実に
+/// 到達できる値ではない(Polygonの壁35bps、Optimism 6bps、差は29bps)が、
+/// 「壁を極限まで下げても $いくらにしかならない」という天井を測る意味がある。
+const WHATIF_DROPS = (process.env.WHATIF_WALL_DROPS || "29,50,100")
+  .split(",").map((v) => parseInt(v.trim(), 10)).filter((v) => v > 0);
+
 function findBestAmount(maxAmountIn, legs) {
   let best = { amountIn: 0n, amountOut: 0n, profit: 0n, returnBps: null };
   const cap = routeMaxAmountIn(maxAmountIn, legs);
-  if (cap <= 0n) return best;
+  if (cap <= 0n) return { ...best, whatIf: [] };
 
   // 赤字でも「一番良かった時の利回り」をbpsで残す。
   // simulateRoute を呼ぶ回数は増やさず、すでに計算した値から比率を取るだけ。
   let bestReturnBps = null;
-  const note = (amountIn, profit) => {
+
+  // 壁が下がった場合の最良の利益(投入額ごとに計算し、一番良いものを残す)。
+  // 手数料が下がる分だけ受取が増えるとみなす。段をまたぐ手数料は掛け算だが、
+  // この規模では足し算で近似できる。
+  const whatIf = WHATIF_DROPS.map((drop) => ({ drop, amountIn: 0n, profit: 0n }));
+
+  const note = (amountIn, amountOut, profit) => {
     if (amountIn <= 0n) return;
     const bps = Number((profit * 10000n) / amountIn);
     if (bestReturnBps == null || bps > bestReturnBps) bestReturnBps = bps;
+    for (const w of whatIf) {
+      const adjOut = amountOut + (amountOut * BigInt(w.drop)) / 10000n;
+      const adjProfit = adjOut - amountIn;
+      if (adjProfit > w.profit) { w.profit = adjProfit; w.amountIn = amountIn; }
+    }
   };
 
   // 上限に対する比率で探すので、上限が大きいほど最小の刻みが粗くなる。
@@ -245,7 +266,7 @@ function findBestAmount(maxAmountIn, legs) {
     if (amountIn <= 0n) continue;
     const amountOut = simulateRoute(amountIn, legs);
     const profit = amountOut - amountIn;
-    note(amountIn, profit);
+    note(amountIn, amountOut, profit);
     if (profit > best.profit) best = { amountIn, amountOut, profit, returnBps: null };
   }
   if (best.amountIn > 0n) {
@@ -254,13 +275,13 @@ function findBestAmount(maxAmountIn, legs) {
       if (amountIn <= 0n || amountIn > cap) continue;
       const amountOut = simulateRoute(amountIn, legs);
       const profit = amountOut - amountIn;
-      note(amountIn, profit);
+      note(amountIn, amountOut, profit);
       if (profit > best.profit) best = { amountIn, amountOut, profit, returnBps: null };
     }
   }
   // 一番良かった額が上限のすぐ下なら、上限で切られていた可能性がある。
   if (best.amountIn > 0n && best.amountIn * 100n >= cap * 95n) routeCalcStats.hitCap++;
-  return { ...best, returnBps: bestReturnBps };
+  return { ...best, returnBps: bestReturnBps, whatIf };
 }
 
 function maxAmountFromUsd(chain, token, capUsd) {
@@ -320,6 +341,56 @@ function routeKeyOf(chain, tokenA, poolAddresses) {
   const pools = poolAddresses.map((a) => a.slice(2, 10)).join(",");
   return `${chain}|${tokenA.slice(2, 8)}|${pools}`;
 }
+
+/// 壁が下がった場合の純利益(USD)を経路ごとに記録する。
+/// ガス代を引いた後の値で、経路ごとに一番良かったものだけを残す。
+function recordWhatIf(key, whatIf, toUsd, gasCostUsd) {
+  const entry = routeBest.get(key);
+  if (!entry || !whatIf || whatIf.length === 0) return;
+  if (!entry.netByDrop) entry.netByDrop = new Array(whatIf.length).fill(0);
+  for (let i = 0; i < whatIf.length; i++) {
+    const w = whatIf[i];
+    if (w.amountIn <= 0n || w.profit <= 0n) continue;
+    const net = toUsd(w.profit) - gasCostUsd;
+    if (net > entry.netByDrop[i]) {
+      entry.netByDrop[i] = net;
+      if (!entry.tradeUsdByDrop) entry.tradeUsdByDrop = new Array(whatIf.length).fill(0);
+      entry.tradeUsdByDrop[i] = toUsd(w.amountIn);
+    }
+  }
+}
+
+/// 「壁がW bps下がっていたら、いくら取れたか」の集計。
+///
+/// [必ず多めに出ることに注意]
+/// ・経路ごとの最良の瞬間だけを足している(同時に全部は取れない)
+/// ・複数の経路が同じプールを共有していても別々に数えている。
+///   実際には1つの価格差は1回しか取れない
+/// ・自分が取れば価格が動くので、その分は引けていない
+/// つまりこれは「この戦略の天井」であって、期待できる金額ではない。
+export function getWhatIfProfit() {
+  const out = {};
+  for (const r of routeBest.values()) {
+    if (!r.netByDrop) continue;
+    if (!out[r.chain]) {
+      out[r.chain] = WHATIF_DROPS.map((drop) => ({ drop, routes: 0, totalUsd: 0, maxUsd: 0, maxTradeUsd: 0 }));
+    }
+    for (let i = 0; i < r.netByDrop.length && i < out[r.chain].length; i++) {
+      const net = r.netByDrop[i];
+      if (net <= 0) continue;
+      const o = out[r.chain][i];
+      o.routes++;
+      o.totalUsd += net;
+      if (net > o.maxUsd) {
+        o.maxUsd = net;
+        o.maxTradeUsd = r.tradeUsdByDrop ? r.tradeUsdByDrop[i] : 0;
+      }
+    }
+  }
+  return out;
+}
+
+export const WHATIF_DROP_LIST = [...WHATIF_DROPS];
 
 function recordNearMiss(chain, key, returnBps, wallBps) {
   if (returnBps == null || !Number.isFinite(returnBps)) return;
@@ -403,17 +474,27 @@ function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, p
   // 捨てる前に「どれくらい惜しかったか」を経路ごとに残す。
   // 同じ経路を何度評価しても1本として数える(回数ではなく本数を知りたい)。
   const wallBps = legs.reduce((sum, l) => sum + l.feeBps, 0);
-  recordNearMiss(chain, routeKeyOf(chain, tokenA, poolAddresses), best.returnBps, wallBps);
+  const routeKey = routeKeyOf(chain, tokenA, poolAddresses);
+  recordNearMiss(chain, routeKey, best.returnBps, wallBps);
+
+  // 桁数と価格は「壁が下がった場合」の金額換算にも要るので、
+  // 赤字で打ち切る前に取っておく。どちらもメモリ上の参照で、RPCは使わない。
+  const decimals = getTokenDecimals(chain, tokenA);
+  const priceUsd = getTokenPriceUsd(chain, tokenA);
+  const toNumber = (v) => Number(v) / Math.pow(10, decimals);
+
+  // 赤字の経路こそ「壁が下がっていれば取れたか」を知りたいので、
+  // 打ち切りの手前で試算を記録する。
+  if (decimals != null && priceUsd) {
+    recordWhatIf(routeKey, best.whatIf, (v) => toNumber(v) * priceUsd, gasCostUsd);
+  }
+
   // 粗利(ガス代を引く前)がプラスでなければ、そこで終わり。
   // 裁定の機会が無い時はここで止まるのが正常。
   if (best.profit <= 0n) return null;
   routeCalcStats.grossProfitable++;
 
-  const decimals = getTokenDecimals(chain, tokenA);
-  const priceUsd = getTokenPriceUsd(chain, tokenA);
   if (decimals == null || !priceUsd) return null;
-
-  const toNumber = (v) => Number(v) / Math.pow(10, decimals);
   const tradeAmountUsd = toNumber(best.amountIn) * priceUsd;
   if (MIN_TRADE_USD > 0 && tradeAmountUsd < MIN_TRADE_USD) return null;
 
