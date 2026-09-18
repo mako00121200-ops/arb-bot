@@ -462,6 +462,117 @@ export function countIfWallDrops(chain, dropBps, maxWallBps = null) {
 
 export const NEAR_MISS_REACHABLE_WALL_BPS = REACHABLE_WALL_BPS;
 
+// ===== 現在価格によるふるいの計測(2026年9月18日に追加) =====
+//
+// [何を測るのか]
+// 見積もりを「常時作り置き」から「候補が出てから」へ変える設計の、前提を測る。
+//
+// 1段の受取比率は、どんなAMMでも投入額が増えるほど悪くなる(V2の x·y=k も、
+// V3の集中流動性も、出力は投入に対して上に凸)。したがって投入額ゼロの極限、
+// つまり**現在価格**が、その段で得られるいちばん良い比率になる。経路全体では
+//
+//     ∏(現在価格ᵢ × (1 − 手数料ᵢ)) ≤ 1  ならば、どんな投入額でも黒字にならない
+//
+// が**必ず**成り立つ。近似ではないので、**本物の機会を取りこぼさない**。
+//
+// [なぜ実装より先に測るのか]
+// 切り替えると「ふるいを通った経路」ごとに正確な見積もりを取ることになる。
+// 通過率が分からないまま切り替えると、候補が毎分数千件出た場合にRPCが破裂する。
+// ここでは**数えるだけ**で、RPCも判定の動作も一切変えない。
+//
+// [桁数を気にしなくてよい理由]
+// rateOf は生の整数どうしの比を返すが、経路は同じトークンに戻ってくるので、
+// 掛け合わせると桁数の係数が打ち消し合う。比は無次元になる。
+
+/// 通過とみなす利幅の段(bps)。0は「理論上あり得る」、それ以上は
+/// ガス代を考えた現実的な線。段ごとに数えると、閾値をどこに置けば
+/// 見積もりの回数がいくつになるかが分かる。
+const SPOT_SCREEN_EDGES = [0, 5, 10, 30];
+const SPOT_SCREEN_ROUTE_LIMIT = 50000;
+/// 1ペアで見るプール数の上限。総当たりは二乗で増えるための歯止め。
+const SPOT_SCREEN_MAX_POOLS = 24;
+
+const spotScreen = {
+  evaluated: 0,
+  passed: SPOT_SCREEN_EDGES.map(() => 0),
+  passedWithTable: 0,
+  bestBps: null,
+  routes: new Map(),
+  capped: 0,
+};
+
+/// 経路の現在価格の積。手数料を引いたあとの利幅をbpsで返す。
+function spotEdgeBps(legs) {
+  let product = 1;
+  for (const leg of legs) {
+    const rate = rateOf(leg);
+    if (!isFinite(rate) || rate <= 0) return null;
+    product *= rate * (1 - leg.feeBps / 10000);
+  }
+  if (!isFinite(product)) return null;
+  return (product - 1) * 10000;
+}
+
+/// 1ペアぶんの2段経路を、**価格表の有無に関係なく**ふるいにかけて数える。
+/// 今の判定は価格表のある段しか使えないので、ここでは「切り替えたら
+/// いくつ候補が出るか」を測るために、その条件を外して数える。
+function measureSpotScreen(chain, tokenA, tokenB, pools) {
+  let usable = pools.filter(hasUsableState);
+  if (usable.length < 2) return;
+  if (usable.length > SPOT_SCREEN_MAX_POOLS) {
+    spotScreen.capped++;
+    usable = usable.slice(0, SPOT_SCREEN_MAX_POOLS);
+  }
+
+  for (const [borrow, other] of [[tokenA, tokenB], [tokenB, tokenA]]) {
+    const borrowLower = borrow.toLowerCase();
+    const otherLower = other.toLowerCase();
+    const outbound = [], inbound = [];
+    for (const p of usable) {
+      const l1 = orient(p, borrowLower);
+      if (l1.tokenOut === otherLower) outbound.push({ pool: p, leg: l1 });
+      const l2 = orient(p, otherLower);
+      if (l2.tokenOut === borrowLower) inbound.push({ pool: p, leg: l2 });
+    }
+    for (const a of outbound) {
+      for (const b of inbound) {
+        if (a.pool.address.toLowerCase() === b.pool.address.toLowerCase()) continue;
+        const legs = [a.leg, b.leg];
+        const edge = spotEdgeBps(legs);
+        if (edge == null) continue;
+        spotScreen.evaluated++;
+        if (spotScreen.bestBps == null || edge > spotScreen.bestBps) spotScreen.bestBps = edge;
+        if (edge <= 0) continue;
+        for (let i = 0; i < SPOT_SCREEN_EDGES.length; i++) {
+          if (edge > SPOT_SCREEN_EDGES[i]) spotScreen.passed[i]++;
+        }
+        if (legIsUsable(a.leg) && legIsUsable(b.leg)) spotScreen.passedWithTable++;
+
+        const key = `${chain}:${borrowLower}:${a.pool.address.toLowerCase()}>${b.pool.address.toLowerCase()}`;
+        const prev = spotScreen.routes.get(key);
+        if (prev == null) {
+          if (spotScreen.routes.size < SPOT_SCREEN_ROUTE_LIMIT) spotScreen.routes.set(key, edge);
+        } else if (edge > prev) {
+          spotScreen.routes.set(key, edge);
+        }
+      }
+    }
+  }
+}
+
+/// ふるいの計測結果。edges は段の値(bps)、passed は段ごとの通過回数。
+export function getSpotScreenStats() {
+  return {
+    edges: [...SPOT_SCREEN_EDGES],
+    evaluated: spotScreen.evaluated,
+    passed: [...spotScreen.passed],
+    passedWithTable: spotScreen.passedWithTable,
+    bestBps: spotScreen.bestBps,
+    distinctRoutes: spotScreen.routes.size,
+    capped: spotScreen.capped,
+  };
+}
+
 function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, poolAddresses }) {
   // V3を1段も含まない経路は判定しない。
   if (!legs.some((l) => l.kind === KIND_V3)) return null;
@@ -519,6 +630,9 @@ function labelOf(legs) {
 }
 
 export function scanTwoStep({ chain, tokenA, tokenB, pools, capUsd, gasCostUsd, isBorrowable }) {
+  // 計測だけ先に行う。RPCは使わず、この下の判定には一切影響しない。
+  measureSpotScreen(chain, tokenA, tokenB, pools);
+
   const usable = pools.filter(hasUsableState);
   if (usable.length < 2) return null;
 
