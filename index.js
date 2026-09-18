@@ -51,7 +51,10 @@ import {
   getArbitragablePairs, savePoolMap, loadPoolMap, snapshotFullMap,
   hasUsableState, clearPoolState, formatStateDiagnostics, KIND_V2, KIND_V3,
 } from "./scripts/pool-registry.js";
-import { scanForChangedPool, scanAllPairs, getRouteCalcStats, getNearMissStats, countIfWallDrops } from "./scripts/opportunity-scanner.js";
+import {
+  scanForChangedPool, scanAllPairs, getRouteCalcStats,
+  getNearMissStats, countIfWallDrops, getWallBreakdown, NEAR_MISS_REACHABLE_WALL_BPS,
+} from "./scripts/opportunity-scanner.js";
 import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS } from "./scripts/execute-opportunity.js";
 import {
   getKnownTokens, isStableToken, isBorrowable,
@@ -1012,11 +1015,19 @@ function heartbeat() {
   // どれくらい惜しかったかの分布。機会が0件でも「壁さえ低ければ届いていた」
   // のか「そもそも価格が動いていない」のかを区別できるようにする。
   try {
-    const nm = getNearMissStats();
-    for (const [chain, d] of Object.entries(nm)) {
+    const W = NEAR_MISS_REACHABLE_WALL_BPS;
+    const all = getNearMissStats();
+    const near = getNearMissStats(W);
+    for (const [chain, d] of Object.entries(all)) {
       if (!d.total) continue;
-      const parts = d.labels.map((l, i) => `${l}:${d.counts[i].toLocaleString()}`).join(" ");
-      console.log(`[惜しい] ${chain}: ${parts} / 壁が${WALL_DROP_BPS}bps下がれば+${countIfWallDrops(chain, WALL_DROP_BPS).toLocaleString()}件`);
+      const r = near[chain];
+      // 件数は「別々の経路の本数」。同じ経路を何度評価しても1本。
+      // 壁が高すぎて構造的に黒字にならない経路を除いた分も併記する。
+      const head = `経路${d.total.toLocaleString()}本(壁${W}bps以下${(r?.total || 0).toLocaleString()}本)`;
+      const parts = r
+        ? r.labels.map((l, i) => `${l}:${r.counts[i].toLocaleString()}`).join(" ")
+        : "壁の低い経路なし";
+      console.log(`[惜しい] ${chain}: ${head} / 壁${W}bps以下の内訳 ${parts} / 壁が${WALL_DROP_BPS}bps下がれば+${countIfWallDrops(chain, WALL_DROP_BPS, W).toLocaleString()}本`);
     }
   } catch (e) {}
 }
@@ -1136,25 +1147,42 @@ function renderPage() {
 
   // 「あと何bpsで黒字だったか」の分布。機会が0件のとき、原因が
   // 「手数料の壁」なのか「そもそも価格が動いていない」のかを見分ける。
-  const nm = getNearMissStats();
-  const nearMissBlocks = Object.entries(nm).filter(([, d]) => d.total > 0).map(([chain, d]) => {
+  // 件数は「別々の経路の本数」で、同じ経路を何度評価しても1本。
+  const W = NEAR_MISS_REACHABLE_WALL_BPS;
+  const nmAll = getNearMissStats();
+  const nmNear = getNearMissStats(W);
+  const walls = getWallBreakdown();
+
+  const barRow = (label, n, scale, color) =>
+    `<tr><td>${label}</td>
+      <td><div style="background:#222;border-radius:3px;height:8px;width:100%"><div style="background:${color};height:8px;border-radius:3px;width:${Math.min(100, Math.round((n / scale) * 100))}%"></div></div></td>
+      <td style="text-align:right">${n.toLocaleString()}</td></tr>`;
+
+  const nearMissBlocks = Object.entries(nmAll).filter(([, d]) => d.total > 0).map(([chain, d]) => {
+    const w = walls[chain];
+    const wScale = Math.max(...(w ? w.counts : [1]), 1);
+    const wallRows = w ? w.labels.map((l, i) =>
+      barRow(l, w.counts[i], wScale, i <= 2 ? '#6fae62' : '#555')).join('') : '';
+
+    const r = nmNear[chain];
+    if (!r || !r.total) {
+      return `<h2 style="margin-top:14px">${chain}</h2>
+<div class="note" style="margin-top:0;border-top:none;padding-top:0">経路${d.total.toLocaleString()}本。壁の内訳:</div>
+<table class="t-miss"><tbody>${wallRows}</tbody></table>
+<div class="note">壁${W}bps以下の経路が1本もありません。手数料の高いプールしか無いため、価格がどれだけ動いても黒字になりません。</div>`;
+    }
     // 棒の目盛りは最下段(-100bps未満)を除いた最大値に合わせる。
     // 大半がそこに入るため、そこを基準にすると判断に使う上の段が潰れて読めない。
-    const scale = Math.max(...d.counts.slice(0, -1), 1);
-    const rows = d.labels.map((l, i) => {
-      const n = d.counts[i];
-      const pct = d.total ? (n / d.total * 100) : 0;
-      const bar = Math.min(100, Math.round((n / scale) * 100));
-      const color = i === 0 ? '#2ecc71' : i <= 3 ? '#e8a33d' : '#555';
-      return `<tr><td>${l}</td>
-        <td><div style="background:#222;border-radius:3px;height:8px;width:100%"><div style="background:${color};height:8px;border-radius:3px;width:${bar}%"></div></div></td>
-        <td style="text-align:right">${n.toLocaleString()}<br><span style="color:#888;font-size:9px">${pct.toFixed(1)}%</span></td></tr>`;
-    }).join('');
-    const gain = countIfWallDrops(chain, WALL_DROP_BPS);
-    const already = d.counts[0];
-    return `<h2 style="margin-top:14px">${chain}(計${d.total.toLocaleString()}本)</h2>
+    const scale = Math.max(...r.counts.slice(0, -1), 1);
+    const rows = r.labels.map((l, i) =>
+      barRow(l, r.counts[i], scale, i === 0 ? '#2ecc71' : i <= 3 ? '#e8a33d' : '#555')).join('');
+    const gain = countIfWallDrops(chain, WALL_DROP_BPS, W);
+    return `<h2 style="margin-top:14px">${chain}</h2>
+<div class="note" style="margin-top:0;border-top:none;padding-top:0">経路${d.total.toLocaleString()}本。まず壁の高さの内訳:</div>
+<table class="t-miss"><tbody>${wallRows}</tbody></table>
+<div class="note" style="border-top:none;padding-top:4px">このうち<b>壁${W}bps以下の${r.total.toLocaleString()}本</b>だけを取り出した、惜しさの分布:</div>
 <table class="t-miss"><tbody>${rows}</tbody></table>
-<div class="note">壁が${WALL_DROP_BPS}bps下がれば <b style="color:#e8a33d">+${gain.toLocaleString()}本</b> が粗利プラスに変わります(いま粗利プラスは${already.toLocaleString()}本)。<br>段をまたぐ分は数えていないので、実際はこれより多くなります。</div>`;
+<div class="note">壁が${WALL_DROP_BPS}bps下がれば <b style="color:#e8a33d">+${gain.toLocaleString()}本</b> が粗利プラスに変わります(いま粗利プラスは${r.counts[0].toLocaleString()}本)。<br>段をまたぐ分は数えていないので、実際はこれより多くなります。</div>`;
   }).join('') || '<div class="note" style="color:#888">まだ経路を計算していません</div>';
 
   const reasonRows = Object.entries(reasons).filter(([, v]) => v > 0).sort((a,b)=>b[1]-a[1]).map(([k, v]) =>
@@ -1243,7 +1271,7 @@ function renderPage() {
 <table class="t-num"><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table></div>
 
 <div class="card"><h2>📏 あと何bpsで黒字だったか</h2>
-<div class="note" style="margin-top:0;border-top:none;padding-top:0">粗利がプラスにならなかった経路が、どれくらい惜しかったかの分布です。<br>手数料の壁は実測で Polygon 最小35bps / Optimism 最小6bps。壁の低いチェーンへ移す価値があるかを、この分布で判断します。</div>
+<div class="note" style="margin-top:0;border-top:none;padding-top:0">件数は<b>別々の経路の本数</b>です(同じ経路を何度評価しても1本)。<br>手数料1%のプールを2段通れば壁は200bpsで、価格がどれだけ動いても黒字になりません。そうした経路を除くため、まず壁の高さで分けてから、届きうる経路だけの惜しさを見ます。<br>壁は実測で Polygon 最小35bps / Optimism 最小6bps です。</div>
 ${nearMissBlocks}</div>
 
 <div class="footerlink"><a href="/about">→ 仕組みについて</a></div></body></html>`;
