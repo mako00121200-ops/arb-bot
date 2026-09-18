@@ -113,12 +113,48 @@ export async function fetchReservesBatch(chain, pools, priority = false) {
   return result;
 }
 
-/// 複数のV3プールの価格(slot0)と流動性を一括で読む。
+// ===== Algebra系の状態の読み取り =====
+//
+// Algebra は slot0() を持たず globalState() で価格を返す。返り値の並びは
+// 版によって違う(V1は7個、Integralは6個で中身も別物)が、先頭2つ
+//   uint160 price / int24 tick
+// はどの版でも共通。そこでABIで丸ごと復号せず、先頭2語だけを自前で読む。
+// 丸ごと復号すると、版が違うだけで失敗して価格が取れなくなる。
+const GLOBAL_STATE_SELECTOR = ethers.id("globalState()").slice(0, 10);
+
+/// globalState() の返り値から先頭2語(価格とtick)だけを読む。
+function decodeGlobalStateHead(returnData) {
+  const hex = returnData.startsWith("0x") ? returnData.slice(2) : returnData;
+  if (hex.length < 128) return null;
+  try {
+    const sqrtPriceX96 = BigInt("0x" + hex.slice(0, 64));
+    let tick = BigInt("0x" + hex.slice(64, 128));
+    // int24 は32バイトに符号拡張されて入っている。負の値を戻す。
+    if (tick >= 1n << 255n) tick -= 1n << 256n;
+    return { sqrtPriceX96, tick: Number(tick) };
+  } catch (e) {
+    return null;
+  }
+}
+
+/// 一度 globalState() で読めたプールを覚えておき、次からは slot0() を
+/// 試さずに直接こちらへ回す(毎回1回分の無駄な呼び出しを省くため)。
+const algebraPools = new Set();
+
+/// 複数のV3プールの価格と流動性を一括で読む。
+/// Uniswap形式は slot0()、Algebra形式は globalState() を使う。
 /// 戻り値: Map<小文字アドレス, { sqrtPriceX96, tick, liquidity } | null>
 export async function fetchV3StatesBatch(chain, addresses, priority = false) {
   const result = new Map();
-  for (let i = 0; i < addresses.length; i += MAX_V3_POOLS_PER_CALL) {
-    const chunk = addresses.slice(i, i + MAX_V3_POOLS_PER_CALL);
+  // 既知のAlgebraプールは最初から globalState() 側に回す。
+  const algebraQueue = [];
+  const uniswapQueue = [];
+  for (const addr of addresses) {
+    (algebraPools.has(`${chain}:${addr.toLowerCase()}`) ? algebraQueue : uniswapQueue).push(addr);
+  }
+
+  for (let i = 0; i < uniswapQueue.length; i += MAX_V3_POOLS_PER_CALL) {
+    const chunk = uniswapQueue.slice(i, i + MAX_V3_POOLS_PER_CALL);
     const calls = [];
     for (const addr of chunk) {
       const target = ethers.getAddress(addr);
@@ -131,6 +167,9 @@ export async function fetchV3StatesBatch(chain, addresses, priority = false) {
       const r1 = returned[j * 2], r2 = returned[j * 2 + 1];
       if (!r1?.success || !r2?.success || r1.returnData === "0x" || r2.returnData === "0x") {
         result.set(key, null);
+        // slot0() の呼び出し自体が失敗した時だけ、Algebra形式の可能性を試す。
+        // 価格が0で返ってきた場合(未初期化のプール)はここに入れない。
+        if (!r1?.success || r1.returnData === "0x") algebraQueue.push(chunk[j]);
         continue;
       }
       try {
@@ -143,6 +182,43 @@ export async function fetchV3StatesBatch(chain, addresses, priority = false) {
       }
     }
   }
+
+  for (let i = 0; i < algebraQueue.length; i += MAX_V3_POOLS_PER_CALL) {
+    const chunk = algebraQueue.slice(i, i + MAX_V3_POOLS_PER_CALL);
+    const calls = [];
+    for (const addr of chunk) {
+      const target = ethers.getAddress(addr);
+      calls.push({ target, allowFailure: true, callData: GLOBAL_STATE_SELECTOR });
+      calls.push({ target, allowFailure: true, callData: V3_IFACE.encodeFunctionData("liquidity") });
+    }
+    let returned;
+    try {
+      returned = await multicallSplitting(chain, calls, priority);
+    } catch (e) {
+      continue; // 読めなければ、そのプールは今回は状態なしのまま
+    }
+    for (let j = 0; j < chunk.length; j++) {
+      const key = chunk[j].toLowerCase();
+      const r1 = returned[j * 2], r2 = returned[j * 2 + 1];
+      if (!r1?.success || !r2?.success || r1.returnData === "0x" || r2.returnData === "0x") {
+        if (!result.has(key)) result.set(key, null);
+        continue;
+      }
+      const head = decodeGlobalStateHead(r1.returnData);
+      if (!head || head.sqrtPriceX96 <= 0n) {
+        if (!result.has(key)) result.set(key, null);
+        continue;
+      }
+      try {
+        const liquidity = V3_IFACE.decodeFunctionResult("liquidity", r2.returnData)[0];
+        result.set(key, { ...head, liquidity });
+        algebraPools.add(`${chain}:${key}`);
+      } catch (e) {
+        if (!result.has(key)) result.set(key, null);
+      }
+    }
+  }
+
   return result;
 }
 

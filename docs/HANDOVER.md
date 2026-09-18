@@ -150,7 +150,29 @@ discoverV3PoolsForChain は fork のファクトリーごとに発見件数を
 - したがって Avalanche で取れる上積みは、いま見ているペアのまま
   **V3の活動量が約2.4倍(387→1,311回)** になる分
 
-## Algebra形式のプールは、まだ使えない(2026年9月17日に判明)
+## Algebra形式のプールへの対応(2026年9月18日に実施)
+
+下の節で「まだ使えない」と書いた2点を直し、`ALGEBRA_SUPPORTED = true` にした。
+
+1. **状態の読み取り** — `multicall-reserves.js` が `globalState()` に対応。
+   返り値の並びは版によって違う(Algebra V1は7個、Integralは6個で中身も別物)
+   ため、**ABIで丸ごと復号せず、共通する先頭2語(uint160 price / int24 tick)
+   だけを自前で読む**。丸ごと復号すると版が違うだけで価格を取れなくなる。
+   int24 は32バイトに符号拡張されて入るので、負のtickを戻す処理を入れてある。
+   一度 globalState で読めたプールは覚えておき、次から slot0 を試さない
+2. **WebSocketの購読** — 手数料を含む Algebra の Swap 識別子2種を追加した。
+   `Swap(…,int24,uint24)` と `Swap(…,int24,uint24,uint24)`。
+   先頭4つ(amount0/amount1/price/liquidity)の位置はどれも同じなので、
+   復号は `decodeV3SwapData` をそのまま使える
+3. **見積もり** — 自前の `quoteV3`。コントラクトは `algebraSwapCallback` を
+   元から持っていたので、コントラクト側の変更は不要だった
+
+このとき `dex-onchain-realtime.js` には **import が1つも無かった**。
+ethers を使うには import の追加が要る(無いと起動時に ReferenceError で落ちる)。
+あわせて、手書きしてあった識別子4件を `ethers.id()` の計算に変えた
+(検算したところ4件とも正しかったが、手書きは過去の事故の原因そのものなので)。
+
+## (上の対応前の記録)Algebra形式のプールは、まだ使えない(2026年9月17日に判明)
 
 PR #9 で algebra-a(Polygon、V3 Swapの22.4%)と algebra-b(Base)を
 V3_FACTORIES に足したが、**今のコードではこの2社のプールは必ず脱落する**。
@@ -235,8 +257,8 @@ RPCが増えていないのは、Multicall3で束ねているため。
 3. 対象チェーンの優先順位は Polygon(31.5%が未監視)→ Optimism(ガス最安・
    壁0.06%・27プール)→ Avalanche(82%が未監視。ガス$0.001で最安)→
    Base(活動量は最大だが主要DEXの出来高が対象外トークンに偏る)
-4. Algebra対応(globalState と Swap識別子)。これを入れるまで
-   algebra-a / algebra-b は足しても使われない。上の節を参照
+4. 済: Algebra対応(globalState と Swap識別子)。上の節を参照。
+   これで Polygon の algebra-a(V3 Swapの22.4%)が判定に入る
 
 ## 後回しにした対策
 - 速度: ガス見積もり省略、Arbitrumシーケンサー直結送信とフィード購読、RailwayをUS Eastへ、Chainstack Trader Node
