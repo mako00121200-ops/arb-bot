@@ -50,6 +50,7 @@ import {
   getAllPoolAddressesByChain, getPoolsForToken, getStalePools, getPoolsByKind,
   getArbitragablePairs, savePoolMap, loadPoolMap, snapshotFullMap,
   hasUsableState, clearPoolState, formatStateDiagnostics, KIND_V2, KIND_V3,
+  markQuoteBase, getQuoteFreshness,
 } from "./scripts/pool-registry.js";
 import {
   scanForChangedPool, scanAllPairs, getRouteCalcStats,
@@ -86,7 +87,13 @@ const V3_REFRESH_PER_TICK = parseInt(process.env.V3_REFRESH_PER_TICK || "120", 1
 const QUOTE_TABLE_PER_TICK = parseInt(process.env.QUOTE_TABLE_PER_TICK || "6", 10);
 const QUOTE_TABLE_INTERVAL_MS = parseInt(process.env.QUOTE_TABLE_INTERVAL_MS || "5000", 10);
 // 価格が動いたV3プールは表を作り直す。この割合(%)以上動いたら対象。
-const QUOTE_REBUILD_MOVE_PCT = parseFloat(process.env.QUOTE_REBUILD_MOVE_PCT || "0.1");
+/// 価格表を作り直す基準。**価格表を作った時からの累積のズレ**(%)。
+///
+/// 以前は「今回の更新1回ぶんの変化率」で判定しており、0.09%ずつ何度も
+/// 動くプールは永久に作り直されなかった。また既定の0.1%は10bpsで、
+/// 狙う利幅(5〜50bps)と同じ桁のため、許容誤差が大きすぎた。
+/// 累積で見るようになったので、既定を3bpsまで下げる。
+const QUOTE_REBUILD_MOVE_PCT = parseFloat(process.env.QUOTE_REBUILD_MOVE_PCT || "0.03");
 const FEE_PROBE_PER_TICK = parseInt(process.env.FEE_PROBE_PER_TICK || "4", 10);
 const FEE_PROBE_INTERVAL_MS = 1000;
 const SAVE_MAP_INTERVAL_MS = 5 * 60 * 1000;
@@ -392,6 +399,13 @@ async function buildTablesForPools(pools) {
   await Promise.all([...byChain.entries()].map(async ([chain, jobs]) => {
     try { built += await buildQuoteTablesBatch(chain, jobs); } catch (e) {}
   }));
+  // 表を作れたプールは、その時点の価格を基準として覚える。
+  // 以降の作り直しは、ここからの累積のズレで判断する。
+  for (const pool of pools) {
+    if (hasQuoteTable(pool.chain, pool.address, true) || hasQuoteTable(pool.chain, pool.address, false)) {
+      markQuoteBase(pool.chain, pool.address);
+    }
+  }
   return built;
 }
 
@@ -404,14 +418,25 @@ async function refreshQuoteTables() {
     const selected = [];
 
     // 価格が動いたプールを優先して作り直す。
-    const urgent = [...quoteRebuildQueue].slice(0, QUOTE_TABLE_PER_TICK);
-    for (const key of urgent) {
+    //
+    // 作り直せる本数は1回あたり QUOTE_TABLE_PER_TICK に限られるので、
+    // 待ち行列の先頭から取るのではなく、**ズレの大きい順**に処理する。
+    // 限られた枠を、いちばん誤差が出ているプールに使うため。
+    const urgent = [...quoteRebuildQueue]
+      .map((key) => {
+        const [chain, address] = key.split("::");
+        return { key, pool: disabledPools.has(key) ? null : getPool(chain, address) };
+      })
+      .filter((x) => x.pool && x.pool.kind === KIND_V3)
+      .sort((a, b) => (b.pool.quoteDriftPct || 0) - (a.pool.quoteDriftPct || 0))
+      .slice(0, QUOTE_TABLE_PER_TICK);
+    for (const { key, pool } of urgent) {
       quoteRebuildQueue.delete(key);
-      if (disabledPools.has(key)) continue;
-      const [chain, address] = key.split("::");
-      const pool = getPool(chain, address);
-      if (!pool || pool.kind !== KIND_V3) continue;
       selected.push(pool);
+    }
+    // 対象外(無効化済みなど)は待ち行列から外しておく。
+    for (const key of [...quoteRebuildQueue]) {
+      if (disabledPools.has(key)) quoteRebuildQueue.delete(key);
     }
 
     // 残り枠で、表がまだ無いプール(破棄された表を含む)を順に埋める。
@@ -654,8 +679,8 @@ async function refreshV3States() {
           const s = states.get(address.toLowerCase());
           if (!s) continue;
           const pool = updateV3FromSwap(chain, address, s.sqrtPriceX96, s.liquidity);
-          // 定期読み直しでも、価格が動いていれば表を作り直す。
-          if (pool && (pool.lastMovePct || 0) >= QUOTE_REBUILD_MOVE_PCT) {
+          // 定期読み直しでも、表を作った時からのズレが基準を超えたら作り直す。
+          if (pool && (pool.quoteDriftPct || 0) >= QUOTE_REBUILD_MOVE_PCT) {
             queueQuoteRebuild(chain, address);
             stats.quoteRebuildsFromPolling++;
           }
@@ -937,8 +962,9 @@ function handleV3Swap(chain, poolAddress, sqrtPriceX96, liquidity, receivedAt) {
   const pool = updateV3FromSwap(chain, poolAddress, sqrtPriceX96, liquidity);
   if (!pool) return false;
   stats.v3Matched++;
-  // 価格が動いたら表を作り直す。小さな変化では作り直さない。
-  if ((pool.lastMovePct || 0) >= QUOTE_REBUILD_MOVE_PCT) queueQuoteRebuild(chain, poolAddress);
+  // 表を作った時からのズレが基準を超えたら作り直す。
+  // 1回ぶんの変化ではなく累積で見る(小さな変化が積み重なる場合を拾うため)。
+  if ((pool.quoteDriftPct || 0) >= QUOTE_REBUILD_MOVE_PCT) queueQuoteRebuild(chain, poolAddress);
   reactToPoolChange(chain, poolAddress, pool, receivedAt, "v3swap");
   return true;
 }
@@ -1054,6 +1080,19 @@ function heartbeat() {
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
   console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 定期で作り直し${stats.quoteRebuildsFromPolling}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}] 失敗段階[${stageLine}] 受信[${ev}] 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}`);
+
+  // 価格表の鮮度。作り直しが追いついているかを見る。
+  // ズレ超過が減らない場合、閾値ではなく作り直しの処理能力
+  // (QUOTE_TABLE_PER_TICK)が上限になっている。
+  try {
+    const parts = [];
+    for (const chain of chainReady) {
+      const f = getQuoteFreshness(chain, QUOTE_REBUILD_MOVE_PCT);
+      if (!f.withBase) continue;
+      parts.push(`${chain}:基準${f.withBase}件 ズレ超過${f.stale}件 最大${f.maxDriftBps.toFixed(1)}bps`);
+    }
+    if (parts.length) console.log(`[価格表の鮮度] ${parts.join(" / ")}(基準${(QUOTE_REBUILD_MOVE_PCT * 100).toFixed(0)}bps)`);
+  } catch (e) {}
 
   // 見積もりの誤差。狙う利幅は5〜50bpsなので、誤差がそれを上回っていれば
   // 「機会」ではなくノイズを拾っていることになる。投入額ごとに出すのは、
