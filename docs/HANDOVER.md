@@ -15,7 +15,11 @@
 - RPC: Chainstack Growth(月2,000万リクエスト、Extra usageオフ=超過で停止)。PolygonのみChainstackのHTTP+WSS。Arbitrum/Avalancheは公開RPCの定期読み直し
 - 稼働チェーン: ACTIVE_CHAINS=polygon,arbitrum,avalanche(Base/Optimismは停止、設定は残してある)
 - botウォレット: 0x9D926340a8F14D3351470997684bD8C4767131f1
-- コントラクト(simulateRoute方式、2026年9月17日デプロイ): Polygon/Avalanche 0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1、Arbitrum 0x2139C1497F7C8c3291e51639ccc978Ffe7a73E18
+- コントラクト: Polygon 0xB26722e1E0d6228ec7F79cc49B0a23f39825e3c9(quoteV3入り、2026年9月18日デプロイ)、
+  Avalanche 0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1 と Arbitrum 0x2139C1497F7C8c3291e51639ccc978Ffe7a73E18 は
+  quoteV3の無い旧版のまま。この2チェーンでフォーク見積もりを使うには先に再デプロイが要る
+- 旧Polygonコントラクト 0xD2D45cC9… には利益が残っている(推定$0.5前後)。所有者キーは
+  同じなのでいつでも回収できるが、withdrawを呼ぶ仕組みはまだ無い
 - コントラクトの再デプロイは環境変数 RUN_MAINNET_DEPLOY=<チェーン名> で起動時に実行し、完了後に MAINNET_CONTRACT_ADDRESS_<チェーン> を設定して RUN_MAINNET_DEPLOY=false に戻す
 
 ## 現在の仕組み
@@ -169,6 +173,37 @@ Avalanche の調査で `0x5F1dddbf…`(Algebra形式)の流動性が
 ファクトリーは探索対象から外している。上の2点を直したら true にする。
 それまでは Uniswap形式のフォーク(univ3-fork-a〜f)だけで効果を測る。
 
+## フォーク見積もりの効果(2026年9月18日、Polygonで実測)
+
+`ENABLE_FORK_QUOTER=polygon` を有効にした前後の実測値。
+
+| 項目 | 前 | 後 |
+|---|---|---|
+| Polygon V3プール | 80 | 166 |
+| 監視プール合計 | 416 | 502 |
+| 判定に使えるV3プール | 72/84 | 130/170 |
+| 価格表 | 288/344 | **401/516** |
+| RPC 毎分 / 月末見込 | 72 / 7% | **72 / 7%(変化なし)** |
+
+発見のログは `univ3-fork-a 59件` / `univ3-fork-b 27件` で、書き写しに誤りが
+無かったことも確認できた。
+
+公式Quoterで作れる表の数は変わっていないので、**増えた113件はすべて自前の
+quoteV3 が作ったもの**。一度も見積もれなかったプールが判定に入った。
+RPCが増えていないのは、Multicall3で束ねているため。
+
+### コントラクト確認で見たこと(再デプロイ前の手順)
+
+`quoteV3` は通常の取引と同じコールバックを使い、中間の足も見積もりも
+どちらも `data.length == 0` で入ってくる。区別は `quoting` フラグだけなので、
+これが実取引に漏れると支払いの代わりに QuoteResult で巻き戻り、全取引が
+失敗する。安全である根拠は次の3つ。
+
+1. `quoting = true` を書くのは `quoteV3` だけで、`quoteV3` は必ず revert して
+   終わる。書き込みは毎回巻き戻り、成功する取引の開始時点では必ず false
+2. `quoteV3` には `require(!inFlashSwap)` があり、実行中には入れない
+3. 実取引の1段目は data が空でないため、この分岐に来ない
+
 ## 過去の誤り(再発防止)
 - イベント識別子を手書きして1文字欠け、最初期から一度も受信できていなかった → ethers.id()で計算する
 - RPCにタイムアウトが無く14時間凍結 → 全呼び出しに上限を設けている
@@ -193,8 +228,10 @@ Avalanche の調査で `0x5F1dddbf…`(Algebra形式)の流動性が
    - 済: 見つかったファクトリーを V3_FACTORIES に追加(fork: true 付き)。
      Algebra系は手数料帯を取らないため poolByPair で探す。ENABLE_FORK_QUOTER
      が未設定の間は探索対象にならないので、本番の動きは変わらない
-   - 未: ENABLE_FORK_QUOTER を1チェーンずつ有効化して効果を測る。
-     まず polygon。上の「ファクトリーの style は未検証」を必ず確認する
+   - 済: 再デプロイ(Polygon、2026年9月18日朝)。デプロイ前にコントラクトを
+     確認し、quoting が実取引に漏れないことを検証した(下の節)
+   - 済: ENABLE_FORK_QUOTER=polygon で効果を確認(下の節)
+   - 未: Avalanche / Optimism / Base へ展開。各チェーンで先に再デプロイが要る
 3. 対象チェーンの優先順位は Polygon(31.5%が未監視)→ Optimism(ガス最安・
    壁0.06%・27プール)→ Avalanche(82%が未監視。ガス$0.001で最安)→
    Base(活動量は最大だが主要DEXの出来高が対象外トークンに偏る)
