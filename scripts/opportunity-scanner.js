@@ -267,31 +267,92 @@ export function getRouteCalcStats() { return { ...routeCalcStats }; }
 /// Optimismは最小6bps)。壁の低いチェーンへ移すと機会が何倍になるのかを、
 /// 推測ではなく実測で答えられるようにするための分布。
 ///
+/// [2026年9月18日の修正: 回数ではなく「別々の経路の数」を数える]
+/// 最初の版は評価するたびに1件数えていた。Polygonは21ペアしか無いのに
+/// 43分で50万回評価するため、同じ経路が何千回も数え直され、
+/// 「+66件」が66個の機会なのか1個を66回見たのかを区別できなかった。
+/// Avalancheで「-20〜-10bpsに200件、隣は0件」という不自然な穴が出たのが
+/// その証拠。今は経路ごとに「今までで一番良かった利回り」だけを持ち、
+/// 分布はそれを数える。これで件数は「届きうる別々の経路の本数」になる。
+///
+/// [壁の高さで絞れるようにした理由]
+/// 手数料1%のプールを2段通れば壁は200bpsで、価格がどれだけ動いても
+/// 黒字にならない。こうした構造的に無理な経路がPolygonでは99.4%を占め、
+/// 届きうる経路の信号を埋もれさせていた。壁の合計も一緒に持たせ、
+/// 「壁がREACHABLE_WALL_BPS以下の経路だけ」に絞った分布も出せるようにする。
+///
 /// RPCは一切使わない。findBestAmount がすでに計算した値を数えるだけ。
 const NEAR_MISS_EDGES = [0, -5, -10, -20, -30, -50, -100];
 const NEAR_MISS_LABELS = [
   "0bps以上(粗利プラス)", "-5〜0bps", "-10〜-5bps", "-20〜-10bps",
   "-30〜-20bps", "-50〜-30bps", "-100〜-50bps", "-100bps未満",
 ];
-const nearMiss = new Map(); // chain -> 件数の配列
 
-function recordNearMiss(chain, returnBps) {
-  if (returnBps == null || !Number.isFinite(returnBps)) return;
-  if (!nearMiss.has(chain)) nearMiss.set(chain, new Array(NEAR_MISS_LABELS.length).fill(0));
-  const row = nearMiss.get(chain);
-  let i = NEAR_MISS_EDGES.findIndex((e) => returnBps >= e);
-  if (i === -1) i = NEAR_MISS_LABELS.length - 1;
-  row[i]++;
+/// 現実的に裁定が成り立つ壁の上限(bps)。既定60は 0.3%+0.3% まで。
+/// 1%+1%(200bps)や1%+0.3%(130bps)はここで外れる。
+const REACHABLE_WALL_BPS = parseInt(process.env.REACHABLE_WALL_BPS || "60", 10);
+
+/// 経路ごとに「今までで一番良かった利回り」と「壁の合計」を持つ。
+/// キーが増え続けないよう上限を設ける(超えたら新規は足さず、既存だけ更新)。
+const ROUTE_LIMIT = parseInt(process.env.NEAR_MISS_ROUTE_LIMIT || "50000", 10);
+const routeBest = new Map(); // "chain|tokenA|pool,pool,..." -> { bps, wall }
+let routeLimitHit = false;
+
+function routeKeyOf(chain, tokenA, poolAddresses) {
+  // アドレスは先頭8文字だけ使う。完全一致でなくても数えるには十分で、
+  // 50,000件ぶん保持してもメモリを圧迫しない長さに収めたい。
+  const pools = poolAddresses.map((a) => a.slice(2, 10)).join(",");
+  return `${chain}|${tokenA.slice(2, 8)}|${pools}`;
 }
 
-export function getNearMissStats() {
+function recordNearMiss(chain, key, returnBps, wallBps) {
+  if (returnBps == null || !Number.isFinite(returnBps)) return;
+  const prev = routeBest.get(key);
+  if (prev) {
+    if (returnBps > prev.bps) prev.bps = returnBps;
+    return;
+  }
+  if (routeBest.size >= ROUTE_LIMIT) {
+    if (!routeLimitHit) {
+      routeLimitHit = true;
+      console.warn(`[惜しい] 経路の記録が上限${ROUTE_LIMIT.toLocaleString()}件に達しました。以降は新しい経路を数えません`);
+    }
+    return;
+  }
+  routeBest.set(key, { bps: returnBps, wall: wallBps, chain });
+}
+
+function bucketOf(bps) {
+  const i = NEAR_MISS_EDGES.findIndex((e) => bps >= e);
+  return i === -1 ? NEAR_MISS_LABELS.length - 1 : i;
+}
+
+/// チェーンごとの分布。maxWallBps を渡すと、壁がそれ以下の経路だけを数える。
+export function getNearMissStats(maxWallBps = null) {
   const out = {};
-  for (const [chain, row] of nearMiss) {
-    out[chain] = {
-      labels: [...NEAR_MISS_LABELS],
-      counts: [...row],
-      total: row.reduce((a, b) => a + b, 0),
-    };
+  for (const r of routeBest.values()) {
+    if (maxWallBps != null && r.wall > maxWallBps) continue;
+    if (!out[r.chain]) {
+      out[r.chain] = { labels: [...NEAR_MISS_LABELS], counts: new Array(NEAR_MISS_LABELS.length).fill(0), total: 0 };
+    }
+    out[r.chain].counts[bucketOf(r.bps)]++;
+    out[r.chain].total++;
+  }
+  return out;
+}
+
+/// 壁の高さごとに、経路が何本あるかの内訳。
+/// 「そもそも届きうる経路がどれだけあるのか」を見るため。
+export function getWallBreakdown() {
+  const edges = [20, 40, 60, 100, 200];
+  const labels = ["20bps以下", "20〜40bps", "40〜60bps", "60〜100bps", "100〜200bps", "200bps超"];
+  const out = {};
+  for (const r of routeBest.values()) {
+    if (!out[r.chain]) out[r.chain] = { labels: [...labels], counts: new Array(labels.length).fill(0), total: 0 };
+    let i = edges.findIndex((e) => r.wall <= e);
+    if (i === -1) i = labels.length - 1;
+    out[r.chain].counts[i]++;
+    out[r.chain].total++;
   }
   return out;
 }
@@ -302,15 +363,17 @@ export function getNearMissStats() {
 ///
 /// 段をまたぐ場合(例: 29bps下がると -30〜-20 の段は一部しか該当しない)は
 /// その段を数えない。つまり必ず少なめに出る。判断を誤る方向ではない。
-export function countIfWallDrops(chain, dropBps) {
-  const row = nearMiss.get(chain);
-  if (!row) return 0;
+export function countIfWallDrops(chain, dropBps, maxWallBps = null) {
+  const d = getNearMissStats(maxWallBps)[chain];
+  if (!d) return 0;
   let n = 0;
   for (let i = 1; i < NEAR_MISS_EDGES.length; i++) {
-    if (NEAR_MISS_EDGES[i] >= -dropBps) n += row[i];
+    if (NEAR_MISS_EDGES[i] >= -dropBps) n += d.counts[i];
   }
   return n;
 }
+
+export const NEAR_MISS_REACHABLE_WALL_BPS = REACHABLE_WALL_BPS;
 
 function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, poolAddresses }) {
   // V3を1段も含まない経路は判定しない。
@@ -321,8 +384,10 @@ function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, p
 
   routeCalcStats.computed++;
   const best = findBestAmount(maxAmountIn, legs);
-  // 捨てる前に「どれくらい惜しかったか」を残す。
-  recordNearMiss(chain, best.returnBps);
+  // 捨てる前に「どれくらい惜しかったか」を経路ごとに残す。
+  // 同じ経路を何度評価しても1本として数える(回数ではなく本数を知りたい)。
+  const wallBps = legs.reduce((sum, l) => sum + l.feeBps, 0);
+  recordNearMiss(chain, routeKeyOf(chain, tokenA, poolAddresses), best.returnBps, wallBps);
   // 粗利(ガス代を引く前)がプラスでなければ、そこで終わり。
   // 裁定の機会が無い時はここで止まるのが正常。
   if (best.profit <= 0n) return null;
@@ -339,7 +404,6 @@ function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, p
   // フラッシュスワップ方式のため、借入手数料は差し引かない。
   const grossProfitUsd = toNumber(best.profit) * priceUsd;
   const netProfitUsd = grossProfitUsd - gasCostUsd;
-  const feeWallBps = legs.reduce((s, l) => s + l.feeBps, 0);
   const hasV3 = legs.some((l) => l.kind === KIND_V3);
 
   return {
@@ -348,7 +412,7 @@ function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, p
     amountOutEstimated: best.amountOut,
     amountOwed: best.amountIn,
     tradeAmountUsd, grossProfitUsd, netProfitUsd,
-    feeWallPercent: feeWallBps / 100,
+    feeWallPercent: wallBps / 100,
     profitable: netProfitUsd > 0,
   };
 }
