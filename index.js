@@ -150,6 +150,7 @@ const stats = {
 
 // ふるいの計測の前回値(毎分の通過回数を出すため)。
 let lastSpotScreenPassed = [];
+let lastSpotScreenFresh = [];
 let lastSpotScreenAt = null;
 
 const chainReady = new Set();
@@ -1321,12 +1322,17 @@ function heartbeat() {
     if (ss.evaluated > 0) {
       const elapsedMin = lastSpotScreenAt ? (Date.now() - lastSpotScreenAt) / 60000 : 0;
       const perMin = (now, prev) => (elapsedMin > 0 ? Math.round((now - prev) / elapsedMin) : 0);
+      // 「毎分」は fresh(状態が変わってから初めて通った回数)で出す。
+      // 同じ状態の同じ経路を何度評価しても見積もりは1回で足りるので、
+      // **こちらが切り替え後に必要なRPCの見積もり**になる。
       const steps = ss.edges
-        .map((e, i) => `${e}bps超:${ss.passed[i].toLocaleString()}(毎分${perMin(ss.passed[i], lastSpotScreenPassed[i] ?? 0)})`)
+        .map((e, i) => `${e}bps超:毎分${perMin(ss.fresh[i], lastSpotScreenFresh[i] ?? 0)}`)
         .join(" ");
+      const routes = ss.routeLabels.map((l, i) => `${l}:${ss.routeCounts[i]}`).join(" ");
       const best = ss.bestBps == null ? "-" : `${ss.bestBps.toFixed(1)}bps`;
-      console.log(`[ふるい] 評価${ss.evaluated.toLocaleString()} 通過[${steps}] 別々の経路${ss.distinctRoutes.toLocaleString()} 表ありでの通過${ss.passedWithTable.toLocaleString()} 最良${best}`);
+      console.log(`[ふるい] 評価${ss.evaluated.toLocaleString()} 要見積もり[${steps}] 経路${ss.distinctRoutes.toLocaleString()}本[${routes}] 表ありでの通過${ss.passedWithTable.toLocaleString()} 異常${ss.insane.toLocaleString()} 最良${best}`);
       lastSpotScreenPassed = [...ss.passed];
+      lastSpotScreenFresh = [...ss.fresh];
       lastSpotScreenAt = Date.now();
     }
   } catch (e) {}
