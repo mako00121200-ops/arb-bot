@@ -39,7 +39,7 @@ import { probePoolFeeBps, isFeeProbeOnHold, getRpcStatus, getRpcCallTotals, call
 import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
 import {
   fetchReservesBatch, fetchPoolTokensBatch, fetchTokenDecimalsBatch,
-  fetchV3StatesBatch, getMulticallStats,
+  fetchV3StatesBatch, getMulticallStats, findV3PoolsBatch,
 } from "./scripts/multicall-reserves.js";
 import { estimateGasCostUsd, getGasCostStatus } from "./scripts/gas-cost.js";
 import { discoverFactory, discoverPoolsFromFactory } from "./scripts/pool-discovery.js";
@@ -50,7 +50,7 @@ import {
   getAllPoolAddressesByChain, getPoolsForToken, getStalePools, getPoolsByKind,
   getArbitragablePairs, savePoolMap, loadPoolMap, snapshotFullMap,
   hasUsableState, clearPoolState, formatStateDiagnostics, KIND_V2, KIND_V3,
-  markQuoteBase, getQuoteFreshness,
+  markQuoteBase, getQuoteFreshness, rankTokensByDepth,
 } from "./scripts/pool-registry.js";
 import {
   scanForChangedPool, scanAllPairs, getRouteCalcStats,
@@ -107,6 +107,12 @@ const MAX_SANE_RETURN_RATIO = parseFloat(process.env.MAX_SANE_RETURN_RATIO || "0
 const BIG_MOVE_PCT = parseFloat(process.env.BIG_MOVE_PCT || "0.5");
 const V3_VERIFY_INTERVAL_MS = parseInt(process.env.V3_VERIFY_INTERVAL_MS || "120000", 10);
 const MIN_PRICE_SOURCE_USD = parseFloat(process.env.MIN_PRICE_SOURCE_USD || "5000");
+/// V3プールを探すトークンの上限。手書きの一覧に、V2で流動性のあるトークンを足す。
+/// ペア数は概ね二乗で増える(24種なら276ペア)。照会は束ねるのでRPCは十数回で済むが、
+/// 見つかったプールの分だけ購読と受信が増えるので、枠を見ながら上げる。
+const V3_DISCOVERY_TOKENS = parseInt(process.env.V3_DISCOVERY_TOKENS || "24", 10);
+/// 探索対象に加えるトークンの、V2での深さの下限(USD)。
+const MIN_DISCOVERY_DEPTH_USD = parseFloat(process.env.MIN_DISCOVERY_DEPTH_USD || "50000");
 const PRICE_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const SCAM_REVERT_PATTERNS = [/blacklist/i, /not allowed/i, /forbidden/i, /trading (is )?not (enabled|open)/i, /cooldown/i, /max ?tx/i, /max ?wallet/i, /antiwhale/i];
 
@@ -640,32 +646,94 @@ async function verifyV3Calculations() {
 // ここの値は画面表示と記録に使うだけの目安で、損益の計算には使われない。
 const ALGEBRA_DISPLAY_FEE_BPS = 30;
 
+/// V3プールを探すトークンの一覧(チェーン別)。絞り込みの前に決める。
+const discoveryTokens = new Map();
+
+/// 「どのトークンでV3プールを探すか」を決める。
+///
+/// [それまでの問題(2026年9月18日に判明)]
+/// ここは `Object.keys(getKnownTokens(chain))`、つまり**手書きの4〜7種**
+/// だけを見ていた。V2は44,000件も発見しているのに、V3の探索だけが
+/// 手書きの一覧に縛られていた。さらに絞り込みが「両トークンがV3プールに
+/// あるV2だけ残す」ため、地図に入るトークンがこの一覧に固定され、
+/// **始点に使える通貨が18件から動かない**原因になっていた。
+///
+/// 推測はしない。実際に発見したV2プールの中で、**価格も桁数も分かっている
+/// 通貨と組んでいて、その相手側が十分に厚い**トークンを選ぶ。
+function pickDiscoveryTokens(chain) {
+  const known = getKnownTokens(chain);
+  const knownList = Object.keys(known);
+  const knownSet = new Set(knownList);
+
+  // 相手側の価値(USD)。手書きの一覧にある通貨だけを物差しに使うので、
+  // まだ桁数も価格も分からないトークンでも深さを測れる。
+  const valueOf = (token, raw) => {
+    const info = known[token];
+    if (!info) return 0;
+    const price = info.stable ? 1 : info.priceHintUsd;
+    if (!price) return 0;
+    return (Number(raw) / Math.pow(10, info.decimals)) * price;
+  };
+
+  const room = Math.max(0, V3_DISCOVERY_TOKENS - knownList.length);
+  const added = rankTokensByDepth(chain, valueOf)
+    .filter(([token, usd]) => !knownSet.has(token) && usd >= MIN_DISCOVERY_DEPTH_USD)
+    .slice(0, room);
+
+  const list = [...knownList, ...added.map(([token]) => token)];
+  discoveryTokens.set(chain, list);
+  if (added.length > 0) {
+    const top = added.slice(0, 3).map(([t, usd]) => `${t.slice(0, 8)}…($${Math.round(usd).toLocaleString()})`).join(" ");
+    console.log(`[探索対象] ${chain}: 手書き${knownList.length}種 + V2で深いトークン${added.length}種 = ${list.length}種でV3プールを探します(上位: ${top})`);
+  } else {
+    console.log(`[探索対象] ${chain}: 手書き${knownList.length}種のみ(深さ$${MIN_DISCOVERY_DEPTH_USD.toLocaleString()}以上の追加候補なし)`);
+  }
+  return list;
+}
+
 async function discoverV3PoolsForChain(chain) {
   // フォークのファクトリーは ENABLE_FORK_QUOTER に入れたチェーンでのみ対象になる。
   const factories = activeV3Factories(chain);
   if (factories.length === 0) return 0;
-  const tokens = Object.keys(getKnownTokens(chain));
+  const tokens = discoveryTokens.get(chain) || Object.keys(getKnownTokens(chain));
   if (tokens.length < 2) return 0;
+
+  const pairs = [];
+  for (let i = 0; i < tokens.length; i++) {
+    for (let j = i + 1; j < tokens.length; j++) pairs.push([tokens[i], tokens[j]]);
+  }
+
   let found = 0;
   for (const factory of factories) {
     // Algebra系は手数料帯の引数を取らないため、ペアごとに1回だけ問い合わせる。
     const feeTiers = factory.style === "algebra" ? [null] : V3_FEE_TIERS;
+    const requests = [];
+    for (const [tokenA, tokenB] of pairs) {
+      for (const feeTier of feeTiers) requests.push({ tokenA, tokenB, feeTier });
+    }
+
+    // 1ペアずつRPCを使うと24種で3,588回になる。Multicall3で束ねる。
+    let addresses;
+    try {
+      addresses = await findV3PoolsBatch(chain, factory.address, factory.style, requests);
+    } catch (e) {
+      console.warn(`[発見] ${chain} ${factory.dexId}: 照会に失敗 ${e.message.slice(0, 60)}`);
+      continue;
+    }
+
     let foundHere = 0;
-    for (let i = 0; i < tokens.length; i++) {
-      for (let j = i + 1; j < tokens.length; j++) {
-        for (const feeTier of feeTiers) {
-          const address = await findV3Pool(chain, factory.address, tokens[i], tokens[j], feeTier, factory.style);
-          if (!address) continue;
-          if (isKnownIncompatiblePool(chain, address)) continue;
-          const [t0, t1] = [tokens[i].toLowerCase(), tokens[j].toLowerCase()].sort();
-          registerPool({
-            chain, address, dexId: factory.dexId, factory: factory.address, kind: KIND_V3,
-            token0: t0, token1: t1, feeTier,
-            feeBps: feeTier == null ? ALGEBRA_DISPLAY_FEE_BPS : feeTierToBps(feeTier),
-          });
-          foundHere++;
-        }
-      }
+    for (let k = 0; k < requests.length; k++) {
+      const address = addresses[k];
+      if (!address) continue;
+      if (isKnownIncompatiblePool(chain, address)) continue;
+      const { tokenA, tokenB, feeTier } = requests[k];
+      const [t0, t1] = [tokenA.toLowerCase(), tokenB.toLowerCase()].sort();
+      registerPool({
+        chain, address, dexId: factory.dexId, factory: factory.address, kind: KIND_V3,
+        token0: t0, token1: t1, feeTier,
+        feeBps: feeTier == null ? ALGEBRA_DISPLAY_FEE_BPS : feeTierToBps(feeTier),
+      });
+      foundHere++;
     }
     // フォークは住所も呼び出し方式も未検証なので、件数を出して正否が分かるようにする。
     // 0件が続く場合はアドレスか style(uniswap / algebra)の指定が誤っている。
@@ -677,23 +745,36 @@ async function discoverV3PoolsForChain(chain) {
   return found;
 }
 
+/// 探索対象を広げると、作られただけで中身が空のV3プールも見つかる。
+/// これを地図に残すと購読枠と受信を消費するだけなので、起動時の読み取りで
+/// 状態が取れなかったものは外す。
+/// ただし読み取りがまとめて失敗した場合(RPCの不調)に地図を壊さないよう、
+/// 失敗が半分を超えたときは何も外さない。
+const V3_EMPTY_DROP_MAX_RATIO = 0.5;
+
 async function loadV3StatesForChain(chain) {
   const pools = getPoolsByKind(chain, KIND_V3).filter((p) => !disabledPools.has(poolKeyOf(chain, p.address)));
-  if (pools.length === 0) return 0;
+  if (pools.length === 0) return { loaded: 0, dropped: 0 };
   let states;
   try {
     states = await fetchV3StatesBatch(chain, pools.map((p) => p.address));
   } catch (e) {
-    return 0;
+    return { loaded: 0, dropped: 0 };
   }
   let loaded = 0;
+  const empty = [];
   for (const pool of pools) {
     const s = states.get(pool.address.toLowerCase());
-    if (!s) continue;
+    if (!s) { empty.push(pool.address); continue; }
     updateV3FromSwap(chain, pool.address, s.sqrtPriceX96, s.liquidity);
+    if (!hasUsableState(getPool(chain, pool.address))) { empty.push(pool.address); continue; }
     loaded++;
   }
-  return loaded;
+  let dropped = 0;
+  if (empty.length > 0 && empty.length <= pools.length * V3_EMPTY_DROP_MAX_RATIO) {
+    for (const address of empty) { removePool(chain, address); dropped++; }
+  }
+  return { loaded, dropped };
 }
 
 const v3NeedsRefresh = new Set();
@@ -813,9 +894,7 @@ async function buildPoolMapFromFactories() {
 
 async function prepareChain(chain) {
   try {
-    const v3 = await discoverV3PoolsForChain(chain);
-    stats.v3Found += v3;
-
+    // V3の探索は preparePoolMap が絞り込みの前に済ませている。
     const addresses = getAllPoolAddressesByChain(KIND_V2)[chain] || [];
     let loaded = 0;
     const CHUNK = 1000;
@@ -834,7 +913,7 @@ async function prepareChain(chain) {
     }
     stats.reservesLoaded += loaded;
 
-    const v3Loaded = await loadV3StatesForChain(chain);
+    const { loaded: v3Loaded, dropped: v3Dropped } = await loadV3StatesForChain(chain);
     const decimalsFound = await loadTokenDecimals(chain);
     stats.decimalsKnown += decimalsFound;
 
@@ -848,7 +927,8 @@ async function prepareChain(chain) {
     setWatchedAddresses(chain, watched);
 
     chainReady.add(chain);
-    console.log(`[準備完了] ${chain}: V2 ${loaded}件 / V3 ${v3Loaded}件、桁数${decimalsFound}トークン、${watched.length}プールを監視します`);
+    const emptyNote = v3Dropped > 0 ? `(中身が空のV3 ${v3Dropped}件を除外)` : "";
+    console.log(`[準備完了] ${chain}: V2 ${loaded}件 / V3 ${v3Loaded}件${emptyNote}、桁数${decimalsFound}トークン、${watched.length}プールを監視します`);
   } catch (e) {
     console.error(`[準備] ${chain}: 失敗 ${e.message.slice(0, 100)}`);
   }
@@ -875,6 +955,21 @@ async function preparePoolMap() {
     }
   }
   console.log(`[無効化] 過去の記録から${stats.disabledFromFile}件を復元しました`);
+
+  // V3の探索は、絞り込みより**先**に行う。
+  //
+  // [順番が結果を決める]
+  // 絞り込みは「両トークンがV3プールにあるV2だけ残す」。先に絞り込むと、
+  // これから探索対象にするトークンのV2プールが、その判断材料ごと
+  // 捨てられてしまう。深さの集計にも全体の地図が要る。
+  for (const chain of Object.keys(CHAIN_CONFIG)) pickDiscoveryTokens(chain);
+  await Promise.all(Object.keys(CHAIN_CONFIG).map(async (chain) => {
+    try {
+      stats.v3Found += await discoverV3PoolsForChain(chain);
+    } catch (e) {
+      console.warn(`[探索] ${chain}: 失敗 ${e.message.slice(0, 80)}`);
+    }
+  }));
 
   const full = snapshotFullMap();
   const { kept, removed } = pruneToCandidates();
