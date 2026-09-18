@@ -492,12 +492,32 @@ const SPOT_SCREEN_ROUTE_LIMIT = 50000;
 /// 1ペアで見るプール数の上限。総当たりは二乗で増えるための歯止め。
 const SPOT_SCREEN_MAX_POOLS = 24;
 
+/// これを超える利幅は本物ではない、とみなす上限(bps)。既定1000 = 10%。
+///
+/// [なぜ要るか(2026年9月18日、最初の計測で判明)]
+/// 最初の版は上限を置かず、`最良10,084,520,773,245bps`(= 10垓%)という
+/// 値が出た。壊れたプール(準備量が1weiしかない、死んだトークンなど)の
+/// 現在価格はいくらでも極端になるので、ふるいは必ず通ってしまう。
+/// HANDOVER の「投入$2で利益$24 のような価格差はハニーポット」と同じ話で、
+/// **本物は投入額の0.1〜0.5%程度**。これを混ぜたまま数えると、
+/// 通過率が実態とかけ離れる。別枠で数えて、通過からは外す。
+const SPOT_SCREEN_SANE_MAX_BPS = parseFloat(process.env.SPOT_SCREEN_SANE_MAX_BPS || "1000");
+
+/// 別々の経路を利幅で分けるときの境目(bps)。
+const SPOT_ROUTE_EDGES = [0, 5, 10, 30, 100];
+const SPOT_ROUTE_LABELS = ["0〜5bps", "5〜10bps", "10〜30bps", "30〜100bps", "100bps超"];
+
 const spotScreen = {
   evaluated: 0,
   passed: SPOT_SCREEN_EDGES.map(() => 0),
+  // 状態が変わってから初めて通った回数。**切り替え後に本当に必要な見積もりの回数**。
+  // 同じ状態の同じ経路を何度評価しても、見積もりは1回で足りる。
+  fresh: SPOT_SCREEN_EDGES.map(() => 0),
   passedWithTable: 0,
+  insane: 0,
   bestBps: null,
   routes: new Map(),
+  signatures: new Map(),
   capped: 0,
 };
 
@@ -541,14 +561,29 @@ function measureSpotScreen(chain, tokenA, tokenB, pools) {
         const edge = spotEdgeBps(legs);
         if (edge == null) continue;
         spotScreen.evaluated++;
-        if (spotScreen.bestBps == null || edge > spotScreen.bestBps) spotScreen.bestBps = edge;
         if (edge <= 0) continue;
+        // 壊れたプールは必ずふるいを通る。別枠で数えて通過からは外す。
+        if (edge > SPOT_SCREEN_SANE_MAX_BPS) { spotScreen.insane++; continue; }
+        if (spotScreen.bestBps == null || edge > spotScreen.bestBps) spotScreen.bestBps = edge;
+
+        const addrs = [a.pool.address, b.pool.address];
+        const key = `${chain}:${borrowLower}:${addrs[0].toLowerCase()}>${addrs[1].toLowerCase()}`;
+
+        // 同じ経路が同じ状態のままなら、見積もりは1回で足りる。
+        // 切り替え後のRPCを見積もるには、こちらを数えないといけない。
+        const sig = routeSignature(chain, addrs);
+        const isFresh = spotScreen.signatures.get(key) !== sig;
+        if (isFresh && spotScreen.signatures.size < SPOT_SCREEN_ROUTE_LIMIT) {
+          spotScreen.signatures.set(key, sig);
+        }
+
         for (let i = 0; i < SPOT_SCREEN_EDGES.length; i++) {
-          if (edge > SPOT_SCREEN_EDGES[i]) spotScreen.passed[i]++;
+          if (edge <= SPOT_SCREEN_EDGES[i]) continue;
+          spotScreen.passed[i]++;
+          if (isFresh) spotScreen.fresh[i]++;
         }
         if (legIsUsable(a.leg) && legIsUsable(b.leg)) spotScreen.passedWithTable++;
 
-        const key = `${chain}:${borrowLower}:${a.pool.address.toLowerCase()}>${b.pool.address.toLowerCase()}`;
         const prev = spotScreen.routes.get(key);
         if (prev == null) {
           if (spotScreen.routes.size < SPOT_SCREEN_ROUTE_LIMIT) spotScreen.routes.set(key, edge);
@@ -562,13 +597,28 @@ function measureSpotScreen(chain, tokenA, tokenB, pools) {
 
 /// ふるいの計測結果。edges は段の値(bps)、passed は段ごとの通過回数。
 export function getSpotScreenStats() {
+  // 別々の経路を、いちばん良かった利幅で分ける。
+  // 通過「回数」は同じ経路の数え直しを含むが、こちらは本数なので実態に近い。
+  const routeCounts = new Array(SPOT_ROUTE_LABELS.length).fill(0);
+  for (const edge of spotScreen.routes.values()) {
+    let i = SPOT_ROUTE_EDGES.findIndex((e, k) => {
+      const next = SPOT_ROUTE_EDGES[k + 1];
+      return edge > e && (next == null || edge <= next);
+    });
+    if (i === -1) i = SPOT_ROUTE_LABELS.length - 1;
+    routeCounts[i]++;
+  }
   return {
     edges: [...SPOT_SCREEN_EDGES],
     evaluated: spotScreen.evaluated,
     passed: [...spotScreen.passed],
+    fresh: [...spotScreen.fresh],
     passedWithTable: spotScreen.passedWithTable,
+    insane: spotScreen.insane,
     bestBps: spotScreen.bestBps,
     distinctRoutes: spotScreen.routes.size,
+    routeLabels: [...SPOT_ROUTE_LABELS],
+    routeCounts,
     capped: spotScreen.capped,
   };
 }
