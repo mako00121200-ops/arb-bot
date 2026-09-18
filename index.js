@@ -1006,19 +1006,52 @@ function heartbeat() {
 }
 
 // ===== ダッシュボード =====
-const STYLE = `body{font-family:-apple-system,sans-serif;background:#0d100c;color:#e8e6d8;margin:0;padding:18px 12px}
+// iPhoneの縦画面(幅390px前後)で横にはみ出さないことを基準にしている。
+// はみ出す原因は2つあった。
+//   ① 経路の表示にプールのアドレス(42文字)がそのまま入ることがあり、
+//      途中で改行できないため表が画面幅より広く押し広げられていた
+//   ② .stat が4列固定で、1枠あたりが狭くなりすぎていた
+// table-layout:fixed にすると列幅が中身に引きずられなくなるので、
+// 長い文字列が入っても表が広がらない。折り返しは overflow-wrap で行う。
+const STYLE = `*{box-sizing:border-box}
+body{font-family:-apple-system,sans-serif;background:#0d100c;color:#e8e6d8;margin:0;padding:18px 12px;overflow-x:hidden}
 h1{font-size:17px;margin:0 0 4px}h2{font-size:13px;margin:0 0 10px;font-weight:600}
 .sub{color:#888;font-size:11px;margin-bottom:16px}
-.card{background:#14180f;border:1px solid #2a331d;border-radius:8px;padding:13px;margin-bottom:13px}
+.card{background:#14180f;border:1px solid #2a331d;border-radius:8px;padding:13px;margin-bottom:13px;overflow:hidden}
 .card.real{border-color:#2ecc71}
-table{width:100%;border-collapse:collapse;font-size:11px}
+table{width:100%;table-layout:fixed;border-collapse:collapse;font-size:11px}
 th{text-align:left;color:#888;font-weight:500;font-size:9.5px;padding:5px 3px;border-bottom:1px solid #2a331d}
 td{padding:6px 3px;border-bottom:1px solid #1c1c1c}
-.note{font-size:10px;color:#888;line-height:1.6;margin-top:9px;padding-top:9px;border-top:1px solid #222}
-.stat{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:13px}
-.stat div{background:#14180f;border:1px solid #2a331d;border-radius:8px;padding:11px 4px;text-align:center}
-.stat .v{font-size:17px;font-weight:600}.stat .l{font-size:8.5px;color:#888;margin-top:2px}
+th,td{overflow-wrap:anywhere;word-break:break-word}
+/* 実際の取引結果。日時と経路に幅を寄せ、右の数字列は詰める */
+.t-real th:nth-child(1),.t-real td:nth-child(1){width:21%}
+.t-real th:nth-child(2),.t-real td:nth-child(2){width:29%}
+.t-real th:nth-child(3),.t-real td:nth-child(3){width:15%}
+.t-real th:nth-child(4),.t-real td:nth-child(4){width:24%}
+.t-real th:nth-child(5),.t-real td:nth-child(5){width:11%}
+/* 連番つきの表(取り逃し・黒字の機会)。#は最小限にし、経路に幅を回す */
+.t-num th:nth-child(1),.t-num td:nth-child(1){width:7%}
+.t-num th:nth-child(2),.t-num td:nth-child(2){width:33%}
+/* 2列の表は左を広く */
+.t-two th:nth-child(2),.t-two td:nth-child(2){width:32%}
+.note{font-size:10px;color:#888;line-height:1.6;margin-top:9px;padding-top:9px;border-top:1px solid #222;overflow-wrap:anywhere}
+/* 幅140pxを下限にすると、iPhoneの縦画面では2列×2段に落ちる。
+   4列のままだと1枠が約90pxしかなく、金額が数字の途中で折り返してしまう。 */
+.stat{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:6px;margin-bottom:13px}
+/* 直接の子だけに枠を付ける。.stat div にすると中の .v と .l(どちらもdiv)
+   にも枠が付き、枠が二重に見えて縦にも間延びする */
+.stat > div{background:#14180f;border:1px solid #2a331d;border-radius:8px;padding:11px 6px;text-align:center;min-width:0;
+display:flex;flex-direction:column;justify-content:center;gap:3px}
+/* 金額は途中で折り返させない。入り切らない時は字を縮める */
+.stat .v{font-size:17px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stat .l{font-size:9px;color:#888}
 a{color:#6fae62}.footerlink{margin-top:18px;font-size:11px}`;
+
+/// 経路の表示を短くする。未知のプールは dexId がアドレスそのものになるため、
+/// そのまま出すと42文字が1列を占めて読みづらい。先頭だけ残す。
+function shortenLabel(label) {
+  return String(label ?? "").replace(/0x[0-9a-fA-F]{40}/g, (m) => `${m.slice(0, 8)}…`);
+}
 
 const REASON_LABEL = {
   disabled: "無効化済みのプールを含む", taxToken: "税トークン", cooldown: "冷却中(直近に失敗)",
@@ -1052,7 +1085,7 @@ function renderPage() {
     if (e.actualProfitUsd == null) return null;
     return e.actualProfitUsd - (gasOf(e) ?? 0);
   };
-  const realRows = real.recent.map((e) => `<tr><td>${new Date(e.timestamp).toLocaleString('ja-JP')}</td><td style="font-size:9px">${e.pairLabel}</td>
+  const realRows = real.recent.map((e) => `<tr><td>${new Date(e.timestamp).toLocaleString('ja-JP')}</td><td style="font-size:9px">${shortenLabel(e.pairLabel)}</td>
     <td style="text-align:right">$${e.tradeAmountUsd.toFixed(2)}</td>
     <td style="text-align:right;color:#2ecc71;font-weight:600">${netOf(e) != null ? `+$${netOf(e).toFixed(4)}` : '-'}<br><span style="color:#888;font-weight:400;font-size:9px">粗${e.actualProfitUsd != null ? `$${e.actualProfitUsd.toFixed(4)}` : '-'} ガス${gasOf(e) != null ? `$${gasOf(e).toFixed(4)}` : '-'}</span></td>
     <td><a href="${e.explorerUrl}" target="_blank">確認</a></td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ実際の取引はありません</td></tr>`;
@@ -1070,14 +1103,14 @@ function renderPage() {
 
   // 黒字と判定したのに取れなかった上位。ここが改善の手がかりになる。
   const missedRows = sum.topMissed.map((m, i) => `<tr><td>${i+1}</td>
-    <td style="font-size:9px">${m.kind || ''} ${m.chain || ''}${m.hasV3 ? ' <span style="color:#6fae62">V3</span>' : ''}<br>${m.label || ''}</td>
+    <td style="font-size:9px">${m.kind || ''} ${m.chain || ''}${m.hasV3 ? ' <span style="color:#6fae62">V3</span>' : ''}<br>${shortenLabel(m.label)}</td>
     <td style="font-size:9px">${OUTCOME_LABEL[m.outcome] || m.outcome}${m.shortfallBps != null ? `<br><span style="color:#888">実測${m.shortfallBps.toFixed(1)}bps</span>` : ''}${m.stage ? `<br><span style="color:#888">${m.stage}</span>` : ''}</td>
     <td style="text-align:right">$${(m.tradeAmountUsd ?? 0).toFixed(2)}</td>
     <td style="text-align:right;color:#e8a33d;font-weight:600">+$${(m.netProfitUsd ?? 0).toFixed(4)}</td></tr>`).join('')
     || `<tr><td colspan="5" style="color:#888">取り逃した黒字はありません</td></tr>`;
 
   const oppRows = stats.recent.slice(0, 10).map((o, i) => `<tr><td>${i+1}</td>
-    <td style="font-size:9px">${o.kind} ${o.chain}${o.hasV3 ? ' <span style="color:#6fae62">V3</span>' : ''}<br>${o.label}</td>
+    <td style="font-size:9px">${o.kind} ${o.chain}${o.hasV3 ? ' <span style="color:#6fae62">V3</span>' : ''}<br>${shortenLabel(o.label)}</td>
     <td style="text-align:right">${o.feeWallPercent.toFixed(2)}%</td>
     <td style="text-align:right">$${o.tradeAmountUsd.toFixed(2)}</td>
     <td style="text-align:right;color:#2ecc71;font-weight:600">+$${o.netProfitUsd.toFixed(4)}</td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ黒字の機会が見つかっていません</td></tr>`;
@@ -1113,7 +1146,7 @@ function renderPage() {
 <div><div class="v" style="color:#2ecc71">+$${real.totalProfitUsd.toFixed(4)}</div><div class="l">累積利益(ガス控除後)</div></div>
 <div><div class="v">$${getCurrentTradeCapUsd()}</div><div class="l">取引上限</div></div>
 <div><div class="v" style="color:${isLive?'#2ecc71':'#888'}">${isLive?'稼働中':'停止中'}</div><div class="l">自動売買</div></div></div>
-<table><thead><tr><th>日時</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table>
+<table class="t-real"><thead><tr><th>日時</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table>
 <div class="note">経路の最初のプール自身から先に受け取るため、借入手数料はかかりません。<br>累計の内訳: 粗利+$${real.totalGrossProfitUsd.toFixed(4)} − ガス代$${real.totalGasCostUsd.toFixed(4)}<br>コントラクトに溜まっている利益: ${balanceLine}</div></div>
 
 <div class="card"><h2>📐 V3の価格表(公式Quoter)</h2>
@@ -1121,7 +1154,7 @@ function renderPage() {
 <div><div class="v">${stats.quoteTablesPending.toLocaleString()}</div><div class="l">作成待ち</div></div>
 <div><div class="v" style="color:${stats.v3VerifyWorst && Math.abs(stats.v3VerifyWorst.diffPercent) > 5 ? '#e74c3c' : '#2ecc71'}">${stats.v3VerifyWorst ? stats.v3VerifyWorst.diffPercent.toFixed(2) + '%' : '-'}</div><div class="l">補間の最大誤差</div></div>
 <div><div class="v">${stats.v3Opportunities}</div><div class="l">V3を含む機会</div></div></div>
-<table><thead><tr><th>プール</th><th style="text-align:right">補間と公式の差</th></tr></thead><tbody>${verifyRows}</tbody></table>
+<table class="t-two"><thead><tr><th>プール</th><th style="text-align:right">補間と公式の差</th></tr></thead><tbody>${verifyRows}</tbody></table>
 <div class="note">V3は価格帯ごとに流動性が分かれるため、独自の近似式では最大2,184%も過大な値になりました。今はプールごとに公式Quoterで「代表的な投入額での受取量」を取得して表にし、判定はそこから補間しています。価格が動いた表は作り直します(WebSocketの無いチェーンでも、定期読み直しで価格の動きを検知して作り直します。これまでに${stats.quoteRebuildsFromPolling}回)。<br>表が無いV3プールは判定に使いません(幻の機会を防ぐため)。</div></div>
 
 <div class="card"><h2>🔎 機会がどこで止まっているか</h2>
@@ -1129,9 +1162,9 @@ function renderPage() {
 <div><div class="v" style="color:${stats.profitableFound>0?'#2ecc71':'#888'}">${stats.profitableFound}</div><div class="l">黒字と判定</div></div>
 <div><div class="v" style="color:${stats.executed>0?'#2ecc71':'#888'}">${stats.executed}</div><div class="l">送信成功</div></div>
 <div><div class="v" style="color:${stats.failed>0?'#e74c3c':'#888'}">${stats.failed}</div><div class="l">送信失敗</div></div></div>
-<table><thead><tr><th>止まった理由</th><th style="text-align:right">件数</th></tr></thead><tbody>${reasonRows}</tbody></table>
+<table class="t-two"><thead><tr><th>止まった理由</th><th style="text-align:right">件数</th></tr></thead><tbody>${reasonRows}</tbody></table>
 <div class="note"><strong>送信に失敗した段階</strong></div>
-<table><thead><tr><th>段階</th><th style="text-align:right">件数</th></tr></thead><tbody>${stageRows}</tbody></table></div>
+<table class="t-two"><thead><tr><th>段階</th><th style="text-align:right">件数</th></tr></thead><tbody>${stageRows}</tbody></table></div>
 
 <div class="card"><h2>📡 監視対象と始点</h2>
 <div class="stat"><div><div class="v" style="color:#6fae62">${stats.prunedKept.toLocaleString()}</div><div class="l">監視中プール</div></div>
@@ -1162,10 +1195,10 @@ function renderPage() {
 <span style="color:#e8a33d">「黒字判定の合計」は同じ経路の再検知を何度も足した値で、送信直前の実測では赤字になる分も含みます。取り逃した金額ではありません。</span></div>
 
 <h2 style="margin-top:14px">黒字と判定したのに取れなかった上位</h2>
-<table><thead><tr><th>#</th><th>経路</th><th>理由</th><th style="text-align:right">投入</th><th style="text-align:right">判定額</th></tr></thead><tbody>${missedRows}</tbody></table>
+<table class="t-num"><thead><tr><th>#</th><th>経路</th><th>理由</th><th style="text-align:right">投入</th><th style="text-align:right">判定額</th></tr></thead><tbody>${missedRows}</tbody></table>
 
 <h2 style="margin-top:14px">直近に検知した機会</h2>
-<table><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table></div>
+<table class="t-num"><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table></div>
 
 <div class="footerlink"><a href="/about">→ 仕組みについて</a></div></body></html>`;
 }
