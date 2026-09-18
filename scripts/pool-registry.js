@@ -42,6 +42,9 @@ export function registerPool({
   chain, address, dexId, factory, token0, token1,
   raw0 = 0n, raw1 = 0n, feeBps = 30, feeProbed = false,
   kind = KIND_V2, feeTier = null, sqrtPriceX96 = 0n, liquidity = 0n,
+  // 保存済みの地図から戻した準備量は古い。0を渡すと「読み直しが必要」と
+  // 判定されるので、復元時だけ明示的に0を渡す。
+  updatedAt = Date.now(),
 }) {
   const key = poolKey(chain, address);
   const existing = pools.get(key);
@@ -54,7 +57,7 @@ export function registerPool({
     feeTier: feeTier ?? existing?.feeTier ?? null,
     feeBps: existing?.feeBps ?? feeBps,
     feeProbed: kind === KIND_V3 ? true : (existing?.feeProbed || feeProbed),
-    updatedAt: Date.now(),
+    updatedAt,
     lastMovePct: existing?.lastMovePct ?? 0,
   });
   if (!existing) {
@@ -417,6 +420,11 @@ export function snapshotFullMap() {
       chain: p.chain, address: p.address, dexId: p.dexId, factory: p.factory,
       token0: p.token0, token1: p.token1, feeBps: p.feeBps, feeProbed: !!p.feeProbed,
       kind: p.kind, feeTier: p.feeTier,
+      // 準備量も残す。次の起動で「どのトークンが厚いか」を測るのに使う。
+      // これが無いと、地図を読み直した直後は全プールの準備量が0になり、
+      // 深さで探索対象を選べない(2026年9月18日に実測で判明)。
+      raw0: p.raw0 > 0n ? p.raw0.toString() : undefined,
+      raw1: p.raw1 > 0n ? p.raw1.toString() : undefined,
     });
   }
   return fullMapSnapshot.length;
@@ -428,7 +436,12 @@ export function savePoolMap() {
   // 全体像に、メモリ上の最新値(手数料の学習結果など)を反映する。
   const entries = (fullMapSnapshot || []).map((e) => {
     const live = current.get(poolKey(e.chain, e.address));
-    return live ? { ...e, feeBps: live.feeBps, feeProbed: !!live.feeProbed } : e;
+    if (!live) return e;
+    return {
+      ...e, feeBps: live.feeBps, feeProbed: !!live.feeProbed,
+      raw0: live.raw0 > 0n ? live.raw0.toString() : e.raw0,
+      raw1: live.raw1 > 0n ? live.raw1.toString() : e.raw1,
+    };
   });
   // 絞り込み後に新しく登録されたプール(V3の再発見など)も加える。
   const known = new Set(entries.map((e) => poolKey(e.chain, e.address)));
@@ -457,7 +470,18 @@ export function loadPoolMap() {
     if (!fs.existsSync(POOL_MAP_FILE)) return { count: 0, savedAt: null };
     const data = JSON.parse(fs.readFileSync(POOL_MAP_FILE, "utf8"));
     for (const e of data.pools || []) {
-      registerPool({ ...e, kind: e.kind || KIND_V2, raw0: 0n, raw1: 0n, sqrtPriceX96: 0n, liquidity: 0n });
+      // 保存済みの準備量は古いので、updatedAt を0にして読み直しの対象にする。
+      // それでも残す理由は、探索対象を「深さ」で選ぶ材料になるため。
+      let raw0 = 0n, raw1 = 0n;
+      try {
+        if (e.raw0) raw0 = BigInt(e.raw0);
+        if (e.raw1) raw1 = BigInt(e.raw1);
+      } catch (err) { raw0 = 0n; raw1 = 0n; }
+      registerPool({
+        ...e, kind: e.kind || KIND_V2, raw0, raw1,
+        sqrtPriceX96: 0n, liquidity: 0n,
+        updatedAt: raw0 > 0n ? 0 : Date.now(),
+      });
     }
     return { count: (data.pools || []).length, savedAt: data.savedAt || null };
   } catch (e) {

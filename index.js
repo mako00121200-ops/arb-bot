@@ -646,6 +646,52 @@ async function verifyV3Calculations() {
 // ここの値は画面表示と記録に使うだけの目安で、損益の計算には使われない。
 const ALGEBRA_DISPLAY_FEE_BPS = 30;
 
+/// 深さを測るために準備量を読むV2プールの上限(1チェーンあたり)。
+/// 起動を何分も待たせないための歯止め。
+const MAX_DEPTH_PROBE_POOLS = parseInt(process.env.MAX_DEPTH_PROBE_POOLS || "15000", 10);
+
+/// 探索対象を選ぶ前に、V2の準備量を読む。
+///
+/// [なぜ要るか(2026年9月18日に実測で判明)]
+/// 保存済みの地図には準備量が入っていなかったため、読み直した直後は
+/// 全プールの準備量が0だった。そのため深さを測れず、
+/// 「深さ$50,000以上の追加候補なし」となって探索対象が1件も増えなかった。
+/// 地図に準備量を残すようにしたが、既存の保存分には入っていないので、
+/// ここで読んで埋める。次回以降は保存済みの値が使えるため、ここは
+/// 「まだ準備量を持たないプール」だけになり、自然に減っていく。
+///
+/// 対象は**片側が手書きの一覧にある通貨**のプールだけ。物差しが無いプールは
+/// 深さを測れないので、読んでも意味がない。
+async function loadDepthProbeReserves(chain) {
+  const known = getKnownTokens(chain);
+  const targets = [];
+  for (const pool of getPoolsByKind(chain, KIND_V2)) {
+    if (pool.raw0 > 0n && pool.raw1 > 0n) continue;
+    if (!known[pool.token0] && !known[pool.token1]) continue;
+    targets.push(pool.address);
+    if (targets.length >= MAX_DEPTH_PROBE_POOLS) break;
+  }
+  if (targets.length === 0) return 0;
+
+  let loaded = 0;
+  const CHUNK = 1000;
+  for (let i = 0; i < targets.length; i += CHUNK) {
+    const chunk = targets.slice(i, i + CHUNK);
+    try {
+      const batch = await fetchReservesBatch(chain, chunk.map((a) => ({ address: a })));
+      for (const address of chunk) {
+        const r = batch.get(address.toLowerCase());
+        if (r && r.raw0 > 0n && r.raw1 > 0n) {
+          updateReservesFromSync(chain, address, r.raw0, r.raw1);
+          loaded++;
+        }
+      }
+    } catch (e) {}
+  }
+  console.log(`[深さ調査] ${chain}: 手書きの通貨と組むV2プール${targets.length}件を読み、${loaded}件で準備量を得ました`);
+  return loaded;
+}
+
 /// V3プールを探すトークンの一覧(チェーン別)。絞り込みの前に決める。
 const discoveryTokens = new Map();
 
@@ -962,6 +1008,11 @@ async function preparePoolMap() {
   // 絞り込みは「両トークンがV3プールにあるV2だけ残す」。先に絞り込むと、
   // これから探索対象にするトークンのV2プールが、その判断材料ごと
   // 捨てられてしまう。深さの集計にも全体の地図が要る。
+  // 深さを測る材料(V2の準備量)を先に揃える。保存済みの地図から戻した直後は
+  // 準備量が入っていないことがあるため。
+  await Promise.all(Object.keys(CHAIN_CONFIG).map(async (chain) => {
+    try { await loadDepthProbeReserves(chain); } catch (e) {}
+  }));
   for (const chain of Object.keys(CHAIN_CONFIG)) pickDiscoveryTokens(chain);
   await Promise.all(Object.keys(CHAIN_CONFIG).map(async (chain) => {
     try {
