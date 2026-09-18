@@ -50,10 +50,18 @@ const FORK_QUOTER_IFACE = new ethers.Interface([
   "error QuoteResult(uint256 amountOut)",
 ]);
 
+/// V3型ファクトリーへの「このペアのプールはあるか」の照会。
+/// Algebra系は手数料が動的なので、手数料帯の引数を取らない poolByPair を使う。
+const V3_FACTORY_IFACE = new ethers.Interface([
+  "function getPool(address tokenA, address tokenB, uint24 fee) view returns (address)",
+  "function poolByPair(address tokenA, address tokenB) view returns (address)",
+]);
+
 const MAX_POOLS_PER_CALL = parseInt(process.env.MULTICALL_POOLS_PER_CALL || "100", 10);
 const MAX_TOKENS_PER_CALL = 120;
 const MAX_V3_POOLS_PER_CALL = parseInt(process.env.MULTICALL_V3_PER_CALL || "60", 10);
 const MAX_QUOTES_PER_CALL = parseInt(process.env.MULTICALL_QUOTES_PER_CALL || "24", 10);
+const MAX_FACTORY_LOOKUPS_PER_CALL = parseInt(process.env.MULTICALL_FACTORY_PER_CALL || "250", 10);
 
 const multicallStats = { calls: 0, subcalls: 0, splits: 0 };
 export function getMulticallStats() { return { ...multicallStats }; }
@@ -305,6 +313,44 @@ export async function quoteV3ByPoolBatch(chain, contractAddress, requests, prior
           if (amountOut > 0n) out[i + j] = amountOut;
         }
       } catch (inner) {}
+    }
+  }
+  return out;
+}
+
+/// ファクトリーに「このペアのプールはあるか」をまとめて聞く。
+///
+/// [なぜ一括にするか(2026年9月18日)]
+/// findV3Pool は1ペアにつきRPCを1回使う。探索対象を24種に広げると
+/// 276ペア×13通り=3,588回になり、1回ずつでは現実的でない。
+/// Multicall3で束ねれば同じ内容が十数回で済む。
+///
+/// @param requests [{ tokenA, tokenB, feeTier }] / style は "uniswap" か "algebra"
+/// 戻り値: requests と同じ並びのアドレス配列(見つからなければ null)
+export async function findV3PoolsBatch(chain, factory, style, requests) {
+  const out = new Array(requests.length).fill(null);
+  if (requests.length === 0) return out;
+  const target = ethers.getAddress(factory);
+  const isAlgebra = style === "algebra";
+  const fn = isAlgebra ? "poolByPair" : "getPool";
+
+  for (let i = 0; i < requests.length; i += MAX_FACTORY_LOOKUPS_PER_CALL) {
+    const chunk = requests.slice(i, i + MAX_FACTORY_LOOKUPS_PER_CALL);
+    const calls = [];
+    for (const r of chunk) {
+      const args = isAlgebra
+        ? [ethers.getAddress(r.tokenA), ethers.getAddress(r.tokenB)]
+        : [ethers.getAddress(r.tokenA), ethers.getAddress(r.tokenB), r.feeTier];
+      calls.push({ target, allowFailure: true, callData: V3_FACTORY_IFACE.encodeFunctionData(fn, args) });
+    }
+    const returned = await multicallSplitting(chain, calls);
+    for (let j = 0; j < chunk.length; j++) {
+      const r = returned[j];
+      if (!r?.success || r.returnData === "0x") continue;
+      try {
+        const addr = V3_FACTORY_IFACE.decodeFunctionResult(fn, r.returnData)[0];
+        if (addr && addr !== ethers.ZeroAddress) out[i + j] = addr;
+      } catch (e) {}
     }
   }
   return out;

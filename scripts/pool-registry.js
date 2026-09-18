@@ -127,6 +127,38 @@ export function pruneToCandidates() {
   return { kept: pools.size, removed: removedV2 + removedOther };
 }
 
+/// V2の地図から、トークンを「隣のプールに入っている価値(USD)」で並べる。
+///
+/// [なぜ要るか(2026年9月18日)]
+/// V3プールの探索が、手書きの一覧にあるトークン同士のペアしか見ていなかった。
+/// そのため地図に入るトークンが4〜7種に固定され、始点もそれだけになっていた。
+/// 実際には44,000件のV2プールを発見しているので、そこから「実際に流動性の
+/// あるトークン」を選び出せば、推測せずに探索対象を広げられる。
+///
+/// 深さは**相手側**の価値で測る。相手が価格も桁数も分かっている通貨なら、
+/// こちら側の桁数や価格を知らなくても深さが求まる。
+///
+/// @param valueOf (token, raw) => USD。分からない場合は 0 を返す
+/// 戻り値: [[token, depthUsd], ...] を深い順に並べたもの
+export function rankTokensByDepth(chain, valueOf) {
+  const best = new Map();
+  for (const p of pools.values()) {
+    if (p.chain !== chain || p.kind !== KIND_V2) continue;
+    if (p.raw0 <= 0n || p.raw1 <= 0n) continue;
+    const sides = [
+      [p.token0, p.token1, p.raw1],
+      [p.token1, p.token0, p.raw0],
+    ];
+    for (const [self, other, otherRaw] of sides) {
+      if (self === other) continue;
+      const usd = valueOf(other, otherRaw);
+      if (!usd || !isFinite(usd) || usd <= 0) continue;
+      if ((best.get(self) ?? 0) < usd) best.set(self, usd);
+    }
+  }
+  return [...best.entries()].sort((a, b) => b[1] - a[1]);
+}
+
 /// 購読すべきプールのアドレス一覧(チェーン別)。
 export function getSubscribedAddresses(chain) {
   const out = [];
