@@ -27,16 +27,27 @@
  * 定期読み直しがスキップされて価格が古いまま固定される危険がある。
  */
 
-// keccak256("Sync(uint112,uint112)") — Uniswap V2形式
-const SYNC_TOPIC = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1";
-// keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)") — V3
-const V3_SWAP_TOPIC = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
-// keccak256("Mint(address,address,int24,int24,uint128,uint256,uint256)") — V3
-const V3_MINT_TOPIC = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde";
-// keccak256("Burn(address,int24,int24,uint128,uint256,uint256)") — V3
-const V3_BURN_TOPIC = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c";
+// 識別子を計算で求めるために読み込む(このファイルで使うのはこれだけ)。
+import { ethers } from "ethers";
 
-const ALL_TOPICS = [SYNC_TOPIC, V3_SWAP_TOPIC, V3_MINT_TOPIC, V3_BURN_TOPIC];
+// 識別子は手で書かない。過去に1文字欠けたまま気づかず、最初期から一度も
+// 受信できていなかった。署名の文字列だけを書き、ハッシュは計算させる。
+const SYNC_TOPIC = ethers.id("Sync(uint112,uint112)");
+const V3_SWAP_TOPIC = ethers.id("Swap(address,address,int256,int256,uint160,uint128,int24)");
+const V3_MINT_TOPIC = ethers.id("Mint(address,address,int24,int24,uint128,uint256,uint256)");
+const V3_BURN_TOPIC = ethers.id("Burn(address,int24,int24,uint128,uint256,uint256)");
+
+// Algebra系は版によって Swap の引数が増えている(末尾に手数料が付く)。
+// 識別子が変わるので、別の識別子として購読しないと1件も受信できない。
+// 先頭4つ(amount0, amount1, price, liquidity)の位置は共通なので、
+// 中身の読み取りは decodeV3SwapData をそのまま使える。
+const ALGEBRA_SWAP_TOPICS = [
+  ethers.id("Swap(address,address,int256,int256,uint160,uint128,int24,uint24)"),
+  ethers.id("Swap(address,address,int256,int256,uint160,uint128,int24,uint24,uint24)"),
+];
+const V3_SWAP_TOPICS = new Set([V3_SWAP_TOPIC, ...ALGEBRA_SWAP_TOPICS]);
+
+const ALL_TOPICS = [SYNC_TOPIC, V3_SWAP_TOPIC, ...ALGEBRA_SWAP_TOPICS, V3_MINT_TOPIC, V3_BURN_TOPIC];
 
 const CHAIN_WS_ENV_VARS = {
   base: "BASE_WSS_URL",
@@ -185,7 +196,7 @@ function connectChain(chainName, wsUrl) {
           if (decoded && globalOnSync) {
             globalOnSync(chainName, address, decoded.reserve0, decoded.reserve1, receivedAt);
           }
-        } else if (topic === V3_SWAP_TOPIC) {
+        } else if (V3_SWAP_TOPICS.has(topic)) {
           chainV3Counts[chainName] = (chainV3Counts[chainName] || 0) + 1;
           const decoded = decodeV3SwapData(log.data);
           if (decoded && globalOnV3Swap) {

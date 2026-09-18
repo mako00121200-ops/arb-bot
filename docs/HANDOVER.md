@@ -15,7 +15,11 @@
 - RPC: Chainstack Growth(月2,000万リクエスト、Extra usageオフ=超過で停止)。PolygonのみChainstackのHTTP+WSS。Arbitrum/Avalancheは公開RPCの定期読み直し
 - 稼働チェーン: ACTIVE_CHAINS=polygon,arbitrum,avalanche(Base/Optimismは停止、設定は残してある)
 - botウォレット: 0x9D926340a8F14D3351470997684bD8C4767131f1
-- コントラクト(simulateRoute方式、2026年9月17日デプロイ): Polygon/Avalanche 0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1、Arbitrum 0x2139C1497F7C8c3291e51639ccc978Ffe7a73E18
+- コントラクト: Polygon 0xB26722e1E0d6228ec7F79cc49B0a23f39825e3c9(quoteV3入り、2026年9月18日デプロイ)、
+  Avalanche 0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1 と Arbitrum 0x2139C1497F7C8c3291e51639ccc978Ffe7a73E18 は
+  quoteV3の無い旧版のまま。この2チェーンでフォーク見積もりを使うには先に再デプロイが要る
+- 旧Polygonコントラクト 0xD2D45cC9… には利益が残っている(推定$0.5前後)。所有者キーは
+  同じなのでいつでも回収できるが、withdrawを呼ぶ仕組みはまだ無い
 - コントラクトの再デプロイは環境変数 RUN_MAINNET_DEPLOY=<チェーン名> で起動時に実行し、完了後に MAINNET_CONTRACT_ADDRESS_<チェーン> を設定して RUN_MAINNET_DEPLOY=false に戻す
 
 ## 現在の仕組み
@@ -146,7 +150,29 @@ discoverV3PoolsForChain は fork のファクトリーごとに発見件数を
 - したがって Avalanche で取れる上積みは、いま見ているペアのまま
   **V3の活動量が約2.4倍(387→1,311回)** になる分
 
-## Algebra形式のプールは、まだ使えない(2026年9月17日に判明)
+## Algebra形式のプールへの対応(2026年9月18日に実施)
+
+下の節で「まだ使えない」と書いた2点を直し、`ALGEBRA_SUPPORTED = true` にした。
+
+1. **状態の読み取り** — `multicall-reserves.js` が `globalState()` に対応。
+   返り値の並びは版によって違う(Algebra V1は7個、Integralは6個で中身も別物)
+   ため、**ABIで丸ごと復号せず、共通する先頭2語(uint160 price / int24 tick)
+   だけを自前で読む**。丸ごと復号すると版が違うだけで価格を取れなくなる。
+   int24 は32バイトに符号拡張されて入るので、負のtickを戻す処理を入れてある。
+   一度 globalState で読めたプールは覚えておき、次から slot0 を試さない
+2. **WebSocketの購読** — 手数料を含む Algebra の Swap 識別子2種を追加した。
+   `Swap(…,int24,uint24)` と `Swap(…,int24,uint24,uint24)`。
+   先頭4つ(amount0/amount1/price/liquidity)の位置はどれも同じなので、
+   復号は `decodeV3SwapData` をそのまま使える
+3. **見積もり** — 自前の `quoteV3`。コントラクトは `algebraSwapCallback` を
+   元から持っていたので、コントラクト側の変更は不要だった
+
+このとき `dex-onchain-realtime.js` には **import が1つも無かった**。
+ethers を使うには import の追加が要る(無いと起動時に ReferenceError で落ちる)。
+あわせて、手書きしてあった識別子4件を `ethers.id()` の計算に変えた
+(検算したところ4件とも正しかったが、手書きは過去の事故の原因そのものなので)。
+
+## (上の対応前の記録)Algebra形式のプールは、まだ使えない(2026年9月17日に判明)
 
 PR #9 で algebra-a(Polygon、V3 Swapの22.4%)と algebra-b(Base)を
 V3_FACTORIES に足したが、**今のコードではこの2社のプールは必ず脱落する**。
@@ -168,6 +194,37 @@ Avalanche の調査で `0x5F1dddbf…`(Algebra形式)の流動性が
 そのため v3-pools.js に `ALGEBRA_SUPPORTED = false` を置き、Algebra形式の
 ファクトリーは探索対象から外している。上の2点を直したら true にする。
 それまでは Uniswap形式のフォーク(univ3-fork-a〜f)だけで効果を測る。
+
+## フォーク見積もりの効果(2026年9月18日、Polygonで実測)
+
+`ENABLE_FORK_QUOTER=polygon` を有効にした前後の実測値。
+
+| 項目 | 前 | 後 |
+|---|---|---|
+| Polygon V3プール | 80 | 166 |
+| 監視プール合計 | 416 | 502 |
+| 判定に使えるV3プール | 72/84 | 130/170 |
+| 価格表 | 288/344 | **401/516** |
+| RPC 毎分 / 月末見込 | 72 / 7% | **72 / 7%(変化なし)** |
+
+発見のログは `univ3-fork-a 59件` / `univ3-fork-b 27件` で、書き写しに誤りが
+無かったことも確認できた。
+
+公式Quoterで作れる表の数は変わっていないので、**増えた113件はすべて自前の
+quoteV3 が作ったもの**。一度も見積もれなかったプールが判定に入った。
+RPCが増えていないのは、Multicall3で束ねているため。
+
+### コントラクト確認で見たこと(再デプロイ前の手順)
+
+`quoteV3` は通常の取引と同じコールバックを使い、中間の足も見積もりも
+どちらも `data.length == 0` で入ってくる。区別は `quoting` フラグだけなので、
+これが実取引に漏れると支払いの代わりに QuoteResult で巻き戻り、全取引が
+失敗する。安全である根拠は次の3つ。
+
+1. `quoting = true` を書くのは `quoteV3` だけで、`quoteV3` は必ず revert して
+   終わる。書き込みは毎回巻き戻り、成功する取引の開始時点では必ず false
+2. `quoteV3` には `require(!inFlashSwap)` があり、実行中には入れない
+3. 実取引の1段目は data が空でないため、この分岐に来ない
 
 ## 過去の誤り(再発防止)
 - イベント識別子を手書きして1文字欠け、最初期から一度も受信できていなかった → ethers.id()で計算する
@@ -193,13 +250,15 @@ Avalanche の調査で `0x5F1dddbf…`(Algebra形式)の流動性が
    - 済: 見つかったファクトリーを V3_FACTORIES に追加(fork: true 付き)。
      Algebra系は手数料帯を取らないため poolByPair で探す。ENABLE_FORK_QUOTER
      が未設定の間は探索対象にならないので、本番の動きは変わらない
-   - 未: ENABLE_FORK_QUOTER を1チェーンずつ有効化して効果を測る。
-     まず polygon。上の「ファクトリーの style は未検証」を必ず確認する
+   - 済: 再デプロイ(Polygon、2026年9月18日朝)。デプロイ前にコントラクトを
+     確認し、quoting が実取引に漏れないことを検証した(下の節)
+   - 済: ENABLE_FORK_QUOTER=polygon で効果を確認(下の節)
+   - 未: Avalanche / Optimism / Base へ展開。各チェーンで先に再デプロイが要る
 3. 対象チェーンの優先順位は Polygon(31.5%が未監視)→ Optimism(ガス最安・
    壁0.06%・27プール)→ Avalanche(82%が未監視。ガス$0.001で最安)→
    Base(活動量は最大だが主要DEXの出来高が対象外トークンに偏る)
-4. Algebra対応(globalState と Swap識別子)。これを入れるまで
-   algebra-a / algebra-b は足しても使われない。上の節を参照
+4. 済: Algebra対応(globalState と Swap識別子)。上の節を参照。
+   これで Polygon の algebra-a(V3 Swapの22.4%)が判定に入る
 
 ## 後回しにした対策
 - 速度: ガス見積もり省略、Arbitrumシーケンサー直結送信とフィード購読、RailwayをUS Eastへ、Chainstack Trader Node

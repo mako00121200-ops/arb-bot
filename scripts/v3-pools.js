@@ -83,9 +83,9 @@ export const V3_FACTORIES = {
     // Swapは8回と少ないが、監視中ペアに13プールあり流動性が厚い。
     // 動きが遅い=価格が取り残されやすいので、相手側として狙う価値がある。
     { address: "0x3e603C14aF37EBdaD31709C4f848Fc6aD5BEc715", dexId: "univ3-fork-f", style: "uniswap", fork: true },
-    // 0x5F1dddbf…(Algebra形式、1プール)は、slot0ではなくglobalStateでしか
-    // 状態を読めず、調査でも「流動性=読めず」だった。globalState対応を
-    // 入れるまで足さない(足しても必ず脱落する)。
+    // 0x5F1dddbf…(Algebra形式、1プール)は調査で「流動性=読めず」だった。
+    // globalState には対応したが、監視中ペアのプールが1件だけで
+    // 流動性も確認できていないため、今は足さない。
   ],
 };
 
@@ -104,14 +104,16 @@ export function isForkFactory(chain, factory) {
 
 /// Algebra形式のプールを実際に使えるかどうか。
 ///
-/// 今は false。発見はできても、次の2つが Uniswap形式しか想定していないため、
-/// 見つけたプールは必ず脱落する。
-///   ① fetchV3StatesBatch が slot0() しか呼ばない(Algebraは globalState())
-///   ② dex-onchain-realtime.js の購読識別子が Uniswap の Swap だけで、
-///      手数料を含む Algebra の Swap(0x121cb44e…)を受信できない
-/// 足したまま有効にすると、使えないプールが監視枠とRPCを食うだけになる。
-/// 上の2点を直したら true にする。
-const ALGEBRA_SUPPORTED = false;
+/// 2026年9月18日に対応した。必要だったのは次の3つ。
+///   ① 状態の読み取り: multicall-reserves.js が globalState() に対応。
+///      返り値の並びは版によって違うので、共通する先頭2語だけを自前で読む
+///   ② WebSocketの購読: dex-onchain-realtime.js に、手数料を含む
+///      Algebra の Swap 識別子2種を追加(引数の位置は共通なので復号は同じ)
+///   ③ 見積もり: プール住所を直接受け取る自前の quoteV3。
+///      コントラクトは algebraSwapCallback を元から持っている
+/// なお ①②③ が揃っても、ENABLE_FORK_QUOTER に入れたチェーンでしか
+/// フォークは探索されない(quoteV3 入りのコントラクトが要るため)。
+const ALGEBRA_SUPPORTED = true;
 
 /// そのチェーンで探索してよいファクトリー。
 /// fork: true のものは ENABLE_FORK_QUOTER に入っているチェーンでだけ返す。
@@ -186,6 +188,9 @@ export async function findV3Pool(chain, factory, tokenA, tokenB, fee, style = "u
 
 /// 1プールの状態を読む(単発用)。複数まとめて読むときは
 /// multicall-reserves.js の fetchV3StatesBatch を使う。
+/// 注意: この関数は slot0() しか見ないため、Algebra形式のプールでは必ず
+/// 失敗する。今は誰も呼んでいない。使う場合は multicall-reserves.js の
+/// fetchV3StatesBatch(globalState に対応済み)を使うこと。
 export async function readV3State(chain, poolAddress, priority = false) {
   try {
     const contract = (p) => new ethers.Contract(ethers.getAddress(poolAddress), V3_POOL_ABI, p);
