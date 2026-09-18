@@ -35,7 +35,7 @@ import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
 import { runPoolSurvey } from "./scripts/pool-survey.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
-import { probePoolFeeBps, getRpcStatus, getRpcCallTotals, callWithRpc } from "./scripts/onchain-reserves.js";
+import { probePoolFeeBps, isFeeProbeOnHold, getRpcStatus, getRpcCallTotals, callWithRpc } from "./scripts/onchain-reserves.js";
 import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
 import {
   fetchReservesBatch, fetchPoolTokensBatch, fetchTokenDecimalsBatch,
@@ -747,6 +747,9 @@ async function probeFeesGradually() {
       if (!isReady(entry.chain)) continue;
       for (const p of entry.pools) {
         if (p.kind === KIND_V3 || p.feeProbed) continue;
+        // 再試行待ちのプールを積み直しても、RPCを呼ばずに null が返るだけで
+        // 何も進まない。積むとキューが空にならず、同じログが毎秒出続ける。
+        if (isFeeProbeOnHold(p.chain, p.address)) continue;
         const key = poolKeyOf(p.chain, p.address);
         if (disabledPools.has(key) || seen.has(key)) continue;
         seen.add(key);

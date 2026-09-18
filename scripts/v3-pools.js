@@ -44,11 +44,14 @@ export const QUOTER_V2_ADDRESS = {
 ///
 /// アドレスは推測していない。チェーン上のSwap/Syncイベントから出てきた
 /// プールに factory() を呼んで逆算した(scripts/pool-survey.js)。
+/// style(uniswap / algebra)も推測ではない。調査は同じファクトリーに
+/// getPool と poolByPair の両方を allowFailure 付きで投げ、実際に住所を
+/// 返した方を採っている(pool-survey.js の probeFactoryForPairs)。
 ///
-/// ただし style(uniswap / algebra)は未検証で、Swapイベントの引数の形からの
-/// 推定にすぎない。実物に getPool / poolByPair を投げて確かめてはいない。
-/// そのため discoverV3PoolsForChain は fork のファクトリーごとに発見件数を
-/// ログに出す。0件が続くなら style かアドレスが違うので、そこで直す。
+/// 残る不確かさは「調査結果をここへ書き写す作業」だけ。実際にチェックサムの
+/// 大文字小文字を3件書き間違えていた。そのため discoverV3PoolsForChain は
+/// fork のファクトリーごとに発見件数をログに出す。0件が続くなら書き写しが
+/// 誤っているので、そこで直す。
 export const V3_FACTORIES = {
   polygon: [
     { address: "0x1F98431c8aD98523631AE4a59f267346ea31F984", dexId: "uniswap-v3", style: "uniswap" },
@@ -73,6 +76,16 @@ export const V3_FACTORIES = {
   ],
   avalanche: [
     { address: "0x740b1c1de25031C31FF4fC9A62f554A55cdC1baD", dexId: "uniswap-v3", style: "uniswap" },
+    // 調査期間中のV3 Swap 2,176回のうち924回(42%)を占めた最大の未監視DEX。
+    // 監視中の10ペアに9プール。うち流動性があるのは USDC/USDT 0.01%、
+    // USDC/WAVAX 0.01%、USDC/WAVAX 0.05% の3件。
+    { address: "0x1128F23D0bc0A8396E9FBC3c0c68f5EA228B8256", dexId: "univ3-fork-e", style: "uniswap", fork: true },
+    // Swapは8回と少ないが、監視中ペアに13プールあり流動性が厚い。
+    // 動きが遅い=価格が取り残されやすいので、相手側として狙う価値がある。
+    { address: "0x3e603C14aF37EBdaD31709C4f848Fc6aD5BEc715", dexId: "univ3-fork-f", style: "uniswap", fork: true },
+    // 0x5F1dddbf…(Algebra形式、1プール)は、slot0ではなくglobalStateでしか
+    // 状態を読めず、調査でも「流動性=読めず」だった。globalState対応を
+    // 入れるまで足さない(足しても必ず脱落する)。
   ],
 };
 
@@ -89,12 +102,24 @@ export function isForkFactory(chain, factory) {
   return hit ? hit.fork === true : true;
 }
 
+/// Algebra形式のプールを実際に使えるかどうか。
+///
+/// 今は false。発見はできても、次の2つが Uniswap形式しか想定していないため、
+/// 見つけたプールは必ず脱落する。
+///   ① fetchV3StatesBatch が slot0() しか呼ばない(Algebraは globalState())
+///   ② dex-onchain-realtime.js の購読識別子が Uniswap の Swap だけで、
+///      手数料を含む Algebra の Swap(0x121cb44e…)を受信できない
+/// 足したまま有効にすると、使えないプールが監視枠とRPCを食うだけになる。
+/// 上の2点を直したら true にする。
+const ALGEBRA_SUPPORTED = false;
+
 /// そのチェーンで探索してよいファクトリー。
 /// fork: true のものは ENABLE_FORK_QUOTER に入っているチェーンでだけ返す。
 export function activeV3Factories(chain) {
   const all = V3_FACTORIES[chain] || [];
-  if (isForkQuoterEnabled(chain)) return all;
-  return all.filter((f) => !f.fork);
+  const usable = ALGEBRA_SUPPORTED ? all : all.filter((f) => f.style !== "algebra");
+  if (isForkQuoterEnabled(chain)) return usable;
+  return usable.filter((f) => !f.fork);
 }
 
 export const V3_FEE_TIERS = [100, 500, 3000, 10000];
