@@ -492,7 +492,7 @@ const SPOT_SCREEN_ROUTE_LIMIT = 50000;
 /// 1ペアで見るプール数の上限。総当たりは二乗で増えるための歯止め。
 const SPOT_SCREEN_MAX_POOLS = 24;
 
-/// これを超える利幅は本物ではない、とみなす上限(bps)。既定1000 = 10%。
+/// これを超える利幅は計算が壊れている、とみなす上限(bps)。既定10000 = 100%。
 ///
 /// [なぜ要るか(2026年9月18日、最初の計測で判明)]
 /// 最初の版は上限を置かず、`最良10,084,520,773,245bps`(= 10垓%)という
@@ -501,11 +501,32 @@ const SPOT_SCREEN_MAX_POOLS = 24;
 /// HANDOVER の「投入$2で利益$24 のような価格差はハニーポット」と同じ話で、
 /// **本物は投入額の0.1〜0.5%程度**。これを混ぜたまま数えると、
 /// 通過率が実態とかけ離れる。別枠で数えて、通過からは外す。
-const SPOT_SCREEN_SANE_MAX_BPS = parseFloat(process.env.SPOT_SCREEN_SANE_MAX_BPS || "1000");
+/// [1000から10000へ上げた理由(2026年9月18日、計器の検証中に判明)]
+/// 1000bps(10%)にしていたため、**薄いプールの大きな価格差が「異常」で
+/// 全部落ちていた**。落ちていたのは正しい結果だったが、落としていたのは
+/// この上限であって、狙っていた「金額の条件」ではなかった。
+/// 割合で切ると「深いプールの大きな価格差」という本物まで落とす。
+/// 本物かどうかを決めるのは**金額**なので、そちらに判断させる。
+/// ここは「10垓%」のような、計算が壊れている値だけを弾く役に戻す。
+const SPOT_SCREEN_SANE_MAX_BPS = parseFloat(process.env.SPOT_SCREEN_SANE_MAX_BPS || "10000");
 
 /// 別々の経路を利幅で分けるときの境目(bps)。
 const SPOT_ROUTE_EDGES = [0, 5, 10, 30, 100];
 const SPOT_ROUTE_LABELS = ["0〜5bps", "5〜10bps", "10〜30bps", "30〜100bps", "100bps超"];
+
+/// 金額の条件を通したとみなす、ガス代を引いたあとの最低利益(USD)。
+const SPOT_SCREEN_MIN_PROFIT_USD = parseFloat(process.env.SPOT_SCREEN_MIN_PROFIT_USD || "0.01");
+
+/// 金額の見積もりで試す投入額(取引上限に対する比率)。
+/// findBestAmount と同じ考え方だが、ふるいなので点数を減らしている。
+const SPOT_SIZE_RATIOS = [0.0005, 0.002, 0.008, 0.03, 0.12, 0.3, 0.6, 1.0];
+
+/// 経路を「ガス代を引いた利益」で分ける境目(USD)。
+const SPOT_NET_EDGES = [0, 0.01, 0.1, 1];
+const SPOT_NET_LABELS = ["赤字", "〜$0.01", "$0.01〜0.1", "$0.1〜1", "$1超"];
+
+/// 実物を確かめるために残す、いちばん良かった経路の数。
+const SPOT_SAMPLE_LIMIT = 5;
 
 const spotScreen = {
   evaluated: 0,
@@ -516,10 +537,93 @@ const spotScreen = {
   passedWithTable: 0,
   insane: 0,
   bestBps: null,
+  // 金額の条件(ガス代+最低利益)まで通った、状態が変わってからの初回。
+  // **これが切り替え後に本当に必要な見積もりの回数**。
+  freshNeedQuote: 0,
+  needQuote: 0,
   routes: new Map(),
+  routeNet: new Map(),
   signatures: new Map(),
+  samples: [],
   capped: 0,
 };
+
+/// 1段の準備量を浮動小数で取り出す。
+///
+/// [V3をx·y=kで近似する理由]
+/// ここは**ふるいの金額の目安**であって、送信前の見積もりではない。
+/// 現在の価格帯の仮想準備量 (L/√P, L·√P) を使うと、価格帯の内側では
+/// x·y=k と同じように動く。価格帯が狭いプールでは多めに出るが、
+/// 多めに出る=ふるいを通る側なので、本物を落とすことはない。
+/// 落としてよいかの最終判断は、通ったあとの正確な見積もりが行う。
+function legReservesFloat(leg) {
+  if (leg.kind === KIND_V3) {
+    const sqrt = Number(leg.sqrtPriceX96) / 2 ** 96;
+    const liquidity = Number(leg.liquidity);
+    if (!(sqrt > 0) || !(liquidity > 0)) return null;
+    const r0 = liquidity / sqrt, r1 = liquidity * sqrt;
+    const out = leg.zeroForOne ? { rIn: r0, rOut: r1 } : { rIn: r1, rOut: r0 };
+    return isFinite(out.rIn) && isFinite(out.rOut) ? out : null;
+  }
+  const rIn = Number(leg.reserveIn), rOut = Number(leg.reserveOut);
+  return rIn > 0 && rOut > 0 ? { rIn, rOut } : null;
+}
+
+/// x·y=k の受取量(浮動小数版)。ふるいの目安なので精度は要らない。
+function outFloat(amountIn, rIn, rOut, feeBps) {
+  if (!(amountIn > 0) || !(rIn > 0) || !(rOut > 0)) return 0;
+  const withFee = (amountIn * (10000 - feeBps)) / 10000;
+  return (withFee * rOut) / (rIn + withFee);
+}
+
+/// 現在の準備量から「取れそうな利益(USD)」を見積もる。RPCは使わない。
+///
+/// [なぜ要るか(2026年9月18日の計測で判明)]
+/// ふるいは**割合(%)しか見ていなかった**。流動性$50のプールで500%の
+/// 価格差があっても取れるのは数ドルで、その大半は税トークンや死んだプール。
+/// 実測では経路3,908本のうち2,282本(58%)が100bps超という、本物では
+/// あり得ない分布になっていた。深さは無料で手に入るので、金額まで見る。
+function estimateNetUsd(chain, tokenA, legs, capUsd, gasCostUsd) {
+  const decimals = getTokenDecimals(chain, tokenA);
+  const priceUsd = getTokenPriceUsd(chain, tokenA);
+  if (decimals == null || !priceUsd) return null;
+  const reserves = [];
+  for (const leg of legs) {
+    const r = legReservesFloat(leg);
+    if (!r) return null;
+    reserves.push(r);
+  }
+  const capRaw = (capUsd / priceUsd) * Math.pow(10, decimals);
+  if (!(capRaw > 0) || !isFinite(capRaw)) return null;
+
+  let bestRaw = 0;
+  for (const ratio of SPOT_SIZE_RATIOS) {
+    const amountIn = capRaw * ratio;
+    let amount = amountIn;
+    for (let i = 0; i < legs.length; i++) {
+      amount = outFloat(amount, reserves[i].rIn, reserves[i].rOut, legs[i].feeBps);
+      if (!(amount > 0)) break;
+    }
+    const profit = amount - amountIn;
+    if (profit > bestRaw) bestRaw = profit;
+  }
+  if (!(bestRaw > 0)) return -gasCostUsd;
+  const grossUsd = (bestRaw / Math.pow(10, decimals)) * priceUsd;
+  return isFinite(grossUsd) ? grossUsd - gasCostUsd : null;
+}
+
+/// 実物を確かめるための見本を残す(利益の大きい順に SPOT_SAMPLE_LIMIT 件)。
+function keepSample(sample) {
+  const list = spotScreen.samples;
+  const existing = list.findIndex((x) => x.key === sample.key);
+  if (existing >= 0) {
+    if (list[existing].netUsd >= sample.netUsd) return;
+    list.splice(existing, 1);
+  }
+  list.push(sample);
+  list.sort((a, b) => b.netUsd - a.netUsd);
+  if (list.length > SPOT_SAMPLE_LIMIT) list.length = SPOT_SAMPLE_LIMIT;
+}
 
 /// 経路の現在価格の積。手数料を引いたあとの利幅をbpsで返す。
 function spotEdgeBps(legs) {
@@ -536,7 +640,7 @@ function spotEdgeBps(legs) {
 /// 1ペアぶんの2段経路を、**価格表の有無に関係なく**ふるいにかけて数える。
 /// 今の判定は価格表のある段しか使えないので、ここでは「切り替えたら
 /// いくつ候補が出るか」を測るために、その条件を外して数える。
-function measureSpotScreen(chain, tokenA, tokenB, pools) {
+function measureSpotScreen(chain, tokenA, tokenB, pools, capUsd, gasCostUsd) {
   let usable = pools.filter(hasUsableState);
   if (usable.length < 2) return;
   if (usable.length > SPOT_SCREEN_MAX_POOLS) {
@@ -584,6 +688,27 @@ function measureSpotScreen(chain, tokenA, tokenB, pools) {
         }
         if (legIsUsable(a.leg) && legIsUsable(b.leg)) spotScreen.passedWithTable++;
 
+        // 金額の条件。ここまで通ったものだけが、切り替え後に見積もりを要する。
+        const netUsd = estimateNetUsd(chain, borrowLower, legs, capUsd, gasCostUsd);
+        if (netUsd != null) {
+          const prevNet = spotScreen.routeNet.get(key);
+          if (prevNet == null) {
+            if (spotScreen.routeNet.size < SPOT_SCREEN_ROUTE_LIMIT) spotScreen.routeNet.set(key, netUsd);
+          } else if (netUsd > prevNet) {
+            spotScreen.routeNet.set(key, netUsd);
+          }
+          if (netUsd > SPOT_SCREEN_MIN_PROFIT_USD) {
+            spotScreen.needQuote++;
+            if (isFresh) spotScreen.freshNeedQuote++;
+            keepSample({
+              key, chain, netUsd, edge,
+              tokenIn: borrowLower,
+              pools: `${a.pool.dexId}:${addrs[0].slice(0, 8)}…→${b.pool.dexId}:${addrs[1].slice(0, 8)}…`,
+              feeBps: legs.reduce((sum, l) => sum + l.feeBps, 0),
+            });
+          }
+        }
+
         const prev = spotScreen.routes.get(key);
         if (prev == null) {
           if (spotScreen.routes.size < SPOT_SCREEN_ROUTE_LIMIT) spotScreen.routes.set(key, edge);
@@ -608,6 +733,13 @@ export function getSpotScreenStats() {
     if (i === -1) i = SPOT_ROUTE_LABELS.length - 1;
     routeCounts[i]++;
   }
+  // 経路を「ガス代を引いた利益」で分ける。
+  const netCounts = new Array(SPOT_NET_LABELS.length).fill(0);
+  for (const net of spotScreen.routeNet.values()) {
+    let i = 0;
+    while (i < SPOT_NET_EDGES.length && net > SPOT_NET_EDGES[i]) i++;
+    netCounts[i]++;
+  }
   return {
     edges: [...SPOT_SCREEN_EDGES],
     evaluated: spotScreen.evaluated,
@@ -619,6 +751,12 @@ export function getSpotScreenStats() {
     distinctRoutes: spotScreen.routes.size,
     routeLabels: [...SPOT_ROUTE_LABELS],
     routeCounts,
+    needQuote: spotScreen.needQuote,
+    freshNeedQuote: spotScreen.freshNeedQuote,
+    netLabels: [...SPOT_NET_LABELS],
+    netCounts,
+    samples: spotScreen.samples.map((x) => ({ ...x })),
+    minProfitUsd: SPOT_SCREEN_MIN_PROFIT_USD,
     capped: spotScreen.capped,
   };
 }
@@ -681,7 +819,7 @@ function labelOf(legs) {
 
 export function scanTwoStep({ chain, tokenA, tokenB, pools, capUsd, gasCostUsd, isBorrowable }) {
   // 計測だけ先に行う。RPCは使わず、この下の判定には一切影響しない。
-  measureSpotScreen(chain, tokenA, tokenB, pools);
+  measureSpotScreen(chain, tokenA, tokenB, pools, capUsd, gasCostUsd);
 
   const usable = pools.filter(hasUsableState);
   if (usable.length < 2) return null;

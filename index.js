@@ -151,6 +151,7 @@ const stats = {
 // ふるいの計測の前回値(毎分の通過回数を出すため)。
 let lastSpotScreenPassed = [];
 let lastSpotScreenFresh = [];
+let lastSpotNeedQuote = 0;
 let lastSpotScreenAt = null;
 
 const chainReady = new Set();
@@ -1329,8 +1330,16 @@ function heartbeat() {
         .map((e, i) => `${e}bps超:毎分${perMin(ss.fresh[i], lastSpotScreenFresh[i] ?? 0)}`)
         .join(" ");
       const routes = ss.routeLabels.map((l, i) => `${l}:${ss.routeCounts[i]}`).join(" ");
+      const nets = ss.netLabels.map((l, i) => `${l}:${ss.netCounts[i]}`).join(" ");
       const best = ss.bestBps == null ? "-" : `${ss.bestBps.toFixed(1)}bps`;
-      console.log(`[ふるい] 評価${ss.evaluated.toLocaleString()} 要見積もり[${steps}] 経路${ss.distinctRoutes.toLocaleString()}本[${routes}] 表ありでの通過${ss.passedWithTable.toLocaleString()} 異常${ss.insane.toLocaleString()} 最良${best}`);
+      const needPerMin = perMin(ss.freshNeedQuote, lastSpotNeedQuote);
+      console.log(`[ふるい] 評価${ss.evaluated.toLocaleString()} 価格差だけ[${steps}] 金額まで通過:毎分${needPerMin} 経路${ss.distinctRoutes.toLocaleString()}本[${routes}] 利益[${nets}] 異常${ss.insane.toLocaleString()} 最良${best}`);
+      lastSpotNeedQuote = ss.freshNeedQuote;
+
+      // 上位の経路を実物で確かめる。2,282本が何なのかを推測で語らないため。
+      for (const x of ss.samples.slice(0, 3)) {
+        console.log(`[ふるいの実物] ${x.chain} ${x.pools} 始点${x.tokenIn.slice(0, 10)}… 価格差${x.edge.toFixed(1)}bps 壁${x.feeBps}bps 見積利益$${x.netUsd.toFixed(4)}`);
+      }
       lastSpotScreenPassed = [...ss.passed];
       lastSpotScreenFresh = [...ss.fresh];
       lastSpotScreenAt = Date.now();
