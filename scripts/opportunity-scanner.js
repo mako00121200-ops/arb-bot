@@ -200,6 +200,23 @@ function routeMaxAmountIn(maxAmountIn, legs) {
   return maxAmountIn < range.max ? maxAmountIn : range.max;
 }
 
+/// 経路を何本計算し、そのうち何本が粗利プラスだったか。
+///
+/// [なぜ数えるか]
+/// 生存ログの「精査」は handleOpportunity に渡った件数、つまり
+/// 粗利がプラスだった件数であって、計算した経路の数ではない。
+/// この区別が無いために「判定が止まっている」と2度誤診した。
+/// 「計算はしているが機会が無い」のか「そもそも計算していない」のかを
+/// 見分けられるようにする。
+///
+/// hitCap は投入額が上限(価格表の最大点)に張り付いた回数。
+/// 価格表を伸ばす意味があったのかを測る。0のままなら上限は効いておらず、
+/// 刻みを増やした分のRPCが無駄なので元に戻せる。
+///
+/// findBestAmount から参照するので、その手前で宣言しておく。
+const routeCalcStats = { computed: 0, grossProfitable: 0, hitCap: 0 };
+export function getRouteCalcStats() { return { ...routeCalcStats }; }
+
 function findBestAmount(maxAmountIn, legs) {
   let best = { amountIn: 0n, amountOut: 0n, profit: 0n, returnBps: null };
   const cap = routeMaxAmountIn(maxAmountIn, legs);
@@ -214,7 +231,15 @@ function findBestAmount(maxAmountIn, legs) {
     if (bestReturnBps == null || bps > bestReturnBps) bestReturnBps = bps;
   };
 
-  const ratios = [0.01, 0.02, 0.04, 0.07, 0.12, 0.2, 0.3, 0.45, 0.6, 0.8, 1.0];
+  // 上限に対する比率で探すので、上限が大きいほど最小の刻みが粗くなる。
+  // 以前は最小が0.01で、上限$300なら$3から探せたが、価格表を$2000まで
+  // 伸ばすと最小が$20になり、実測の最適額($1.78〜$8.05)を全て飛ばしていた。
+  // 検証では上限$2000のとき理想の60%の利益しか取れなかった。
+  // 小さい側を対数的に細かく刻み、上限を伸ばしても取り逃さないようにする。
+  const ratios = [
+    0.0005, 0.001, 0.002, 0.004, 0.008, 0.015, 0.03, 0.06,
+    0.12, 0.2, 0.3, 0.45, 0.6, 0.8, 1.0,
+  ];
   for (const r of ratios) {
     const amountIn = (cap * BigInt(Math.round(r * 100000))) / 100000n;
     if (amountIn <= 0n) continue;
@@ -233,6 +258,8 @@ function findBestAmount(maxAmountIn, legs) {
       if (profit > best.profit) best = { amountIn, amountOut, profit, returnBps: null };
     }
   }
+  // 一番良かった額が上限のすぐ下なら、上限で切られていた可能性がある。
+  if (best.amountIn > 0n && best.amountIn * 100n >= cap * 95n) routeCalcStats.hitCap++;
   return { ...best, returnBps: bestReturnBps };
 }
 
@@ -246,17 +273,6 @@ function maxAmountFromUsd(chain, token, capUsd) {
     return BigInt(intPart + fracPart.padEnd(decimals, "0").slice(0, decimals));
   } catch (e) { return null; }
 }
-
-/// 経路を何本計算し、そのうち何本が粗利プラスだったか。
-///
-/// [なぜ数えるか]
-/// 生存ログの「精査」は handleOpportunity に渡った件数、つまり
-/// 粗利がプラスだった件数であって、計算した経路の数ではない。
-/// この区別が無いために「判定が止まっている」と2度誤診した。
-/// 「計算はしているが機会が無い」のか「そもそも計算していない」のかを
-/// 見分けられるようにする。
-const routeCalcStats = { computed: 0, grossProfitable: 0 };
-export function getRouteCalcStats() { return { ...routeCalcStats }; }
 
 /// 「あと何bpsで粗利プラスだったか」の分布。
 ///
