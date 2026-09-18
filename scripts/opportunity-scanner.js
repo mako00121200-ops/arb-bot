@@ -201,9 +201,18 @@ function routeMaxAmountIn(maxAmountIn, legs) {
 }
 
 function findBestAmount(maxAmountIn, legs) {
-  let best = { amountIn: 0n, amountOut: 0n, profit: 0n };
+  let best = { amountIn: 0n, amountOut: 0n, profit: 0n, returnBps: null };
   const cap = routeMaxAmountIn(maxAmountIn, legs);
   if (cap <= 0n) return best;
+
+  // 赤字でも「一番良かった時の利回り」をbpsで残す。
+  // simulateRoute を呼ぶ回数は増やさず、すでに計算した値から比率を取るだけ。
+  let bestReturnBps = null;
+  const note = (amountIn, profit) => {
+    if (amountIn <= 0n) return;
+    const bps = Number((profit * 10000n) / amountIn);
+    if (bestReturnBps == null || bps > bestReturnBps) bestReturnBps = bps;
+  };
 
   const ratios = [0.01, 0.02, 0.04, 0.07, 0.12, 0.2, 0.3, 0.45, 0.6, 0.8, 1.0];
   for (const r of ratios) {
@@ -211,7 +220,8 @@ function findBestAmount(maxAmountIn, legs) {
     if (amountIn <= 0n) continue;
     const amountOut = simulateRoute(amountIn, legs);
     const profit = amountOut - amountIn;
-    if (profit > best.profit) best = { amountIn, amountOut, profit };
+    note(amountIn, profit);
+    if (profit > best.profit) best = { amountIn, amountOut, profit, returnBps: null };
   }
   if (best.amountIn > 0n) {
     for (const r of [0.7, 0.85, 1.15, 1.3]) {
@@ -219,10 +229,11 @@ function findBestAmount(maxAmountIn, legs) {
       if (amountIn <= 0n || amountIn > cap) continue;
       const amountOut = simulateRoute(amountIn, legs);
       const profit = amountOut - amountIn;
-      if (profit > best.profit) best = { amountIn, amountOut, profit };
+      note(amountIn, profit);
+      if (profit > best.profit) best = { amountIn, amountOut, profit, returnBps: null };
     }
   }
-  return best;
+  return { ...best, returnBps: bestReturnBps };
 }
 
 function maxAmountFromUsd(chain, token, capUsd) {
@@ -247,6 +258,60 @@ function maxAmountFromUsd(chain, token, capUsd) {
 const routeCalcStats = { computed: 0, grossProfitable: 0 };
 export function getRouteCalcStats() { return { ...routeCalcStats }; }
 
+/// 「あと何bpsで粗利プラスだったか」の分布。
+///
+/// [なぜ数えるか]
+/// 粗利がプラスにならない経路は finalize がその場で捨てるので、
+/// 「機会が無かった」としか残らず、どれくらい惜しかったのかが分からない。
+/// 手数料の壁はチェーンによって大きく違う(実測: Polygonは最小35bps、
+/// Optimismは最小6bps)。壁の低いチェーンへ移すと機会が何倍になるのかを、
+/// 推測ではなく実測で答えられるようにするための分布。
+///
+/// RPCは一切使わない。findBestAmount がすでに計算した値を数えるだけ。
+const NEAR_MISS_EDGES = [0, -5, -10, -20, -30, -50, -100];
+const NEAR_MISS_LABELS = [
+  "0bps以上(粗利プラス)", "-5〜0bps", "-10〜-5bps", "-20〜-10bps",
+  "-30〜-20bps", "-50〜-30bps", "-100〜-50bps", "-100bps未満",
+];
+const nearMiss = new Map(); // chain -> 件数の配列
+
+function recordNearMiss(chain, returnBps) {
+  if (returnBps == null || !Number.isFinite(returnBps)) return;
+  if (!nearMiss.has(chain)) nearMiss.set(chain, new Array(NEAR_MISS_LABELS.length).fill(0));
+  const row = nearMiss.get(chain);
+  let i = NEAR_MISS_EDGES.findIndex((e) => returnBps >= e);
+  if (i === -1) i = NEAR_MISS_LABELS.length - 1;
+  row[i]++;
+}
+
+export function getNearMissStats() {
+  const out = {};
+  for (const [chain, row] of nearMiss) {
+    out[chain] = {
+      labels: [...NEAR_MISS_LABELS],
+      counts: [...row],
+      total: row.reduce((a, b) => a + b, 0),
+    };
+  }
+  return out;
+}
+
+/// 手数料の壁が dropBps 下がったら、新たに粗利プラスへ変わる経路の本数。
+/// 壁の分だけ受取が増えるので、-dropBps 以上に入っている経路が黒字側へ移る。
+/// すでに黒字の段(先頭)は含めない。
+///
+/// 段をまたぐ場合(例: 29bps下がると -30〜-20 の段は一部しか該当しない)は
+/// その段を数えない。つまり必ず少なめに出る。判断を誤る方向ではない。
+export function countIfWallDrops(chain, dropBps) {
+  const row = nearMiss.get(chain);
+  if (!row) return 0;
+  let n = 0;
+  for (let i = 1; i < NEAR_MISS_EDGES.length; i++) {
+    if (NEAR_MISS_EDGES[i] >= -dropBps) n += row[i];
+  }
+  return n;
+}
+
 function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, poolAddresses }) {
   // V3を1段も含まない経路は判定しない。
   if (!legs.some((l) => l.kind === KIND_V3)) return null;
@@ -256,6 +321,8 @@ function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, p
 
   routeCalcStats.computed++;
   const best = findBestAmount(maxAmountIn, legs);
+  // 捨てる前に「どれくらい惜しかったか」を残す。
+  recordNearMiss(chain, best.returnBps);
   // 粗利(ガス代を引く前)がプラスでなければ、そこで終わり。
   // 裁定の機会が無い時はここで止まるのが正常。
   if (best.profit <= 0n) return null;

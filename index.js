@@ -51,7 +51,7 @@ import {
   getArbitragablePairs, savePoolMap, loadPoolMap, snapshotFullMap,
   hasUsableState, clearPoolState, formatStateDiagnostics, KIND_V2, KIND_V3,
 } from "./scripts/pool-registry.js";
-import { scanForChangedPool, scanAllPairs, getRouteCalcStats } from "./scripts/opportunity-scanner.js";
+import { scanForChangedPool, scanAllPairs, getRouteCalcStats, getNearMissStats, countIfWallDrops } from "./scripts/opportunity-scanner.js";
 import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS } from "./scripts/execute-opportunity.js";
 import {
   getKnownTokens, isStableToken, isBorrowable,
@@ -68,6 +68,11 @@ import {
 import { CHAIN_CONFIG } from "./chain-config.js";
 
 const MIN_PROFIT_USD = parseFloat(process.env.MIN_PROFIT_USD || "0.01");
+
+/// 「壁がこれだけ下がったら何件増えるか」を見るときの基準値(bps)。
+/// 実測: Polygonの手数料の壁は最小35bps、Optimismは最小6bps。その差が29bps。
+/// Optimismへ移すと機会がどれだけ増えるかの目安になる。
+const WALL_DROP_BPS = parseInt(process.env.WALL_DROP_BPS || "29", 10);
 const FULL_SCAN_INTERVAL_SEC = parseInt(process.env.FULL_SCAN_INTERVAL_SEC || "30", 10);
 const REFRESH_STALE_SEC = parseInt(process.env.REFRESH_STALE_SEC || "60", 10);
 const REFRESH_BATCH_SIZE = parseInt(process.env.REFRESH_BATCH_SIZE || "600", 10);
@@ -1003,6 +1008,17 @@ function heartbeat() {
   for (const chain of chainReady) {
     try { console.log(formatStateDiagnostics(chain)); } catch (e) {}
   }
+
+  // どれくらい惜しかったかの分布。機会が0件でも「壁さえ低ければ届いていた」
+  // のか「そもそも価格が動いていない」のかを区別できるようにする。
+  try {
+    const nm = getNearMissStats();
+    for (const [chain, d] of Object.entries(nm)) {
+      if (!d.total) continue;
+      const parts = d.labels.map((l, i) => `${l}:${d.counts[i].toLocaleString()}`).join(" ");
+      console.log(`[惜しい] ${chain}: ${parts} / 壁が${WALL_DROP_BPS}bps下がれば+${countIfWallDrops(chain, WALL_DROP_BPS).toLocaleString()}件`);
+    }
+  } catch (e) {}
 }
 
 // ===== ダッシュボード =====
@@ -1032,6 +1048,9 @@ th,td{overflow-wrap:anywhere;word-break:break-word}
 /* 連番つきの表(取り逃し・黒字の機会)。#は最小限にし、経路に幅を回す */
 .t-num th:nth-child(1),.t-num td:nth-child(1){width:7%}
 .t-num th:nth-child(2),.t-num td:nth-child(2){width:33%}
+/* 惜しかった分布: 目盛り・棒・件数 */
+.t-miss th:nth-child(1),.t-miss td:nth-child(1){width:38%}
+.t-miss th:nth-child(3),.t-miss td:nth-child(3){width:22%}
 /* 2列の表は左を広く */
 .t-two th:nth-child(2),.t-two td:nth-child(2){width:32%}
 .note{font-size:10px;color:#888;line-height:1.6;margin-top:9px;padding-top:9px;border-top:1px solid #222;overflow-wrap:anywhere}
@@ -1114,6 +1133,29 @@ function renderPage() {
     <td style="text-align:right">${o.feeWallPercent.toFixed(2)}%</td>
     <td style="text-align:right">$${o.tradeAmountUsd.toFixed(2)}</td>
     <td style="text-align:right;color:#2ecc71;font-weight:600">+$${o.netProfitUsd.toFixed(4)}</td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ黒字の機会が見つかっていません</td></tr>`;
+
+  // 「あと何bpsで黒字だったか」の分布。機会が0件のとき、原因が
+  // 「手数料の壁」なのか「そもそも価格が動いていない」のかを見分ける。
+  const nm = getNearMissStats();
+  const nearMissBlocks = Object.entries(nm).filter(([, d]) => d.total > 0).map(([chain, d]) => {
+    // 棒の目盛りは最下段(-100bps未満)を除いた最大値に合わせる。
+    // 大半がそこに入るため、そこを基準にすると判断に使う上の段が潰れて読めない。
+    const scale = Math.max(...d.counts.slice(0, -1), 1);
+    const rows = d.labels.map((l, i) => {
+      const n = d.counts[i];
+      const pct = d.total ? (n / d.total * 100) : 0;
+      const bar = Math.min(100, Math.round((n / scale) * 100));
+      const color = i === 0 ? '#2ecc71' : i <= 3 ? '#e8a33d' : '#555';
+      return `<tr><td>${l}</td>
+        <td><div style="background:#222;border-radius:3px;height:8px;width:100%"><div style="background:${color};height:8px;border-radius:3px;width:${bar}%"></div></div></td>
+        <td style="text-align:right">${n.toLocaleString()}<br><span style="color:#888;font-size:9px">${pct.toFixed(1)}%</span></td></tr>`;
+    }).join('');
+    const gain = countIfWallDrops(chain, WALL_DROP_BPS);
+    const already = d.counts[0];
+    return `<h2 style="margin-top:14px">${chain}(計${d.total.toLocaleString()}本)</h2>
+<table class="t-miss"><tbody>${rows}</tbody></table>
+<div class="note">壁が${WALL_DROP_BPS}bps下がれば <b style="color:#e8a33d">+${gain.toLocaleString()}本</b> が粗利プラスに変わります(いま粗利プラスは${already.toLocaleString()}本)。<br>段をまたぐ分は数えていないので、実際はこれより多くなります。</div>`;
+  }).join('') || '<div class="note" style="color:#888">まだ経路を計算していません</div>';
 
   const reasonRows = Object.entries(reasons).filter(([, v]) => v > 0).sort((a,b)=>b[1]-a[1]).map(([k, v]) =>
     `<tr><td>${REASON_LABEL[k] || k}</td><td style="text-align:right">${v.toLocaleString()}件</td></tr>`).join('') || `<tr><td colspan="2" style="color:#888">まだ記録がありません</td></tr>`;
@@ -1199,6 +1241,10 @@ function renderPage() {
 
 <h2 style="margin-top:14px">直近に検知した機会</h2>
 <table class="t-num"><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table></div>
+
+<div class="card"><h2>📏 あと何bpsで黒字だったか</h2>
+<div class="note" style="margin-top:0;border-top:none;padding-top:0">粗利がプラスにならなかった経路が、どれくらい惜しかったかの分布です。<br>手数料の壁は実測で Polygon 最小35bps / Optimism 最小6bps。壁の低いチェーンへ移す価値があるかを、この分布で判断します。</div>
+${nearMissBlocks}</div>
 
 <div class="footerlink"><a href="/about">→ 仕組みについて</a></div></body></html>`;
 }
