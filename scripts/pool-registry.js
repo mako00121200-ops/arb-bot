@@ -169,7 +169,49 @@ export function updateV3FromSwap(chain, address, sqrtPriceX96, liquidity) {
   if (liquidity > 0n) pool.liquidity = liquidity;
   pool.updatedAt = Date.now();
   pool.lastMovePct = movePct;
+
+  // 価格表を作った時点からの「累積の」ズレ。
+  //
+  // [なぜ1回ぶんの変化では駄目か]
+  // 作り直しの判定に lastMovePct(今回の更新1回ぶん)を使っていた。
+  // これだと 0.09% ずつ 100回 動いても一度も閾値を超えず、ズレが
+  // 9% まで無制限に積み上がる。実測でも、送信直前に赤字と確定した
+  // 4件の誤差(-3.2 / -5.2 / -8.9 / -13.6bps)が閾値0.1%=10bpsの
+  // 周辺に収まっていた。
+  if ((pool.quoteBasePrice ?? 0n) > 0n && sqrtPriceX96 > 0n) {
+    const base = Number(pool.quoteBasePrice);
+    const now = Number(sqrtPriceX96);
+    if (isFinite(base) && base > 0 && isFinite(now)) {
+      // sqrtPrice の変化率は価格の変化率の約半分なので200倍する。
+      pool.quoteDriftPct = Math.abs((now - base) / base) * 200;
+    }
+  }
   return pool;
+}
+
+/// 価格表を作った時点の価格を基準として記録する。
+/// 以降の作り直しは、ここからの累積のズレで判断する。
+export function markQuoteBase(chain, address) {
+  const pool = pools.get(poolKey(chain, address));
+  if (!pool || pool.kind !== KIND_V3) return;
+  pool.quoteBasePrice = pool.sqrtPriceX96;
+  pool.quoteDriftPct = 0;
+}
+
+/// 価格表の鮮度。基準を持つプールのうち、何件がどれだけズレているか。
+/// 作り直しが追いついているかを見るために使う。
+export function getQuoteFreshness(chain, thresholdPct) {
+  let withBase = 0, stale = 0, maxDriftPct = 0;
+  for (const pool of pools.values()) {
+    if (chain && pool.chain !== chain) continue;
+    if (pool.kind !== KIND_V3) continue;
+    if (!((pool.quoteBasePrice ?? 0n) > 0n)) continue;
+    withBase++;
+    const drift = pool.quoteDriftPct || 0;
+    if (drift > maxDriftPct) maxDriftPct = drift;
+    if (drift >= thresholdPct) stale++;
+  }
+  return { withBase, stale, maxDriftBps: maxDriftPct * 100 };
 }
 
 export function setPoolFee(chain, address, feeBps) {
