@@ -59,7 +59,7 @@ import {
 } from "./scripts/opportunity-scanner.js";
 import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS } from "./scripts/execute-opportunity.js";
 import {
-  getKnownTokens, isStableToken, isBorrowable,
+  getKnownTokens, isBorrowable,
   markUsableStart, clearUsableStarts, countUsableStarts,
 } from "./scripts/borrowable-tokens.js";
 import { getVerifiedPairs } from "./scripts/verified-pairs.js";
@@ -278,51 +278,128 @@ async function loadTokenDecimals(chain) {
   return found.size;
 }
 
-function derivePriceFromStablePools(chain, token) {
-  const decimals = getTokenDecimals(chain, token);
-  if (decimals == null) return null;
-  let best = null, bestLiquidityUsd = 0;
-  for (const pool of getPoolsForToken(chain, token)) {
-    if (pool.kind !== KIND_V2) continue;
-    if (pool.raw0 <= 0n || pool.raw1 <= 0n) continue;
-    const other = pool.token0 === token ? pool.token1 : pool.token0;
-    if (!isStableToken(chain, other)) continue;
-    const otherDecimals = getTokenDecimals(chain, other);
-    if (otherDecimals == null) continue;
-    const isToken0 = pool.token0 === token;
-    const reserveToken = isToken0 ? pool.raw0 : pool.raw1;
-    const reserveStable = isToken0 ? pool.raw1 : pool.raw0;
-    const tokenAmount = Number(reserveToken) / Math.pow(10, decimals);
-    const stableAmount = Number(reserveStable) / Math.pow(10, otherDecimals);
-    if (tokenAmount <= 0 || stableAmount < MIN_PRICE_SOURCE_USD) continue;
-    if (stableAmount > bestLiquidityUsd) {
-      bestLiquidityUsd = stableAmount;
-      best = stableAmount / tokenAmount;
-    }
-  }
-  return best && isFinite(best) && best > 0 ? best : null;
+/// 価格を何回まで隣へ辿るか。1回目は「すでに価格が分かっている通貨と
+/// 直結したトークン」、2回目はその隣、と広がる。
+const PRICE_HOPS = parseInt(process.env.PRICE_HOPS || "4", 10);
+
+/// V3プールの「仮想準備量」。
+///
+/// V3は価格帯ごとに流動性が分かれているため、実際の残高は価格の比率を
+/// 表さない。代わりに現在の価格帯での仮想準備量 (L/√P, L·√P) を使う。
+/// この2つの比を取ると現在価格そのものになり、また現在の価格帯の内側では
+/// x·y=k と同じように動くので、深さの目安としても使える。
+/// 価格帯が狭いプールでは深さを多めに見積もるが、その分は
+/// MIN_PRICE_SOURCE_USD の下限で落とす。
+function v3VirtualReserves(pool) {
+  const sqrt = Number(pool.sqrtPriceX96) / Number(2n ** 96n);
+  const liquidity = Number(pool.liquidity);
+  if (!isFinite(sqrt) || sqrt <= 0) return null;
+  if (!isFinite(liquidity) || liquidity <= 0) return null;
+  return { raw0: liquidity / sqrt, raw1: liquidity * sqrt };
 }
 
+/// そのトークンのUSD価格を、隣のプールから逆算する。
+///
+/// [2026年9月18日に広げた。それまで始点が少なかった原因]
+/// 以前は「安定通貨と直結したV2プール」しか見ていなかった。そのため
+///   ① V3にしかないトークン(チェーンによっては活動の97%がV3)
+///   ② 安定通貨と直接のプールが無いトークン(WETH経由など)
+/// が丸ごと価格不明になり、始点から外れていた。始点に使えるかは
+/// 「桁数と価格が分かるか」だけで決まるので、これがそのまま
+/// 「狙える範囲の狭さ」になっていた。
+///
+/// 今は相手が安定通貨でなくても、**その周で価格が確定した通貨**なら
+/// 起点にする。V3プールの現在価格も使う。呼び出し側が数回まわすので
+/// 安定通貨 → WETH → その隣、と順に広がる。
+///
+/// RPCは使わない。全てメモリ上の地図の値だけで求める。
+///
+/// @param priceOf その周で確定した価格を返す関数(前の周の値は使わない)
+function derivePriceFromPools(chain, token, priceOf) {
+  const decimals = getTokenDecimals(chain, token);
+  if (decimals == null) return null;
+  let best = null, bestDepthUsd = 0;
+  for (const pool of getPoolsForToken(chain, token)) {
+    if (!hasUsableState(pool)) continue;
+    const isToken0 = pool.token0 === token;
+    const other = isToken0 ? pool.token1 : pool.token0;
+    if (other === token) continue;
+    const otherPrice = priceOf(other);
+    if (!otherPrice) continue;
+    const otherDecimals = getTokenDecimals(chain, other);
+    if (otherDecimals == null) continue;
+
+    let rawToken, rawOther;
+    if (pool.kind === KIND_V3) {
+      const v = v3VirtualReserves(pool);
+      if (!v) continue;
+      rawToken = isToken0 ? v.raw0 : v.raw1;
+      rawOther = isToken0 ? v.raw1 : v.raw0;
+    } else {
+      rawToken = Number(isToken0 ? pool.raw0 : pool.raw1);
+      rawOther = Number(isToken0 ? pool.raw1 : pool.raw0);
+    }
+    const tokenAmount = rawToken / Math.pow(10, decimals);
+    const otherAmount = rawOther / Math.pow(10, otherDecimals);
+    if (!(tokenAmount > 0) || !(otherAmount > 0)) continue;
+
+    // 深さは「相手側の価値」で測る。薄いプールの価格は当てにならないうえ、
+    // 価格を間違えると投入額の計算ごと狂うので、下限は必ず掛ける。
+    const depthUsd = otherAmount * otherPrice;
+    if (depthUsd < MIN_PRICE_SOURCE_USD) continue;
+
+    const price = depthUsd / tokenAmount;
+    if (!isFinite(price) || price <= 0) continue;
+    // 同じトークンに複数の経路がある場合は、いちばん深いプールを採る。
+    if (depthUsd > bestDepthUsd) { bestDepthUsd = depthUsd; best = price; }
+  }
+  return best;
+}
+
+/// 全チェーンのトークン価格を作り直し、始点に使える通貨を登録する。
+///
+/// [毎回ゼロから作り直す理由(2026年9月18日)]
+/// 以前は「まだ価格が無いトークンだけ」を埋めていたため、一度付いた価格は
+/// 二度と更新されなかった。価格は投入額の計算と利益のUSD換算の両方に
+/// 使うので、古いままだとガス代とのハードル比較がその分ずれる。
+/// 計算はメモリ上だけで完結しRPCを使わないので、毎回作り直す。
 function refreshTokenPrices() {
   clearUsableStarts();
   let priced = 0;
   for (const chain of Object.keys(CHAIN_CONFIG)) {
+    // その周で確定した価格。前の周の値を混ぜると、古い価格が
+    // いつまでも残り続けるので分けて持つ。
+    const next = new Map();
+    const priceOf = (token) => next.get(token) ?? null;
+
     for (const [address, info] of Object.entries(getKnownTokens(chain))) {
       setTokenDecimals(chain, address, info.decimals);
-      if (info.stable) setTokenPriceUsd(chain, address, 1);
-      else if (info.priceHintUsd && !getTokenPriceUsd(chain, address)) {
-        setTokenPriceUsd(chain, address, info.priceHintUsd);
-      }
+      if (info.stable) next.set(address, 1);
     }
-    for (let round = 0; round < 2; round++) {
-      for (const pool of getPoolsByKind(chain, KIND_V2)) {
-        for (const token of [pool.token0, pool.token1]) {
-          if (getTokenPriceUsd(chain, token)) continue;
-          const price = derivePriceFromStablePools(chain, token);
-          if (price) setTokenPriceUsd(chain, token, price);
+    // 価格の起点。安定通貨から辿れないトークンのために、
+    // よく使う通貨の目安値も起点に入れる(辿れるなら上書きされる)。
+    for (const [address, info] of Object.entries(getKnownTokens(chain))) {
+      if (next.has(address) || !info.priceHintUsd) continue;
+      next.set(address, info.priceHintUsd);
+    }
+
+    for (let hop = 0; hop < PRICE_HOPS; hop++) {
+      const found = [];
+      for (const kind of [KIND_V2, KIND_V3]) {
+        for (const pool of getPoolsByKind(chain, kind)) {
+          for (const token of [pool.token0, pool.token1]) {
+            if (next.has(token)) continue;
+            const price = derivePriceFromPools(chain, token, priceOf);
+            if (price) found.push([token, price]);
+          }
         }
       }
+      if (found.length === 0) break; // これ以上は広がらない
+      for (const [token, price] of found) if (!next.has(token)) next.set(token, price);
     }
+
+    for (const [token, price] of next) setTokenPriceUsd(chain, token, price);
+
     const seen = new Set();
     for (const kind of [KIND_V2, KIND_V3]) {
       for (const pool of getPoolsByKind(chain, kind)) {
@@ -330,7 +407,7 @@ function refreshTokenPrices() {
           if (seen.has(token)) continue;
           seen.add(token);
           if (getTokenDecimals(chain, token) == null) continue;
-          if (!getTokenPriceUsd(chain, token)) continue;
+          if (!next.has(token)) continue;
           markUsableStart(chain, token);
           priced++;
         }
