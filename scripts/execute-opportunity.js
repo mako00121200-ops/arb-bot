@@ -33,9 +33,89 @@ import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
 import { recordRealExecution } from "./real-execution-log.js";
 import { estimateGasCostUsd, gasUnitsToUsd, weiToUsd, getEstimatedGasPriceWei, recordActualGasPrice } from "./gas-cost.js";
 import { getTokenDecimals, getTokenPriceUsd, getPool, KIND_V3 } from "./pool-registry.js";
+import { quoteV3ByPoolBatch, fetchReservesBatch } from "./multicall-reserves.js";
 import { clearQuoteTable } from "./v3-pools.js";
 import { markRouteRejected, markRouteConfirmed } from "./opportunity-scanner.js";
 import { scheduleCompetitorCheck } from "./competitor-check.js";
+
+// ===== 赤字と確定した経路の、段ごとの答え合わせ(2026年9月19日に追加) =====
+//
+// [なぜ要るか]
+// 今までは「経路全体で何bpsずれたか」しか分からなかった。記録簿には
+// -9.5bps から **-476.7bps** まで並んでいたが、どの段が嘘をついているのか
+// 特定できず、原因を推測で決めるしかなかった。
+//
+// 段ごとの見込み(opp.legAmounts)は判定時に残してある。赤字と確定した時だけ、
+// **同じ投入額で各段を単独に正確に見積もり直し**、見込みと突き合わせる。
+// 犯人の段が名指しできる。
+//
+// [RPCはほぼ増えない]
+// 赤字の確定は1日329件。1件につきV3用とV2用で最大2回の束ね呼び出し。
+// 月に約2万回で、枠2,000万の0.1%。
+const DIAGNOSE_MIN_BPS = parseFloat(process.env.DIAGNOSE_MIN_BPS || "5");
+
+function bpsDiff(expected, actual) {
+  if (expected <= 0n) return null;
+  return Number(((actual - expected) * 10000n) / expected);
+}
+
+/// 赤字だった経路について、段ごとの誤差をログに出す。失敗しても判定は止めない。
+async function diagnoseRejectedRoute(chain, contractAddress, opp) {
+  const legs = opp.legs || [];
+  const expected = opp.legAmounts || [];
+  if (legs.length === 0 || expected.length !== legs.length) return;
+
+  // ① V3の段: 自前コントラクトの quoteV3 に、見込みと同じ投入額で聞き直す。
+  const v3Jobs = [], v3Index = [];
+  for (let i = 0; i < legs.length; i++) {
+    if (legs[i].kind !== KIND_V3 || expected[i].in <= 0n) continue;
+    v3Jobs.push({ pool: legs[i].pool, tokenIn: legs[i].tokenIn, amountIn: expected[i].in });
+    v3Index.push(i);
+  }
+  // ② V2の段: 今の準備量を読み直して、同じ式で計算し直す。
+  const v2Addrs = [], v2Index = [];
+  for (let i = 0; i < legs.length; i++) {
+    if (legs[i].kind === KIND_V3) continue;
+    v2Addrs.push(legs[i].pool);
+    v2Index.push(i);
+  }
+
+  const actual = new Array(legs.length).fill(null);
+  const [v3Outs, v2States] = await Promise.all([
+    v3Jobs.length ? quoteV3ByPoolBatch(chain, contractAddress, v3Jobs, true).catch(() => []) : [],
+    v2Addrs.length ? fetchReservesBatch(chain, v2Addrs.map((a) => ({ address: a })), true).catch(() => new Map()) : new Map(),
+  ]);
+  for (let k = 0; k < v3Index.length; k++) {
+    const out = v3Outs[k];
+    if (out != null && out > 0n) actual[v3Index[k]] = out;
+  }
+  for (let k = 0; k < v2Index.length; k++) {
+    const i = v2Index[k];
+    const st = v2States.get(legs[i].pool.toLowerCase());
+    if (!st || st.raw0 <= 0n || st.raw1 <= 0n) continue;
+    const isToken0In = (st.token0 || "").toLowerCase() === legs[i].tokenIn.toLowerCase();
+    const rIn = isToken0In ? st.raw0 : st.raw1;
+    const rOut = isToken0In ? st.raw1 : st.raw0;
+    const withFee = expected[i].in * (10000n - BigInt(legs[i].feeBps));
+    const denom = rIn * 10000n + withFee;
+    if (denom > 0n) actual[i] = (withFee * rOut) / denom;
+  }
+
+  const parts = [];
+  let worst = null;
+  for (let i = 0; i < legs.length; i++) {
+    if (actual[i] == null) { parts.push(`${i + 1}段目 ${legs[i].dexId}:読めず`); continue; }
+    const diff = bpsDiff(expected[i].out, actual[i]);
+    if (diff == null) { parts.push(`${i + 1}段目 ${legs[i].dexId}:比較不能`); continue; }
+    parts.push(`${i + 1}段目 ${legs[i].dexId}(${legs[i].kind}) ${diff >= 0 ? "+" : ""}${diff.toFixed(1)}bps`);
+    if (worst == null || diff < worst.diff) worst = { i, diff, leg: legs[i] };
+  }
+  if (parts.length === 0) return;
+  const blame = worst && worst.diff <= -DIAGNOSE_MIN_BPS
+    ? ` ← ${worst.i + 1}段目 ${worst.leg.dexId}:${worst.leg.pool.slice(0, 10)}… が原因`
+    : "";
+  console.log(`[段ごとの答え合わせ] ${chain} ${opp.label} 投入${opp.amountIn}: ${parts.join(" / ")}${blame}`);
+}
 
 const LEG_TUPLE = "(address pool, address tokenIn, address tokenOut, uint8 kind, uint16 feeBps)[]";
 const CONTRACT_ABI = [
@@ -187,6 +267,8 @@ async function executeOpportunityInner(opp) {
     opp.sendResult = "rejected";
     opp.shortfallBps = profitBps;
     console.log(`[実行] ${opp.label}: チェーン上の計算では赤字(${profitBps.toFixed(1)}bps、判定時の見込み$${opp.netProfitUsd.toFixed(4)}、確認${simMs}ms)。プールが動くまで再判定しません`);
+    // どの段が嘘をついていたのかを名指しする。失敗しても判定は止めない。
+    try { await diagnoseRejectedRoute(chain, contractAddress, opp); } catch (e) {}
     return false;
   }
 

@@ -863,8 +863,26 @@ function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, p
   const netProfitUsd = grossProfitUsd - gasCostUsd;
   const hasV3 = legs.some((l) => l.kind === KIND_V3);
 
+  // 段ごとに「いくら入れて、いくら返ると見込んだか」を残す。
+  //
+  // [なぜ要るか(2026年9月19日)]
+  // 送信直前の確認で赤字と分かったとき、今までは**経路全体で何bpsずれたか**
+  // しか分からなかった。-476.7bps のようなずれが出ても、どの段が嘘を
+  // ついているのか特定できない。段ごとの見込みを残しておけば、赤字の時に
+  // 各段を単独で正確に見積もり直して突き合わせられる。
+  const legAmounts = [];
+  {
+    let amount = best.amountIn;
+    for (const leg of legs) {
+      const out = legAmountOut(leg, amount);
+      legAmounts.push({ in: amount, out });
+      amount = out;
+      if (amount <= 0n) break;
+    }
+  }
+
   return {
-    kind, chain, tokenA, label, poolAddresses, legs, hasV3,
+    kind, chain, tokenA, label, poolAddresses, legs, hasV3, legAmounts,
     amountIn: best.amountIn,
     amountOutEstimated: best.amountOut,
     amountOwed: best.amountIn,
