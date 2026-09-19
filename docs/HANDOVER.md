@@ -1,4 +1,4 @@
-# arb-bot 引き継ぎ資料(2026年9月17日時点)
+# arb-bot 引き継ぎ資料(2026年9月19日時点)
 
 ## 目的と方針(オーナーが決めたこと)
 - DEX内で完結する原子的裁定bot。フラッシュスワップ+自作コントラクト。CEX裁定は対象外
@@ -13,22 +13,39 @@
 - Railway: プロジェクトID f9a69c7e-b52c-4e06-bd1b-9863019619bc / サービスID d47495c6-84bb-4228-9f87-bc2f2f9a9ddb(secure-amazement)/ 環境 production
 - ダッシュボード: https://secure-amazement-production-5364.up.railway.app
 - RPC: Chainstack Growth(月2,000万リクエスト、Extra usageオフ=超過で停止)。PolygonのみChainstackのHTTP+WSS。Arbitrum/Avalancheは公開RPCの定期読み直し
-- 稼働チェーン: ACTIVE_CHAINS=polygon,arbitrum,avalanche(Base/Optimismは停止、設定は残してある)
+- 稼働チェーン: ACTIVE_CHAINS=polygon,arbitrum,avalanche,optimism(2026年9月19日に Optimism を再開。Base は停止、設定は残してある)。ENABLE_FORK_QUOTER=polygon,optimism
 - botウォレット: 0x9D926340a8F14D3351470997684bD8C4767131f1
 - コントラクト: Polygon 0xB26722e1E0d6228ec7F79cc49B0a23f39825e3c9(quoteV3入り、2026年9月18日デプロイ)、
+  **Optimism 0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1(quoteV3入り、2026年9月19日デプロイ。
+  Avalanche の旧コントラクトと同じ住所だが別チェーンの別物。展開時のウォレット残高 0.00506 ETH)**、
   Avalanche 0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1 と Arbitrum 0x2139C1497F7C8c3291e51639ccc978Ffe7a73E18 は
   quoteV3の無い旧版のまま。この2チェーンでフォーク見積もりを使うには先に再デプロイが要る
+- Optimism の RPC/WSS は Chainstack(2026年9月19日に追加)。`OPTIMISM_RPC_URL` / `OPTIMISM_WSS_URL` に設定済み
 - 旧Polygonコントラクト 0xD2D45cC9… には利益が残っている(推定$0.5前後)。所有者キーは
   同じなのでいつでも回収できるが、withdrawを呼ぶ仕組みはまだ無い
 - コントラクトの再デプロイは環境変数 RUN_MAINNET_DEPLOY=<チェーン名> で起動時に実行し、完了後に MAINNET_CONTRACT_ADDRESS_<チェーン> を設定して RUN_MAINNET_DEPLOY=false に戻す
 
-## 現在の仕組み
-- V2のSync/V3のSwapをWebSocketで受信し、メモリ上の地図で経路(2〜3段)を即判定
-- 監視対象はV3プールと「両トークンがV3プールに含まれるV2プール」だけ。V3を含まない経路は判定しない
-- V3は公式QuoterV2で作った価格表から補間(Multicall3で束ねて作成)
-- 送信は「simulateRoute(eth_call)で正確な利益を確認 → executeRoute送信」。受取量はコントラクトが実行時の準備量で計算
-- 送信直前に赤字と分かった経路は、プールの状態が変わるまで再判定しない
-- 30秒後に「誰が取ったか」(自分/他者の裁定/通常取引/誰も触らず)を記録簿に残す
+## 現在の仕組み(2026年9月19日に書き直し。下の各節が経緯)
+
+- V2の `Sync` / V3の `Swap` をWebSocketで受信し、メモリ上の地図で経路(2〜3段)を即判定
+- **始点トークンは36種**。手書きの一覧に加え、V2で深さ$50,000以上のトークンを
+  起動時に選んでV3プールを探す(`V3_DISCOVERY_TOKENS=40`)。価格は安定通貨から
+  隣へ辿って逆算し、5分ごとに作り直す
+- V3の見積もりは**価格表**(公式QuoterV2、フォークとAlgebraは自前の `quoteV3`)。
+  ただし**作り置きはしない**(`QUOTE_TABLE_FILL_ALL=false`)。現在価格と深さで
+  ふるいにかけ、**ガス代を引いて$0.01を超える候補が出た経路の段だけ**その場で
+  作る。費用はプール数ではなく候補の数に比例する
+- 価格表は作った時の価格つきで `/data` に保存し、起動時に**動いていない表だけ**戻す
+- 価格表の作り直しは**累積のズレ**(3bps)で判定。送信直前に同じプールが2回
+  赤字になったら、そのV2の手数料の前提(30bps)を捨てて45bpsに戻し、実測し直す
+- 送信は「`simulateRoute`(eth_call)で正確な利益を確認 → `executeRoute`」。
+  赤字と分かった経路は**段ごとに正確に見積もり直して犯人を名指し**し、
+  プールが動くまで再判定しない
+- 送信は**プール単位の錠**で並行(`NonceManager` が nonce を手元で管理、
+  同時最大3本)。同じプールを使う経路だけ直列
+- ガス代の見積もりは実測の gasUsed と実効単価から学習(上限は費用に数えない)
+- 最低利益 `MIN_PROFIT_USD=0.005`。取引上限$2000
+- 30秒後に「誰が取ったか」を記録簿に残す。ダッシュボードの時刻は日本時間
 
 ## 実績
 - 2026年9月17日に初の自動売買成功。午前中に4件成功・失敗0件、確定利益合計+$0.118
@@ -1312,8 +1329,52 @@ $5投入時のハードルは Polygon 59bps に対し **Optimism 16bps**。
 5. **確認**: `[発見] optimism univ3-fork-d(uniswap): V3プール○件` が0件で
    ないこと、`[準備完了] optimism` の監視プール数、`[判定の精度]`
 
+**注意(点検で判明)**: V3プールは起動ごとに探索されるが、**V2プールは
+プール地図の再構築時にしか集めない**(保存済みの地図があると週1回)。
+新しいチェーンを加えた直後は Optimism の V2 が地図に無いため、始点の拡張
+(深さで選ぶ)も V2↔V3 の経路も、まず手書きの5トークン分だけになる。
+初回だけ `MAP_REBUILD_AFTER_HOURS=0` で起動して地図を作り直し、終わったら
+`168` に戻す(再構築は全チェーンぶんで数百回のRPCを使う。枠には十分収まる)。
+
 Arbitrum / Avalanche の**再デプロイ**も同じ手順(手順2だけ)。
 これで両チェーンのフォークのプールと、段ごとの答え合わせが使えるようになる。
+
+## Optimism を再開した(2026年9月19日 13:45 UTC)
+
+手順どおりに進めた結果。
+
+| 段階 | 結果 |
+|---|---|
+| Chainstack ノード追加 → `OPTIMISM_RPC_URL` / `OPTIMISM_WSS_URL` | 設定済み |
+| bot ウォレットへ ETH 入金 | 0.00257 ETH(残高 0.00506 ETH) |
+| `RUN_MAINNET_DEPLOY=optimism` | **完了: 0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1**(1回で成功、`false` に戻した) |
+| `ACTIVE_CHAINS` に追加、`ENABLE_FORK_QUOTER=polygon,optimism`、初回 `MAP_REBUILD_AFTER_HOURS=0` | 起動後に `168` へ戻した |
+
+起動ログ:
+
+```
+[発見] optimism univ3-fork-d(uniswap): V3プール27件        ← 9/17の調査と一致。書き写しの誤りなし
+[準備完了] optimism: V2 0件 / V3 57件(中身が空のV3 8件を除外)、57プールを監視します
+[オンチェーン] optimism: 57プールを1回の購読で監視します    ← WSS 接続、受信開始
+[状態] optimism: 判定可能ペア 9/9 / 使えるプール V3 57/57
+```
+
+始点は 36 → **45種**、監視プールは 1,143 → **1,303**。RPC の月末見込は直後で 17%(変化なし)。
+
+### 予告どおりの制限
+
+**V2 は 0件。** 種プール(verified pairs)に Optimism が無いため、地図の再構築でも
+Optimism の V2 は集まらなかった。V2↔V3 の経路は当面組めず、**V3↔V3 の経路のみ**
+(HANDOVER の実測では Optimism の活動の 97.6% が V3 なので、影響は限定的)。
+V2 を足すには、Optimism の V2 ファクトリー(Velodrome 等)の種プールを
+verified pairs に入れる必要がある。
+
+### これから見るもの
+
+- `[判定の精度]` と `実行` に **optimism** が現れるか。壁が 6bps なので、
+  Polygon より小さい価格差で黒字になるはず
+- `枠[… 月末見込N%]`。Optimism の受信が乗る。20%台なら問題なし
+- `[発見] optimism` が今後の起動で 0件になったら RPC/WSS の疎通を疑う
 
 ## 過去の誤り(再発防止)
 - イベント識別子を手書きして1文字欠け、最初期から一度も受信できていなかった → ethers.id()で計算する
