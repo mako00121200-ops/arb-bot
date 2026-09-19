@@ -142,6 +142,38 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
   console.log(`[段ごとの答え合わせ] ${chain} ${opp.label} 投入${opp.amountIn}: ${parts.join(" / ")}${blame}`);
 }
 
+// ===== 送信用の署名者(チェーンごとに1つ、nonceを手元で管理)=====
+//
+// [なぜ要るか(2026年9月19日)]
+// 同じチェーンで送信が重なると、両方が pending の nonce を取って同じ番号に
+// なり、片方が "replacement fee too low" で失われていた(実測: 粗利$0.4155を
+// 丸ごと失った)。その対策で「同じチェーンでは一度に1件」にしていたが、
+// 24時間で **26件** が「送信中」で見送りになっていた。成功は40件なので、
+// 見送った分は成功の6割に相当する。機会は数分間に集中して来る
+// (6件が3分間に来た実測がある)ので、直列だとその山を取りこぼす。
+//
+// ethers の NonceManager は nonce を手元で数えるので、同時に送っても
+// 番号が重ならない。送信に失敗したら reset() で鎖上の値に合わせ直す
+// (送れなかった番号が残ると、以降の送信が詰まるため)。
+const signers = new Map(); // chain -> { wallet, signer }
+
+function getSigner(chain, privateKey) {
+  const key = (chain || "").toLowerCase();
+  let entry = signers.get(key);
+  if (!entry) {
+    const wallet = new ethers.Wallet(privateKey, getProviderForChain(chain));
+    entry = { wallet, signer: new ethers.NonceManager(wallet) };
+    signers.set(key, entry);
+  }
+  return entry;
+}
+
+/// 送信に失敗した後に呼ぶ。手元の nonce を鎖上の値に合わせ直す。
+function resetNonce(chain) {
+  const entry = signers.get((chain || "").toLowerCase());
+  if (entry) { try { entry.signer.reset(); } catch (e) {} }
+}
+
 const LEG_TUPLE = "(address pool, address tokenIn, address tokenOut, uint8 kind, uint16 feeBps)[]";
 const CONTRACT_ABI = [
   `function executeRoute(address asset, uint256 amount, ${LEG_TUPLE} legs, uint256 minProfit) external`,
@@ -266,7 +298,7 @@ async function executeOpportunityInner(opp) {
     return false;
   }
 
-  const wallet = new ethers.Wallet(privateKey, getProviderForChain(chain));
+  const { wallet, signer } = getSigner(chain, privateKey);
   const asset = ethers.getAddress(opp.tokenA);
   const legArgs = buildLegArgs(chain, opp);
 
@@ -309,7 +341,7 @@ async function executeOpportunityInner(opp) {
 
   // 2. 送信。値動きの余裕として、確認した利益の一部だけを最低利益にする。
   const minProfit = (profitRaw * MIN_PROFIT_SHARE_BPS) / 10000n;
-  const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, wallet);
+  const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
   let gasUnits;
   try {
     gasUnits = await contract.executeRoute.estimateGas(asset, amountIn, legArgs, minProfit);
@@ -338,6 +370,8 @@ async function executeOpportunityInner(opp) {
     tx = await contract.executeRoute(asset, amountIn, legArgs, minProfit, { gasLimit: gasWithBuffer });
   } catch (e) {
     const msg = e.message || "";
+    // 送れなかった番号が手元に残ると以降の送信が詰まるので、鎖上の値に戻す。
+    resetNonce(chain);
     throw new ExecutionError(msg.slice(0, 160), { reverted: msg.includes("execution reverted"), stage: "send" });
   }
 
@@ -346,6 +380,7 @@ async function executeOpportunityInner(opp) {
   try {
     receipt = await tx.wait();
   } catch (e) {
+    resetNonce(chain);
     throw new ExecutionError(`確定待ちで失敗: ${(e.message || "").slice(0, 120)}`, { reverted: true, stage: "wait" });
   }
   console.log(`[実行] 完了: ブロック${receipt.blockNumber} ガス${receipt.gasUsed.toString()}`);

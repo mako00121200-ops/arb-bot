@@ -1236,7 +1236,20 @@ const executing = new Set();
 /// 裁定の機会は数秒で消える。ロックが空くまで待ってから送ると、その時には
 /// 状態が変わっていて simulateRoute で赤字になるだけ。次のイベントで
 /// 同じ機会が改めて検知されるので、ここでは見送る方が無駄がない。
-const sendingChains = new Set();
+// [同じチェーンで1件ずつ → 同じプールを使わなければ並行(2026年9月19日)]
+// nonce の取り合いは execute-opportunity.js の NonceManager が防ぐようになった
+// ので、チェーン単位の錠は要らない。代わりに**プール単位**で錠をかける。
+// 同じプールを使う経路を同時に送ると、先に着いた方が価格を動かして
+// 後の方が巻き戻り、ガス代だけ失うため。
+// 同時に飛ばす本数には上限を置く(1本が詰まった時の被害を限るため)。
+const MAX_PARALLEL_SENDS_PER_CHAIN = parseInt(process.env.MAX_PARALLEL_SENDS_PER_CHAIN || "3", 10);
+const executingPools = new Set();   // "chain::pool" 送信中の経路が使っているプール
+const inFlightByChain = new Map();  // chain -> 送信中の本数
+
+function poolLockKeys(opp) {
+  return opp.poolAddresses.map((a) => `${opp.chain}::${a.toLowerCase()}`);
+}
+
 async function handleOpportunity(opp, meta = {}) {
   stats.examined++;
   if (hasDisabledPool(opp)) { reasons.disabled++; return; }
@@ -1256,10 +1269,16 @@ async function handleOpportunity(opp, meta = {}) {
 
   if (opp.netProfitUsd < MIN_PROFIT_USD) { reasons.belowMin++; record(opp, "below_min", meta); return; }
   if (executing.has(key)) { reasons.executing++; return; }
-  // 同じチェーンで別の送信が進行中なら見送る(nonceの取り合いを防ぐ)。
-  if (sendingChains.has(opp.chain)) { reasons.sendBusy++; return; }
+  // 同じプールを使う送信が進行中か、同時送信の上限に達していれば見送る。
+  const lockKeys = poolLockKeys(opp);
+  const inFlight = inFlightByChain.get(opp.chain) || 0;
+  if (inFlight >= MAX_PARALLEL_SENDS_PER_CHAIN || lockKeys.some((k) => executingPools.has(k))) {
+    reasons.sendBusy++;
+    return;
+  }
   executing.add(key);
-  sendingChains.add(opp.chain);
+  for (const k of lockKeys) executingPools.add(k);
+  inFlightByChain.set(opp.chain, inFlight + 1);
   try {
     console.log(`[機会] ${opp.kind} ${opp.chain} ${opp.label}: 純利益+$${opp.netProfitUsd.toFixed(4)}(投入$${opp.tradeAmountUsd.toFixed(2)} 壁${opp.feeWallPercent.toFixed(2)}%${opp.hasV3 ? " V3含む" : ""})`);
     const ok = await Promise.race([
@@ -1284,7 +1303,8 @@ async function handleOpportunity(opp, meta = {}) {
     record(opp, "failed", { ...meta, error: msg, stage });
   } finally {
     executing.delete(key);
-    sendingChains.delete(opp.chain);
+    for (const k of lockKeys) executingPools.delete(k);
+    inFlightByChain.set(opp.chain, Math.max(0, (inFlightByChain.get(opp.chain) || 1) - 1));
   }
 }
 
