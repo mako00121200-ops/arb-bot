@@ -115,6 +115,15 @@ const MAX_SANE_RETURN_RATIO = parseFloat(process.env.MAX_SANE_RETURN_RATIO || "0
 const BIG_MOVE_PCT = parseFloat(process.env.BIG_MOVE_PCT || "0.5");
 const V3_VERIFY_INTERVAL_MS = parseInt(process.env.V3_VERIFY_INTERVAL_MS || "120000", 10);
 const MIN_PRICE_SOURCE_USD = parseFloat(process.env.MIN_PRICE_SOURCE_USD || "5000");
+/// 画面に出す時刻のタイムゾーン。
+///
+/// [なぜ要るか(2026年9月19日)]
+/// 記録簿の時刻を `toLocaleString('ja-JP')` で出していたが、これは
+/// **表示の書式だけ**を日本式にするもので、時刻そのものはコンテナの
+/// タイムゾーン(UTC)のままだった。日本式の書式で9時間ずれた時刻が
+/// 出ていたため、かえって気づきにくい。時刻を読むのはオーナーだけなので
+/// 日本時間に固定する。
+const DISPLAY_TIMEZONE = process.env.DISPLAY_TIMEZONE || "Asia/Tokyo";
 /// V3プールを探すトークンの上限。手書きの一覧に、V2で流動性のあるトークンを足す。
 /// ペア数は概ね二乗で増える(24種なら276ペア)。照会は束ねるのでRPCは十数回で済むが、
 /// 見つかったプールの分だけ購読と受信が増えるので、枠を見ながら上げる。
@@ -1323,6 +1332,9 @@ function heartbeat() {
   const sync = getSyncStats();
   const ev = Object.entries(sync).map(([c, v]) => `${c}:${v.received}`).join(" ") || "なし";
   const mc = getMulticallStats();
+  // 表の日時がどのタイムゾーンかを明示する。9時間ずれていても
+  // 「日本式の書式」だと気づけないため、見出しに出しておく。
+  const tzLabel = DISPLAY_TIMEZONE === "Asia/Tokyo" ? "日本時間" : DISPLAY_TIMEZONE;
   // RPCの月間使用量を更新する。呼び出しとWebSocket受信の両方が枠を消費する。
   // 生存ログは稼働の健全性を見る唯一の手段なので、使用量の計測が失敗しても
   // ログ自体は必ず出るようにする。
@@ -1491,6 +1503,25 @@ a{color:#6fae62}.footerlink{margin-top:18px;font-size:11px}`;
 
 /// 経路の表示を短くする。未知のプールは dexId がアドレスそのものになるため、
 /// そのまま出すと42文字が1列を占めて読みづらい。先頭だけ残す。
+/// 記録の時刻を、画面に出す形(日本時間)に整える。
+/// toLocaleString の第1引数は**書式**しか決めない。時刻そのものを日本時間に
+/// するには timeZone を渡す必要がある(渡さないとコンテナのUTCのまま)。
+function formatLocalTime(value) {
+  if (!value) return "-";
+  const d = new Date(value);
+  if (isNaN(d.getTime())) return "-";
+  try {
+    // 桁を揃える(2桁固定)。列が狭いiPhoneでも折り返さないよう年は省く。
+    return d.toLocaleString("ja-JP", {
+      timeZone: DISPLAY_TIMEZONE, hour12: false,
+      month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    });
+  } catch (e) {
+    return d.toISOString().replace("T", " ").slice(0, 19) + " UTC";
+  }
+}
+
 function shortenLabel(label) {
   return String(label ?? "").replace(/0x[0-9a-fA-F]{40}/g, (m) => `${m.slice(0, 8)}…`);
 }
@@ -1527,7 +1558,7 @@ function renderPage() {
     if (e.actualProfitUsd == null) return null;
     return e.actualProfitUsd - (gasOf(e) ?? 0);
   };
-  const realRows = real.recent.map((e) => `<tr><td>${new Date(e.timestamp).toLocaleString('ja-JP')}</td><td style="font-size:9px">${shortenLabel(e.pairLabel)}</td>
+  const realRows = real.recent.map((e) => `<tr><td>${formatLocalTime(e.timestamp)}</td><td style="font-size:9px">${shortenLabel(e.pairLabel)}</td>
     <td style="text-align:right">$${e.tradeAmountUsd.toFixed(2)}</td>
     <td style="text-align:right;color:#2ecc71;font-weight:600">${netOf(e) != null ? `+$${netOf(e).toFixed(4)}` : '-'}<br><span style="color:#888;font-weight:400;font-size:9px">粗${e.actualProfitUsd != null ? `$${e.actualProfitUsd.toFixed(4)}` : '-'} ガス${gasOf(e) != null ? `$${gasOf(e).toFixed(4)}` : '-'}</span></td>
     <td><a href="${e.explorerUrl}" target="_blank">確認</a></td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ実際の取引はありません</td></tr>`;
@@ -1645,7 +1676,7 @@ ${whatIfRows(chain)}`;
 <div><div class="v" style="color:#2ecc71">+$${real.totalProfitUsd.toFixed(4)}</div><div class="l">累積利益(ガス控除後)</div></div>
 <div><div class="v">$${getCurrentTradeCapUsd()}</div><div class="l">取引上限</div></div>
 <div><div class="v" style="color:${isLive?'#2ecc71':'#888'}">${isLive?'稼働中':'停止中'}</div><div class="l">自動売買</div></div></div>
-<table class="t-real"><thead><tr><th>日時</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table>
+<table class="t-real"><thead><tr><th>日時(${tzLabel})</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table>
 <div class="note">経路の最初のプール自身から先に受け取るため、借入手数料はかかりません。<br>累計の内訳: 粗利+$${real.totalGrossProfitUsd.toFixed(4)} − ガス代$${real.totalGasCostUsd.toFixed(4)}<br>コントラクトに溜まっている利益: ${balanceLine}</div></div>
 
 <div class="card"><h2>📐 V3の価格表(公式Quoter)</h2>
