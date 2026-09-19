@@ -126,6 +126,9 @@ const MIN_PRICE_SOURCE_USD = parseFloat(process.env.MIN_PRICE_SOURCE_USD || "500
 /// 出ていたため、かえって気づきにくい。時刻を読むのはオーナーだけなので
 /// 日本時間に固定する。
 const DISPLAY_TIMEZONE = process.env.DISPLAY_TIMEZONE || "Asia/Tokyo";
+/// 表の日時がどのタイムゾーンかを見出しに出すための表記。
+/// 9時間ずれていても「日本式の書式」では気づけないため、必ず明示する。
+const TZ_LABEL = DISPLAY_TIMEZONE === "Asia/Tokyo" ? "日本時間" : DISPLAY_TIMEZONE;
 
 // ===== 価格表の保存と復元(2026年9月19日) =====
 //
@@ -1417,9 +1420,6 @@ function heartbeat() {
   const sync = getSyncStats();
   const ev = Object.entries(sync).map(([c, v]) => `${c}:${v.received}`).join(" ") || "なし";
   const mc = getMulticallStats();
-  // 表の日時がどのタイムゾーンかを明示する。9時間ずれていても
-  // 「日本式の書式」だと気づけないため、見出しに出しておく。
-  const tzLabel = DISPLAY_TIMEZONE === "Asia/Tokyo" ? "日本時間" : DISPLAY_TIMEZONE;
   // RPCの月間使用量を更新する。呼び出しとWebSocket受信の両方が枠を消費する。
   // 生存ログは稼働の健全性を見る唯一の手段なので、使用量の計測が失敗しても
   // ログ自体は必ず出るようにする。
@@ -1761,7 +1761,7 @@ ${whatIfRows(chain)}`;
 <div><div class="v" style="color:#2ecc71">+$${real.totalProfitUsd.toFixed(4)}</div><div class="l">累積利益(ガス控除後)</div></div>
 <div><div class="v">$${getCurrentTradeCapUsd()}</div><div class="l">取引上限</div></div>
 <div><div class="v" style="color:${isLive?'#2ecc71':'#888'}">${isLive?'稼働中':'停止中'}</div><div class="l">自動売買</div></div></div>
-<table class="t-real"><thead><tr><th>日時(${tzLabel})</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table>
+<table class="t-real"><thead><tr><th>日時(${TZ_LABEL})</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table>
 <div class="note">経路の最初のプール自身から先に受け取るため、借入手数料はかかりません。<br>累計の内訳: 粗利+$${real.totalGrossProfitUsd.toFixed(4)} − ガス代$${real.totalGasCostUsd.toFixed(4)}<br>コントラクトに溜まっている利益: ${balanceLine}</div></div>
 
 <div class="card"><h2>📐 V3の価格表(公式Quoter)</h2>
@@ -1836,9 +1836,26 @@ function renderAbout() {
 
 function startServer() {
   const port = process.env.PORT || 8080;
+  // [画面の不具合でbotを止めない(2026年9月19日)]
+  // 見出しに ${tzLabel} と書いたが、その変数は別の関数の中にあった。
+  // renderPage が ReferenceError を投げ、**捕まえる人がいないので
+  // プロセスごと落ちた**。裁定の判定も送信も道連れになり、
+  // 復旧のたびに価格表の作り直し(20〜40分)からやり直しになっていた。
+  // 画面は「あれば便利なもの」で、botの本体ではない。必ず捕まえる。
   http.createServer((req, res) => {
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(req.url === "/about" ? renderAbout() : renderPage());
+    try {
+      const body = req.url === "/about" ? renderAbout() : renderPage();
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(body);
+    } catch (e) {
+      console.error(`[ダッシュボード] 表示に失敗(botは動き続けます): ${e.message}`);
+      try {
+        res.writeHead(500, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(`<meta charset="utf-8"><body style="font-family:sans-serif;background:#111;color:#eee;padding:20px">
+<h2>画面の表示に失敗しました</h2><p>botの判定と売買は動き続けています。</p>
+<pre style="color:#e74c3c;white-space:pre-wrap">${String(e && e.message).slice(0, 300)}</pre></body>`);
+      } catch (inner) {}
+    }
   }).listen(port, () => console.log(`ダッシュボード: ポート${port}`));
 }
 
