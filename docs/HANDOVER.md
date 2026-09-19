@@ -13,7 +13,7 @@
 - Railway: プロジェクトID f9a69c7e-b52c-4e06-bd1b-9863019619bc / サービスID d47495c6-84bb-4228-9f87-bc2f2f9a9ddb(secure-amazement)/ 環境 production
 - ダッシュボード: https://secure-amazement-production-5364.up.railway.app
 - RPC: Chainstack Growth(月2,000万リクエスト、Extra usageオフ=超過で停止)。PolygonのみChainstackのHTTP+WSS。Arbitrum/Avalancheは公開RPCの定期読み直し
-- 稼働チェーン: ACTIVE_CHAINS=polygon,arbitrum,avalanche(Base/Optimismは停止、設定は残してある)
+- 稼働チェーン: ACTIVE_CHAINS=polygon,arbitrum,avalanche,optimism(2026年9月19日に Optimism を再開。Base は停止、設定は残してある)。ENABLE_FORK_QUOTER=polygon,optimism
 - botウォレット: 0x9D926340a8F14D3351470997684bD8C4767131f1
 - コントラクト: Polygon 0xB26722e1E0d6228ec7F79cc49B0a23f39825e3c9(quoteV3入り、2026年9月18日デプロイ)、
   **Optimism 0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1(quoteV3入り、2026年9月19日デプロイ。
@@ -1338,6 +1338,43 @@ $5投入時のハードルは Polygon 59bps に対し **Optimism 16bps**。
 
 Arbitrum / Avalanche の**再デプロイ**も同じ手順(手順2だけ)。
 これで両チェーンのフォークのプールと、段ごとの答え合わせが使えるようになる。
+
+## Optimism を再開した(2026年9月19日 13:45 UTC)
+
+手順どおりに進めた結果。
+
+| 段階 | 結果 |
+|---|---|
+| Chainstack ノード追加 → `OPTIMISM_RPC_URL` / `OPTIMISM_WSS_URL` | 設定済み |
+| bot ウォレットへ ETH 入金 | 0.00257 ETH(残高 0.00506 ETH) |
+| `RUN_MAINNET_DEPLOY=optimism` | **完了: 0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1**(1回で成功、`false` に戻した) |
+| `ACTIVE_CHAINS` に追加、`ENABLE_FORK_QUOTER=polygon,optimism`、初回 `MAP_REBUILD_AFTER_HOURS=0` | 起動後に `168` へ戻した |
+
+起動ログ:
+
+```
+[発見] optimism univ3-fork-d(uniswap): V3プール27件        ← 9/17の調査と一致。書き写しの誤りなし
+[準備完了] optimism: V2 0件 / V3 57件(中身が空のV3 8件を除外)、57プールを監視します
+[オンチェーン] optimism: 57プールを1回の購読で監視します    ← WSS 接続、受信開始
+[状態] optimism: 判定可能ペア 9/9 / 使えるプール V3 57/57
+```
+
+始点は 36 → **45種**、監視プールは 1,143 → **1,303**。RPC の月末見込は直後で 17%(変化なし)。
+
+### 予告どおりの制限
+
+**V2 は 0件。** 種プール(verified pairs)に Optimism が無いため、地図の再構築でも
+Optimism の V2 は集まらなかった。V2↔V3 の経路は当面組めず、**V3↔V3 の経路のみ**
+(HANDOVER の実測では Optimism の活動の 97.6% が V3 なので、影響は限定的)。
+V2 を足すには、Optimism の V2 ファクトリー(Velodrome 等)の種プールを
+verified pairs に入れる必要がある。
+
+### これから見るもの
+
+- `[判定の精度]` と `実行` に **optimism** が現れるか。壁が 6bps なので、
+  Polygon より小さい価格差で黒字になるはず
+- `枠[… 月末見込N%]`。Optimism の受信が乗る。20%台なら問題なし
+- `[発見] optimism` が今後の起動で 0件になったら RPC/WSS の疎通を疑う
 
 ## 過去の誤り(再発防止)
 - イベント識別子を手書きして1文字欠け、最初期から一度も受信できていなかった → ethers.id()で計算する
