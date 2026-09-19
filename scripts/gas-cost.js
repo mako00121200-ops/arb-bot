@@ -95,6 +95,58 @@ function effectiveGasPrice(feeData, block) {
   return feeData?.gasPrice ?? null;
 }
 
+// ===== 単価の補正(2026年9月19日) =====
+//
+// [なぜ要るか]
+// 実測すると、事前の見積もりが実際に払った額より一貫して高かった。
+//   見積もり$0.0107 / 実際$0.0074、$0.0139 / $0.0090、$0.0125 / $0.0082
+// ガス使用量はほぼ的中しているので、ずれているのは**単価**。
+// baseFeePerGas + maxPriorityFeePerGas は「送信時にこれだけ出す用意がある」
+// 額で、実際にブロックに入る時の実効単価はそれより低いことが多い。
+//
+// 過大な単価はそのままハードルの高さになり、本物の機会を赤字と判定する。
+// そこで receipt の実効単価と見積もりの比を覚えて、次から掛ける。
+//
+// [安全のための歯止め]
+// 比は 0.7〜1.0 に収める。**見積もりを実際より低くする方向には振らない**
+// (1.0を超えない)し、7割より下げもしない。ガスが急に上がった場面で
+// 過小評価して赤字を出さないため。
+const GAS_PRICE_RATIO_MIN = 0.7;
+const GAS_PRICE_RATIO_SAMPLES = 8;
+const gasPriceRatio = new Map(); // chain -> { ratio, samples }
+
+/// 送信後に、見積もりの単価と実際の実効単価を突き合わせて学習する。
+export function recordActualGasPrice(chain, estimatedWei, actualWei) {
+  const key = (chain || "").toLowerCase();
+  if (!estimatedWei || !actualWei || estimatedWei <= 0n || actualWei <= 0n) return null;
+  let observed = Number(actualWei) / Number(estimatedWei);
+  if (!isFinite(observed) || observed <= 0) return null;
+  if (observed > 1) observed = 1;               // 高い側へは振らない
+  if (observed < GAS_PRICE_RATIO_MIN) observed = GAS_PRICE_RATIO_MIN;
+
+  const prev = gasPriceRatio.get(key);
+  // 少ない実測で大きく動かさないよう、件数で重みを付けた平均にする。
+  const n = Math.min((prev?.samples ?? 0) + 1, GAS_PRICE_RATIO_SAMPLES);
+  const ratio = prev ? prev.ratio + (observed - prev.ratio) / n : observed;
+  gasPriceRatio.set(key, { ratio, samples: n });
+  return { ratio, samples: n, observed };
+}
+
+export function getGasPriceRatio(chain) {
+  return gasPriceRatio.get((chain || "").toLowerCase())?.ratio ?? 1;
+}
+
+/// 事前判定に使う単価。実測から学んだ比を掛けたもの。
+export async function getEstimatedGasPriceWei(chain) {
+  const key = (chain || "").toLowerCase();
+  const raw = await getGasPriceWei(key);
+  if (!raw) return null;
+  const ratio = getGasPriceRatio(key);
+  if (ratio >= 1) return raw;
+  const adjusted = (raw * BigInt(Math.round(ratio * 10000))) / 10000n;
+  return adjusted > 0n ? adjusted : raw;
+}
+
 async function getNativePriceUsd(chain) {
   const cached = nativePriceCache.get(chain);
   if (cached && Date.now() - cached.at < NATIVE_PRICE_CACHE_MS) return cached.value;
@@ -127,7 +179,7 @@ export async function weiToUsd(chain, wei) {
 /// 指定したガス使用量をUSDに換算する。送信直前の estimateGas 結果に使う。
 export async function gasUnitsToUsd(chain, gasUnits) {
   const key = (chain || "").toLowerCase();
-  const [gasPriceWei, nativePriceUsd] = await Promise.all([getGasPriceWei(key), getNativePriceUsd(key)]);
+  const [gasPriceWei, nativePriceUsd] = await Promise.all([getEstimatedGasPriceWei(key), getNativePriceUsd(key)]);
   if (!gasPriceWei || !nativePriceUsd) return null;
   const costNative = parseFloat(ethers.formatEther(BigInt(gasUnits) * gasPriceWei));
   return costNative * nativePriceUsd;
@@ -155,11 +207,14 @@ export function getGasCostStatus() {
   for (const chain of Object.keys(NATIVE_TOKEN_FOR_PRICE)) {
     const gp = gasPriceCache.get(chain), np = nativePriceCache.get(chain);
     if (!gp || !np) continue;
-    const costNative = parseFloat(ethers.formatEther(gasUnitsFor(chain, "2step") * gp.value));
+    const ratio = getGasPriceRatio(chain);
+    const adjusted = ratio >= 1 ? gp.value : (gp.value * BigInt(Math.round(ratio * 10000))) / 10000n;
+    const costNative = parseFloat(ethers.formatEther(gasUnitsFor(chain, "2step") * adjusted));
     out[chain] = {
-      gwei: parseFloat(ethers.formatUnits(gp.value, "gwei")).toFixed(3),
+      gwei: parseFloat(ethers.formatUnits(adjusted, "gwei")).toFixed(3),
       nativeUsd: np.value.toFixed(2),
       costUsd: (costNative * np.value).toFixed(4),
+      priceRatio: ratio.toFixed(3),
     };
   }
   return out;
