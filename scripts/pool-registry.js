@@ -226,6 +226,17 @@ export function updateV3FromSwap(chain, address, sqrtPriceX96, liquidity) {
 
 /// 価格表を作った時点の価格を基準として記録する。
 /// 以降の作り直しは、ここからの累積のズレで判断する。
+/// 価格表を作った時の価格を、外から明示的に入れ直す(保存分の復元用)。
+/// markQuoteBase は「今の価格」を基準にするが、復元では
+/// **表を作った当時の価格**を基準にしないと、ズレの積算がやり直しになる。
+export function setQuoteBase(chain, address, sqrtPriceX96, driftPct = 0) {
+  const pool = pools.get(poolKey(chain, address));
+  if (!pool || pool.kind !== KIND_V3 || !(sqrtPriceX96 > 0n)) return false;
+  pool.quoteBasePrice = sqrtPriceX96;
+  pool.quoteDriftPct = driftPct;
+  return true;
+}
+
 export function markQuoteBase(chain, address) {
   const pool = pools.get(poolKey(chain, address));
   if (!pool || pool.kind !== KIND_V3) return;
