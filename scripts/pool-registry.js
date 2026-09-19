@@ -254,6 +254,21 @@ export function setPoolFee(chain, address, feeBps) {
   if (pool && feeBps != null && pool.kind === KIND_V2) pool.feeBps = feeBps;
 }
 
+/// 「手数料は実測済み」の印を外す。
+///
+/// [なぜ要るか(2026年9月19日)]
+/// 送信直前の確認で赤字と分かる経路が、同じプールで何度も繰り返された。
+/// 誤差は投入額によらず −11.6〜−20.6bps でほぼ一定だった。
+/// 幅が一定ということは、深さの計算ではなく**手数料の値**が違うということ。
+/// 印を外すと、判定は安全側の UNPROBED_FEE_BPS(既定45bps)に戻り、
+/// あわせて手数料の実測待ち行列にも入る。
+export function clearFeeProbed(chain, address) {
+  const pool = pools.get(poolKey(chain, address));
+  if (!pool || pool.kind !== KIND_V2 || !pool.feeProbed) return false;
+  pool.feeProbed = false;
+  return true;
+}
+
 export function getPool(chain, address) { return pools.get(poolKey(chain, address)) ?? null; }
 
 export function getPoolsForPair(chain, tokenA, tokenB) {
