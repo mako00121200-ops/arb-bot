@@ -8,6 +8,10 @@
 - 修正は「実装が目的」にならないよう、利益への効果を先に説明する
 - 作業は1つずつ提案する
 
+## 別テーマ: Limitless Exchange(予測市場)の調査
+- 2026年9月19日に調査メモ `docs/limitless-research.md` と観測スクリプト `limitless/` を追加。本番botとは無関係で、依存も起動も別
+- 第1段階(観測のみ・注文なし)。Railwayの別サービスとして動かす。手順は `limitless/README.md`
+
 ## 稼働環境
 - GitHub: mako00121200-ops/arb-bot(main にMergeするとRailwayが自動デプロイ)
 - Railway: プロジェクトID f9a69c7e-b52c-4e06-bd1b-9863019619bc / サービスID d47495c6-84bb-4228-9f87-bc2f2f9a9ddb(secure-amazement)/ 環境 production
