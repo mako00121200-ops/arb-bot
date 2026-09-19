@@ -347,3 +347,34 @@ p_up = Φ( ln(S_t / openPrice) / (σ * sqrt(τ)) )
 - 非対称スピードバンプの研究: https://arxiv.org/html/1910.03068
 - 予測市場のマーケットメイク経済性: https://startpolymarket.com/strategies/market-making/
 - 出来高: https://bitcoinfoundation.org/news/prediction-markets/prediction-market-limitless-volume-base/
+
+---
+
+## 10. 第1段階の実装(2026年9月19日)
+
+`limitless/collector.js` を追加した。**注文は出さない観測専用**で、本番botとは依存も起動も別(`limitless/package.json`、Railwayでは別サービス)。
+動かし方と確認手順は `limitless/README.md`。
+
+### 書く前に見直して直した点
+
+- **WSは生のWebSocketではなく socket.io(EIO=4、namespace `/markets`)** だった。公式SDKの `src/websocket/client.ts` で確認。生の `ws` で書いていたら1バイトも受け取れなかった
+- **slugの数字は市場の開始時刻(Unix秒)**。`btc-up-or-down-hourly-1785049200` = 2026-07-26 07:00 UTC 開始、08:00 決済。新市場は `GET /markets/active/slugs`(認証不要)と `subscribe_market_lifecycle` の `marketCreated` の両方で拾う
+- 購読解除チャネル `unsubscribe_market_prices` は SDK の一覧に**無い**。決済済みの市場は無視するだけにした
+- `oraclePriceData` が1時間市場で流れるかは**未確認**。流れなければ Pyth Hermes(公開・キー不要)と Binance を参照価格に使う。どれを使ったかは `theo` 行の `src` に残る
+- σ推定器は「最初の120サンプルは単純平均、以降EWMA(半減期10分)」。EWMAだけだと立ち上がりが遅い(自己診断で発覚し修正)
+- Hermes / Binance の受信形式はこの環境から確認できなかったので、**各イベントの最初の1件を `raw_sample` に生で残す**ようにした。起動後10分のログで形式を照合する
+
+### この段階で答えが出る問い
+
+| 問い | 見る場所 |
+|---|---|
+| 戦略A(寄り付きの乖離)に信号があるか | `[要約]` 行の「理論5sが正解側」と「板5sが正解側」の的中率の差。理論が板より当たっていれば信号あり |
+| 板は既に効率的か | `theo` 行の `edgeBuyYes` / `edgeSellYes` の分布。常に0付近なら手が無い |
+| 決済価格は Limitless から取れるか | `raw_sample` に `ws:oraclePriceData` があるか |
+| どれくらいの頻度で板がズレるか | `edge` が閾値(例: 0.02)を超えた秒数 / 全体 |
+
+### まだ出来ないこと
+
+- **テイカー・ディレイの実測**(注文が要る。第2段階)
+- **リベート/LP報酬の実額**(同上)
+- この環境からは api/ws.limitless.exchange、Hermes、Binance の全てが遮断されているため、**動作確認は Railway 上で行うしかない**。自己診断(`npm run selftest`)と、外部が全部落ちてもクラッシュしないことだけ確認済み

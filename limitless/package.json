@@ -1,0 +1,19 @@
+{
+  "name": "limitless-collector",
+  "version": "0.1.0",
+  "description": "Limitless Exchange 1時間 Up/Down 市場の観測専用スクリプト(注文は出さない)",
+  "type": "module",
+  "private": true,
+  "main": "collector.js",
+  "scripts": {
+    "start": "node collector.js",
+    "selftest": "node collector.js --selftest"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "socket.io-client": "^4.7.0",
+    "ws": "^8.18.0"
+  }
+}
