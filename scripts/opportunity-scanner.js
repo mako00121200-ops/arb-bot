@@ -33,7 +33,7 @@
 
 import {
   getPoolsForPair, getPoolsForToken, getArbitragablePairs,
-  getTokenDecimals, getTokenPriceUsd, getPool, hasUsableState,
+  getTokenDecimals, getTokenPriceUsd, getPool, hasUsableState, clearFeeProbed,
   KIND_V2, KIND_V3,
 } from "./pool-registry.js";
 import { quoteFromTable, hasQuoteTable, getTableRange } from "./v3-pools.js";
@@ -64,9 +64,38 @@ function routeSignature(chain, poolAddresses) {
   }).join("|");
 }
 
+/// 同じプールで何度も赤字と確定したら、手数料の実測をやり直させる。
+///
+/// [2026年9月19日の実測がもとになっている]
+/// dystopia を含む経路が12回続けて「チェーン上では赤字」になった。
+/// 誤差は投入額によらず −11.6〜−20.6bps でほぼ一定。**幅が一定なのは
+/// 深さの計算ではなく手数料の値が違うから**で、壁0.35%(V3 5bps +
+/// V2 30bps)という前提が実際より約16bps低かったことになる。
+///
+/// しかも `feeProbed` はプール地図に保存されるため、**一度「実測済み」に
+/// なると二度とやり直されない**。生存ログの「手数料0(残0)」がその状態。
+/// ここで印を外すと、判定は安全側の45bpsに戻り、実測待ち行列にも入る。
+const rejectionsByPool = new Map();
+const REPROBE_AFTER_REJECTIONS = parseInt(process.env.REPROBE_AFTER_REJECTIONS || "2", 10);
+
+function noteRejectionForFeeCheck(opp) {
+  for (const leg of opp.legs || []) {
+    if (leg.kind === KIND_V3) continue;
+    const key = `${opp.chain}::${(leg.pool || "").toLowerCase()}`;
+    const n = (rejectionsByPool.get(key) || 0) + 1;
+    rejectionsByPool.set(key, n);
+    if (n < REPROBE_AFTER_REJECTIONS) continue;
+    if (clearFeeProbed(opp.chain, leg.pool)) {
+      rejectionsByPool.set(key, 0);
+      console.log(`[手数料の見直し] ${opp.chain} ${leg.dexId}:${leg.pool.slice(0, 10)}… が${n}回続けてチェーン上で赤字。手数料${leg.feeBps}bpsの前提を外し、実測し直します`);
+    }
+  }
+}
+
 /// 送信直前の正確な見積もりで赤字と確定した経路を記録する。
 export function markRouteRejected(opp) {
   if (!opp || !opp.poolAddresses) return;
+  noteRejectionForFeeCheck(opp);
   if (rejectedRoutes.size >= MAX_REJECTED_ROUTES) {
     const oldest = rejectedRoutes.keys().next().value;
     rejectedRoutes.delete(oldest);
