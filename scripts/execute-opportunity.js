@@ -34,7 +34,7 @@ import { recordRealExecution } from "./real-execution-log.js";
 import { estimateGasCostUsd, gasUnitsToUsd, weiToUsd, getEstimatedGasPriceWei, recordActualGasPrice } from "./gas-cost.js";
 import { getTokenDecimals, getTokenPriceUsd, getPool, KIND_V3 } from "./pool-registry.js";
 import { quoteV3ByPoolBatch, fetchReservesBatch } from "./multicall-reserves.js";
-import { clearQuoteTable } from "./v3-pools.js";
+import { clearQuoteTable, quoteV3Exact, isForkFactory } from "./v3-pools.js";
 import { markRouteRejected, markRouteConfirmed } from "./opportunity-scanner.js";
 import { scheduleCompetitorCheck } from "./competitor-check.js";
 
@@ -88,6 +88,31 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
   for (let k = 0; k < v3Index.length; k++) {
     const out = v3Outs[k];
     if (out != null && out > 0n) actual[v3Index[k]] = out;
+  }
+
+  // 自前の quoteV3 が使えないチェーンへの備え(2026年9月19日)。
+  //
+  // [実測で判明]
+  // Arbitrum の答え合わせが「1段目 読めず / 2段目 読めず」になった。
+  // Arbitrum と Avalanche のコントラクトは quoteV3 の無い旧版のままなので
+  // (再デプロイ未実施)、自前の見積もりが1件も返らない。
+  // 公式の QuoterV2 は**公式ファクトリーのプールなら**引けるので、
+  // 読めなかった段だけそちらで埋める。フォークは公式では引けない
+  // (別のプールの価格が返る)ので対象外。
+  for (let k = 0; k < v3Index.length; k++) {
+    const i = v3Index[k];
+    if (actual[i] != null) continue;
+    const leg = legs[i];
+    const pool = getPool(chain, leg.pool);
+    if (!pool || leg.feeTier == null) continue;
+    if (isForkFactory(chain, pool.factory)) continue;
+    try {
+      const out = await quoteV3Exact({
+        chain, tokenIn: leg.tokenIn, tokenOut: leg.tokenOut,
+        amountIn: expected[i].in, feeTier: leg.feeTier, priority: true,
+      });
+      if (out != null && out > 0n) actual[i] = out;
+    } catch (e) {}
   }
   for (let k = 0; k < v2Index.length; k++) {
     const i = v2Index[k];
