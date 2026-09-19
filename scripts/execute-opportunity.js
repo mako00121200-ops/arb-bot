@@ -31,7 +31,7 @@ import { getChainConfig } from "../chain-config.js";
 import { getProviderForChain, callWithRpc } from "./onchain-reserves.js";
 import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
 import { recordRealExecution } from "./real-execution-log.js";
-import { estimateGasCostUsd, gasUnitsToUsd, weiToUsd } from "./gas-cost.js";
+import { estimateGasCostUsd, gasUnitsToUsd, weiToUsd, getEstimatedGasPriceWei, recordActualGasPrice } from "./gas-cost.js";
 import { getTokenDecimals, getTokenPriceUsd, getPool, KIND_V3 } from "./pool-registry.js";
 import { clearQuoteTable } from "./v3-pools.js";
 import { markRouteRejected, markRouteConfirmed } from "./opportunity-scanner.js";
@@ -211,9 +211,15 @@ async function executeOpportunityInner(opp) {
     markRouteRejected(opp);
     throw new ExecutionError(`確認後に状況が変わり拒否: ${msg}`, { reverted: true, staleReserves: true, stage: "estimateGas" });
   }
+  // 上限(gasLimit)には余裕を持たせるが、**費用の見積もりには使わない**。
+  // EVMは使わなかったガスを請求しないので、払うのは gasUnits の分だけ。
+  // 余裕の20%をそのまま費用に足していたため、見積もりが2割過大になり、
+  // その分ハードルが上がって本物の機会を捨てていた(2026年9月19日に修正)。
   const gasWithBuffer = (gasUnits * 120n) / 100n;
-  const measuredGasUsd = await gasUnitsToUsd(chain, gasWithBuffer);
+  const measuredGasUsd = await gasUnitsToUsd(chain, gasUnits);
   if (measuredGasUsd != null) gasCostUsd = measuredGasUsd;
+  // 単価の学習に使うため、この時点の見積もり単価を控えておく。
+  const estimatedGasPriceWei = await getEstimatedGasPriceWei(chain);
 
   markRouteConfirmed(opp);
   opp.sendResult = "confirmed";
@@ -258,6 +264,15 @@ async function executeOpportunityInner(opp) {
   const actualNetProfitUsd = actualProfitUsd != null && actualGasCostUsd != null
     ? actualProfitUsd - actualGasCostUsd
     : null;
+
+  // 見積もりの単価と実際の実効単価を突き合わせて学習する。
+  // 次からの事前判定のハードルが、実態に合った高さになる。
+  try {
+    const learned = recordActualGasPrice(chain, estimatedGasPriceWei, receipt.gasPrice);
+    if (learned) {
+      console.log(`[ガス単価の学習] ${chain}: 今回 実際/見積もり=${learned.observed.toFixed(3)} → 補正${learned.ratio.toFixed(3)}(実測${learned.samples}件)`);
+    }
+  } catch (e) {}
 
   if (actualNetProfitUsd != null) {
     console.log(`[実行] 確定: 粗利+$${actualProfitUsd.toFixed(4)} − ガス$${actualGasCostUsd.toFixed(4)} = 純利益+$${actualNetProfitUsd.toFixed(4)}(見積もりガス$${gasCostUsd.toFixed(4)})`);
