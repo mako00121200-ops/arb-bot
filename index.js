@@ -29,6 +29,8 @@
 // 候補だけに絞ることでイベント量が1/10になり、費用が予算内に収まる。
 
 import http from "http";
+import fs from "fs";
+import path from "path";
 import { ethers } from "ethers";
 import { startOnchainFeeds, getSyncStats, isChainWsEnabled, isChainHealthy, setWatchedAddresses } from "./dex-onchain-realtime.js";
 import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
@@ -50,7 +52,7 @@ import {
   getAllPoolAddressesByChain, getPoolsForToken, getStalePools, getPoolsByKind,
   getArbitragablePairs, savePoolMap, loadPoolMap, snapshotFullMap,
   hasUsableState, clearPoolState, formatStateDiagnostics, KIND_V2, KIND_V3,
-  markQuoteBase, getQuoteFreshness, rankTokensByDepth,
+  markQuoteBase, setQuoteBase, getQuoteFreshness, rankTokensByDepth,
 } from "./scripts/pool-registry.js";
 import {
   scanForChangedPool, scanAllPairs, getRouteCalcStats,
@@ -68,7 +70,7 @@ import { journal, loadJournal, trimJournalIfNeeded, summarize } from "./scripts/
 import {
   activeV3Factories, isForkFactory, V3_FEE_TIERS, findV3Pool, feeTierToBps,
   buildQuoteTablesBatch, hasQuoteTable, clearQuoteTable, countQuoteTables,
-  verifyQuoteTable, QUOTE_SAMPLES_USD,
+  verifyQuoteTable, QUOTE_SAMPLES_USD, exportQuoteTables, importQuoteTable,
 } from "./scripts/v3-pools.js";
 import { CHAIN_CONFIG } from "./chain-config.js";
 
@@ -124,6 +126,27 @@ const MIN_PRICE_SOURCE_USD = parseFloat(process.env.MIN_PRICE_SOURCE_USD || "500
 /// 出ていたため、かえって気づきにくい。時刻を読むのはオーナーだけなので
 /// 日本時間に固定する。
 const DISPLAY_TIMEZONE = process.env.DISPLAY_TIMEZONE || "Asia/Tokyo";
+
+// ===== 価格表の保存と復元(2026年9月19日) =====
+//
+// [なぜ要るか]
+// 作り置きをやめてから、**再デプロイのたびに価格表がゼロに戻り、
+// 判定が立ち上がるまで20〜40分かかる**ようになった。この日の計測は
+// 何度もその空白に当たって読めなかった。取引の機会もその間は取れない。
+//
+// [安全の考え方]
+// 古い価格表をそのまま使うのは危険(それが9月18日の幻の利益の正体)。
+// そこで**表を作った時の価格も一緒に保存し、起動時に今の価格と比べる**。
+//   ・プールが動いていなければ、その表はいま作っても同じ → 復元してよい
+//   ・少しでも動いていれば捨てる(作り直しは要求が来た時に走る)
+// 基準の価格も当時の値で戻すので、ズレの積算もやり直しにならない。
+const QUOTE_TABLE_FILE = process.env.QUOTE_TABLE_FILE
+  || (process.env.POOL_MAP_FILE
+      ? path.join(path.dirname(process.env.POOL_MAP_FILE), "quote-tables.json")
+      : "/tmp/quote-tables.json");
+/// これより古い価格表は、価格が動いていなくても捨てる。
+/// 価格が同じでも、流動性の出し入れで曲線そのものが変わっているため。
+const QUOTE_TABLE_MAX_AGE_HOURS = parseFloat(process.env.QUOTE_TABLE_MAX_AGE_HOURS || "6");
 /// V3プールを探すトークンの上限。手書きの一覧に、V2で流動性のあるトークンを足す。
 /// ペア数は概ね二乗で増える(24種なら276ペア)。照会は束ねるのでRPCは十数回で済むが、
 /// 見つかったプールの分だけ購読と受信が増えるので、枠を見ながら上げる。
@@ -515,6 +538,64 @@ async function buildTablesForPools(pools) {
     }
   }
   return built;
+}
+
+/// いま持っている価格表を、作った時の価格つきで保存する。
+function saveQuoteTables() {
+  try {
+    const tables = [];
+    for (const e of exportQuoteTables()) {
+      const [chain, address] = e.key.split("::");
+      const pool = getPool(chain, address);
+      // 基準の価格が無い表は、動いたかどうかを確かめられないので保存しない。
+      if (!pool || !(pool.quoteBasePrice > 0n)) continue;
+      tables.push({ ...e, basePrice: pool.quoteBasePrice.toString() });
+    }
+    if (tables.length === 0) return 0;
+    const tmp = QUOTE_TABLE_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify({ savedAt: new Date().toISOString(), count: tables.length, tables }));
+    fs.renameSync(tmp, QUOTE_TABLE_FILE);
+    return tables.length;
+  } catch (e) {
+    console.warn(`[価格表の保存] 失敗: ${e.message.slice(0, 80)}`);
+    return 0;
+  }
+}
+
+/// 保存しておいた価格表を戻す。**V3の状態を読んだ後に呼ぶこと**
+/// (今の価格と比べて、動いていない分だけを戻すため)。
+function loadQuoteTables() {
+  let restored = 0, movedOut = 0, tooOld = 0, noPool = 0;
+  try {
+    if (!fs.existsSync(QUOTE_TABLE_FILE)) return 0;
+    const data = JSON.parse(fs.readFileSync(QUOTE_TABLE_FILE, "utf8"));
+    const maxAgeMs = QUOTE_TABLE_MAX_AGE_HOURS * 3600 * 1000;
+    for (const t of data.tables || []) {
+      if (!t || typeof t.key !== "string") continue;
+      if (t.at && Date.now() - t.at > maxAgeMs) { tooOld++; continue; }
+      const [chain, address] = t.key.split("::");
+      const pool = getPool(chain, address);
+      if (!pool || pool.kind !== KIND_V3 || !(pool.sqrtPriceX96 > 0n)) { noPool++; continue; }
+
+      let base;
+      try { base = BigInt(t.basePrice); } catch (e) { continue; }
+      if (!(base > 0n)) continue;
+
+      // 表を作った時から価格が動いていれば、その表はもう正しくない。
+      const drift = Math.abs((Number(pool.sqrtPriceX96) - Number(base)) / Number(base)) * 200;
+      if (!isFinite(drift) || drift > QUOTE_REBUILD_MOVE_PCT) { movedOut++; continue; }
+
+      if (importQuoteTable(t.key, t.points, t.at)) {
+        setQuoteBase(chain, address, base, drift);
+        restored++;
+      }
+    }
+    const ageHours = data.savedAt ? (Date.now() - new Date(data.savedAt).getTime()) / 3600000 : null;
+    console.log(`[価格表の復元] ${restored}本を戻しました(${ageHours != null ? ageHours.toFixed(1) + "時間前の保存" : "保存時刻不明"}) / 価格が動いていて破棄${movedOut} / 古すぎ${tooOld} / 対象なし${noPool}`);
+  } catch (e) {
+    console.warn(`[価格表の復元] 失敗: ${e.message.slice(0, 80)}`);
+  }
+  return restored;
 }
 
 let quoteCursor = 0;
@@ -1077,6 +1158,10 @@ async function preparePoolMap() {
   console.log(`[プール地図] 候補: V2 ${s.byKind.v2}件 / V3 ${s.byKind.v3}件 / ${s.arbitragablePairs}ペア(うちV2とV3が共存${s.mixedPairs}件)`);
 
   await Promise.all(Object.keys(CHAIN_CONFIG).map((chain) => prepareChain(chain)));
+
+  // 価格表の復元は、V3の状態を読んだ後(prepareChain の後)に行う。
+  // 今の価格と比べて「動いていない表」だけを戻すため。
+  loadQuoteTables();
 
   const priced = refreshTokenPrices();
   console.log(`[始点] 桁数と価格が揃い、経路の始点として使えるトークン: ${priced}件`);
@@ -1794,7 +1879,11 @@ async function main() {
   setInterval(refreshQuoteTables, QUOTE_TABLE_INTERVAL_MS);
   setInterval(verifyV3Calculations, V3_VERIFY_INTERVAL_MS);
   setInterval(refreshTokenPrices, PRICE_REFRESH_INTERVAL_MS);
-  setInterval(() => { savePoolMap(); stats.mapSavedAt = new Date().toISOString(); }, SAVE_MAP_INTERVAL_MS);
+  setInterval(() => {
+    savePoolMap();
+    stats.mapSavedAt = new Date().toISOString();
+    saveQuoteTables();
+  }, SAVE_MAP_INTERVAL_MS);
   setInterval(trimJournalIfNeeded, 30 * 60 * 1000);
   setTimeout(refreshContractBalances, 30000);
   setInterval(refreshContractBalances, 10 * 60 * 1000);

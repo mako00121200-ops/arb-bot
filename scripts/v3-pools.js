@@ -405,6 +405,38 @@ export function getTableRange(chain, pool, zeroForOne) {
   return { min: t.points[0].in, max: t.points[t.points.length - 1].in };
 }
 
+/// 保存用に、いま持っている価格表を書き出す。
+/// BigInt はJSONにできないので文字列にする。
+export function exportQuoteTables() {
+  const out = [];
+  for (const [key, t] of quoteTables.entries()) {
+    if (!t || !t.points || t.points.length === 0) continue;
+    out.push({
+      key, at: t.at,
+      points: t.points.map((pt) => ({ in: pt.in.toString(), out: pt.out.toString() })),
+    });
+  }
+  return out;
+}
+
+/// 保存しておいた価格表を1本戻す。
+/// **古さと「プールが動いていないか」の確認は呼び出し側の責任**。
+/// ここは形の検査だけを行う。
+export function importQuoteTable(key, points, at) {
+  if (typeof key !== "string" || !Array.isArray(points) || points.length === 0) return false;
+  try {
+    const parsed = points
+      .map((pt) => ({ in: BigInt(pt.in), out: BigInt(pt.out) }))
+      .filter((pt) => pt.in > 0n && pt.out > 0n)
+      .sort((a, b) => (a.in < b.in ? -1 : a.in > b.in ? 1 : 0));
+    if (parsed.length === 0) return false;
+    quoteTables.set(key, { points: parsed, at: typeof at === "number" ? at : Date.now() });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 /// 価格表と公式Quoterの一致を確かめる(表の中間の値で検証する)。
 export async function verifyQuoteTable({ chain, pool, zeroForOne, tokenIn, tokenOut, feeTier, amountIn }) {
   const estimated = quoteFromTable({ chain, pool, zeroForOne, amountIn });
