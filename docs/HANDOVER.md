@@ -16,8 +16,11 @@
 - 稼働チェーン: ACTIVE_CHAINS=polygon,arbitrum,avalanche(Base/Optimismは停止、設定は残してある)
 - botウォレット: 0x9D926340a8F14D3351470997684bD8C4767131f1
 - コントラクト: Polygon 0xB26722e1E0d6228ec7F79cc49B0a23f39825e3c9(quoteV3入り、2026年9月18日デプロイ)、
+  **Optimism 0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1(quoteV3入り、2026年9月19日デプロイ。
+  Avalanche の旧コントラクトと同じ住所だが別チェーンの別物。展開時のウォレット残高 0.00506 ETH)**、
   Avalanche 0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1 と Arbitrum 0x2139C1497F7C8c3291e51639ccc978Ffe7a73E18 は
   quoteV3の無い旧版のまま。この2チェーンでフォーク見積もりを使うには先に再デプロイが要る
+- Optimism の RPC/WSS は Chainstack(2026年9月19日に追加)。`OPTIMISM_RPC_URL` / `OPTIMISM_WSS_URL` に設定済み
 - 旧Polygonコントラクト 0xD2D45cC9… には利益が残っている(推定$0.5前後)。所有者キーは
   同じなのでいつでも回収できるが、withdrawを呼ぶ仕組みはまだ無い
 - コントラクトの再デプロイは環境変数 RUN_MAINNET_DEPLOY=<チェーン名> で起動時に実行し、完了後に MAINNET_CONTRACT_ADDRESS_<チェーン> を設定して RUN_MAINNET_DEPLOY=false に戻す
