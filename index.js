@@ -37,7 +37,7 @@ import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
 import { runPoolSurvey } from "./scripts/pool-survey.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
-import { probePoolFeeBps, isFeeProbeOnHold, getRpcStatus, getRpcCallTotals, callWithRpc } from "./scripts/onchain-reserves.js";
+import { probePoolFeeBps, isFeeProbeOnHold, getRpcStatus, getRpcCallTotals, callWithRpc, probePendingState } from "./scripts/onchain-reserves.js";
 import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
 import {
   fetchReservesBatch, fetchPoolTokensBatch, fetchTokenDecimalsBatch,
@@ -1916,6 +1916,12 @@ async function main() {
   // 各チェーンのコントラクトの版(新旧)と住所の中身を起動時に確かめてログに出す。
   // 再デプロイ直後の裏付け用。失敗しても起動は止めない。
   try { await checkContractVersions(Object.keys(CHAIN_CONFIG)); } catch (e) {}
+  // OP Stack のチェーンで、Flashblocks の「pending」状態が標準の RPC から読めるかを確かめる(ログのみ)。
+  for (const chain of ["optimism", "base"]) {
+    if (CHAIN_CONFIG[chain] && process.env.FLASHBLOCKS_PROBE !== "false") {
+      try { await probePendingState(chain); } catch (e) {}
+    }
+  }
 
   setInterval(probeFeesGradually, FEE_PROBE_INTERVAL_MS);
   setInterval(refreshStaleReserves, REFRESH_STALE_SEC * 1000);

@@ -192,6 +192,42 @@ function isContractLevelError(msg) {
 
 /// RPC呼び出しの共通入口。
 /// priority=true は「実行に直結する問い合わせ」で、待ち行列を通さず即座に投げる。
+/// Flashblocks の「pending」状態が読めるかを確かめる(2026年9月20日)。
+/// Chainstack のサポートは Optimism で Flashblocks 対応済みと答えたが、WSS の
+/// 購読(newFlashblocks 等)は拒否された。Chainstack の説明では Flashblocks は
+/// 標準の RPC の pending ブロックとして見える。250ms 間隔で pending と latest を
+/// 数回読み、pending の番号が latest+1 で取引数が増えていけば「確定前の状態」が
+/// 取れている。結果はログに出すだけで判定には使わない。RPC は10回程度。
+export async function probePendingState(chain) {
+  const key = (chain || "").toLowerCase();
+  const samples = [];
+  try {
+    for (let i = 0; i < 5; i++) {
+      const [pending, latest] = await Promise.all([
+        callWithRpc(key, (p) => p.send("eth_getBlockByNumber", ["pending", false]), true),
+        callWithRpc(key, (p) => p.send("eth_getBlockByNumber", ["latest", false]), true),
+      ]);
+      samples.push({
+        at: Date.now(),
+        pendingNumber: pending?.number ? parseInt(pending.number, 16) : null,
+        pendingTxs: Array.isArray(pending?.transactions) ? pending.transactions.length : null,
+        pendingTimestamp: pending?.timestamp ? parseInt(pending.timestamp, 16) : null,
+        latestNumber: latest?.number ? parseInt(latest.number, 16) : null,
+        latestTxs: Array.isArray(latest?.transactions) ? latest.transactions.length : null,
+      });
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  } catch (e) {
+    console.log(`[Flashblocks/pending] ${key}: 読めず: ${(e.message || "").slice(0, 100)}`);
+    return null;
+  }
+  const line = samples.map((s) => `latest ${s.latestNumber}(${s.latestTxs}件) / pending ${s.pendingNumber}(${s.pendingTxs}件)`).join(" → ");
+  const ahead = samples.filter((s) => s.pendingNumber != null && s.latestNumber != null && s.pendingNumber > s.latestNumber).length;
+  const growing = samples.some((s, i) => i > 0 && s.pendingNumber === samples[i - 1].pendingNumber && s.pendingTxs != null && s.pendingTxs > samples[i - 1].pendingTxs);
+  console.log(`[Flashblocks/pending] ${key}: ${line} / pendingがlatestより先 ${ahead}/${samples.length}回 / 同じpendingの中で取引数が増えた: ${growing ? "はい(確定前の状態が読めている)" : "いいえ"}`);
+  return { samples, ahead, growing };
+}
+
 export async function callWithRpc(chain, fn, priority = false) {
   const call = () => fn(getProviderForChain(chain));
   try {
