@@ -44,7 +44,7 @@ import {
   fetchReservesBatch, fetchPoolTokensBatch, fetchTokenDecimalsBatch,
   fetchV3StatesBatch, getMulticallStats, findV3PoolsBatch,
 } from "./scripts/multicall-reserves.js";
-import { estimateGasCostUsd, getGasCostStatus } from "./scripts/gas-cost.js";
+import { estimateGasCostUsd, getGasCostStatus, exportGasPriceRatios, importGasPriceRatios, getGasPriceRatio } from "./scripts/gas-cost.js";
 import { discoverFactory, discoverPoolsFromFactory } from "./scripts/pool-discovery.js";
 import {
   registerPool, removePool, pruneToCandidates, getSubscribedAddresses,
@@ -148,6 +148,19 @@ const QUOTE_TABLE_FILE = process.env.QUOTE_TABLE_FILE
   || (process.env.POOL_MAP_FILE
       ? path.join(path.dirname(process.env.POOL_MAP_FILE), "quote-tables.json")
       : "/tmp/quote-tables.json");
+// ===== ガス単価の補正比の保存(2026年9月20日) =====
+//
+// 補正比は**送信が成功した時にしか学習できない**(1日数件)。再デプロイの
+// たびに 1.0 へ戻っていたため、実際には一度も貯まっていなかった。
+// 比は相場そのものではなく「出す用意のあった単価と、実際に取られた単価の比」
+// なので、数時間は持ち越してよい。
+const GAS_RATIO_FILE = process.env.GAS_RATIO_FILE
+  || (process.env.POOL_MAP_FILE
+      ? path.join(path.dirname(process.env.POOL_MAP_FILE), "gas-price-ratio.json")
+      : "/tmp/gas-price-ratio.json");
+/// これより古い補正比は使わない。
+const GAS_RATIO_MAX_AGE_HOURS = parseFloat(process.env.GAS_RATIO_MAX_AGE_HOURS || "6");
+
 /// これより古い価格表は、価格が動いていなくても捨てる。
 /// 価格が同じでも、流動性の出し入れで曲線そのものが変わっているため。
 const QUOTE_TABLE_MAX_AGE_HOURS = parseFloat(process.env.QUOTE_TABLE_MAX_AGE_HOURS || "6");
@@ -622,6 +635,43 @@ function saveQuoteTables() {
     return tables.length;
   } catch (e) {
     console.warn(`[価格表の保存] 失敗: ${e.message.slice(0, 80)}`);
+    return 0;
+  }
+}
+
+/// 学んだガス単価の補正比を保存する。
+function saveGasPriceRatios() {
+  try {
+    const ratios = exportGasPriceRatios();
+    if (Object.keys(ratios).length === 0) return 0;
+    const tmp = GAS_RATIO_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify({ savedAt: new Date().toISOString(), ratios }));
+    fs.renameSync(tmp, GAS_RATIO_FILE);
+    return Object.keys(ratios).length;
+  } catch (e) {
+    console.warn(`[ガス単価の補正] 保存に失敗: ${e.message.slice(0, 80)}`);
+    return 0;
+  }
+}
+
+/// 保存しておいた補正比を戻す。古すぎるものは使わない。
+function restoreGasPriceRatios() {
+  try {
+    if (!fs.existsSync(GAS_RATIO_FILE)) return 0;
+    const data = JSON.parse(fs.readFileSync(GAS_RATIO_FILE, "utf8"));
+    const ageHours = data.savedAt ? (Date.now() - new Date(data.savedAt).getTime()) / 3600000 : null;
+    if (ageHours != null && ageHours > GAS_RATIO_MAX_AGE_HOURS) {
+      console.log(`[ガス単価の補正] 保存分は${ageHours.toFixed(1)}時間前で古いため使いません`);
+      return 0;
+    }
+    const n = importGasPriceRatios(data.ratios);
+    if (n > 0) {
+      const parts = Object.keys(data.ratios).map((c) => `${c}:${getGasPriceRatio(c).toFixed(3)}`).join(" ");
+      console.log(`[ガス単価の補正] ${n}チェーン分を戻しました(${parts})。見積もりはこの比を掛けた額になります`);
+    }
+    return n;
+  } catch (e) {
+    console.warn(`[ガス単価の補正] 復元に失敗: ${e.message.slice(0, 80)}`);
     return 0;
   }
 }
@@ -2053,6 +2103,7 @@ async function main() {
     savePoolMap();
     stats.mapSavedAt = new Date().toISOString();
     saveQuoteTables();
+    saveGasPriceRatios();
   }, SAVE_MAP_INTERVAL_MS);
   setInterval(trimJournalIfNeeded, 30 * 60 * 1000);
   // 新しく出来たプールを定期的に拾う。見つかったら、そのチェーンだけ
@@ -2077,6 +2128,7 @@ async function main() {
   setTimeout(fullScanOnce, 10000);
   setInterval(fullScanOnce, FULL_SCAN_INTERVAL_SEC * 1000);
 
+  restoreGasPriceRatios();
   console.log(`[起動] 準備完了 / 取引上限$${getCurrentTradeCapUsd()} / 最低利益$${MIN_PROFIT_USD} / ふるいの足切り$${getScreenMinProfitUsd()}`);
 }
 
