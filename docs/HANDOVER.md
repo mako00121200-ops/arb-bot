@@ -13,18 +13,21 @@
 - Railway: プロジェクトID f9a69c7e-b52c-4e06-bd1b-9863019619bc / サービスID d47495c6-84bb-4228-9f87-bc2f2f9a9ddb(secure-amazement)/ 環境 production
 - ダッシュボード: https://secure-amazement-production-5364.up.railway.app
 - RPC: Chainstack Growth(月2,000万リクエスト、Extra usageオフ=超過で停止)。PolygonのみChainstackのHTTP+WSS。Arbitrum/Avalancheは公開RPCの定期読み直し
-- 稼働チェーン: ACTIVE_CHAINS=polygon,arbitrum,avalanche,optimism(2026年9月19日に Optimism を再開。Base は停止、設定は残してある)。ENABLE_FORK_QUOTER=polygon,optimism
+- 稼働チェーン: ACTIVE_CHAINS=polygon,arbitrum,avalanche,optimism(2026年9月19日に Optimism を再開。Base は停止、設定は残してある)。ENABLE_FORK_QUOTER=polygon,optimism,avalanche(avalanche は2026年9月20日の再デプロイ後に追加)
 - botウォレット: 0x9D926340a8F14D3351470997684bD8C4767131f1
-- コントラクト: Polygon 0xB26722e1E0d6228ec7F79cc49B0a23f39825e3c9(quoteV3入り、2026年9月18日デプロイ)、
-  **Optimism 0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1(quoteV3入り、2026年9月19日デプロイ。
-  Avalanche の旧コントラクトと同じ住所だが別チェーンの別物。展開時のウォレット残高 0.00506 ETH)**、
-  Avalanche 0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1 と Arbitrum 0x2139C1497F7C8c3291e51639ccc978Ffe7a73E18 は
-  quoteV3の無い旧版のまま。この2チェーンでフォーク見積もりを使うには先に再デプロイが要る
+- コントラクト(**全チェーンがガス削減版、2026年9月20日に再デプロイ**。起動ログの
+  `[コントラクト] <チェーン> …: ガス削減版(flags) と判別しました` で4チェーンとも確認済み):
+  - Polygon **0xd0Fae44b77833744faFfA012082ba001DfB7E0fF**
+  - Avalanche **0x3bCdCC60b0d1A8a98152A08985dF87C47f2e4Cc9**
+  - Optimism **0x43e0536aA8F740253A7f6580565695c7F7A3E9A7**(展開時に RPC が "already known" を返して
+    台本は失敗扱いになったが、取引は送られていた。住所は送信者と nonce=8 から計算し、起動時の確認で裏付けた)
+  - Arbitrum **0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1**(Avalanche / Optimism の旧コントラクトと同じ住所だが別チェーンの別物)
+  - 旧版(利益が残っている可能性あり、withdraw は所有者キーで直接呼ぶ): Polygon 0xB26722e1…(9月18日版)と
+    0xD2D45cC9…(それ以前)、Avalanche 0xD2D45cC9…、Optimism 0xD2D45cC9…、Arbitrum 0x2139C149…
 - Optimism の RPC/WSS は Chainstack(2026年9月19日に追加)。`OPTIMISM_RPC_URL` / `OPTIMISM_WSS_URL` に設定済み
-- **コントラクトのガス削減版(2026年9月20日、`contracts/` を変更、未デプロイ)**。Leg の形が変わったが、
-  bot は起動後に各チェーンのコントラクトへ `FLAG_V3()` を1回問い合わせて新旧を判別するので、
-  チェーンごとに順番に再デプロイできる(推奨順: Avalanche → Polygon → Optimism → Arbitrum)。
-  下の「コントラクトのガス削減」の節を参照
+- **コントラクトのガス削減版(2026年9月20日、`contracts/` を変更、同日に4チェーンとも再デプロイ済み)**。
+  Leg の形が変わったが、bot は起動時と送信時に各チェーンのコントラクトへ `FLAG_V3()` を問い合わせて
+  新旧を判別するので、版が混在しても動く。下の「コントラクトのガス削減」の節を参照
 - 旧Polygonコントラクト 0xD2D45cC9… には利益が残っている(推定$0.5前後)。所有者キーは
   同じなのでいつでも回収できるが、withdrawを呼ぶ仕組みはまだ無い
 - コントラクトの再デプロイは環境変数 RUN_MAINNET_DEPLOY=<チェーン名> で起動時に実行し、完了後に MAINNET_CONTRACT_ADDRESS_<チェーン> を設定して RUN_MAINNET_DEPLOY=false に戻す
@@ -1445,7 +1448,16 @@ verified pairs に入れる必要がある。
   「未実測○プールを確認します」が2秒ごと・1日約43,200行出て、[生存] や
   [機会] の行が流れていた → isFeeProbeOnHold() でキューに入れないようにした
 
-## コントラクトのガス削減(2026年9月20日に実装。再デプロイは未実施)
+## コントラクトのガス削減(2026年9月20日に実装し、同日に4チェーンとも再デプロイ)
+
+再デプロイの記録(JST 12:50〜13:00、Avalanche → Polygon → Optimism → Arbitrum の順。
+`RUN_MAINNET_DEPLOY=<次のチェーン>` と前のチェーンの住所を1回の変数更新にまとめ、
+再起動を5回に抑えた): 住所は「稼働環境」の節。Optimism だけ RPC が "already known"
+(同じ取引の二重受信)を返して台本が失敗扱いになったが、取引は送られていた。
+住所は送信者と nonce から計算し(前日の Optimism 展開が nonce 7 = 既知の住所で
+一致することも確認)、起動時の `[コントラクト]` ログで中身を裏付けた。
+この件で、起動時に全チェーンの版を確かめるログ(`checkContractVersions`)を足した。
+旧コントラクトの利益の回収は未実施(所有者キーで withdraw を直接呼ぶ)。
 
 取引頻度が上がらない主因は「1件の粗利($0.01〜0.04)に対してガス代($0.015)が
 同程度」であること。2段の実測 272,246 ガスの内訳を実測して削った。
@@ -1512,10 +1524,11 @@ Pharaoh(Avalanche の出来高の約78%)は Ramses のフォークで V3形式�
 - **fallback を「今スワップ中のプールの形式で解釈」**するよう拡張。V3形式なら
   `(int256,int256,bytes)`、V2形式なら `(address,uint256,uint256,bytes)`。名前が
   何であれ受け付けるので、今後のフォークにも再デプロイ不要
-- `V3_FACTORIES.avalanche` に Pharaoh のファクトリー候補 `0xAAA32926…`(Snowtrace の
+- `V3_FACTORIES.avalanche` に Pharaoh のファクトリー `0xAAA32926…`(Snowtrace の
   表示名「Pharaoh Exchange: Factory V2」、fork: true、dexId `pharaoh-cl`)を追加。
-  **未検証**。`ENABLE_FORK_QUOTER` に avalanche を足した後の探索ログで、見つかった
-  プール数を確かめる。住所が違えば0件になるだけ
+  **2026年9月20日の再デプロイ後、`ENABLE_FORK_QUOTER` に avalanche を足して検証済み**:
+  `[発見] avalanche pharaoh-cl(uniswap): V3プール9件`(univ3-fork-e 9件、univ3-fork-f 16件)。
+  Avalanche の監視は V2 40件 / V3 41件の79プールになった
 - 調査で42%を占めた `0x1128F23D…`(univ3-fork-e)は **Pangolin V3**(Uniswap V3形式)
   だった。こちらも同じ再デプロイで開く
 
@@ -1575,8 +1588,8 @@ minProfit 未達の取り消し、失敗の前後で残高が変わらないこ�
      確認し、quoting が実取引に漏れないことを検証した(下の節)
    - 済: ENABLE_FORK_QUOTER=polygon で効果を確認(下の節)
    - 済: Optimism へ展開(2026年9月19日に再デプロイ)
-   - 未: Avalanche / Arbitrum へ展開。ガス削減版(上の節)で再デプロイする。
-     Avalanche では Pangolin V3(fork-e)と Pharaoh が同時に開く
+   - 済: Avalanche / Arbitrum へ展開(2026年9月20日、ガス削減版で再デプロイ)。
+     ENABLE_FORK_QUOTER に avalanche を追加し、Pangolin V3(fork-e)と Pharaoh の探索を開始
 3. 対象チェーンの優先順位は Polygon(31.5%が未監視)→ Optimism(ガス最安・
    壁0.06%・27プール)→ Avalanche(82%が未監視。ガス$0.001で最安)→
    Base(活動量は最大だが主要DEXの出来高が対象外トークンに偏る)

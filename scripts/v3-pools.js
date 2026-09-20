@@ -85,10 +85,9 @@ export const V3_FACTORIES = {
     { address: "0x3e603C14aF37EBdaD31709C4f848Fc6aD5BEc715", dexId: "univ3-fork-f", style: "uniswap", fork: true },
     // Pharaoh(Avalanche の DEX 出来高の約78%。Ramses のフォークで V3形式)。
     // 住所は Snowtrace の表示名「Pharaoh Exchange: Factory V2」による(Ramses系では
-    // V2=集中流動性)。この砂場からは鎖に届かず未検証なので、ENABLE_FORK_QUOTER に
-    // avalanche を足した後の探索ログ(見つかったプール数)で確かめる。住所が違えば
-    // プールが0件になるだけで、判定には影響しない。コールバックの名前が何であれ、
-    // ガス削減版コントラクトの fallback が受け付ける。
+    // V2=集中流動性)。2026年9月20日の再デプロイ後に ENABLE_FORK_QUOTER へ avalanche を
+    // 足し、探索ログ「[発見] avalanche pharaoh-cl(uniswap): V3プール9件」で実在を確認した。
+    // コールバックの名前が何であれ、ガス削減版コントラクトの fallback が受け付ける。
     { address: "0xAAA32926fcE6bE95ea2c51cB4Fcb60836D320C42", dexId: "pharaoh-cl", style: "uniswap", fork: true },
     // 0x5F1dddbf…(Algebra形式、1プール)は調査で「流動性=読めず」だった。
     // globalState には対応したが、監視中ペアのプールが1件だけで
