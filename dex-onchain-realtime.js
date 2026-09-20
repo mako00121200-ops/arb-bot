@@ -250,6 +250,66 @@ function connectChain(chainName, wsUrl) {
   connect();
 }
 
+// ===== Flashblocks(OP Stack の確定前ブロック配信)の対応確認(2026年9月20日) =====
+//
+// Optimism / Base のシーケンサーは 200〜250ms ごとに「確定前の部分ブロック」を配る。
+// これを受ければ、ブロック確定(2秒)を待たずに判定でき、「1ブロック遅い」が解消する。
+// 対応した端点では eth_subscribe("newFlashblocks") が通り、非対応なら失敗する。
+// 起動時に別の接続で一度だけ試し、結果と配信間隔をログに出す(判定には使わない)。
+// 試す URL は <CHAIN>_FLASHBLOCKS_WSS_URL があればそれ、無ければ通常の WSS。
+const FLASHBLOCKS_CHAINS = new Set(["optimism", "base"]);
+const FLASHBLOCKS_PROBE_TIMEOUT_MS = 20 * 1000;
+const flashblocksStatus = {}; // chain -> { supported, url, intervalsMs, error }
+
+export function getFlashblocksStatus() { return { ...flashblocksStatus }; }
+
+function probeFlashblocks(chainName, wsUrl) {
+  return new Promise((resolve) => {
+    let socket;
+    const arrivals = [];
+    let subId = null;
+    let finished = false;
+    const finish = (supported, error) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      const intervals = arrivals.slice(1).map((t, i) => t - arrivals[i]);
+      flashblocksStatus[chainName] = { supported, url: wsUrl.replace(/\/[^/]*$/, "/…"), intervalsMs: intervals, error: error || null };
+      if (supported) {
+        console.log(`[Flashblocks] ${chainName}: 対応あり(newFlashblocks を購読できました)。配信間隔 ${intervals.length ? intervals.join("/") + "ms" : "計測できず"}`);
+      } else {
+        console.log(`[Flashblocks] ${chainName}: 対応なし(${error})。Chainstack で Flashblocks 対応の端点にすると使えます`);
+      }
+      try { if (subId && socket && socket.readyState === 1) socket.send(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "eth_unsubscribe", params: [subId] })); } catch (e) {}
+      try { socket && socket.close(); } catch (e) {}
+      resolve();
+    };
+    const timer = setTimeout(() => finish(subId != null, subId != null ? null : "20秒以内に応答なし"), FLASHBLOCKS_PROBE_TIMEOUT_MS);
+    try {
+      socket = new WebSocket(wsUrl);
+    } catch (e) { finish(false, e.message); return; }
+    socket.addEventListener("open", () => {
+      try { socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_subscribe", params: ["newFlashblocks"] })); } catch (e) { finish(false, e.message); }
+    });
+    socket.addEventListener("message", (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.id === 1) {
+          if (msg.error) return finish(false, (msg.error.message || "購読を拒否").slice(0, 80));
+          subId = msg.result;
+          return;
+        }
+        if (msg.method === "eth_subscription" && msg.params?.subscription === subId) {
+          arrivals.push(Date.now());
+          if (arrivals.length >= 6) finish(true, null);
+        }
+      } catch (e) {}
+    });
+    socket.addEventListener("error", () => finish(false, "接続に失敗"));
+    socket.addEventListener("close", () => finish(subId != null, subId != null ? null : "接続が閉じられた"));
+  });
+}
+
 /// WebSocketを開始する。監視対象は後から setWatchedAddresses() で渡す。
 export function startOnchainFeeds(onSync, onV3Swap, onV3Liquidity) {
   globalOnSync = onSync;
@@ -273,6 +333,11 @@ export function startOnchainFeeds(onSync, onV3Swap, onV3Liquidity) {
     chainLastEventAt[chainName] = Date.now();
     connectChain(chainName, wsUrl);
     anyStarted = true;
+    // OP Stack のチェーンは、Flashblocks に対応した端点かを別接続で一度だけ確かめる。
+    if (FLASHBLOCKS_CHAINS.has(chainName) && process.env.FLASHBLOCKS_PROBE !== "false") {
+      const probeUrl = process.env[`${chainName.toUpperCase()}_FLASHBLOCKS_WSS_URL`] || wsUrl;
+      probeFlashblocks(chainName, probeUrl).catch(() => {});
+    }
   }
   if (!anyStarted) {
     console.log("[オンチェーン] WebSocket URLが1つも未設定。定期読み直しのみで動作します。");
