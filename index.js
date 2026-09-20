@@ -175,6 +175,45 @@ async function refreshGasCosts() {
 
 // ===== 統計 =====
 const reasons = { disabled: 0, taxToken: 0, cooldown: 0, trap: 0, belowMin: 0, executing: 0, sendBusy: 0, notSent: 0, failed: 0, success: 0 };
+
+// ===== 最低利益未満で見送った機会の内訳(2026年9月20日) =====
+//
+// [なぜ要るか]
+// 30分ごとの見回りで「下限で落ちている機会を通す調整」を判断するのに、
+// 内訳[下限N] の件数だけでは、どのチェーンで・粗利がいくらで・ガス代がいくらで
+// 落ちているのかが分からない(記録簿はダッシュボードにしか無く、ログからは読めない)。
+// 直近30分の見送りをチェーン別に集計して [生存] に出し、5分に1件だけ実物も出す。
+const BELOW_MIN_WINDOW_MS = 30 * 60 * 1000;
+const belowMinRecent = []; // { at, chain, kind, tradeUsd, gross, net }
+const belowMinLastSampleAt = {};
+function noteBelowMin(opp) {
+  const now = Date.now();
+  belowMinRecent.push({ at: now, chain: opp.chain, kind: opp.kind, tradeUsd: opp.tradeAmountUsd, gross: opp.grossProfitUsd, net: opp.netProfitUsd });
+  while (belowMinRecent.length > 0 && now - belowMinRecent[0].at > BELOW_MIN_WINDOW_MS) belowMinRecent.shift();
+  if (belowMinRecent.length > 2000) belowMinRecent.shift();
+  if (!belowMinLastSampleAt[opp.chain] || now - belowMinLastSampleAt[opp.chain] > 5 * 60 * 1000) {
+    belowMinLastSampleAt[opp.chain] = now;
+    const gas = (opp.grossProfitUsd ?? 0) - (opp.netProfitUsd ?? 0);
+    console.log(`[下限] ${opp.kind} ${opp.chain} ${opp.label}: 投入$${(opp.tradeAmountUsd ?? 0).toFixed(2)} 粗利$${(opp.grossProfitUsd ?? 0).toFixed(4)} − ガス$${gas.toFixed(4)} = 純利$${(opp.netProfitUsd ?? 0).toFixed(4)}(最低$${MIN_PROFIT_USD})`);
+  }
+}
+function belowMinSummary() {
+  const now = Date.now();
+  while (belowMinRecent.length > 0 && now - belowMinRecent[0].at > BELOW_MIN_WINDOW_MS) belowMinRecent.shift();
+  if (belowMinRecent.length === 0) return "";
+  const byChain = new Map();
+  for (const r of belowMinRecent) {
+    const e = byChain.get(r.chain) || { n: 0, gross: [], gas: [], bestNet: -Infinity };
+    e.n++;
+    e.gross.push(r.gross ?? 0);
+    e.gas.push((r.gross ?? 0) - (r.net ?? 0));
+    if ((r.net ?? -Infinity) > e.bestNet) e.bestNet = r.net;
+    byChain.set(r.chain, e);
+  }
+  const median = (a) => { const s = [...a].sort((x, y) => x - y); return s.length ? s[Math.floor(s.length / 2)] : 0; };
+  const parts = [...byChain.entries()].map(([c, e]) => `${c}:${e.n}件 粗利中央$${median(e.gross).toFixed(4)} ガス中央$${median(e.gas).toFixed(4)} 最良純利$${e.bestNet.toFixed(4)}`);
+  return ` 下限の内訳30分[${parts.join(" ")}]`;
+}
 const failStages = {};
 
 const stats = {
@@ -1267,7 +1306,12 @@ async function handleOpportunity(opp, meta = {}) {
   stats.lastOpportunity = new Date().toISOString();
   stats.recent = [{ ...opp, at: new Date().toISOString(), ...meta }, ...stats.recent.filter((r) => r.label !== opp.label)].slice(0, 20);
 
-  if (opp.netProfitUsd < MIN_PROFIT_USD) { reasons.belowMin++; record(opp, "below_min", meta); return; }
+  if (opp.netProfitUsd < MIN_PROFIT_USD) {
+    reasons.belowMin++;
+    record(opp, "below_min", meta);
+    noteBelowMin(opp);
+    return;
+  }
   if (executing.has(key)) { reasons.executing++; return; }
   // 同じプールを使う送信が進行中か、同時送信の上限に達していれば見送る。
   const lockKeys = poolLockKeys(opp);
@@ -1461,7 +1505,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}] 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}`);
+  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}`);
 
   // 現在価格によるふるいの通過率。
   //
