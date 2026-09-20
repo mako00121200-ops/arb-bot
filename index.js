@@ -367,6 +367,27 @@ async function loadTokenDecimals(chain) {
   for (const [address, info] of Object.entries(known)) {
     setTokenDecimals(chain, address, info.decimals);
   }
+  // [手書きの桁数をチェーンで照合する(2026年9月20日)]
+  // 手書きの一覧のトークンは、これまでチェーンに問い合わせずにそのまま
+  // 使っていた。桁数を1つ間違えると量の計算が10倍ずれ、投入額も利益の
+  // 判定も丸ごと狂う。CLAUDE.md の「推測で決めない」に従い、起動時に
+  // 実物と突き合わせる。数トークンなので1回の束ね呼び出しで済む。
+  // 食い違ったらチェーンの値を採り、直すべき場所が分かるよう大きく出す。
+  const knownList = Object.keys(known);
+  if (knownList.length > 0) {
+    try {
+      const actual = await fetchTokenDecimalsBatch(chain, knownList);
+      for (const [address, decimals] of actual) {
+        const written = known[address]?.decimals;
+        if (written != null && decimals !== written) {
+          console.error(`[桁数の照合] ${chain} ${known[address].symbol} ${address}: 手書き${written}桁 ≠ チェーン${decimals}桁。チェーンの値を使います(borrowable-tokens.js を直してください)`);
+          setTokenDecimals(chain, address, decimals);
+        }
+      }
+    } catch (e) {
+      console.warn(`[桁数の照合] ${chain}: 確認できませんでした: ${(e.message || "").slice(0, 80)}`);
+    }
+  }
   if (needed.size === 0) return 0;
   const found = await fetchTokenDecimalsBatch(chain, [...needed]);
   for (const [address, decimals] of found) setTokenDecimals(chain, address, decimals);
