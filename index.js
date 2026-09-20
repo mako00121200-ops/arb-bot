@@ -37,6 +37,7 @@ import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
 import { runPoolSurvey } from "./scripts/pool-survey.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
+import { scoutAllChains, getScoutChains, SCOUT_INTERVAL_MS } from "./scripts/pool-scout.js";
 import { probePoolFeeBps, isFeeProbeOnHold, getRpcStatus, getRpcCallTotals, callWithRpc, probePendingState } from "./scripts/onchain-reserves.js";
 import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
 import {
@@ -219,7 +220,7 @@ const failStages = {};
 const stats = {
   scans: 0, profitableFound: 0, examined: 0, executed: 0, failed: 0,
   skippedCooldown: 0, trapsRejected: 0, taxTokensRejected: 0, staleRejected: 0, bigMoves: 0,
-  v3Found: 0, v3Matched: 0, v3Opportunities: 0, v3LiquidityEvents: 0,
+  v3Found: 0, v3Matched: 0, v3Opportunities: 0, v3LiquidityEvents: 0, scoutAdded: 0,
   quoteTablesBuilt: 0, quoteTablesPending: 0, quoteRebuildsFromPolling: 0, quoteTablesOnDemand: 0,
   v3VerifyCount: 0, v3VerifyWorst: null, v3VerifyRecent: [],
   disabledFromFile: 0, disabledRuntime: 0,
@@ -1190,6 +1191,15 @@ async function preparePoolMap() {
     }
   }));
 
+  // ファクトリーの住所を知らないプールを、取引のイベントから見つけて足す。
+  // 絞り込みより先に行う(V3が増えると、組めるV2も増えるため)。
+  try {
+    const scouted = await scoutAllChains(Object.keys(CHAIN_CONFIG));
+    stats.scoutAdded = Object.values(scouted).reduce((s, r) => s + (r?.added || 0), 0);
+  } catch (e) {
+    console.warn(`[プール発見] 失敗 ${(e.message || "").slice(0, 80)}`);
+  }
+
   const full = snapshotFullMap();
   const { kept, removed } = pruneToCandidates();
   stats.prunedTotal = removed;
@@ -2022,6 +2032,23 @@ async function main() {
     saveQuoteTables();
   }, SAVE_MAP_INTERVAL_MS);
   setInterval(trimJournalIfNeeded, 30 * 60 * 1000);
+  // 新しく出来たプールを定期的に拾う。見つかったら、そのチェーンだけ
+  // 桁数・状態・購読を作り直す(判定は止めない)。
+  if (getScoutChains().length > 0 && SCOUT_INTERVAL_MS > 0) {
+    setInterval(async () => {
+      try {
+        const scouted = await scoutAllChains(Object.keys(CHAIN_CONFIG));
+        for (const [chain, r] of Object.entries(scouted)) {
+          if (!r || r.added === 0) continue;
+          stats.scoutAdded += r.added;
+          await prepareChain(chain);
+          refreshTokenPrices();
+        }
+      } catch (e) {
+        console.warn(`[プール発見] 定期実行に失敗 ${(e.message || "").slice(0, 80)}`);
+      }
+    }, SCOUT_INTERVAL_MS);
+  }
   setTimeout(refreshContractBalances, 30000);
   setInterval(refreshContractBalances, 10 * 60 * 1000);
   setTimeout(fullScanOnce, 10000);
