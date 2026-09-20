@@ -50,8 +50,18 @@ function kindOf(entry) {
   return head === "2step" || head === "3step" ? head : null;
 }
 
-/// そのチェーン・段数で実際に使われたガス量の平均(直近分)。
+/// そのチェーン・段数で実際に使われたガス量の代表値(直近分)。
 /// 実測が無ければ null を返し、呼び出し側は想定値に戻る。
+///
+/// [平均から中央値へ(2026年9月20日、実測で判明)]
+/// Polygon の同じ経路(sync発見→algebra-a)を2回実行し、545,203 と 258,117 と
+/// **2.1倍の開き**が出た(V3の価格帯をまたぐ回数で変わる)。平均だと1件の外れ値で
+/// 401,660 まで上がり、事前判定のハードルが約$0.005 上がる。これは最低利益
+/// ($0.005)と同じ大きさで、**本物の機会を丸ごと1段分捨てる**ことになる。
+/// 同じ30分で「下限未満」で見送った Polygon の106件は、粗利の中央値$0.0121 に対し
+/// ガスの中央値$0.0107 で、この差がそのまま効いていた。
+/// 中央値は外れ値に引きずられないので、ハードルが実態に合う。
+/// 余裕の1割は、外れ値に備えてそのまま残す。
 export function getAverageGasUnits(chain, kind) {
   const target = (chain || "").toLowerCase();
   const samples = [];
@@ -66,9 +76,12 @@ export function getAverageGasUnits(chain, kind) {
     } catch (inner) {}
   }
   if (samples.length === 0) return null;
-  // 実行ごとの差(経路のプールの種類など)を吸収するため、平均に1割の余裕を足す。
-  const sum = samples.reduce((a, b) => a + b, 0n);
-  return (sum / BigInt(samples.length)) * 110n / 100n;
+  // 実行ごとの差(経路のプールの種類、価格帯をまたぐ回数)を吸収するため、
+  // 中央値に1割の余裕を足す。
+  samples.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const mid = samples.length >> 1;
+  const median = samples.length % 2 === 1 ? samples[mid] : (samples[mid - 1] + samples[mid]) / 2n;
+  return (median * 110n) / 100n;
 }
 
 export function getRealExecutionStats() {
