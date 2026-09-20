@@ -414,7 +414,33 @@ export function getStateDiagnostics(chain) {
     if (usable >= 2) pairsReady++;
   }
 
-  return { v2Total, v2Usable, v3Total, v3Usable, v3NoLiquidity, v3NoPrice, pairsTotal, pairsReady };
+  // ===== 手数料の壁の実測(2026年9月20日) =====
+  //
+  // [なぜ測るか]
+  // 「プールを増やして壁を下げる」のが Optimism 攻略の主眼なのに、
+  // 今のログでは壁が下がったかどうかが分からなかった。
+  // 「同じペアで最も安い2つのプールの手数料の和」がそのペアの最小の壁で、
+  // その中で一番低い値が、このチェーンで狙える理論上の下限になる。
+  // 価格差がこの壁を超えない限り、どれだけ速く見つけても黒字にはならない。
+  let minWallBps = null;
+  let lowWallPairs = 0; // 壁が20bps以下のペア(価格が少し動けば届く)
+  for (const [pk, set] of byPair.entries()) {
+    if (!pk.startsWith(`${chain}::`)) continue;
+    if (set.size < 2) continue;
+    const fees = [];
+    for (const k of set) {
+      const p = pools.get(k);
+      if (!p || !hasUsableState(p)) continue;
+      fees.push(p.feeBps);
+    }
+    if (fees.length < 2) continue;
+    fees.sort((a, b) => a - b);
+    const wall = fees[0] + fees[1];
+    if (minWallBps == null || wall < minWallBps) minWallBps = wall;
+    if (wall <= 20) lowWallPairs++;
+  }
+
+  return { v2Total, v2Usable, v3Total, v3Usable, v3NoLiquidity, v3NoPrice, pairsTotal, pairsReady, minWallBps, lowWallPairs };
 }
 
 /// 診断を1行にまとめる。
@@ -422,7 +448,8 @@ export function formatStateDiagnostics(chain) {
   const d = getStateDiagnostics(chain);
   return `[状態] ${chain}: 判定可能ペア ${d.pairsReady}/${d.pairsTotal}`
     + ` / 使えるプール V2 ${d.v2Usable}/${d.v2Total} V3 ${d.v3Usable}/${d.v3Total}`
-    + ` / V3の脱落[流動性0 ${d.v3NoLiquidity} 価格なし ${d.v3NoPrice}]`;
+    + ` / V3の脱落[流動性0 ${d.v3NoLiquidity} 価格なし ${d.v3NoPrice}]`
+    + ` / 最小の壁${d.minWallBps != null ? `${d.minWallBps}bps` : "-"}(20bps以下のペア${d.lowWallPairs})`;
 }
 
 export function clearPoolState(pool) {
