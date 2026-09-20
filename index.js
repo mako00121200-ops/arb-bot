@@ -58,7 +58,7 @@ import {
 import {
   scanForChangedPool, scanAllPairs, getRouteCalcStats,
   getNearMissStats, countIfWallDrops, getWallBreakdown, NEAR_MISS_REACHABLE_WALL_BPS,
-  getWhatIfProfit, getSpotScreenStats, takeQuoteDemand, getQuoteDemandTotal,
+  getWhatIfProfit, getSpotScreenStats, takeQuoteDemand, getQuoteDemandTotal, getScreenMinProfitUsd,
 } from "./scripts/opportunity-scanner.js";
 import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS, resetNonce, checkContractVersions } from "./scripts/execute-opportunity.js";
 import {
@@ -2077,7 +2077,7 @@ async function main() {
   setTimeout(fullScanOnce, 10000);
   setInterval(fullScanOnce, FULL_SCAN_INTERVAL_SEC * 1000);
 
-  console.log(`[起動] 準備完了 / 取引上限$${getCurrentTradeCapUsd()} / 最低利益$${MIN_PROFIT_USD}`);
+  console.log(`[起動] 準備完了 / 取引上限$${getCurrentTradeCapUsd()} / 最低利益$${MIN_PROFIT_USD} / ふるいの足切り$${getScreenMinProfitUsd()}`);
 }
 
 main().catch((e) => { console.error("致命的エラー:", e); process.exit(1); });

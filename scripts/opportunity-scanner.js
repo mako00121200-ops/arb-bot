@@ -544,7 +544,25 @@ const SPOT_ROUTE_EDGES = [0, 5, 10, 30, 100];
 const SPOT_ROUTE_LABELS = ["0〜5bps", "5〜10bps", "10〜30bps", "30〜100bps", "100bps超"];
 
 /// 金額の条件を通したとみなす、ガス代を引いたあとの最低利益(USD)。
-const SPOT_SCREEN_MIN_PROFIT_USD = parseFloat(process.env.SPOT_SCREEN_MIN_PROFIT_USD || "0.01");
+///
+/// [送信の基準に合わせる(2026年9月20日、実測で判明)]
+/// ここは $0.01 固定だった。一方、実際に送る基準は MIN_PROFIT_USD で、
+/// 本番は **$0.005**。つまり**ふるいが送信基準の2倍厳しく**、
+/// 「送るなら通る」はずの経路を、価格表を作る前に捨てていた。
+///
+/// Optimism を育てている最中にこれが表面化した。`[ふるいの実物]` を
+/// チェーンごとに出すようにしたところ、arbitrum / polygon / avalanche は
+/// 出るのに **optimism だけ1件も出ない**。Optimism はガスが最安($0.005)で
+/// 1件あたりの利益が小さく、$0.01 の足切りにほぼ全部が引っかかっていた。
+/// 価格表は「候補が出た段」しか作らないので、ここで捨てられた経路は
+/// **永久に正確な判定を受けられない**。
+///
+/// 送信の基準と揃える。捨てるのは「送っても基準に満たない」経路だけにする。
+const SPOT_SCREEN_MIN_PROFIT_USD = parseFloat(
+  process.env.SPOT_SCREEN_MIN_PROFIT_USD || process.env.MIN_PROFIT_USD || "0.01",
+);
+
+export function getScreenMinProfitUsd() { return SPOT_SCREEN_MIN_PROFIT_USD; }
 
 /// 金額の見積もりで試す投入額(取引上限に対する比率)。
 /// findBestAmount と同じ考え方だが、ふるいなので点数を減らしている。
