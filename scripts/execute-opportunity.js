@@ -35,7 +35,7 @@ import { estimateGasCostUsd, gasUnitsToUsd, weiToUsd, getEstimatedGasPriceWei, r
 import { getTokenDecimals, getTokenPriceUsd, getPool, KIND_V3 } from "./pool-registry.js";
 import { quoteV3ByPoolBatch, fetchReservesBatch } from "./multicall-reserves.js";
 import { clearQuoteTable, quoteV3Exact, isForkFactory } from "./v3-pools.js";
-import { markRouteRejected, markRouteConfirmed, notePoolBlame } from "./opportunity-scanner.js";
+import { markRouteRejected, markRouteConfirmed, notePoolBlame, revalueRouteFromMap } from "./opportunity-scanner.js";
 import { scheduleCompetitorCheck } from "./competitor-check.js";
 
 // ===== 赤字と確定した経路の、段ごとの答え合わせ(2026年9月19日に追加) =====
@@ -53,6 +53,8 @@ import { scheduleCompetitorCheck } from "./competitor-check.js";
 // 赤字の確定は1日329件。1件につきV3用とV2用で最大2回の束ね呼び出し。
 // 月に約2万回で、枠2,000万の0.1%。
 const DIAGNOSE_MIN_BPS = parseFloat(process.env.DIAGNOSE_MIN_BPS || "5");
+// 「判定からの動き」を記録する下限(bps)。小さな揺れは出さない。
+const DRIFT_MIN_BPS = parseFloat(process.env.DRIFT_MIN_BPS || "5");
 
 function bpsDiff(expected, actual) {
   if (expected <= 0n) return null;
@@ -124,15 +126,17 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
       }
     } catch (e) {}
   }
-  // V2の段は「同じ式・同じ手数料」で読み直すため、見込みとの差は
-  // そのままでは原因が分からない。地図に持っている準備量でも同じ式で計算し、
-  // **準備量の古さ**と**式や手数料の違い**を切り分ける(2026年9月20日に追加)。
+  // V2の段のずれを、**2つの時点の差**に分解する(2026年9月20日に追加)。
   //
-  // [なぜ要るか]
-  // polygon の dystopia で −204.0bps が投入額を変えても同じ値で出た。
-  // 幅が投入額によらず一定なら深さ(準備量)の問題、投入額とともに広がるなら
-  // 曲線の形の問題、というところまでは分かったが、地図の準備量とチェーンの
-  // 準備量のどちらがずれているのかは、この2つを並べないと決められない。
+  // 準備量は3つの時点のものが存在する。
+  //   ① 経路を作った時に leg に写し取った値(opportunity-scanner の orient)
+  //   ② 今のプール地図が持っている値(Syncイベントで更新され続けている)
+  //   ③ 今チェーンから読み直した値
+  // 見込み(expected.out)は①、読み直し(actual)は③から計算される。
+  // ②でも同じ式で計算して間に挟めば、
+  //   ①→② = 判定してから今までに地図が動いた分(こちらの処理の遅れ)
+  //   ②→③ = 地図とチェーンのずれ(取りこぼしたイベント)
+  // に分けられる。原因が「先を越された」のか「地図が古い」のかが決まる。
   const storedOut = new Array(legs.length).fill(null);
   for (let k = 0; k < v2Index.length; k++) {
     const i = v2Index[k];
@@ -163,13 +167,13 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
     // 自前と公式の両方が取れた段は、公式との差も並べる(一致なら価格表の古さが原因)。
     const offDiff = ownQuoted[i] && official[i] != null ? bpsDiff(expected[i].out, official[i]) : null;
     const offNote = offDiff != null ? `(公式${offDiff >= 0 ? "+" : ""}${offDiff.toFixed(1)}bps)` : "";
-    // V2の段は、差を「準備量の古さ」と「式・手数料の違い」に分けて出す。
+    // V2の段は、差を「判定してから地図が動いた分」と「地図とチェーンの差」に分ける。
     let splitNote = "";
     if (storedOut[i] != null) {
-      const stale = bpsDiff(storedOut[i], actual[i]);       // 地図の準備量 → 今の準備量
-      const model = bpsDiff(expected[i].out, storedOut[i]); // 見込み → 同じ準備量で計算し直した値
-      if (stale != null && model != null) {
-        splitNote = `(準備量の古さ${stale >= 0 ? "+" : ""}${stale.toFixed(1)}bps / 式${model >= 0 ? "+" : ""}${model.toFixed(1)}bps 手数料${legs[i].feeBps}bps)`;
+      const moved = bpsDiff(expected[i].out, storedOut[i]); // ①判定時 → ②今の地図
+      const gap = bpsDiff(storedOut[i], actual[i]);         // ②今の地図 → ③チェーン
+      if (moved != null && gap != null) {
+        splitNote = `(判定後に地図が${moved >= 0 ? "+" : ""}${moved.toFixed(1)}bps / 地図とチェーンの差${gap >= 0 ? "+" : ""}${gap.toFixed(1)}bps 手数料${legs[i].feeBps}bps)`;
       }
     }
     parts.push(`${i + 1}段目 ${legs[i].dexId}(${legs[i].kind}) ${diff >= 0 ? "+" : ""}${diff.toFixed(1)}bps${offNote}${splitNote}`);
@@ -441,6 +445,27 @@ async function executeOpportunityInner(opp) {
   // コントラクトの版(新旧)は1回だけ判別して覚えるので、2回目以降は RPC を使わない。
   const contractVersion = await detectContractVersion(chain, contractAddress);
   const legArgs = buildLegArgs(chain, opp, contractVersion.version);
+
+  // 判定してから今までに、プール地図の上で経路がどれだけ動いたかを測る。
+  //
+  // [なぜ測るか(2026年9月20日)]
+  // 答え合わせで avalanche の3段目が −190.0bps と出た時、内訳は
+  // 「判定後に地図が −190.0bps / 地図とチェーンの差 0.0bps」だった。
+  // 地図は正確で、古かったのは**経路が写し取った準備量の方**。つまり
+  // 送信直前の確認(eth_call)を使わなくても、地図を見るだけで
+  // 「もう消えている機会」が分かる可能性がある。まずRPCを一切使わずに
+  // どれくらい動いているかを記録し、値が揃ってから足切りを入れるか決める。
+  try {
+    const revalued = revalueRouteFromMap(opp);
+    if (revalued && opp.amountOutEstimated > 0n) {
+      const driftBps = Number(((revalued.amountOut - opp.amountOutEstimated) * 10000n) / opp.amountOutEstimated);
+      if (Math.abs(driftBps) >= DRIFT_MIN_BPS) {
+        const owed = opp.amountOwed || opp.amountIn; // 見込みと同じ投入額で比べる
+        const stillPlus = revalued.amountOut > owed;
+        console.log(`[判定からの動き] ${chain} ${opp.label}: 地図の上で${driftBps >= 0 ? "+" : ""}${driftBps.toFixed(1)}bps 動いた(今の地図では${stillPlus ? "まだ黒字" : "もう赤字"}。RPCは使っていない)`);
+      }
+    }
+  } catch (e) {}
 
   // 1. 結果の問い合わせ(1回)
   const sim = await simulate(chain, contractAddress, wallet.address, asset, amountIn, legArgs, contractVersion.iface);
