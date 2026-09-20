@@ -269,14 +269,18 @@ function probeFlashblocks(chainName, wsUrl) {
     const arrivals = [];
     let subId = null;
     let finished = false;
+    // 購読の名前は提供元で違う(Chainstack: newFlashblocks / Alchemy: newFlashblockTransactions)。
+    // 順に試し、通った名前を記録する。
+    const methods = ["newFlashblocks", "newFlashblockTransactions"];
+    let tried = 0;
     const finish = (supported, error) => {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
       const intervals = arrivals.slice(1).map((t, i) => t - arrivals[i]);
-      flashblocksStatus[chainName] = { supported, url: wsUrl.replace(/\/[^/]*$/, "/…"), intervalsMs: intervals, error: error || null };
+      flashblocksStatus[chainName] = { supported, method: supported ? methods[tried] : null, url: wsUrl.replace(/\/[^/]*$/, "/…"), intervalsMs: intervals, error: error || null };
       if (supported) {
-        console.log(`[Flashblocks] ${chainName}: 対応あり(newFlashblocks を購読できました)。配信間隔 ${intervals.length ? intervals.join("/") + "ms" : "計測できず"}`);
+        console.log(`[Flashblocks] ${chainName}: 対応あり(${methods[tried]} を購読できました)。配信間隔 ${intervals.length ? intervals.join("/") + "ms" : "計測できず"}`);
       } else {
         console.log(`[Flashblocks] ${chainName}: 対応なし(${error})。Chainstack で Flashblocks 対応の端点にすると使えます`);
       }
@@ -288,14 +292,22 @@ function probeFlashblocks(chainName, wsUrl) {
     try {
       socket = new WebSocket(wsUrl);
     } catch (e) { finish(false, e.message); return; }
-    socket.addEventListener("open", () => {
-      try { socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_subscribe", params: ["newFlashblocks"] })); } catch (e) { finish(false, e.message); }
-    });
+    // 購読の名前は提供元で違う(Chainstack: newFlashblocks / Alchemy: newFlashblockTransactions)。
+    // 順に試し、通った名前を記録する。
+    const trySubscribe = () => {
+      try { socket.send(JSON.stringify({ jsonrpc: "2.0", id: 10 + tried, method: "eth_subscribe", params: [methods[tried]] })); } catch (e) { finish(false, e.message); }
+    };
+    socket.addEventListener("open", trySubscribe);
     socket.addEventListener("message", (event) => {
       try {
         const msg = JSON.parse(event.data);
-        if (msg.id === 1) {
-          if (msg.error) return finish(false, (msg.error.message || "購読を拒否").slice(0, 80));
+        if (msg.id === 10 + tried && subId == null) {
+          if (msg.error) {
+            const reason = (msg.error.message || "購読を拒否").slice(0, 80);
+            tried++;
+            if (tried < methods.length) return trySubscribe();
+            return finish(false, reason);
+          }
           subId = msg.result;
           return;
         }
