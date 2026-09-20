@@ -822,7 +822,62 @@ export function getSpotScreenStats() {
   };
 }
 
+// ===== 答え合わせで繰り返し犯人になったプールの一時除外(2026年9月20日) =====
+//
+// [実測がもとになっている]
+// 一晩(8.5時間)の赤字12件を段ごとに答え合わせしたところ、同じプールが
+// 何度も犯人になっていた(Optimism の 0xc1738D90… が2回、dystopia、sushiswap…)。
+// 誤差は −15〜−57bps で、狙う利幅(5〜50bps)と同じ大きさ。
+// このプールを含む経路は「黒字に見えて送信直前で赤字」を繰り返し、
+// 見積もりの呼び出しと冷却の枠を消費し、精度(67%→25%)を下げていた。
+//
+// [なぜ外しても本物の機会は減らないか]
+// 犯人の段は「同じ式・同じ手数料で、今の状態を読み直して」も見込みと
+// 合わなかったプール。つまりメモリ上の状態そのものが信用できない。
+// 本物の機会ならチェーン上でも黒字のはずで、それが出ていない。
+// 手数料の見直し(45bpsに戻す)と同じ発想で、一定回数で一定時間外す。
+const BLAME_QUARANTINE_AFTER = parseInt(process.env.BLAME_QUARANTINE_AFTER || "2", 10);
+const BLAME_QUARANTINE_MINUTES = parseFloat(process.env.BLAME_QUARANTINE_MINUTES || "60");
+const BLAME_WINDOW_MINUTES = parseFloat(process.env.BLAME_WINDOW_MINUTES || "360");
+const blamedPools = new Map(); // "chain::pool" -> { times: [ms...], until: ms }
+const quarantineStats = { quarantined: 0, skippedRoutes: 0 };
+
+/// 答え合わせで犯人と名指しされたプールを記録する。回数が閾値に達したら一時除外。
+export function notePoolBlame(chain, pool, diffBps) {
+  const key = `${chain}::${(pool || "").toLowerCase()}`;
+  const now = Date.now();
+  const entry = blamedPools.get(key) || { times: [], until: 0 };
+  entry.times = entry.times.filter((t) => now - t < BLAME_WINDOW_MINUTES * 60000);
+  entry.times.push(now);
+  blamedPools.set(key, entry);
+  if (entry.times.length >= BLAME_QUARANTINE_AFTER && now >= entry.until) {
+    entry.until = now + BLAME_QUARANTINE_MINUTES * 60000;
+    entry.times = [];
+    quarantineStats.quarantined++;
+    console.log(`[一時除外] ${chain} ${pool}: 答え合わせで${BLAME_QUARANTINE_AFTER}回犯人になった(直近${diffBps != null ? diffBps.toFixed(1) + "bps" : "-"})。${BLAME_QUARANTINE_MINUTES}分間、このプールを含む経路を判定しません`);
+    return true;
+  }
+  return false;
+}
+
+export function isPoolQuarantined(chain, pool) {
+  const entry = blamedPools.get(`${chain}::${(pool || "").toLowerCase()}`);
+  return !!entry && Date.now() < entry.until;
+}
+
+export function getQuarantineStats() {
+  let active = 0;
+  const now = Date.now();
+  for (const e of blamedPools.values()) if (now < e.until) active++;
+  return { ...quarantineStats, active };
+}
+
 function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, poolAddresses }) {
+  // 答え合わせで繰り返し犯人になったプールを含む経路は、しばらく判定しない。
+  if (poolAddresses.some((a) => isPoolQuarantined(chain, a))) {
+    quarantineStats.skippedRoutes++;
+    return null;
+  }
   // V3を1段も含まない経路は判定しない。
   if (!legs.some((l) => l.kind === KIND_V3)) return null;
 
