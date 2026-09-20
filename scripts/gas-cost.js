@@ -28,6 +28,7 @@
 import { ethers } from "ethers";
 import { callWithRpc } from "./onchain-reserves.js";
 import { getAverageGasUnits } from "./real-execution-log.js";
+import { getAnyChainConfig } from "../chain-config.js";
 
 // 事前判定用の概算ガス使用量。送信直前は estimateGas の実測値で上書きする。
 // 2段は本番の実測(256k〜272k)に少しだけ余裕を足した値。
@@ -57,6 +58,111 @@ const FALLBACK_GAS_COST_USD = { base: 0.010, polygon: 0.012, optimism: 0.005, av
 
 const gasPriceCache = new Map();
 const nativePriceCache = new Map();
+
+// ===== OP Stack の L1 データ手数料(2026年9月20日) =====
+//
+// [なぜ要るか]
+// Optimism / Base(OP Stack)は、L2 の実行費(gasUsed × 単価)とは別に、取引の
+// データを L1 に書く費用を取引ごとに取る。receipt の l1Fee に出るが、ethers の
+// receipt.gasUsed × receipt.gasPrice には入らない。bot はこれを数えておらず、
+// Optimism の費用を実態より低く見積もっていた。L2 の実行費は極小なので、
+// L1 側が費用の大半になり得る。
+//
+// [求め方]
+// 予備コントラクト GasPriceOracle(0x4200…000F)の getL1Fee(取引のバイト列)に
+// 聞く。送信直前は実際の呼び出しデータで作った取引(署名は仮)で聞き、
+// 事前判定には代表的な大きさ(2段 420バイト)の取引で聞いた値を5分だけ覚えて
+// 使う。確定後は receipt の l1Fee を読んで費用に足し、代表値の学習にも使う。
+const OP_STACK_CHAINS = new Set(["optimism", "base"]);
+const GAS_PRICE_ORACLE = "0x420000000000000000000000000000000000000F";
+const ORACLE_IFACE = new ethers.Interface(["function getL1Fee(bytes data) view returns (uint256)"]);
+const L1_FEE_CACHE_MS = 5 * 60 * 1000;
+const L1_FEE_SAMPLES = 8;
+const l1FeeTypical = new Map();  // chain -> { value(wei), at, source }
+const l1FeeMeasured = new Map(); // chain -> { value(wei), samples }
+
+export function isOpStackChain(chain) {
+  return OP_STACK_CHAINS.has((chain || "").toLowerCase());
+}
+
+/// 呼び出しデータから「送る取引のバイト列」を作る。署名は仮(長さだけ合わせる)。
+/// L1 データ手数料は長さと圧縮のしやすさで決まるので、中身の正確さは要らない。
+function buildProbeTx(chainId, to, data, gasLimit) {
+  const tx = ethers.Transaction.from({
+    type: 2, chainId, to, data, value: 0n, nonce: 1,
+    gasLimit: BigInt(gasLimit || 300_000n),
+    maxFeePerGas: 1_000_000_000n, maxPriorityFeePerGas: 1_000_000n,
+  });
+  // s は曲線の半分より小さい値でないと ethers が拒否する(仮なので小さい値でよい)。
+  tx.signature = ethers.Signature.from({ r: "0x" + "ab".repeat(32), s: "0x" + "12".repeat(32), v: 27 });
+  return tx.serialized;
+}
+
+/// 代表的な2段の呼び出しデータ(420バイト)。住所とゼロが混ざる実物に近い形。
+const REPRESENTATIVE_CALLDATA = "0x" + Array.from({ length: 13 }, (_, i) =>
+  (i % 3 === 0 ? "5a".repeat(20) + "00".repeat(12) : "00".repeat(28) + "12".repeat(4))).join("") + "1234";
+
+/// 実際の呼び出しデータで L1 データ手数料(wei)を聞く。OP Stack 以外は 0。
+export async function estimateL1FeeWei(chain, to, data, gasLimit) {
+  const key = (chain || "").toLowerCase();
+  if (!isOpStackChain(key)) return 0n;
+  const chainId = getAnyChainConfig(key)?.chainId;
+  if (!chainId) return 0n;
+  const raw = buildProbeTx(chainId, to, data, gasLimit);
+  const ret = await callWithRpc(key, (p) => p.call({ to: GAS_PRICE_ORACLE, data: ORACLE_IFACE.encodeFunctionData("getL1Fee", [raw]) }), true);
+  return ORACLE_IFACE.decodeFunctionResult("getL1Fee", ret)[0];
+}
+
+/// 事前判定用の L1 データ手数料(wei)。実測があればその平均、無ければ代表的な
+/// 取引で予備コントラクトに聞いた値。5分だけ覚える。OP Stack 以外は 0。
+export async function getTypicalL1FeeWei(chain) {
+  const key = (chain || "").toLowerCase();
+  if (!isOpStackChain(key)) return 0n;
+  const measured = l1FeeMeasured.get(key);
+  if (measured && measured.samples >= 1) return measured.value;
+  const cached = l1FeeTypical.get(key);
+  if (cached && Date.now() - cached.at < L1_FEE_CACHE_MS) return cached.value;
+  try {
+    const value = await estimateL1FeeWei(key, GAS_PRICE_ORACLE, REPRESENTATIVE_CALLDATA, 300_000n);
+    l1FeeTypical.set(key, { value, at: Date.now(), source: "oracle" });
+    return value;
+  } catch (e) {}
+  return cached?.value ?? 0n;
+}
+
+/// 確定後に receipt の l1Fee を学習する(件数で重みを付けた平均)。
+export function recordActualL1Fee(chain, wei) {
+  const key = (chain || "").toLowerCase();
+  if (wei == null || wei < 0n) return null;
+  const prev = l1FeeMeasured.get(key);
+  const n = Math.min((prev?.samples ?? 0) + 1, L1_FEE_SAMPLES);
+  const value = prev ? prev.value + (wei - prev.value) / BigInt(n) : wei;
+  l1FeeMeasured.set(key, { value, samples: n });
+  return { value, samples: n };
+}
+
+/// receipt の l1Fee(wei)を読む。ethers の receipt には無いので生の応答を読む。
+/// OP Stack 以外、または読めなければ 0。
+export async function readL1FeeFromReceipt(chain, txHash) {
+  const key = (chain || "").toLowerCase();
+  if (!isOpStackChain(key)) return 0n;
+  try {
+    const raw = await callWithRpc(key, (p) => p.send("eth_getTransactionReceipt", [txHash]), true);
+    const hex = raw?.l1Fee;
+    if (typeof hex === "string" && hex.startsWith("0x")) return BigInt(hex);
+  } catch (e) {}
+  return 0n;
+}
+
+/// 事前判定に使う L1 データ手数料の状況(ダッシュボード・ログ用)。
+export function getL1FeeStatus(chain) {
+  const key = (chain || "").toLowerCase();
+  const measured = l1FeeMeasured.get(key);
+  if (measured) return { wei: measured.value, source: `実測${measured.samples}件` };
+  const cached = l1FeeTypical.get(key);
+  if (cached) return { wei: cached.value, source: "予備コントラクト" };
+  return null;
+}
 
 /// 実際に払う見込みのガス単価(wei)。上限(maxFeePerGas)ではない。
 /// EIP-1559のチェーンでは baseFeePerGas + maxPriorityFeePerGas を払う。
@@ -177,11 +283,16 @@ export async function weiToUsd(chain, wei) {
 }
 
 /// 指定したガス使用量をUSDに換算する。送信直前の estimateGas 結果に使う。
-export async function gasUnitsToUsd(chain, gasUnits) {
+/// OP Stack では L1 データ手数料を足す(l1FeeWei を渡さなければ代表値)。
+export async function gasUnitsToUsd(chain, gasUnits, l1FeeWei = null) {
   const key = (chain || "").toLowerCase();
-  const [gasPriceWei, nativePriceUsd] = await Promise.all([getEstimatedGasPriceWei(key), getNativePriceUsd(key)]);
+  const [gasPriceWei, nativePriceUsd, l1Wei] = await Promise.all([
+    getEstimatedGasPriceWei(key),
+    getNativePriceUsd(key),
+    l1FeeWei != null ? Promise.resolve(BigInt(l1FeeWei)) : getTypicalL1FeeWei(key),
+  ]);
   if (!gasPriceWei || !nativePriceUsd) return null;
-  const costNative = parseFloat(ethers.formatEther(BigInt(gasUnits) * gasPriceWei));
+  const costNative = parseFloat(ethers.formatEther(BigInt(gasUnits) * gasPriceWei + (l1Wei || 0n)));
   return costNative * nativePriceUsd;
 }
 
