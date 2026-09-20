@@ -28,7 +28,7 @@
 
 import { ethers } from "ethers";
 import { getChainConfig } from "../chain-config.js";
-import { getProviderForChain, callWithRpc } from "./onchain-reserves.js";
+import { getProviderForChain, callWithRpc, poolHasAmountOut } from "./onchain-reserves.js";
 import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
 import { recordRealExecution } from "./real-execution-log.js";
 import { estimateGasCostUsd, gasUnitsToUsd, weiToUsd, getEstimatedGasPriceWei, recordActualGasPrice } from "./gas-cost.js";
@@ -184,14 +184,52 @@ export function resetNonce(chain) {
   if (entry) { try { entry.signer.reset(); } catch (e) {} }
 }
 
-const LEG_TUPLE = "(address pool, address tokenIn, address tokenOut, uint8 kind, uint16 feeBps)[]";
-const CONTRACT_ABI = [
-  `function executeRoute(address asset, uint256 amount, ${LEG_TUPLE} legs, uint256 minProfit) external`,
-  `function simulateRoute(address asset, uint256 amount, ${LEG_TUPLE} legs) external`,
-  "error SimulationResult(uint256 returned, uint256 owed)",
-  "event RouteExecuted(address indexed asset, uint256 amountIn, uint256 profit, uint8 legCount)",
-];
-const CONTRACT_IFACE = new ethers.Interface(CONTRACT_ABI);
+// ===== コントラクトの ABI(新旧2種、2026年9月20日) =====
+//
+// ガス削減版で Leg の形が (pool, tokenIn, tokenOut, kind, feeBps) から
+// (pool, tokenOut, flags, feeBps) に変わった。再デプロイはチェーンごとに順番に
+// 行うので両方の形を持ち、各チェーンのコントラクトへ FLAG_V3() を1回だけ
+// 問い合わせて判別する(新版は 1 を返し、旧版には無いので失敗する)。
+const LEG_TUPLE_V1 = "(address pool, address tokenIn, address tokenOut, uint8 kind, uint16 feeBps)[]";
+const LEG_TUPLE_V2 = "(address pool, address tokenOut, uint8 flags, uint16 feeBps)[]";
+function makeContractAbi(legTuple) {
+  return [
+    `function executeRoute(address asset, uint256 amount, ${legTuple} legs, uint256 minProfit) external`,
+    `function simulateRoute(address asset, uint256 amount, ${legTuple} legs) external`,
+    "error SimulationResult(uint256 returned, uint256 owed)",
+    "event RouteExecuted(address indexed asset, uint256 amountIn, uint256 profit, uint8 legCount)",
+  ];
+}
+const CONTRACT_VERSIONS = {
+  1: { version: 1, abi: makeContractAbi(LEG_TUPLE_V1) },
+  2: { version: 2, abi: makeContractAbi(LEG_TUPLE_V2) },
+};
+for (const v of Object.values(CONTRACT_VERSIONS)) v.iface = new ethers.Interface(v.abi);
+const FLAG_IFACE = new ethers.Interface(["function FLAG_V3() view returns (uint8)"]);
+const contractVersionCache = new Map(); // chain:address -> 1 | 2
+
+/// そのチェーンのコントラクトが新版(flags)か旧版かを判別する。結果は覚える。
+/// RPC の失敗(取り消し以外)は覚えない。新版に旧版の形で送ると fallback が
+/// "unknown call" で拒否するだけで資産は動かないが、判別を誤ったまま固定すると
+/// そのチェーンで一切送れなくなるため。
+async function detectContractVersion(chain, address) {
+  const key = `${chain}:${address.toLowerCase()}`;
+  const cached = contractVersionCache.get(key);
+  if (cached) return CONTRACT_VERSIONS[cached];
+  let version;
+  try {
+    const ret = await callWithRpc(chain, (p) => p.call({ to: address, data: FLAG_IFACE.encodeFunctionData("FLAG_V3", []) }), true);
+    version = ret && ret !== "0x" && FLAG_IFACE.decodeFunctionResult("FLAG_V3", ret)[0] === 1n ? 2 : 1;
+  } catch (e) {
+    if (e?.code !== "CALL_EXCEPTION") {
+      throw new ExecutionError(`コントラクトの版を判別できず(RPC失敗): ${(e?.shortMessage || e?.message || "").slice(0, 100)}`, { stage: "version" });
+    }
+    version = 1; // 旧版には FLAG_V3 が無く、fallback が "unknown call" で取り消す
+  }
+  contractVersionCache.set(key, version);
+  console.log(`[コントラクト] ${chain} ${address}: ${version === 2 ? "ガス削減版(flags)" : "旧版(tokenIn/kind)"} と判別しました`);
+  return CONTRACT_VERSIONS[version];
+}
 
 const MIN_PROFIT_USD = parseFloat(process.env.MIN_PROFIT_USD || "0.01");
 export const TAX_TOKEN_FEE_BPS = parseInt(process.env.TAX_TOKEN_FEE_BPS || "100", 10);
@@ -199,8 +237,13 @@ export const TAX_TOKEN_FEE_BPS = parseInt(process.env.TAX_TOKEN_FEE_BPS || "100"
 // 最低利益は「確認した利益」のこの割合にする(残りは値動きの余裕)。
 const MIN_PROFIT_SHARE_BPS = BigInt(parseInt(process.env.MIN_PROFIT_SHARE_BPS || "5000", 10));
 
+// 旧版の kind。
 const CONTRACT_KIND_V2 = 0;
 const CONTRACT_KIND_V3 = 1;
+// 新版の flags(contracts/DexArbFlashLoan.sol の FLAG_* と同じ値)。
+const CONTRACT_FLAG_V3 = 1;
+const CONTRACT_FLAG_IN_IS_TOKEN0 = 2;
+const CONTRACT_FLAG_HAS_QUOTE = 4;
 
 export class ExecutionError extends Error {
   constructor(message, { reverted = false, taxToken = false, taxPools = [], staleReserves = false, stage = "unknown" } = {}) {
@@ -219,19 +262,40 @@ function isKRevert(message) {
   return /: K\b/.test(m) || /["']K["']/.test(m);
 }
 
-function buildLegArgs(chain, opp) {
+/// コントラクトに渡す経路。version はコントラクトの版(1: 旧版、2: ガス削減版)。
+///
+/// [新版の flags]
+/// 「投入通貨が token0 か」は地図で分かるので鎖上で問い直さない(token0() の呼び出しが
+/// 消える)。「getAmountOut を持つか」は手数料の実測で判明したプールだけ立てる
+/// (Uniswap系で失敗する試し呼びが消える)。間違えた flags を渡しても、V2 なら
+/// 出力の差分が0で、V3 ならプールの支払い確認で取り消されるだけで資産は動かない。
+function buildLegArgs(chain, opp, version) {
   return opp.legs.map((leg, i) => {
     const isV3 = leg.kind === KIND_V3;
+    const address = opp.poolAddresses[i];
+    const pool = getPool(chain, address);
     let feeBps = 0;
-    if (!isV3) {
-      const pool = getPool(chain, opp.poolAddresses[i]);
-      feeBps = Math.max(0, Math.min(9999, Math.round(pool?.feeBps ?? leg.feeBps ?? 30)));
+    if (!isV3) feeBps = Math.max(0, Math.min(9999, Math.round(pool?.feeBps ?? leg.feeBps ?? 30)));
+    if (version === 1) {
+      return {
+        pool: ethers.getAddress(address),
+        tokenIn: ethers.getAddress(leg.tokenIn),
+        tokenOut: ethers.getAddress(leg.tokenOut),
+        kind: isV3 ? CONTRACT_KIND_V3 : CONTRACT_KIND_V2,
+        feeBps,
+      };
     }
+    if (!pool?.token0) {
+      throw new ExecutionError(`プール ${address} の token0 が地図に無く、flags を作れません`, { stage: "legs" });
+    }
+    let flags = 0;
+    if (isV3) flags |= CONTRACT_FLAG_V3;
+    if (pool.token0.toLowerCase() === (leg.tokenIn || "").toLowerCase()) flags |= CONTRACT_FLAG_IN_IS_TOKEN0;
+    if (!isV3 && poolHasAmountOut(chain, address)) flags |= CONTRACT_FLAG_HAS_QUOTE;
     return {
-      pool: ethers.getAddress(opp.poolAddresses[i]),
-      tokenIn: ethers.getAddress(leg.tokenIn),
+      pool: ethers.getAddress(address),
       tokenOut: ethers.getAddress(leg.tokenOut),
-      kind: isV3 ? CONTRACT_KIND_V3 : CONTRACT_KIND_V2,
+      flags,
       feeBps,
     };
   });
@@ -239,8 +303,8 @@ function buildLegArgs(chain, opp) {
 
 /// コントラクトに経路を最後まで回させて、戻ってきた量と返済額を受け取る。
 /// 戻り値: { returned, owed } または { error: 拒否理由 }
-async function simulate(chain, contractAddress, from, asset, amountIn, legArgs) {
-  const data = CONTRACT_IFACE.encodeFunctionData("simulateRoute", [asset, amountIn, legArgs]);
+async function simulate(chain, contractAddress, from, asset, amountIn, legArgs, iface) {
+  const data = iface.encodeFunctionData("simulateRoute", [asset, amountIn, legArgs]);
   try {
     await callWithRpc(chain, (p) => p.call({ to: contractAddress, from, data }), true);
     return { error: "結果が返りませんでした" };
@@ -248,7 +312,7 @@ async function simulate(chain, contractAddress, from, asset, amountIn, legArgs) 
     const revertData = e?.data ?? e?.info?.error?.data ?? e?.error?.data ?? null;
     if (typeof revertData === "string" && revertData.startsWith("0x")) {
       try {
-        const parsed = CONTRACT_IFACE.parseError(revertData);
+        const parsed = iface.parseError(revertData);
         if (parsed && parsed.name === "SimulationResult") {
           return { returned: parsed.args.returned, owed: parsed.args.owed };
         }
@@ -310,10 +374,12 @@ async function executeOpportunityInner(opp) {
 
   const { wallet, signer } = getSigner(chain, privateKey);
   const asset = ethers.getAddress(opp.tokenA);
-  const legArgs = buildLegArgs(chain, opp);
+  // コントラクトの版(新旧)は1回だけ判別して覚えるので、2回目以降は RPC を使わない。
+  const contractVersion = await detectContractVersion(chain, contractAddress);
+  const legArgs = buildLegArgs(chain, opp, contractVersion.version);
 
   // 1. 結果の問い合わせ(1回)
-  const sim = await simulate(chain, contractAddress, wallet.address, asset, amountIn, legArgs);
+  const sim = await simulate(chain, contractAddress, wallet.address, asset, amountIn, legArgs, contractVersion.iface);
   const simMs = Date.now() - startedAt;
 
   if (sim.error) {
@@ -351,7 +417,7 @@ async function executeOpportunityInner(opp) {
 
   // 2. 送信。値動きの余裕として、確認した利益の一部だけを最低利益にする。
   const minProfit = (profitRaw * MIN_PROFIT_SHARE_BPS) / 10000n;
-  const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
+  const contract = new ethers.Contract(contractAddress, contractVersion.abi, signer);
   let gasUnits;
   try {
     gasUnits = await contract.executeRoute.estimateGas(asset, amountIn, legArgs, minProfit);
