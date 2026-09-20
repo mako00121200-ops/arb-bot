@@ -225,6 +225,26 @@ export async function probePendingState(chain) {
   const ahead = samples.filter((s) => s.pendingNumber != null && s.latestNumber != null && s.pendingNumber > s.latestNumber).length;
   const growing = samples.some((s, i) => i > 0 && s.pendingNumber === samples[i - 1].pendingNumber && s.pendingTxs != null && s.pendingTxs > samples[i - 1].pendingTxs);
   console.log(`[Flashblocks/pending] ${key}: ${line} / pendingがlatestより先 ${ahead}/${samples.length}回 / 同じpendingの中で取引数が増えた: ${growing ? "はい(確定前の状態が読めている)" : "いいえ"}`);
+
+  // 実際に使う形: pending ブロックのイベントを eth_getLogs で1回で取れるか
+  // (取れれば、250ms ごとに1リクエストで確定前の Swap/Sync を拾える)。
+  // 併せて pending の eth_call(送信直前の確認に使う)も通るかを見る。
+  let logsResult = "読めず";
+  try {
+    const logs = await callWithRpc(key, (p) => p.send("eth_getLogs", [{ fromBlock: "pending", toBlock: "pending" }]), true);
+    const blocks = new Set((logs || []).map((l) => l.blockNumber));
+    logsResult = `${Array.isArray(logs) ? logs.length : "?"}件(ブロック ${[...blocks].map((b) => parseInt(b, 16)).join(",") || "なし"})`;
+  } catch (e) {
+    logsResult = `拒否: ${(e.message || "").slice(0, 80)}`;
+  }
+  let callResult = "読めず";
+  try {
+    const ret = await callWithRpc(key, (p) => p.send("eth_call", [{ to: "0x4200000000000000000000000000000000000006", data: "0x18160ddd" }, "pending"]), true);
+    callResult = typeof ret === "string" && ret.length > 2 ? "通った" : `応答 ${ret}`;
+  } catch (e) {
+    callResult = `拒否: ${(e.message || "").slice(0, 80)}`;
+  }
+  console.log(`[Flashblocks/pending] ${key}: eth_getLogs(pending) ${logsResult} / eth_call(pending) ${callResult}`);
   return { samples, ahead, growing };
 }
 

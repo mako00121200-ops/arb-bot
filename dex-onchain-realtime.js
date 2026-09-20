@@ -271,16 +271,20 @@ function probeFlashblocks(chainName, wsUrl) {
     let finished = false;
     // 購読の名前は提供元で違う(Chainstack: newFlashblocks / Alchemy: newFlashblockTransactions)。
     // 順に試し、通った名前を記録する。
-    const methods = ["newFlashblocks", "newFlashblockTransactions"];
+    // 最後の newHeads は Flashblocks ではなく、比較用(通常の新ブロック通知の間隔を測る)。
+    const methods = ["newFlashblocks", "newFlashblockTransactions", "newHeads"];
     let tried = 0;
-    const finish = (supported, error) => {
+    const finish = (subscribed, error) => {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
       const intervals = arrivals.slice(1).map((t, i) => t - arrivals[i]);
-      flashblocksStatus[chainName] = { supported, method: supported ? methods[tried] : null, url: wsUrl.replace(/\/[^/]*$/, "/…"), intervalsMs: intervals, error: error || null };
+      const supported = subscribed && methods[tried] !== "newHeads";
+      flashblocksStatus[chainName] = { supported, method: subscribed ? methods[tried] : null, url: wsUrl.replace(/\/[^/]*$/, "/…"), intervalsMs: intervals, error: error || null };
       if (supported) {
         console.log(`[Flashblocks] ${chainName}: 対応あり(${methods[tried]} を購読できました)。配信間隔 ${intervals.length ? intervals.join("/") + "ms" : "計測できず"}`);
+      } else if (subscribed) {
+        console.log(`[Flashblocks] ${chainName}: Flashblocks の購読は拒否(標準の pending タグで読む)。比較用 newHeads の間隔 ${intervals.length ? intervals.join("/") + "ms" : "計測できず"}`);
       } else {
         console.log(`[Flashblocks] ${chainName}: 対応なし(${error})。Chainstack で Flashblocks 対応の端点にすると使えます`);
       }
