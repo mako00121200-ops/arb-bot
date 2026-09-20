@@ -219,8 +219,14 @@ async function detectContractVersion(chain, address) {
   let version;
   try {
     const ret = await callWithRpc(chain, (p) => p.call({ to: address, data: FLAG_IFACE.encodeFunctionData("FLAG_V3", []) }), true);
-    version = ret && ret !== "0x" && FLAG_IFACE.decodeFunctionResult("FLAG_V3", ret)[0] === 1n ? 2 : 1;
+    if (!ret || ret === "0x") {
+      // 中身の無い住所への eth_call は "0x" を返す(取り消しではない)。住所の設定
+      // 間違いか、展開の取引がまだ確定していない。覚えずに、この機会は見送る。
+      throw new ExecutionError(`コントラクトの住所 ${address} に中身がありません(設定を確認してください)`, { stage: "version" });
+    }
+    version = FLAG_IFACE.decodeFunctionResult("FLAG_V3", ret)[0] === 1n ? 2 : 1;
   } catch (e) {
+    if (e instanceof ExecutionError) throw e;
     if (e?.code !== "CALL_EXCEPTION") {
       throw new ExecutionError(`コントラクトの版を判別できず(RPC失敗): ${(e?.shortMessage || e?.message || "").slice(0, 100)}`, { stage: "version" });
     }
@@ -229,6 +235,23 @@ async function detectContractVersion(chain, address) {
   contractVersionCache.set(key, version);
   console.log(`[コントラクト] ${chain} ${address}: ${version === 2 ? "ガス削減版(flags)" : "旧版(tokenIn/kind)"} と判別しました`);
   return CONTRACT_VERSIONS[version];
+}
+
+/// 起動時に、稼働チェーン全部のコントラクトの版を確かめてログに出す。
+/// 判別は送信時にも行うが、再デプロイ直後に「住所が正しく、中身がある」ことを
+/// 最初の機会を待たずに確認できるようにする(2026年9月20日、Optimism の展開で
+/// RPC が "already known" を返し、住所の裏付けが要った)。失敗しても起動は止めない。
+export async function checkContractVersions(chains) {
+  for (const chain of chains) {
+    const chainConfig = getChainConfig(chain);
+    const address = chainConfig ? process.env[chainConfig.contractAddressEnvVar] : null;
+    if (!address) { console.log(`[コントラクト] ${chain}: 住所が未設定です`); continue; }
+    try {
+      await detectContractVersion(chain, address);
+    } catch (e) {
+      console.warn(`[コントラクト] ${chain} ${address}: 確認できず: ${(e.message || "").slice(0, 120)}`);
+    }
+  }
 }
 
 const MIN_PROFIT_USD = parseFloat(process.env.MIN_PROFIT_USD || "0.01");

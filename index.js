@@ -59,7 +59,7 @@ import {
   getNearMissStats, countIfWallDrops, getWallBreakdown, NEAR_MISS_REACHABLE_WALL_BPS,
   getWhatIfProfit, getSpotScreenStats, takeQuoteDemand, getQuoteDemandTotal,
 } from "./scripts/opportunity-scanner.js";
-import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS, resetNonce } from "./scripts/execute-opportunity.js";
+import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS, resetNonce, checkContractVersions } from "./scripts/execute-opportunity.js";
 import {
   getKnownTokens, isBorrowable,
   markUsableStart, clearUsableStarts, countUsableStarts,
@@ -1912,6 +1912,10 @@ async function main() {
   startOnchainFeeds(handleSync, handleV3Swap, handleV3Liquidity);
 
   await preparePoolMap();
+
+  // 各チェーンのコントラクトの版(新旧)と住所の中身を起動時に確かめてログに出す。
+  // 再デプロイ直後の裏付け用。失敗しても起動は止めない。
+  try { await checkContractVersions(Object.keys(CHAIN_CONFIG)); } catch (e) {}
 
   setInterval(probeFeesGradually, FEE_PROBE_INTERVAL_MS);
   setInterval(refreshStaleReserves, REFRESH_STALE_SEC * 1000);
