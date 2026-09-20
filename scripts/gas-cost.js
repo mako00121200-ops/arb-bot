@@ -124,9 +124,21 @@ export async function getTypicalL1FeeWei(chain) {
   if (cached && Date.now() - cached.at < L1_FEE_CACHE_MS) return cached.value;
   try {
     const value = await estimateL1FeeWei(key, GAS_PRICE_ORACLE, REPRESENTATIVE_CALLDATA, 300_000n);
+    // 初回と、前回から2割以上動いた時だけログに出す(実額の確認用)。
+    const prevValue = cached?.value ?? null;
+    const moved = prevValue == null || prevValue === 0n || (value > prevValue ? value - prevValue : prevValue - value) * 5n > prevValue;
     l1FeeTypical.set(key, { value, at: Date.now(), source: "oracle" });
+    if (moved) {
+      let usd = null;
+      try { usd = await weiToUsd(key, value); } catch (e) {}
+      console.log(`[L1データ手数料] ${key}: 代表的な2段の取引で ${ethers.formatEther(value)} ETH${usd != null ? `(約$${usd.toFixed(4)})` : ""}`);
+    }
     return value;
-  } catch (e) {}
+  } catch (e) {
+    // 失敗しても5分は聞き直さない(ガス代の更新は数十秒ごとなので、警告が並ばないように)。
+    l1FeeTypical.set(key, { value: cached?.value ?? 0n, at: Date.now(), source: "失敗" });
+    console.warn(`[L1データ手数料] ${key}: 予備コントラクトに聞けず: ${(e.message || "").slice(0, 80)}`);
+  }
   return cached?.value ?? 0n;
 }
 
