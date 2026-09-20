@@ -124,6 +124,16 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
       }
     } catch (e) {}
   }
+  // V2の段は「同じ式・同じ手数料」で読み直すため、見込みとの差は
+  // そのままでは原因が分からない。地図に持っている準備量でも同じ式で計算し、
+  // **準備量の古さ**と**式や手数料の違い**を切り分ける(2026年9月20日に追加)。
+  //
+  // [なぜ要るか]
+  // polygon の dystopia で −204.0bps が投入額を変えても同じ値で出た。
+  // 幅が投入額によらず一定なら深さ(準備量)の問題、投入額とともに広がるなら
+  // 曲線の形の問題、というところまでは分かったが、地図の準備量とチェーンの
+  // 準備量のどちらがずれているのかは、この2つを並べないと決められない。
+  const storedOut = new Array(legs.length).fill(null);
   for (let k = 0; k < v2Index.length; k++) {
     const i = v2Index[k];
     const st = v2States.get(legs[i].pool.toLowerCase());
@@ -134,6 +144,14 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
     const withFee = expected[i].in * (10000n - BigInt(legs[i].feeBps));
     const denom = rIn * 10000n + withFee;
     if (denom > 0n) actual[i] = (withFee * rOut) / denom;
+
+    const held = getPool(chain, legs[i].pool);
+    if (held && held.raw0 > 0n && held.raw1 > 0n) {
+      const sIn = isToken0In ? held.raw0 : held.raw1;
+      const sOut = isToken0In ? held.raw1 : held.raw0;
+      const sDenom = sIn * 10000n + withFee;
+      if (sDenom > 0n) storedOut[i] = (withFee * sOut) / sDenom;
+    }
   }
 
   const parts = [];
@@ -145,7 +163,16 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
     // 自前と公式の両方が取れた段は、公式との差も並べる(一致なら価格表の古さが原因)。
     const offDiff = ownQuoted[i] && official[i] != null ? bpsDiff(expected[i].out, official[i]) : null;
     const offNote = offDiff != null ? `(公式${offDiff >= 0 ? "+" : ""}${offDiff.toFixed(1)}bps)` : "";
-    parts.push(`${i + 1}段目 ${legs[i].dexId}(${legs[i].kind}) ${diff >= 0 ? "+" : ""}${diff.toFixed(1)}bps${offNote}`);
+    // V2の段は、差を「準備量の古さ」と「式・手数料の違い」に分けて出す。
+    let splitNote = "";
+    if (storedOut[i] != null) {
+      const stale = bpsDiff(storedOut[i], actual[i]);       // 地図の準備量 → 今の準備量
+      const model = bpsDiff(expected[i].out, storedOut[i]); // 見込み → 同じ準備量で計算し直した値
+      if (stale != null && model != null) {
+        splitNote = `(準備量の古さ${stale >= 0 ? "+" : ""}${stale.toFixed(1)}bps / 式${model >= 0 ? "+" : ""}${model.toFixed(1)}bps 手数料${legs[i].feeBps}bps)`;
+      }
+    }
+    parts.push(`${i + 1}段目 ${legs[i].dexId}(${legs[i].kind}) ${diff >= 0 ? "+" : ""}${diff.toFixed(1)}bps${offNote}${splitNote}`);
     if (worst == null || diff < worst.diff) worst = { i, diff, leg: legs[i] };
   }
   if (parts.length === 0) return;

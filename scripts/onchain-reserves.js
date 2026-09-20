@@ -321,6 +321,18 @@ const MIN_SAMPLE_AMOUNT_IN = 1_000_000_000n;
 // 正常なDEXの手数料は最大1%程度。これを超える値は取引1件だけでは採用しない。
 const SINGLE_SAMPLE_MAX_BPS = 100;
 const MAX_FEE_BPS = 1000;
+// 実測値として信用できる手数料の下限(bps)。
+//
+// [なぜ要るか(2026年9月20日 本番ログ)]
+// polygon の dystopia プール2件で「手数料0bps」が実測値として採用され、
+// 判定は0bps前提で黒字と見なしたのに、チェーン上の確認では −79〜−204bps。
+// 1件は送信前の確認で3回続けて K検算に弾かれ(DystPair: K)、自動的に
+// 無効化された。手数料0%のAMMは現実には無く、**0bps は「測れた」ではなく
+// 「測り方が通用しなかった」印**。Solidly系のstable曲線(x³y+y³x)や
+// 課税トークンのプールを x·y=k の式で逆算すると、この値になり得る。
+// 信用できない値を採用するくらいなら、安全側の既定値(30bps)のままにして
+// 後で測り直す方が、幻の機会を追いかけずに済む。
+const MIN_PLAUSIBLE_FEE_BPS = parseInt(process.env.MIN_PLAUSIBLE_FEE_BPS || "1", 10);
 // 問い合わせを止める時間。
 const RETRY_NO_TRADES_MS = 24 * 60 * 60 * 1000;
 const RETRY_ERROR_MS = 60 * 60 * 1000;
@@ -332,7 +344,7 @@ const feeProbeState = new Map();   // key -> { fee } または { retryAt }
 const noAmountOutPools = new Set(); // getAmountOut を持たないプール
 const feeProbeActive = new Map();  // chain -> 実測中の数
 const blockNumberCache = new Map();
-const feeProbeStats = { byAmountOut: 0, byLogs: 0, non30: 0, noTrades: 0, errors: 0 };
+const feeProbeStats = { byAmountOut: 0, byLogs: 0, non30: 0, noTrades: 0, errors: 0, implausible: 0 };
 let lastFeeStatsLine = "";
 
 function feeKey(chain, address) {
@@ -423,6 +435,8 @@ async function measureFeeFromSwapLogs(chain, address) {
   if (minCentiBps > SINGLE_SAMPLE_MAX_BPS * 100 && samples.length < 2) return { fee: null, reason: "noTrades" };
   // 端数の切り捨てで僅かに高めに出るため、0.01bpsの誤差を許して切り上げる
   const fee = Math.max(0, Math.ceil((minCentiBps - 1) / 100));
+  // 0bps は手数料ではなく「x·y=k の前提が通用しなかった」印なので採用しない。
+  if (fee < MIN_PLAUSIBLE_FEE_BPS) return { fee: null, reason: "implausible" };
   return { fee, samples: samples.length };
 }
 
@@ -453,7 +467,7 @@ export async function probePoolFeeBps({ chain, pairAddress, tokenInAddress, rese
           const ideal = (amountIn * reserveOut) / (reserveIn + amountIn);
           if (amountOut > 0n && ideal > 0n) {
             const feeBps = Number(((ideal - amountOut) * 10000n) / ideal);
-            if (feeBps >= 0 && feeBps <= MAX_FEE_BPS) {
+            if (feeBps >= MIN_PLAUSIBLE_FEE_BPS && feeBps <= MAX_FEE_BPS) {
               // byAmountOut: このプールは getAmountOut を持つ。コントラクトの
               // Leg.flags(FLAG_HAS_QUOTE)に使う(poolHasAmountOut)。
               feeProbeState.set(key, { fee: feeBps, byAmountOut: true });
@@ -461,6 +475,12 @@ export async function probePoolFeeBps({ chain, pairAddress, tokenInAddress, rese
               if (feeBps !== 30) feeProbeStats.non30++;
               return feeBps;
             }
+            // 値は使えないが、getAmountOut を持つこと自体は分かった。
+            // この印は残す。コントラクトは実行時にプール自身へ聞くので、
+            // 判定側の手数料が既定値のままでも、送る量は正確になる。
+            feeProbeState.set(key, { byAmountOut: true, retryAt: Date.now() + RETRY_NO_TRADES_MS });
+            feeProbeStats.implausible++;
+            return null;
           }
           noAmountOutPools.add(key);
         } catch (e) {
@@ -480,13 +500,14 @@ export async function probePoolFeeBps({ chain, pairAddress, tokenInAddress, rese
     try {
       const result = await measureFeeFromSwapLogs(chain, addr);
       if (result.fee != null) {
-        feeProbeState.set(key, { fee: result.fee });
+        feeProbeState.set(key, { ...(feeProbeState.get(key) || {}), fee: result.fee });
         feeProbeStats.byLogs++;
         if (result.fee !== 30) feeProbeStats.non30++;
         return result.fee;
       }
-      feeProbeState.set(key, { retryAt: Date.now() + RETRY_NO_TRADES_MS });
-      feeProbeStats.noTrades++;
+      feeProbeState.set(key, { ...(feeProbeState.get(key) || {}), retryAt: Date.now() + RETRY_NO_TRADES_MS });
+      if (result.reason === "implausible") feeProbeStats.implausible++;
+      else feeProbeStats.noTrades++;
       return null;
     } catch (e) {
       const msg = e.message || "";
@@ -515,7 +536,7 @@ export function getFeeProbeStats() {
 
 setInterval(() => {
   const s = feeProbeStats;
-  const line = `[手数料実測/集計] 判明: getAmountOut ${s.byAmountOut}件 / 取引記録 ${s.byLogs}件(うち30bps以外${s.non30}件) / 直近取引なしで24時間保留 ${s.noTrades}件 / 取得失敗 ${s.errors}件`;
+  const line = `[手数料実測/集計] 判明: getAmountOut ${s.byAmountOut}件 / 取引記録 ${s.byLogs}件(うち30bps以外${s.non30}件) / 直近取引なしで24時間保留 ${s.noTrades}件 / 値が信用できず既定値のまま ${s.implausible}件 / 取得失敗 ${s.errors}件`;
   if (line !== lastFeeStatsLine) {
     console.log(line);
     lastFeeStatsLine = line;

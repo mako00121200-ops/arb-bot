@@ -83,6 +83,7 @@ const POOL_IFACE = new ethers.Interface([
   "function tickSpacing() view returns (int24)",
   "function liquidity() view returns (uint128)",
   "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
+  "function stable() view returns (bool)",
 ]);
 
 /// tickSpacing から手数料を見積もる。
@@ -148,9 +149,13 @@ async function collectActivePools(chain) {
 }
 
 /// プールの正体(ファクトリー・トークン・手数料・形式)をまとめて読む。
+/// 1プールにつき読む項目。stable は Solidly系(Velodrome・Dystopia・Ramses系)の
+/// 判別に使う。stable プールは x³y+y³x 曲線で、x·y=k の式が通用しない。
+const FIELDS = ["factory", "token0", "token1", "fee", "tickSpacing", "liquidity", "getReserves", "stable"];
+
 async function identifyPools(chain, addresses) {
   const info = new Map();
-  const PER_CALL = 28; // 1プールにつき7つ読むので、1回200件以内に収める
+  const PER_CALL = 25; // 1プールにつき8つ読むので、1回200件以内に収める
 
   for (let i = 0; i < addresses.length; i += PER_CALL) {
     if (requestsUsed >= SCOUT_MAX_REQUESTS) break;
@@ -158,7 +163,7 @@ async function identifyPools(chain, addresses) {
     const calls = [];
     for (const addr of slice) {
       const target = ethers.getAddress(addr);
-      for (const fn of ["factory", "token0", "token1", "fee", "tickSpacing", "liquidity", "getReserves"]) {
+      for (const fn of FIELDS) {
         calls.push({ target, allowFailure: true, callData: POOL_IFACE.encodeFunctionData(fn) });
       }
     }
@@ -171,7 +176,8 @@ async function identifyPools(chain, addresses) {
       continue;
     }
     for (let j = 0; j < slice.length; j++) {
-      const [rf, r0, r1, rFee, rSpacing, rLiq, rRes] = returned.slice(j * 7, j * 7 + 7);
+      const n = FIELDS.length;
+      const [rf, r0, r1, rFee, rSpacing, rLiq, rRes, rStable] = returned.slice(j * n, j * n + n);
       const ok = (r) => !!(r?.success && r.returnData !== "0x");
       if (!ok(rf) || !ok(r0) || !ok(r1)) continue;
       try {
@@ -183,7 +189,11 @@ async function identifyPools(chain, addresses) {
           tickSpacing: ok(rSpacing) ? Number(POOL_IFACE.decodeFunctionResult("tickSpacing", rSpacing.returnData)[0]) : null,
           liquidity: ok(rLiq) ? POOL_IFACE.decodeFunctionResult("liquidity", rLiq.returnData)[0] : null,
           hasReserves: ok(rRes),
+          stable: false,
         };
+        if (ok(rStable)) {
+          try { entry.stable = POOL_IFACE.decodeFunctionResult("stable", rStable.returnData)[0]; } catch (e2) {}
+        }
         // V2 は getReserves を持ち、tickSpacing も liquidity(uint128) も持たない。
         entry.kind = entry.hasReserves && entry.tickSpacing == null ? KIND_V2 : KIND_V3;
         info.set(slice[j].toLowerCase(), entry);
@@ -199,6 +209,14 @@ function decide(chain, address, entry, knownSet, rank) {
   if (isKnownIncompatiblePool(chain, address)) return { take: false, why: "過去に不適合" };
   if (getPool(chain, address)) return { take: false, why: "既に地図にある" };
   if (!entry.token0 || !entry.token1 || entry.token0 === entry.token1) return { take: false, why: "トークンが読めず" };
+  // Solidly系の stable プールは x³y+y³x 曲線で、判定に使う x·y=k の式が
+  // 通用しない。ファクトリーからの取り込み(pool-discovery.js)では以前から
+  // 除いているので、イベントからの発見でも同じ扱いに揃える。
+  // [2026年9月20日] polygon の dystopia プールが「手数料0bps」と実測され、
+  // 判定は黒字・チェーン上では −79〜−204bps、送信前の確認で K検算に弾かれて
+  // 自動的に無効化された。Optimism の Velodrome も同じ系統なので、
+  // 主戦場を広げる前にここで止める。
+  if (entry.stable) return { take: false, why: "stable曲線のプール" };
   if (entry.kind === KIND_V3 && (entry.liquidity == null || entry.liquidity <= 0n)) {
     return { take: false, why: "流動性が0" };
   }
