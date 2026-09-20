@@ -1565,7 +1565,9 @@ function heartbeat() {
       lastSpotNeedQuote = ss.freshNeedQuote;
 
       // 上位の経路を実物で確かめる。2,282本が何なのかを推測で語らないため。
-      for (const x of ss.samples.slice(0, 3)) {
+      // チェーンごとに残してあるので、全チェーンぶんを出す(育てている最中の
+      // チェーンが、他所の壊れたプールに押し出されないように)。
+      for (const x of ss.samples.slice(0, 8)) {
         console.log(`[ふるいの実物] ${x.chain} ${x.pools} 始点${x.tokenIn.slice(0, 10)}… 価格差${x.edge.toFixed(1)}bps 壁${x.feeBps}bps 見積利益$${x.netUsd.toFixed(4)}`);
       }
       lastSpotScreenPassed = [...ss.passed];

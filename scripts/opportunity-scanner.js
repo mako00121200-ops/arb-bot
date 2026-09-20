@@ -663,7 +663,16 @@ export function takeQuoteDemand() {
 
 export function getQuoteDemandTotal() { return quoteDemandTotal; }
 
-/// 実物を確かめるための見本を残す(利益の大きい順に SPOT_SAMPLE_LIMIT 件)。
+/// 実物を確かめるための見本を残す(利益の大きい順)。
+///
+/// [チェーンごとに残す(2026年9月20日)]
+/// 以前は全チェーンをまとめて上位3件にしていた。ところが Polygon の
+/// 壊れたプール(価格差6,622bps・見積利益$10.67)が毎分1位〜3位を占め続け、
+/// **他のチェーンの候補が1件も見えなかった**。Optimism を育てている最中に
+/// 「そこで何が惜しかったのか」が読めないのは困る。
+/// チェーンごとに上位 SPOT_SAMPLE_PER_CHAIN 件を残す。
+const SPOT_SAMPLE_PER_CHAIN = parseInt(process.env.SPOT_SAMPLE_PER_CHAIN || "2", 10);
+
 function keepSample(sample) {
   const list = spotScreen.samples;
   const existing = list.findIndex((x) => x.key === sample.key);
@@ -673,7 +682,13 @@ function keepSample(sample) {
   }
   list.push(sample);
   list.sort((a, b) => b.netUsd - a.netUsd);
-  if (list.length > SPOT_SAMPLE_LIMIT) list.length = SPOT_SAMPLE_LIMIT;
+  // チェーンごとに上限まで残す。全体の上限も残しておく(際限なく増やさないため)。
+  const perChain = new Map();
+  spotScreen.samples = list.filter((x) => {
+    const n = (perChain.get(x.chain) || 0) + 1;
+    perChain.set(x.chain, n);
+    return n <= SPOT_SAMPLE_PER_CHAIN;
+  }).slice(0, SPOT_SAMPLE_LIMIT * 4);
 }
 
 /// 経路の現在価格の積。手数料を引いたあとの利幅をbpsで返す。
