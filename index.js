@@ -1686,7 +1686,15 @@ function heartbeat() {
       const parts = rows.map((r) =>
         `壁-${r.drop}bps:${r.routes.toLocaleString()}本 $${r.totalUsd.toFixed(2)}(最大$${r.maxUsd.toFixed(4)}/投入$${r.maxTradeUsd.toFixed(0)})`
       ).join(" ");
-      if (parts) console.log(`[試算] ${chain}: ${parts}`);
+      // 一番現実的な幅(最初の値)について、その最大の経路を名指しする。
+      // 「深い経路があと何bpsで黒字になるか」と「どのプールを直せばいいか」が
+      // これで分かる。不足が小さいほど、そのペアに安い手数料のプールを
+      // 足す価値が高い(2026年9月21日に追加)。
+      const top = rows[0];
+      const detail = top && top.maxLabel
+        ? ` / 最良の1本[${top.maxLabel} 壁${top.maxWallBps ?? "-"}bps 投入$${top.maxTradeUsd.toFixed(0)} 不足${top.maxShortfallBps != null ? top.maxShortfallBps.toFixed(1) : "-"}bps]`
+        : "";
+      if (parts) console.log(`[試算] ${chain}: ${parts}${detail}`);
     }
   } catch (e) {}
 }
