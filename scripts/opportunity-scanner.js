@@ -411,6 +411,12 @@ function recordWhatIf(key, whatIf, toUsd, gasCostUsd) {
       entry.netByDrop[i] = net;
       if (!entry.tradeUsdByDrop) entry.tradeUsdByDrop = new Array(whatIf.length).fill(0);
       entry.tradeUsdByDrop[i] = toUsd(w.amountIn);
+      // 壁が下がらなかった場合、この投入額であと何bps足りないのか。
+      // 試算は「受取が drop bps 増えたら」なので、その分を引けば実際の
+      // 利回りになる。深い経路がどれだけ惜しいかを直接読めるようにする。
+      if (!entry.shortfallByDrop) entry.shortfallByDrop = new Array(whatIf.length).fill(null);
+      const adjBps = Number((w.profit * 10000n) / w.amountIn);
+      entry.shortfallByDrop[i] = adjBps - w.drop;
     }
   }
 }
@@ -428,7 +434,10 @@ export function getWhatIfProfit() {
   for (const r of routeBest.values()) {
     if (!r.netByDrop) continue;
     if (!out[r.chain]) {
-      out[r.chain] = WHATIF_DROPS.map((drop) => ({ drop, routes: 0, totalUsd: 0, maxUsd: 0, maxTradeUsd: 0 }));
+      out[r.chain] = WHATIF_DROPS.map((drop) => ({
+        drop, routes: 0, totalUsd: 0, maxUsd: 0, maxTradeUsd: 0,
+        maxLabel: null, maxWallBps: null, maxShortfallBps: null,
+      }));
     }
     for (let i = 0; i < r.netByDrop.length && i < out[r.chain].length; i++) {
       const net = r.netByDrop[i];
@@ -439,6 +448,9 @@ export function getWhatIfProfit() {
       if (net > o.maxUsd) {
         o.maxUsd = net;
         o.maxTradeUsd = r.tradeUsdByDrop ? r.tradeUsdByDrop[i] : 0;
+        o.maxLabel = r.label ?? null;
+        o.maxWallBps = r.wall ?? null;
+        o.maxShortfallBps = r.shortfallByDrop ? r.shortfallByDrop[i] : null;
       }
     }
   }
@@ -447,7 +459,7 @@ export function getWhatIfProfit() {
 
 export const WHATIF_DROP_LIST = [...WHATIF_DROPS];
 
-function recordNearMiss(chain, key, returnBps, wallBps) {
+function recordNearMiss(chain, key, returnBps, wallBps, label) {
   if (returnBps == null || !Number.isFinite(returnBps)) return;
   const prev = routeBest.get(key);
   if (prev) {
@@ -461,7 +473,7 @@ function recordNearMiss(chain, key, returnBps, wallBps) {
     }
     return;
   }
-  routeBest.set(key, { bps: returnBps, wall: wallBps, chain });
+  routeBest.set(key, { bps: returnBps, wall: wallBps, chain, label });
 }
 
 function bucketOf(bps) {
@@ -949,7 +961,7 @@ function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, p
   // 同じ経路を何度評価しても1本として数える(回数ではなく本数を知りたい)。
   const wallBps = legs.reduce((sum, l) => sum + l.feeBps, 0);
   const routeKey = routeKeyOf(chain, tokenA, poolAddresses);
-  recordNearMiss(chain, routeKey, best.returnBps, wallBps);
+  recordNearMiss(chain, routeKey, best.returnBps, wallBps, label);
 
   // 桁数と価格は「壁が下がった場合」の金額換算にも要るので、
   // 赤字で打ち切る前に取っておく。どちらもメモリ上の参照で、RPCは使わない。
