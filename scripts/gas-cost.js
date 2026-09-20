@@ -254,6 +254,44 @@ export function getGasPriceRatio(chain) {
   return gasPriceRatio.get((chain || "").toLowerCase())?.ratio ?? 1;
 }
 
+// ===== 学んだ比の持ち越し(2026年9月20日) =====
+//
+// [なぜ要るか]
+// この学習は**送信が成功した時にしか進まない**。成功は1日数件しかないのに、
+// 手を入れて再デプロイするたびに比は 1.0(=補正なし)へ戻っていた。
+// つまり実際には一度も貯まっていない。
+//
+// 実測(2026年9月20日 17:22 UTC、polygon):
+//   [実行] 確定: 粗利+$0.0201 − ガス$0.0105 = 純利益+$0.0096(見積もりガス$0.0125)
+// 見積もりが実際より **19%高い**。同じ30分の下限の内訳は
+//   polygon:127件 粗利中央$0.0138 ガス中央$0.0124
+// なので、この19%はそのままハードルの高さとして効いていて、
+// 見送った127件の多くがこの差の中にいる。
+//
+// 比は「出す用意のあった単価」と「実際に取られた単価」の比なので、
+// ガスの相場そのものより安定している。古すぎる値は使わない。
+export function exportGasPriceRatios() {
+  const out = {};
+  for (const [chain, v] of gasPriceRatio.entries()) out[chain] = { ratio: v.ratio, samples: v.samples };
+  return out;
+}
+
+/// 保存しておいた比を戻す。戻した件数を返す。
+/// 件数(samples)は最大4に抑えるので、その後の実測がすぐ効くようにする。
+export function importGasPriceRatios(saved) {
+  if (!saved || typeof saved !== "object") return 0;
+  let n = 0;
+  for (const [chain, v] of Object.entries(saved)) {
+    const ratio = Number(v?.ratio);
+    if (!isFinite(ratio) || ratio <= 0 || ratio > 1) continue;
+    const bounded = Math.max(GAS_PRICE_RATIO_MIN, Math.min(1, ratio));
+    const samples = Math.min(Math.max(1, Number(v?.samples) || 1), 4);
+    gasPriceRatio.set((chain || "").toLowerCase(), { ratio: bounded, samples });
+    n++;
+  }
+  return n;
+}
+
 /// 事前判定に使う単価。実測から学んだ比を掛けたもの。
 export async function getEstimatedGasPriceWei(chain) {
   const key = (chain || "").toLowerCase();
