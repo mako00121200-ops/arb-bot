@@ -1,4 +1,4 @@
-# arb-bot 引き継ぎ資料(2026年9月19日時点)
+# arb-bot 引き継ぎ資料(2026年9月20日時点)
 
 ## 目的と方針(オーナーが決めたこと)
 - DEX内で完結する原子的裁定bot。フラッシュスワップ+自作コントラクト。CEX裁定は対象外
@@ -21,6 +21,10 @@
   Avalanche 0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1 と Arbitrum 0x2139C1497F7C8c3291e51639ccc978Ffe7a73E18 は
   quoteV3の無い旧版のまま。この2チェーンでフォーク見積もりを使うには先に再デプロイが要る
 - Optimism の RPC/WSS は Chainstack(2026年9月19日に追加)。`OPTIMISM_RPC_URL` / `OPTIMISM_WSS_URL` に設定済み
+- **コントラクトのガス削減版(2026年9月20日、`contracts/` を変更、未デプロイ)**。Leg の形が変わったが、
+  bot は起動後に各チェーンのコントラクトへ `FLAG_V3()` を1回問い合わせて新旧を判別するので、
+  チェーンごとに順番に再デプロイできる(推奨順: Avalanche → Polygon → Optimism → Arbitrum)。
+  下の「コントラクトのガス削減」の節を参照
 - 旧Polygonコントラクト 0xD2D45cC9… には利益が残っている(推定$0.5前後)。所有者キーは
   同じなのでいつでも回収できるが、withdrawを呼ぶ仕組みはまだ無い
 - コントラクトの再デプロイは環境変数 RUN_MAINNET_DEPLOY=<チェーン名> で起動時に実行し、完了後に MAINNET_CONTRACT_ADDRESS_<チェーン> を設定して RUN_MAINNET_DEPLOY=false に戻す
@@ -44,6 +48,9 @@
 - 送信は**プール単位の錠**で並行(`NonceManager` が nonce を手元で管理、
   同時最大3本)。同じプールを使う経路だけ直列
 - ガス代の見積もりは実測の gasUsed と実効単価から学習(上限は費用に数えない)
+- コントラクトは新旧2版がある。新版(ガス削減版)には経路を `(pool, tokenOut, flags, feeBps)` で
+  渡し、`flags` に「V3か」「投入通貨が token0 か」「getAmountOut を持つか」を bot が地図から
+  入れる。旧版には従来の形で渡す。どちらかは起動後に `FLAG_V3()` で判別して覚える
 - 最低利益 `MIN_PROFIT_USD=0.005`。取引上限$2000
 - 30秒後に「誰が取ったか」を記録簿に残す。ダッシュボードの時刻は日本時間
 
@@ -1438,6 +1445,120 @@ verified pairs に入れる必要がある。
   「未実測○プールを確認します」が2秒ごと・1日約43,200行出て、[生存] や
   [機会] の行が流れていた → isFeeProbeOnHold() でキューに入れないようにした
 
+## コントラクトのガス削減(2026年9月20日に実装。再デプロイは未実施)
+
+取引頻度が上がらない主因は「1件の粗利($0.01〜0.04)に対してガス代($0.015)が
+同程度」であること。2段の実測 272,246 ガスの内訳を実測して削った。
+
+### 計測のやり方(この砂場は鎖の RPC に届かないため)
+
+ローカルの EVM(anvil)に**実物の Uniswap V2 pair / V3 pool のバイトコード**
+(npm の @uniswap/v2-core, v3-core)と簡易ERC20を置き、現行と改良案を同じ
+経路で実行して gasUsed を比べた。各経路は1回ならし運転してから2回目を測る
+(V2の累積価格やコントラクトの残高が0でない、本番と同じ状態にするため)。
+計測台と試験は砂場(scratchpad)に置き、リポジトリには入れていない。
+
+### 分かったこと: 主犯は永続記憶への印の書き込み
+
+現行は `activePool` / `activePayToken` / `inFlashSwap` を永続記憶に書く。
+1件の取引で 0→値→0 と書き戻すため、**書き込み約65,000ガス、払い戻し約60,000ガス**。
+EVM は払い戻しを**取引全体の2割まで**しか認めない(EIP-3529)ので、本番
+(払い戻し前 約340,000)では上限 68,000 に当たり、約12,000 が消えていた。
+これが「estimateGas が実測より27%多い」の正体でもある(見積もり 345,000 =
+払い戻し前 / 実測 272,246 = 払い戻し後)。
+
+### 変更(contracts/DexArbFlashLoan.sol)
+
+| # | 変更 | 削減(2段 V2→V3、本番見込み) |
+|---|---|---|
+| 1 | 印を一時記憶(`transient`、EIP-1153)に。取引の終わりに勝手に消える | 約15,000 |
+| 2 | `token0()` を鎖上で問い直さず、`flags` で受け取る | 約3,500 |
+| 3 | `getAmountOut` の試し呼びをやめ、持つプールだけ `flags` で指定 | 約1,000 |
+| 4 | V3の段は残高で測らず、プールが返す量(delta)を使う | 約1,600/段 |
+| 5 | `owner` を immutable に | 約2,100 |
+| 6 | Leg から `tokenIn` を外す(前の段の tokenOut と同じ)。呼び出しデータ 484→420バイト | 約700 |
+| 7 | optimizer runs 200 → 1,000,000、evmVersion cancun を明示 | 約1,300 |
+| | 合計 | **約21,000〜22,000(約8%)**。Polygon で $0.015 → 約$0.0138 |
+
+残したもの(資金の安全のため): 最終段の資産残高の差分(税トークンで自分の
+残高から返済してしまう事故を防ぐ)、V2の段の到着量確認、`RouteExecuted`。
+
+計測台の値(実物の Uniswap のバイトコード、ならし運転後):
+
+| 経路 | 現行 | 一時記憶のみ | 全部 |
+|---|---|---|---|
+| V2→V3(2段) | 196,927 | 159,698 | 151,924 |
+| V3→V2(2段) | 165,652 | 157,429 | 149,080 |
+| V3→V3(2段) | 187,370 | 168,553 | 159,659 |
+| V2→V3→V2(3段) | 248,957 | 219,354 | 207,875 |
+
+4経路とも利益の値が現行と完全に一致した。計測台は本番より軽い(トークンが
+簡易ERC20で、本番は USDC の代理コントラクトやティック越えが乗る)ため、
+払い戻し上限の効き方が違い、**本番の見込みは上の「約8%」の方**。
+
+### 正直な見立て
+
+2段の約20万ガスは Uniswap のプールとトークン側の処理で、こちらのコントラクト
+自身は4〜5万ガスしか使っていない。**8%が上限に近く、「粗利 ≒ ガス代」の
+構造はコントラクトでは変わらない**。構造を変えるのは、この再デプロイで開く
+Avalanche(ガス$0.001)の対象拡大、投入額の最適化、Optimism の費用に L1 データ
+手数料が入っていない疑いの確認(別件)。
+
+### Pharaoh 対応(同じ再デプロイに含めた)
+
+Pharaoh(Avalanche の出来高の約78%)は Ramses のフォークで V3形式の `swap` を
+持つ。コールバックの名前は公開資料から確定できなかったので、名前に依存しない:
+- `ramsesV2SwapCallback` を名前つきで追加(Ramses 本家の名前)
+- **fallback を「今スワップ中のプールの形式で解釈」**するよう拡張。V3形式なら
+  `(int256,int256,bytes)`、V2形式なら `(address,uint256,uint256,bytes)`。名前が
+  何であれ受け付けるので、今後のフォークにも再デプロイ不要
+- `V3_FACTORIES.avalanche` に Pharaoh のファクトリー候補 `0xAAA32926…`(Snowtrace の
+  表示名「Pharaoh Exchange: Factory V2」、fork: true、dexId `pharaoh-cl`)を追加。
+  **未検証**。`ENABLE_FORK_QUOTER` に avalanche を足した後の探索ログで、見つかった
+  プール数を確かめる。住所が違えば0件になるだけ
+- 調査で42%を占めた `0x1128F23D…`(univ3-fork-e)は **Pangolin V3**(Uniswap V3形式)
+  だった。こちらも同じ再デプロイで開く
+
+### bot 側の変更
+
+- `scripts/execute-opportunity.js`: 新旧2つの ABI を持ち、`detectContractVersion` が
+  `FLAG_V3()` の eth_call で判別して覚える(新版は 1、旧版は fallback が
+  "unknown call" で取り消す)。RPC の失敗(取り消し以外)は覚えず、その機会だけ
+  見送る。`buildLegArgs` が版に応じた形を作る。`flags` の token0 は地図(pool-registry)
+  から、getAmountOut の有無は手数料の実測で判明した記録(`poolHasAmountOut`)から
+- `scripts/onchain-reserves.js`: getAmountOut で手数料が取れたプールに印
+  (`byAmountOut`)を残し、`poolHasAmountOut` で読めるようにした
+- `scripts/compile-contract.js`: runs 1,000,000、evmVersion cancun(展開サイズ 14,615バイト)
+- `quoteV3` の引数と `SimulationResult` / `RouteExecuted` は旧版と同じ。
+  `quoteV3ByPoolBatch`(multicall-reserves.js)は変更なし
+
+### 一時記憶が使えるチェーンの確認
+
+| チェーン | 根拠 |
+|---|---|
+| Polygon / Optimism | 現行のバイトコードに既に Cancun の `MCOPY` が含まれ、本番で動いている(cast disassemble で確認) |
+| Avalanche | Etna アップグレード(2024年12月16日)で ACP-131(Cancun EIP、EIP-1153 含む)が有効 |
+| Arbitrum | ArbOS 20 "Atlas" で TSTORE/TLOAD に対応 |
+
+### 試験(ローカル EVM、18項目合格)
+
+版の判別(新版 `FLAG_V3()`=1、旧版は取り消し)、simulateRoute と executeRoute の
+利益の一致、quoteV3(実物の V3 プール)、**名前の分からないコールバックで呼び返す
+模型プール**で quoteV3 / 2段目 / 1段目(flash)の全て、部外者からのコールバックと
+fallback と executeRoute の拒否、token0 の向きを間違えた flags の取り消し(V2/V3)、
+minProfit 未達の取り消し、失敗の前後で残高が変わらないこと、withdraw。
+
+### 再デプロイの手順(オーナー立ち会い)
+
+1. 対象チェーンの旧コントラクトの利益を `withdraw` で回収する(仕組みは未実装。
+   所有者キーで直接呼ぶ)
+2. `RUN_MAINNET_DEPLOY=<チェーン名>` で起動 → 表示された住所を
+   `MAINNET_CONTRACT_ADDRESS_<チェーン>` に設定 → `RUN_MAINNET_DEPLOY=false`
+3. 起動ログの `[コントラクト] <チェーン> …: ガス削減版(flags) と判別しました` を確認
+4. Avalanche なら `ENABLE_FORK_QUOTER` に avalanche を足し、探索ログで Pangolin V3 /
+   Pharaoh のプール数を確認する
+5. 最初の取引の `[実行] 完了: … ガスN` で削減幅を実測し、この節に追記する
+
 ## 進行中の計画
 1. 済: V3型プールをDEX別に数える調査(scripts/pool-survey.js)。Polygon /
    Base / Optimism で実施し、未監視ファクトリーの活動量と、監視ペアの
@@ -1453,7 +1574,9 @@ verified pairs に入れる必要がある。
    - 済: 再デプロイ(Polygon、2026年9月18日朝)。デプロイ前にコントラクトを
      確認し、quoting が実取引に漏れないことを検証した(下の節)
    - 済: ENABLE_FORK_QUOTER=polygon で効果を確認(下の節)
-   - 未: Avalanche / Optimism / Base へ展開。各チェーンで先に再デプロイが要る
+   - 済: Optimism へ展開(2026年9月19日に再デプロイ)
+   - 未: Avalanche / Arbitrum へ展開。ガス削減版(上の節)で再デプロイする。
+     Avalanche では Pangolin V3(fork-e)と Pharaoh が同時に開く
 3. 対象チェーンの優先順位は Polygon(31.5%が未監視)→ Optimism(ガス最安・
    壁0.06%・27プール)→ Avalanche(82%が未監視。ガス$0.001で最安)→
    Base(活動量は最大だが主要DEXの出来高が対象外トークンに偏る)
@@ -1464,5 +1587,5 @@ verified pairs に入れる必要がある。
 - 速度: ガス見積もり省略、Arbitrumシーケンサー直結送信とフィード購読、RailwayをUS Eastへ、Chainstack Trader Node
   (nonceの事前取得は「速度」ではなく機会を失う不具合だったため対応済み)
 - 範囲: 始点トークン拡張、4段経路、BNB追加、Polygon FastLane入札
-- 利益: 投入額の最適化、コントラクトのガス削減、取引上限の引き上げ
+- 利益: 投入額の最適化、取引上限の引き上げ(コントラクトのガス削減は2026年9月20日に実装済み、再デプロイ待ち)
 - 守り: 私設送信、コントラクトからの利益の引き出し、異常の通知

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.10;
+// 一時記憶(transient)を使うため 0.8.28 以上。evmVersion は cancun 以上で
+// コンパイルする(scripts/compile-contract.js で明示している)。
+pragma solidity ^0.8.28;
 
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
@@ -9,7 +11,6 @@ interface IERC20 {
 // Uniswap V2形式(Solidly形式も同じ)。
 interface IAmmPoolV2 {
     function swap(uint amount0Out, uint amount1Out, address to, bytes calldata data) external;
-    function token0() external view returns (address);
     function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
 }
 
@@ -18,7 +19,7 @@ interface IAmmQuoteV2 {
     function getAmountOut(uint256 amountIn, address tokenIn) external view returns (uint256);
 }
 
-// Uniswap V3形式(集中流動性)。
+// Uniswap V3形式(集中流動性)。Ramses/Pharaoh 等のフォークも同じ形。
 interface IAmmPoolV3 {
     function swap(
         address recipient,
@@ -33,11 +34,23 @@ interface IAmmPoolV3 {
 /// @title DexArbFlashLoan
 /// @notice フラッシュスワップ方式のDEXアービトラージ実行コントラクト。
 ///
+/// [ガス削減版(2026年9月20日)]
+/// 2段の実測は272,246ガスで、1件の粗利($0.01〜0.04)とガス代($0.015)が
+/// 同程度だった。実測で分かった無駄を削っている。
+///   1. 取引中の印(activePool 等)を永続記憶から一時記憶(EIP-1153)へ。
+///      永続記憶では 0→値→0 の書き戻しに約65,000ガスかかり、払い戻しは
+///      取引全体の2割まで(EIP-3529)なので一部が消えていた。一時記憶は
+///      1回100ガスで、取引の終わりに勝手に消える
+///   2. token0() を鎖上で問い直さない。bot は地図で知っているので flags で渡す
+///   3. getAmountOut の試し呼びをやめる。持つプール(Solidly系)だけ flags で指定
+///   4. V3の段は残高で測らず、プールが返す量(delta)をそのまま使う
+///   5. owner を immutable に
+///   6. Leg から tokenIn を外す(前の段の tokenOut と同じ)。呼び出しデータも減る
+/// 資金の安全に関わる読み取りは残している: 最終段の資産残高の差分(税トークンで
+/// 自分の残高から返済してしまう事故を防ぐ)、V2の段の到着量確認。
+///
 /// [受取量はチェーン上で計算する(2026年9月17日)]
-/// 以前はbotが各段の受取量を事前に計算して渡していた。botの手元の準備量や
-/// 手数料の想定、価格表が少しでも古いと、要求量が合わずに失敗するか、
-/// 安全余裕(各段5bps)で薄い機会を赤字と判定していた。
-/// この版では、各段の受取量を「実行するその瞬間の準備量」から計算する。
+/// 各段の受取量を「実行するその瞬間の準備量」から計算する。
 ///   V2 … プールが getAmountOut を持っていればそれを使い(Solidly系・Camelot等)、
 ///        無ければ準備量と手数料(botが実測値を渡す)から計算する
 ///   V3 … 投入額ちょうどをスワップする(プールが正確に計算する)
@@ -46,8 +59,7 @@ interface IAmmPoolV3 {
 ///
 /// [結果の問い合わせ]
 /// simulateRoute は経路を最後まで実行し、戻ってきた量と返済額を
-/// SimulationResult として返して取り消す(ガス見積もりの呼び出しで使う)。
-/// botは1回の問い合わせで正確な利益が分かる。
+/// SimulationResult として返して取り消す(eth_call で使う)。
 ///
 /// [仕組み]
 ///   1. 最初のプールから、1段目の出力通貨を先に受け取る
@@ -55,24 +67,27 @@ interface IAmmPoolV3 {
 ///   3. 利益が minProfit 以上なら最初のプールへ支払う。届かなければ取消
 ///
 /// [コールバック]
-/// V2のフォークはそれぞれ独自の名前で呼び返す(uniswapV2Call, pancakeCall等)。
-/// 名前が分からないフォーク(ApeSwap等)も受け付けるよう、同じ形の呼び出しは
-/// fallback で処理する。呼び出し元の確認は全て同じ条件で行う。
+/// フォークはそれぞれ独自の名前で呼び返す(uniswapV2Call, pancakeCall,
+/// ramsesV2SwapCallback 等)。名前が分からないフォーク(Pharaoh 等)も受け付ける
+/// よう、fallback は「今スワップ中のプールの形式」で呼び出しを解釈する。
+/// 呼び出し元の確認は全て同じ条件で行う。
 contract DexArbFlashLoan {
-    address public owner;
+    address public immutable owner;
 
     uint160 private constant MIN_SQRT_RATIO = 4295128739;
     uint160 private constant MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
 
-    uint8 public constant KIND_V2 = 0;
-    uint8 public constant KIND_V3 = 1;
+    // Leg.flags のビット。bot が地図から分かっている事をそのまま渡す。
+    uint8 public constant FLAG_V3 = 1;           // V3形式(集中流動性)。無ければV2形式
+    uint8 public constant FLAG_IN_IS_TOKEN0 = 2; // 投入通貨がそのプールの token0
+    uint8 public constant FLAG_HAS_QUOTE = 4;    // プールが getAmountOut を持つ(Solidly系・Camelot等)
 
-    /// @dev 経路の1段。feeBps はV2の手数料(実測値)。V3では使わない。
+    /// @dev 経路の1段。投入通貨は「前の段の出力通貨」(1段目は asset)なので持たない。
+    /// feeBps はV2の手数料(実測値)。V3では使わない。
     struct Leg {
         address pool;
-        address tokenIn;
         address tokenOut;
-        uint8 kind;
+        uint8 flags;
         uint16 feeBps;
     }
 
@@ -87,11 +102,13 @@ contract DexArbFlashLoan {
     /// @dev quoteV3 の結果。QuoterV2 と同じで、わざと失敗させて値を返す。
     error QuoteResult(uint256 amountOut);
 
-    address private activePool;
-    address private activePayToken;
-    bool private inFlashSwap;
-    bool private simulating;
-    bool private quoting;
+    // 取引の間だけ要る印。一時記憶なので取引の終わりに勝手に消える。
+    address private transient activePool;
+    address private transient activePayToken;
+    bool private transient activeIsV3;
+    bool private transient inFlashSwap;
+    bool private transient simulating;
+    bool private transient quoting;
 
     event RouteExecuted(address indexed asset, uint256 amountIn, uint256 profit, uint8 legCount);
     event Withdrawn(address indexed token, uint256 amount);
@@ -111,7 +128,7 @@ contract DexArbFlashLoan {
     }
 
     /// @notice 経路を最後まで実行し、結果を SimulationResult で返して取り消す。
-    /// ガス見積もり(eth_call)で呼び、実際に送信はしない。
+    /// eth_call で呼び、実際に送信はしない。
     function simulateRoute(address asset, uint256 amount, Leg[] calldata legs) external onlyOwner {
         simulating = true;
         _start(asset, amount, legs, 0);
@@ -121,22 +138,20 @@ contract DexArbFlashLoan {
     /// @notice プールを指定して受取量を求める。eth_call 専用で、送信はしない。
     ///
     /// [なぜ要るか(2026年9月17日)]
-    /// Uniswap公式の QuoterV2 は quoteExactInputSingle(tokenIn, tokenOut, fee) の形で、
-    /// 引数にプールのアドレスが無い。中に固定されたファクトリーからアドレスを
-    /// 計算するため、フォークのプールには届かない。botの判定はV3の段に価格表を
-    /// 要求するので、価格表が作れないプールは経路に使えず、Polygonの RamsesX
-    /// (V3 Swapの22%)も Optimism/Base の未監視ファクトリーも取れなかった。
+    /// Uniswap公式の QuoterV2 は引数にプールのアドレスが無く、中に固定された
+    /// ファクトリーからアドレスを計算するため、フォークのプールには届かない。
     /// プールのアドレスを直接受け取れば、ファクトリーを問わず見積もれる。
     /// コールバックは実行と同じものを使うので、対応済みの形式はそのまま扱える。
     ///
-    /// onlyOwner は付けない。eth_call で値を読むだけで資産は動かず、
-    /// 価格表の作成は所有者以外の視点からも行えた方が扱いやすいため。
+    /// onlyOwner は付けない。eth_call で値を読むだけで資産は動かない。
+    /// 引数の形は旧版と同じ(bot の quoteV3ByPoolBatch がそのまま使える)。
     function quoteV3(address pool, address tokenIn, uint256 amountIn) external {
         require(amountIn > 0, "DexArbFlashLoan: zero amount");
         require(!inFlashSwap, "DexArbFlashLoan: reentrant");
         quoting = true;
         activePool = pool;
         activePayToken = tokenIn;
+        activeIsV3 = true;
         bool zeroForOne = IAmmPoolV3(pool).token0() == tokenIn;
         IAmmPoolV3(pool).swap(
             address(this),
@@ -152,30 +167,29 @@ contract DexArbFlashLoan {
     function _start(address asset, uint256 amount, Leg[] calldata legs, uint256 minProfit) internal {
         require(legs.length >= 2 && legs.length <= 4, "DexArbFlashLoan: 2-4 legs");
         require(amount > 0, "DexArbFlashLoan: zero amount");
-        require(legs[0].tokenIn == asset, "DexArbFlashLoan: first leg must start with asset");
         require(legs[legs.length - 1].tokenOut == asset, "DexArbFlashLoan: last leg must end with asset");
-        for (uint256 i = 1; i < legs.length; i++) {
-            require(legs[i].tokenIn == legs[i - 1].tokenOut, "DexArbFlashLoan: legs not connected");
-        }
         require(!inFlashSwap, "DexArbFlashLoan: reentrant");
 
+        Leg calldata first = legs[0];
+        bool firstV3 = first.flags & FLAG_V3 != 0;
         Context memory ctx = Context({
             amountIn: amount,
             assetBefore: IERC20(asset).balanceOf(address(this)),
-            firstOutBefore: IERC20(legs[0].tokenOut).balanceOf(address(this)),
+            // V3は受取量をプールが正確に返すので、残高で測るのはV2の時だけ。
+            firstOutBefore: firstV3 ? 0 : IERC20(first.tokenOut).balanceOf(address(this)),
             minProfit: minProfit
         });
-        bytes memory data = abi.encode(legs, ctx);
+        bytes memory data = abi.encode(asset, legs, ctx);
 
         inFlashSwap = true;
-        activePool = legs[0].pool;
+        activePool = first.pool;
+        activeIsV3 = firstV3;
 
-        if (legs[0].kind == KIND_V2) {
-            _borrowFromV2(legs[0], amount, data);
-        } else if (legs[0].kind == KIND_V3) {
-            _borrowFromV3(legs[0].pool, asset, amount, data);
+        if (firstV3) {
+            activePayToken = asset;
+            _callV3Swap(first.pool, first.flags & FLAG_IN_IS_TOKEN0 != 0, amount, data);
         } else {
-            revert("DexArbFlashLoan: unknown pool kind");
+            _borrowFromV2(first, asset, amount, data);
         }
 
         require(!inFlashSwap, "DexArbFlashLoan: callback not received");
@@ -184,63 +198,71 @@ contract DexArbFlashLoan {
     }
 
     /// @dev プールの準備量を、入力側・出力側の順で返す。
-    function _reserves(address pool, address tokenIn) internal view returns (uint256 rIn, uint256 rOut, bool inIsToken0) {
+    function _reserves(address pool, bool inIsToken0) internal view returns (uint256 rIn, uint256 rOut) {
         (uint112 r0, uint112 r1, ) = IAmmPoolV2(pool).getReserves();
-        inIsToken0 = IAmmPoolV2(pool).token0() == tokenIn;
         rIn = inIsToken0 ? r0 : r1;
         rOut = inIsToken0 ? r1 : r0;
     }
 
-    /// @dev V2の受取量。プール自身が計算できればそれを使い、無ければ計算式で求める。
-    function _v2Quote(address pool, address tokenIn, uint256 amountIn, uint16 feeBps, uint256 rIn, uint256 rOut)
+    /// @dev V2の受取量。プール自身が計算できる(flags で指定)ならそれを使い、無ければ計算式で求める。
+    function _v2Quote(Leg memory leg, address tokenIn, uint256 amountIn, uint256 rIn, uint256 rOut)
         internal view returns (uint256)
     {
-        try IAmmQuoteV2(pool).getAmountOut(amountIn, tokenIn) returns (uint256 out) {
-            if (out > 0) return out;
-        } catch {}
-        if (rIn == 0 || rOut == 0 || feeBps >= 10000) return 0;
-        uint256 inWithFee = amountIn * (10000 - feeBps);
+        if (leg.flags & FLAG_HAS_QUOTE != 0) {
+            try IAmmQuoteV2(leg.pool).getAmountOut(amountIn, tokenIn) returns (uint256 out) {
+                if (out > 0) return out;
+            } catch {}
+        }
+        if (rIn == 0 || rOut == 0 || leg.feeBps >= 10000) return 0;
+        uint256 inWithFee = amountIn * (10000 - leg.feeBps);
         return (inWithFee * rOut) / (rIn * 10000 + inWithFee);
     }
 
     /// @dev V2プールから、1段目の出力通貨を支払わずに先に受け取る。
     /// 受け取る量は、今の準備量から計算した「投入額に見合う量」。
-    function _borrowFromV2(Leg calldata leg, uint256 amount, bytes memory data) internal {
-        (uint256 rIn, uint256 rOut, bool inIsToken0) = _reserves(leg.pool, leg.tokenIn);
-        uint256 out = _v2Quote(leg.pool, leg.tokenIn, amount, leg.feeBps, rIn, rOut);
+    function _borrowFromV2(Leg calldata leg, address tokenIn, uint256 amount, bytes memory data) internal {
+        bool inIsToken0 = leg.flags & FLAG_IN_IS_TOKEN0 != 0;
+        (uint256 rIn, uint256 rOut) = _reserves(leg.pool, inIsToken0);
+        uint256 out = _v2Quote(leg, tokenIn, amount, rIn, rOut);
         require(out > 0, "DexArbFlashLoan: zero output");
         IAmmPoolV2(leg.pool).swap(inIsToken0 ? 0 : out, inIsToken0 ? out : 0, address(this), data);
     }
 
-    function _borrowFromV3(address pool, address asset, uint256 amount, bytes memory data) internal {
-        bool zeroForOne = IAmmPoolV3(pool).token0() == asset;
-        IAmmPoolV3(pool).swap(
+    /// @dev V3のスワップ。受け取った量(プールが返す負の delta)を返す。
+    function _callV3Swap(address pool, bool zeroForOne, uint256 amountIn, bytes memory data)
+        internal returns (uint256 received)
+    {
+        (int256 a0, int256 a1) = IAmmPoolV3(pool).swap(
             address(this),
             zeroForOne,
-            int256(amount),
+            int256(amountIn),
             zeroForOne ? MIN_SQRT_RATIO + 1 : MAX_SQRT_RATIO - 1,
             data
         );
+        int256 r = zeroForOne ? -a1 : -a0;
+        received = r > 0 ? uint256(r) : 0;
     }
 
     /// @dev 最初のプールから受け取った後に呼ばれる本体。
-    function _runRouteAndRepay(bytes memory data, uint256 v3Owed) internal {
-        (Leg[] memory legs, Context memory ctx) = abi.decode(data, (Leg[], Context));
+    /// v3Received は1段目がV3の時にコールバックが受け取った量(V2なら0で、残高で測る)。
+    function _runRouteAndRepay(bytes memory data, uint256 v3Owed, uint256 v3Received) internal {
+        (address asset, Leg[] memory legs, Context memory ctx) = abi.decode(data, (address, Leg[], Context));
         inFlashSwap = false;
 
-        uint256 running = IERC20(legs[0].tokenOut).balanceOf(address(this)) - ctx.firstOutBefore;
+        uint256 running = v3Received > 0
+            ? v3Received
+            : IERC20(legs[0].tokenOut).balanceOf(address(this)) - ctx.firstOutBefore;
         require(running > 0, "DexArbFlashLoan: nothing received");
 
+        address tokenIn = legs[0].tokenOut;
         for (uint256 i = 1; i < legs.length; i++) {
-            running = _swapLeg(legs[i], running);
+            running = _swapLeg(legs[i], tokenIn, running);
+            tokenIn = legs[i].tokenOut;
         }
 
-        _repayAndReport(legs, ctx, v3Owed);
-    }
-
-    function _repayAndReport(Leg[] memory legs, Context memory ctx, uint256 v3Owed) internal {
-        uint256 owed = legs[0].kind == KIND_V3 ? v3Owed : ctx.amountIn;
-        address asset = legs[0].tokenIn;
+        uint256 owed = legs[0].flags & FLAG_V3 != 0 ? v3Owed : ctx.amountIn;
+        // 戻ってきた量は実際の残高で測る(最終段が税トークンでも、自分の残高から
+        // 返済してしまわないため)。
         uint256 returned = IERC20(asset).balanceOf(address(this)) - ctx.assetBefore;
         if (simulating) revert SimulationResult(returned, owed);
         require(returned >= owed + ctx.minProfit, "DexArbFlashLoan: not profitable, reverting");
@@ -248,32 +270,33 @@ contract DexArbFlashLoan {
         emit RouteExecuted(asset, ctx.amountIn, returned - owed, uint8(legs.length));
     }
 
-    /// @dev 1段をスワップし、実際に受け取った量を返す(残高の差分で測る)。
-    function _swapLeg(Leg memory leg, uint256 amountIn) internal returns (uint256) {
+    /// @dev 1段をスワップし、受け取った量を返す。V3はプールが返す量、V2は残高の差分。
+    function _swapLeg(Leg memory leg, address tokenIn, uint256 amountIn) internal returns (uint256 received) {
         require(amountIn > 0, "DexArbFlashLoan: zero input");
-        uint256 before = IERC20(leg.tokenOut).balanceOf(address(this));
-
-        if (leg.kind == KIND_V2) {
-            _swapV2(leg, amountIn);
-        } else if (leg.kind == KIND_V3) {
-            _swapV3(leg.pool, leg.tokenIn, amountIn);
+        bool inIsToken0 = leg.flags & FLAG_IN_IS_TOKEN0 != 0;
+        if (leg.flags & FLAG_V3 != 0) {
+            address prevPool = activePool;
+            address prevToken = activePayToken;
+            bool prevV3 = activeIsV3;
+            activePool = leg.pool;
+            activePayToken = tokenIn;
+            activeIsV3 = true;
+            received = _callV3Swap(leg.pool, inIsToken0, amountIn, new bytes(0));
+            activePool = prevPool;
+            activePayToken = prevToken;
+            activeIsV3 = prevV3;
         } else {
-            revert("DexArbFlashLoan: unknown pool kind");
+            // V2は送った後にプールへ実際に届いた量で受取量を計算する
+            // (送金時に税を取るトークンでも失敗しない)。
+            uint256 before = IERC20(leg.tokenOut).balanceOf(address(this));
+            (uint256 rIn, uint256 rOut) = _reserves(leg.pool, inIsToken0);
+            _safeTransfer(tokenIn, leg.pool, amountIn);
+            uint256 out = _v2Quote(leg, tokenIn, _arrived(tokenIn, leg.pool, rIn, amountIn), rIn, rOut);
+            require(out > 0, "DexArbFlashLoan: zero output");
+            IAmmPoolV2(leg.pool).swap(inIsToken0 ? 0 : out, inIsToken0 ? out : 0, address(this), new bytes(0));
+            received = IERC20(leg.tokenOut).balanceOf(address(this)) - before;
         }
-
-        uint256 received = IERC20(leg.tokenOut).balanceOf(address(this)) - before;
         require(received > 0, "DexArbFlashLoan: insufficient output");
-        return received;
-    }
-
-    /// @dev V2のスワップ。送った後にプールへ実際に届いた量で受取量を計算する
-    /// (送金時に税を取るトークンでも失敗しない)。
-    function _swapV2(Leg memory leg, uint256 amountIn) internal {
-        (uint256 rIn, uint256 rOut, bool inIsToken0) = _reserves(leg.pool, leg.tokenIn);
-        _safeTransfer(leg.tokenIn, leg.pool, amountIn);
-        uint256 out = _v2Quote(leg.pool, leg.tokenIn, _arrived(leg.tokenIn, leg.pool, rIn, amountIn), leg.feeBps, rIn, rOut);
-        require(out > 0, "DexArbFlashLoan: zero output");
-        IAmmPoolV2(leg.pool).swap(inIsToken0 ? 0 : out, inIsToken0 ? out : 0, address(this), new bytes(0));
     }
 
     /// @dev プールに実際に届いた量(送った量を上限とする)。
@@ -283,23 +306,6 @@ contract DexArbFlashLoan {
         if (arrived > sent) arrived = sent;
         require(arrived > 0, "DexArbFlashLoan: nothing arrived");
         return arrived;
-    }
-
-    function _swapV3(address pool, address tokenIn, uint256 amountIn) internal {
-        bool zeroForOne = IAmmPoolV3(pool).token0() == tokenIn;
-        address prevPool = activePool;
-        address prevToken = activePayToken;
-        activePool = pool;
-        activePayToken = tokenIn;
-        IAmmPoolV3(pool).swap(
-            address(this),
-            zeroForOne,
-            int256(amountIn),
-            zeroForOne ? MIN_SQRT_RATIO + 1 : MAX_SQRT_RATIO - 1,
-            new bytes(0)
-        );
-        activePool = prevPool;
-        activePayToken = prevToken;
     }
 
     /// @dev 戻り値の無いトークン(USDT等)にも対応した送金。
@@ -323,7 +329,7 @@ contract DexArbFlashLoan {
         if (data.length == 0) return;
         require(sender == address(this), "DexArbFlashLoan: unexpected initiator");
         require(msg.sender == activePool && inFlashSwap, "DexArbFlashLoan: unexpected callback");
-        _runRouteAndRepay(data, 0);
+        _runRouteAndRepay(data, 0, 0);
     }
 
     function uniswapV2Call(address sender, uint256, uint256, bytes calldata data) external {
@@ -339,17 +345,9 @@ contract DexArbFlashLoan {
         _onV2Callback(sender, data);
     }
 
-    /// @dev 名前の分からないV2フォークのコールバック(ApeSwap等)。
-    /// 形が (address, uint256, uint256, bytes) の呼び出しを同じ条件で処理する。
-    fallback() external {
-        require(msg.data.length >= 4 + 32 * 4, "DexArbFlashLoan: unknown call");
-        (address sender, , , bytes memory data) = abi.decode(msg.data[4:], (address, uint256, uint256, bytes));
-        _onV2Callback(sender, data);
-    }
-
     // ===== V3形式のコールバック =====
 
-    function _onV3Callback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) internal {
+    function _onV3Callback(int256 amount0Delta, int256 amount1Delta, bytes memory data) internal {
         require(msg.sender == activePool, "DexArbFlashLoan: unexpected callback");
         int256 owedSigned = amount0Delta > 0 ? amount0Delta : amount1Delta;
         require(owedSigned > 0, "DexArbFlashLoan: nothing owed");
@@ -366,7 +364,8 @@ contract DexArbFlashLoan {
             return;
         }
         require(inFlashSwap, "DexArbFlashLoan: not in flash swap");
-        _runRouteAndRepay(data, owed);
+        int256 recv = amount0Delta < 0 ? -amount0Delta : -amount1Delta;
+        _runRouteAndRepay(data, owed, recv > 0 ? uint256(recv) : 0);
     }
 
     function uniswapV3SwapCallback(int256 a0, int256 a1, bytes calldata data) external {
@@ -377,6 +376,26 @@ contract DexArbFlashLoan {
     }
     function algebraSwapCallback(int256 a0, int256 a1, bytes calldata data) external {
         _onV3Callback(a0, a1, data);
+    }
+    /// @dev Ramses 系(Pharaoh の元)の名前。
+    function ramsesV2SwapCallback(int256 a0, int256 a1, bytes calldata data) external {
+        _onV3Callback(a0, a1, data);
+    }
+
+    /// @dev 名前の分からないフォークのコールバック。今スワップ中のプールの形式で解釈する。
+    /// V3形式なら (int256, int256, bytes)、V2形式なら (address, uint256, uint256, bytes)。
+    /// 呼び出し元がスワップ中のプールである事は、どちらの道でも同じ条件で確かめる
+    /// (スワップ中でなければ activePool は 0 なので、誰が呼んでも通らない)。
+    fallback() external {
+        if (activeIsV3) {
+            require(msg.data.length >= 4 + 32 * 3, "DexArbFlashLoan: unknown call");
+            (int256 a0, int256 a1, bytes memory data) = abi.decode(msg.data[4:], (int256, int256, bytes));
+            _onV3Callback(a0, a1, data);
+        } else {
+            require(msg.data.length >= 4 + 32 * 4, "DexArbFlashLoan: unknown call");
+            (address sender, , , bytes memory data) = abi.decode(msg.data[4:], (address, uint256, uint256, bytes));
+            _onV2Callback(sender, data);
+        }
     }
 
     // ===== 残高確認と引き出し =====

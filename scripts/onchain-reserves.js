@@ -380,7 +380,9 @@ export async function probePoolFeeBps({ chain, pairAddress, tokenInAddress, rese
           if (amountOut > 0n && ideal > 0n) {
             const feeBps = Number(((ideal - amountOut) * 10000n) / ideal);
             if (feeBps >= 0 && feeBps <= MAX_FEE_BPS) {
-              feeProbeState.set(key, { fee: feeBps });
+              // byAmountOut: このプールは getAmountOut を持つ。コントラクトの
+              // Leg.flags(FLAG_HAS_QUOTE)に使う(poolHasAmountOut)。
+              feeProbeState.set(key, { fee: feeBps, byAmountOut: true });
               feeProbeStats.byAmountOut++;
               if (feeBps !== 30) feeProbeStats.non30++;
               return feeBps;
@@ -422,6 +424,15 @@ export async function probePoolFeeBps({ chain, pairAddress, tokenInAddress, rese
   } finally {
     feeProbeActive.set(chain, (feeProbeActive.get(chain) || 1) - 1);
   }
+}
+
+/// そのプールが getAmountOut を持つ(手数料の実測がそれで取れた)かどうか。
+/// ガス削減版コントラクトの Leg.flags(FLAG_HAS_QUOTE)に使う。分からなければ
+/// false で、コントラクトは準備量と手数料から計算する(旧版と同じ動き)。
+export function poolHasAmountOut(chain, address) {
+  if (!address) return false;
+  const state = feeProbeState.get(feeKey(chain, address));
+  return !!(state && state.byAmountOut);
 }
 
 export function getFeeProbeStats() {
