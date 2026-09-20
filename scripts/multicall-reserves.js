@@ -18,7 +18,7 @@
 // タイムアウト・待ち行列・RPC自動切り替えがそのまま適用される。
 
 import { ethers } from "ethers";
-import { callWithRpc } from "./onchain-reserves.js";
+import { callWithRpc, readBlockTag } from "./onchain-reserves.js";
 
 export const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11";
 
@@ -70,7 +70,8 @@ async function multicall(chain, calls, priority = false) {
   multicallStats.calls++;
   multicallStats.subcalls += calls.length;
   return callWithRpc(chain, (provider) =>
-    new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider).aggregate3(calls), priority);
+    // Flashblocks のチェーンでは確定前(pending)の状態を読む。他は latest(今までどおり)。
+    new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider).aggregate3(calls, { blockTag: readBlockTag(chain) }), priority);
 }
 
 /// 失敗したら半分に割って再試行する。1件まで割っても失敗した分は null。

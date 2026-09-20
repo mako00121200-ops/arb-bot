@@ -29,6 +29,7 @@
 
 // 識別子を計算で求めるために読み込む(このファイルで使うのはこれだけ)。
 import { ethers } from "ethers";
+import { callWithRpc, isPendingReadChain } from "./scripts/onchain-reserves.js";
 
 // 識別子は手で書かない。過去に1文字欠けたまま気づかず、最初期から一度も
 // 受信できていなかった。署名の文字列だけを書き、ハッシュは計算させる。
@@ -110,11 +111,139 @@ let globalOnSync = null;
 let globalOnV3Swap = null;
 let globalOnV3Liquidity = null;
 
+// ===== 確定前(pending)のイベントの取得(2026年9月20日) =====
+//
+// [なぜ要るか]
+// WebSocket の logs 購読はブロック確定(Optimism は2秒)まで届かない。
+// Chainstack の Optimism 端点は Flashblocks を「標準 RPC の pending ブロック」として
+// 見せる(起動時の確認: pending の取引数が 250ms ごとに増え、eth_getLogs(pending) が
+// 1回で取れる)。そこで pending のイベントを一定間隔で取りに行き、確定を待たずに
+// 判定へ回す。Optimism は先着順なので、確定前に検知できれば同じブロックの後ろに
+// 自分の取引が入る(「1ブロック遅い」の解消)。
+//
+// [重複の扱い]
+// 同じイベントは、pending で複数回(取引が増えるたび)、そして確定後に logs 購読で
+// もう一度届く。txHash と logIndex で覚えておき、2回目以降は判定に回さない。
+// 確定後に届いた時は「先読みできた時間」(確定より何ms早く見えたか)を記録する。
+//
+// [RPC の消費]
+// 1回の取得 = 1リクエスト。400ms 間隔で 1日約216,000、月約650万(枠2,000万の3割)。
+// FLASHBLOCKS_POLL_MS で調整できる。監視対象が無いチェーンや、pending を読まない
+// チェーン(FLASHBLOCKS_PENDING_CHAINS に無い)では動かない。
+const FLASHBLOCKS_POLL_MS = parseInt(process.env.FLASHBLOCKS_POLL_MS || "400", 10);
+const SEEN_LOG_LIMIT = 20000;
+const seenLogs = {};           // chain -> Map(key -> pendingSeenAt)
+const pendingTimers = {};      // chain -> interval
+const pendingInFlight = {};    // chain -> bool
+const pendingStats = {};       // chain -> { polls, errors, events, sealedHits, leadTotalMs, leadMaxMs }
+
+function pendingStatsFor(chain) {
+  if (!pendingStats[chain]) pendingStats[chain] = { polls: 0, errors: 0, events: 0, sealedHits: 0, leadTotalMs: 0, leadMaxMs: 0 };
+  return pendingStats[chain];
+}
+
+/// 見たことのあるイベントか。初見なら覚えて false、既知なら true。
+function rememberLog(chainName, log, seenAt, source) {
+  if (!log?.transactionHash || log.logIndex == null) return false;
+  const key = `${log.transactionHash}:${log.logIndex}`;
+  let map = seenLogs[chainName];
+  if (!map) { map = new Map(); seenLogs[chainName] = map; }
+  const prev = map.get(key);
+  if (prev != null) {
+    if (source === "sealed" && prev.source === "pending" && !prev.sealedAt) {
+      prev.sealedAt = seenAt;
+      const st = pendingStatsFor(chainName);
+      const lead = seenAt - prev.at;
+      st.sealedHits++;
+      st.leadTotalMs += lead;
+      if (lead > st.leadMaxMs) st.leadMaxMs = lead;
+    }
+    return true;
+  }
+  map.set(key, { at: seenAt, source, sealedAt: null });
+  if (map.size > SEEN_LOG_LIMIT) {
+    // 古い順に半分捨てる(Map は挿入順)。
+    let n = 0;
+    for (const k of map.keys()) { map.delete(k); if (++n >= SEEN_LOG_LIMIT / 2) break; }
+  }
+  return false;
+}
+
+/// 1件のイベントを判定へ回す。source は "sealed"(確定後の購読)か "pending"(確定前の取得)。
+function dispatchLog(chainName, log, receivedAt, source) {
+  if (rememberLog(chainName, log, receivedAt, source)) return;
+  const topic = (log.topics && log.topics[0]) || "";
+  const address = (log.address || "").toLowerCase();
+  if (!address) return;
+  if (source === "pending") pendingStatsFor(chainName).events++;
+
+  if (topic === SYNC_TOPIC) {
+    chainV2Counts[chainName] = (chainV2Counts[chainName] || 0) + 1;
+    const decoded = decodeSyncData(log.data);
+    if (decoded && globalOnSync) {
+      globalOnSync(chainName, address, decoded.reserve0, decoded.reserve1, receivedAt);
+    }
+  } else if (V3_SWAP_TOPICS.has(topic)) {
+    chainV3Counts[chainName] = (chainV3Counts[chainName] || 0) + 1;
+    const decoded = decodeV3SwapData(log.data);
+    if (decoded && globalOnV3Swap) {
+      globalOnV3Swap(chainName, address, decoded.sqrtPriceX96, decoded.liquidity, receivedAt);
+    }
+  } else if (topic === V3_MINT_TOPIC || topic === V3_BURN_TOPIC) {
+    chainLiquidityCounts[chainName] = (chainLiquidityCounts[chainName] || 0) + 1;
+    if (globalOnV3Liquidity) {
+      globalOnV3Liquidity(chainName, address, topic === V3_MINT_TOPIC ? "mint" : "burn");
+    }
+  }
+}
+
+/// pending のイベントを一定間隔で取りに行く。監視対象が決まった後に始める。
+function startPendingPolling(chainName) {
+  if (!isPendingReadChain(chainName) || pendingTimers[chainName]) return;
+  if (!(FLASHBLOCKS_POLL_MS > 0)) return;
+  console.log(`[Flashblocks/pending] ${chainName}: 確定前のイベントを ${FLASHBLOCKS_POLL_MS}ms ごとに取りに行きます`);
+  pendingTimers[chainName] = setInterval(async () => {
+    if (pendingInFlight[chainName]) return;
+    const addresses = chainAddresses[chainName] || [];
+    if (addresses.length === 0) return;
+    pendingInFlight[chainName] = true;
+    const st = pendingStatsFor(chainName);
+    try {
+      st.polls++;
+      const logs = await callWithRpc(chainName, (p) =>
+        p.send("eth_getLogs", [{ fromBlock: "pending", toBlock: "pending", address: addresses, topics: [ALL_TOPICS] }]), true);
+      const receivedAt = Date.now();
+      if (Array.isArray(logs) && logs.length > 0) {
+        chainLastEventAt[chainName] = receivedAt;
+        for (const log of logs) dispatchLog(chainName, log, receivedAt, "pending");
+      }
+    } catch (e) {
+      st.errors++;
+      if (st.errors <= 3 || st.errors % 100 === 0) {
+        console.warn(`[Flashblocks/pending] ${chainName}: 取得に失敗(通算${st.errors}回): ${(e.message || "").slice(0, 80)}`);
+      }
+    } finally {
+      pendingInFlight[chainName] = false;
+    }
+  }, FLASHBLOCKS_POLL_MS);
+}
+
+/// 先読みの統計(生存ログ用)。
+export function getPendingStats() {
+  const out = {};
+  for (const [chain, st] of Object.entries(pendingStats)) {
+    out[chain] = { ...st, leadAvgMs: st.sealedHits ? Math.round(st.leadTotalMs / st.sealedHits) : null };
+  }
+  return out;
+}
+
 /// 監視対象のアドレスを登録する。接続済みなら購読をやり直す。
 export function setWatchedAddresses(chain, addresses) {
   chainAddresses[chain] = addresses.map((a) => a.toLowerCase());
   const socket = chainSockets[chain];
   if (socket && socket.readyState === 1) sendSubscription(chain);
+  // pending を読むチェーンは、監視対象が決まったら確定前のイベントも取りに行く。
+  if (chainAddresses[chain].length > 0) startPendingPolling(chain);
 }
 
 function sendSubscription(chainName) {
@@ -186,28 +315,7 @@ function connectChain(chainName, wsUrl) {
         chainLastEventAt[chainName] = receivedAt;
         chainEventCounts[chainName] = (chainEventCounts[chainName] || 0) + 1;
 
-        const log = msg.params.result;
-        const topic = (log.topics && log.topics[0]) || "";
-        const address = log.address.toLowerCase();
-
-        if (topic === SYNC_TOPIC) {
-          chainV2Counts[chainName] = (chainV2Counts[chainName] || 0) + 1;
-          const decoded = decodeSyncData(log.data);
-          if (decoded && globalOnSync) {
-            globalOnSync(chainName, address, decoded.reserve0, decoded.reserve1, receivedAt);
-          }
-        } else if (V3_SWAP_TOPICS.has(topic)) {
-          chainV3Counts[chainName] = (chainV3Counts[chainName] || 0) + 1;
-          const decoded = decodeV3SwapData(log.data);
-          if (decoded && globalOnV3Swap) {
-            globalOnV3Swap(chainName, address, decoded.sqrtPriceX96, decoded.liquidity, receivedAt);
-          }
-        } else if (topic === V3_MINT_TOPIC || topic === V3_BURN_TOPIC) {
-          chainLiquidityCounts[chainName] = (chainLiquidityCounts[chainName] || 0) + 1;
-          if (globalOnV3Liquidity) {
-            globalOnV3Liquidity(chainName, address, topic === V3_MINT_TOPIC ? "mint" : "burn");
-          }
-        }
+        dispatchLog(chainName, msg.params.result, receivedAt, "sealed");
       } catch (e) {}
     });
 

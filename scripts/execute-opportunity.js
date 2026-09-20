@@ -28,7 +28,7 @@
 
 import { ethers } from "ethers";
 import { getChainConfig } from "../chain-config.js";
-import { getProviderForChain, callWithRpc, poolHasAmountOut } from "./onchain-reserves.js";
+import { getProviderForChain, callWithRpc, poolHasAmountOut, readBlockTag, isPendingReadChain } from "./onchain-reserves.js";
 import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
 import { recordRealExecution } from "./real-execution-log.js";
 import { estimateGasCostUsd, gasUnitsToUsd, weiToUsd, getEstimatedGasPriceWei, recordActualGasPrice, isOpStackChain, estimateL1FeeWei, readL1FeeFromReceipt, recordActualL1Fee } from "./gas-cost.js";
@@ -329,7 +329,8 @@ function buildLegArgs(chain, opp, version) {
 async function simulate(chain, contractAddress, from, asset, amountIn, legArgs, iface) {
   const data = iface.encodeFunctionData("simulateRoute", [asset, amountIn, legArgs]);
   try {
-    await callWithRpc(chain, (p) => p.call({ to: contractAddress, from, data }), true);
+    // Flashblocks のチェーンでは確定前(pending)の状態で確認する(判定に使った状態と揃える)。
+    await callWithRpc(chain, (p) => p.call({ to: contractAddress, from, data, blockTag: readBlockTag(chain) }), true);
     return { error: "結果が返りませんでした" };
   } catch (e) {
     const revertData = e?.data ?? e?.info?.error?.data ?? e?.error?.data ?? null;
@@ -443,7 +444,14 @@ async function executeOpportunityInner(opp) {
   const contract = new ethers.Contract(contractAddress, contractVersion.abi, signer);
   let gasUnits;
   try {
-    gasUnits = await contract.executeRoute.estimateGas(asset, amountIn, legArgs, minProfit);
+    if (isPendingReadChain(chain)) {
+      // ethers の estimateGas はブロックの指定を送らないので、pending を明示して生で呼ぶ。
+      const callData = contract.interface.encodeFunctionData("executeRoute", [asset, amountIn, legArgs, minProfit]);
+      const hex = await callWithRpc(chain, (p) => p.send("eth_estimateGas", [{ from: wallet.address, to: contractAddress, data: callData }, "pending"]), true);
+      gasUnits = BigInt(hex);
+    } else {
+      gasUnits = await contract.executeRoute.estimateGas(asset, amountIn, legArgs, minProfit);
+    }
   } catch (e) {
     const msg = (e?.shortMessage || e?.message || "").slice(0, 160);
     markRouteRejected(opp);
