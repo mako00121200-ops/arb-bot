@@ -1914,6 +1914,12 @@ function startServer() {
   // 画面は「あれば便利なもの」で、botの本体ではない。必ず捕まえる。
   http.createServer((req, res) => {
     try {
+      // 生きているかだけを確かめる軽い入口。画面が真っ白な時の切り分けに使う。
+      if (req.url === "/ping") {
+        res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end(`ok ${new Date().toISOString()}\n`);
+        return;
+      }
       const body = req.url === "/about" ? renderAbout() : renderPage();
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(body);
@@ -1927,6 +1933,40 @@ function startServer() {
       } catch (inner) {}
     }
   }).listen(port, () => console.log(`ダッシュボード: ポート${port}`));
+
+  // ===== 画面の自己点検(2026年9月20日) =====
+  //
+  // [なぜ要るか]
+  // 「画面が真っ白」と報告されたが、Railway の記録では応答は全て 200 で、
+  // サーバー側にエラーのログも無かった。この砂場からは本番の画面を取れないため、
+  // **bot 自身に自分の画面を取りに行かせて**、中身が壊れていないかを記録する。
+  // 送り出す直前の姿がそのまま分かるので、原因が中身か経路かを切り分けられる。
+  // 自分自身への接続なので費用も外部への通信も発生しない。
+  const check = () => {
+    const started = Date.now();
+    const req = http.get({ host: "127.0.0.1", port, path: "/", timeout: 10000 }, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => { body += c; });
+      res.on("end", () => {
+        const bytes = Buffer.byteLength(body, "utf8");
+        const closed = body.trimEnd().endsWith("</html>");
+        const opens = (body.match(/<!--/g) || []).length;
+        const closes = (body.match(/-->/g) || []).length;
+        const broken = !closed || bytes < 2000 || opens !== closes;
+        const line = `[画面の自己点検] ${res.statusCode} / ${bytes.toLocaleString()}バイト / 末尾${closed ? "正常" : "欠け"} / コメント${opens}:${closes} / ${Date.now() - started}ms`;
+        if (broken) {
+          console.error(`${line} ← 壊れています。先頭120字: ${JSON.stringify(body.slice(0, 120))} / 末尾120字: ${JSON.stringify(body.slice(-120))}`);
+        } else {
+          console.log(line);
+        }
+      });
+    });
+    req.on("timeout", () => { req.destroy(); console.error("[画面の自己点検] 10秒以内に応答がありません"); });
+    req.on("error", (e) => console.error(`[画面の自己点検] 取得に失敗: ${e.message}`));
+  };
+  setTimeout(check, 20000);
+  setInterval(check, 10 * 60 * 1000);
 }
 
 async function main() {
