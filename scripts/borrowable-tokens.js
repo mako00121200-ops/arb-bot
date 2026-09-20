@@ -48,6 +48,18 @@ const KNOWN_TOKENS = {
     "0x94b008aa00579c1307b0ef2c499ad98a8ce58e58": { symbol: "USDT", decimals: 6, stable: true },
     "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1": { symbol: "DAI", decimals: 18, stable: true },
     "0x4200000000000000000000000000000000000006": { symbol: "WETH", decimals: 18, priceHintUsd: 2600 },
+    // [2026年9月20日に追加]
+    // 住所は推測ではなく、チェーン上のイベント調査(pool-scout.js)で実際に
+    // 取引のあったプールから読み取ったもの。この2つを相手にするプールが
+    // 未採用の上位を占めていた(USDC/WBTC 491回、wstETH/WETH 442回、
+    // WETH/WBTC 351回・312回、USDC/wstETH 240回 / いずれも100分間)。
+    // Optimism の最小の壁は既に1bpsまで下がっており、足りないのは
+    // 「値動きのある深いペア」。この2つがまさにそれにあたる。
+    // 桁数は起動時にチェーンと突き合わせる(loadTokenDecimals の桁数の照合)。
+    // priceHintUsd は探索候補の深さを測る目安にしか使わず、判定に使う価格は
+    // プールから導出する。
+    "0x68f180fcce6836688e9084f035309e29bf0a2095": { symbol: "WBTC", decimals: 8, priceHintUsd: 95000 },
+    "0x1f32b1c2345538c0c6f582fcb022739c4a194ebb": { symbol: "wstETH", decimals: 18, priceHintUsd: 3100 },
   },
   avalanche: {
     "0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e": { symbol: "USDC", decimals: 6, stable: true },
