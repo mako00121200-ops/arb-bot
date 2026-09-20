@@ -35,7 +35,7 @@ import { estimateGasCostUsd, gasUnitsToUsd, weiToUsd, getEstimatedGasPriceWei, r
 import { getTokenDecimals, getTokenPriceUsd, getPool, KIND_V3 } from "./pool-registry.js";
 import { quoteV3ByPoolBatch, fetchReservesBatch } from "./multicall-reserves.js";
 import { clearQuoteTable, quoteV3Exact, isForkFactory } from "./v3-pools.js";
-import { markRouteRejected, markRouteConfirmed } from "./opportunity-scanner.js";
+import { markRouteRejected, markRouteConfirmed, notePoolBlame } from "./opportunity-scanner.js";
 import { scheduleCompetitorCheck } from "./competitor-check.js";
 
 // ===== 赤字と確定した経路の、段ごとの答え合わせ(2026年9月19日に追加) =====
@@ -140,6 +140,10 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
     ? ` ← ${worst.i + 1}段目 ${worst.leg.dexId}:${worst.leg.pool.slice(0, 10)}… が原因`
     : "";
   console.log(`[段ごとの答え合わせ] ${chain} ${opp.label} 投入${opp.amountIn}: ${parts.join(" / ")}${blame}`);
+  // 犯人が名指しできた時だけ記録する。繰り返せば一時除外される。
+  if (blame) {
+    try { notePoolBlame(chain, worst.leg.pool, worst.diff); } catch (e) {}
+  }
 }
 
 // ===== 送信用の署名者(チェーンごとに1つ、nonceを手元で管理)=====
@@ -169,7 +173,13 @@ function getSigner(chain, privateKey) {
 }
 
 /// 送信に失敗した後に呼ぶ。手元の nonce を鎖上の値に合わせ直す。
-function resetNonce(chain) {
+/// [制限時間超過にも要る(2026年9月20日の実測)]
+/// 20秒の制限時間は index.js 側の Promise.race で発生するため、ここの
+/// send / wait の catch を通らず、reset() が走らなかった。手元の nonce が
+/// 1つ進んだままになり、その送信が未確定のまま消えると、以降の送信が
+/// 全部その番号待ちで詰まる。旧コードは送信のたびに nonce を読み直して
+/// いたので自然に直っていた。index.js の失敗処理からも呼べるように公開する。
+export function resetNonce(chain) {
   const entry = signers.get((chain || "").toLowerCase());
   if (entry) { try { entry.signer.reset(); } catch (e) {} }
 }

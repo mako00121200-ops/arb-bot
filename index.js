@@ -59,7 +59,7 @@ import {
   getNearMissStats, countIfWallDrops, getWallBreakdown, NEAR_MISS_REACHABLE_WALL_BPS,
   getWhatIfProfit, getSpotScreenStats, takeQuoteDemand, getQuoteDemandTotal,
 } from "./scripts/opportunity-scanner.js";
-import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS } from "./scripts/execute-opportunity.js";
+import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS, resetNonce } from "./scripts/execute-opportunity.js";
 import {
   getKnownTokens, isBorrowable,
   markUsableStart, clearUsableStarts, countUsableStarts,
@@ -1300,6 +1300,9 @@ async function handleOpportunity(opp, meta = {}) {
     const stage = e instanceof ExecutionError ? e.stage : "unknown";
     console.warn(`[実行] 失敗(${stage}): ${msg}`);
     noteExecutionFailure(opp, e);
+    // 制限時間超過など、送信側の catch を通らない失敗でも手元の nonce を
+    // 鎖上の値に合わせ直す。放置すると以降の送信が詰まる。
+    try { resetNonce(opp.chain); } catch (inner) {}
     record(opp, "failed", { ...meta, error: msg, stage });
   } finally {
     executing.delete(key);
