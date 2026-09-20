@@ -32,7 +32,7 @@ import http from "http";
 import fs from "fs";
 import path from "path";
 import { ethers } from "ethers";
-import { startOnchainFeeds, getSyncStats, isChainWsEnabled, isChainHealthy, setWatchedAddresses } from "./dex-onchain-realtime.js";
+import { startOnchainFeeds, getSyncStats, isChainWsEnabled, isChainHealthy, setWatchedAddresses, getPendingStats } from "./dex-onchain-realtime.js";
 import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
 import { runPoolSurvey } from "./scripts/pool-survey.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
@@ -1441,6 +1441,9 @@ function heartbeat() {
   const queued = Object.entries(rpc).filter(([, v]) => v.queued > 0).map(([c, v]) => `${c}:${v.normalQueued}`).join(" ");
   const stageLine = Object.entries(failStages).map(([k, v]) => `${k}:${v}`).join(" ") || "なし";
   const sync = getSyncStats();
+  // 確定前(pending)のイベントの先読み統計。取れているチェーンだけ出す。
+  const pendingLine = Object.entries(getPendingStats()).filter(([, p]) => p.polls > 0).map(([c, p]) =>
+    `${c}:事前${p.events}件 確定で照合${p.sealedHits}件 先行平均${p.leadAvgMs ?? "-"}ms(最大${p.leadMaxMs}ms) 取得${p.polls}回 失敗${p.errors}`).join(" ");
   const ev = Object.entries(sync).map(([c, v]) => `${c}:${v.received}`).join(" ") || "なし";
   const mc = getMulticallStats();
   // RPCの月間使用量を更新する。呼び出しとWebSocket受信の両方が枠を消費する。
@@ -1458,7 +1461,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}] 失敗段階[${stageLine}] 受信[${ev}] 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}`);
+  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}] 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}`);
 
   // 現在価格によるふるいの通過率。
   //

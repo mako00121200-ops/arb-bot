@@ -1592,6 +1592,54 @@ Optimism の `[惜しい]` が粗利プラス40/112本あるのに黒字が出�
 費用の過小評価「ではなく」本当にガス代に届いていないのかは、この修正後の
 `[生存]` の 内訳[下限] と `[実行] 確定:` の L1 の実額で判断する。
 
+## Optimism で確定前(pending)の状態を使う: Flashblocks(2026年9月20日)
+
+### 背景: 「1ブロック遅い」
+bot は WebSocket の logs 購読で動くが、これはブロック確定(Optimism は2秒)まで
+届かない。専業の裁定者は確定前の状態で動くので、常に1ブロック遅かった。
+OP Stack の Flashblocks は、シーケンサーが 200〜250ms ごとに確定前の部分ブロックを
+配る仕組み。Optimism は先着順なので、確定前に検知できれば同じブロックの後ろに
+自分の取引が入る。
+
+### 調べたこと(2026年9月20日)
+- Polygon は 2026年4月からプライベートメンプールと VeBloP に移行し、未確定取引を
+  見る前提が崩れている。FastLane/Atlas のバックラン入札は、未確定取引の配信を
+  自前で用意する必要があり(Chainstack は通知1件=1リクエストで枠が数日で尽きる)、
+  保証金と 250ms の封印入札で専業5〜8社と競う。安くは直せないので保留
+- Arbitrum は Timeboost(優先レーンの入札)が3社で99.7%を独占。シーケンサー配信
+  (無料)は数百ms早いだけ。後回し
+- Optimism は Chainstack の既存端点が Flashblocks 対応済み。ただし WSS の購読
+  (`newFlashblocks` / `newFlashblockTransactions`)は「Invalid params」で拒否され、
+  **標準 RPC の pending タグ**として見える形だった(起動時の確認ログ):
+  ```
+  [Flashblocks/pending] optimism: latest 157148294(29件) / pending 157148295(17件) → … pending 157148295(31件)
+    / pendingがlatestより先 5/5回 / 同じpendingの中で取引数が増えた: はい
+  [Flashblocks/pending] optimism: eth_getLogs(pending) 72件(ブロック 157148296) / eth_call(pending) 通った
+  [Flashblocks] optimism: Flashblocks の購読は拒否(標準の pending タグで読む)。比較用 newHeads の間隔 1899/1998/2125/1911/1949ms
+  ```
+- Optimism の L1 データ手数料は約$0.000003/件で無視できる(費用に入れる仕組みは入れた)
+
+### 実装(2026年9月20日)
+- `dex-onchain-realtime.js`: `FLASHBLOCKS_PENDING_CHAINS`(既定 optimism)のチェーンで、
+  監視対象のプールの `eth_getLogs(fromBlock/toBlock = pending)` を `FLASHBLOCKS_POLL_MS`
+  (既定 400ms)ごとに取り、確定を待たずに判定へ回す。同じイベントは txHash と logIndex
+  で覚え、pending で何度届いても、確定後に logs 購読で届いても、2回目以降は判定に
+  回さない。確定後に届いた時に「先読みできた時間」を記録し、`[生存]` の
+  `先読み[optimism:事前N件 確定で照合N件 先行平均Nms …]` に出す
+- 読み取りも pending に揃える: 準備量と V3 状態と価格表(Multicall3 の `aggregate3`)、
+  公式 Quoter、送信直前の `simulateRoute`(eth_call)、ガス見積もり(`eth_estimateGas` を
+  pending を明示して生で呼ぶ。ethers の estimateGas はブロックの指定を送らない)。
+  他のチェーンは latest のままで動きは変わらない(`readBlockTag`)
+- RPC の消費: 400ms 間隔で1日約216,000、月約650万(枠2,000万の3割)。効果を見て
+  `FLASHBLOCKS_POLL_MS` を調整する(250ms なら月約1,040万)
+- 危険: 確定前の状態は稀に確定しない(取引が落ちる)ことがある。その場合、
+  送信した取引が巻き戻ってガス代だけ失う(Optimism のガスは$0.005前後)
+
+### 確かめること
+- `[生存]` の 先読み の「先行平均」が数百ms〜1秒台になっているか(確定より早く見えているか)
+- Optimism の `[機会]` と送信が増えるか、送信直前の赤字(価格表のずれ)が減るか
+- 枠の月末見込が 50% を超えないか
+
 ## 進行中の計画
 1. 済: V3型プールをDEX別に数える調査(scripts/pool-survey.js)。Polygon /
    Base / Optimism で実施し、未監視ファクトリーの活動量と、監視ペアの

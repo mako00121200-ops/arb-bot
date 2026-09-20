@@ -192,6 +192,24 @@ function isContractLevelError(msg) {
 
 /// RPC呼び出しの共通入口。
 /// priority=true は「実行に直結する問い合わせ」で、待ち行列を通さず即座に投げる。
+// ===== 確定前(pending)の状態を読むチェーン(2026年9月20日) =====
+//
+// Chainstack の Optimism 端点は Flashblocks を「標準 RPC の pending ブロック」として
+// 見せる(起動時の確認で、pending = latest+1 の取引数が 250ms ごとに増え、
+// eth_getLogs / eth_call の pending も通った)。このチェーンでは、確定前の
+// イベントを拾って判定するので、読み取り(準備量・V3 状態・見積もり・送信直前の
+// 確認・ガス見積もり)も pending で行い、判定と確認の状態を揃える。
+// 他のチェーンは今までどおり latest。
+const FLASHBLOCKS_PENDING_CHAINS = new Set(
+  (process.env.FLASHBLOCKS_PENDING_CHAINS ?? "optimism").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
+);
+export function readBlockTag(chain) {
+  return FLASHBLOCKS_PENDING_CHAINS.has((chain || "").toLowerCase()) ? "pending" : "latest";
+}
+export function isPendingReadChain(chain) {
+  return readBlockTag(chain) === "pending";
+}
+
 /// Flashblocks の「pending」状態が読めるかを確かめる(2026年9月20日)。
 /// Chainstack のサポートは Optimism で Flashblocks 対応済みと答えたが、WSS の
 /// 購読(newFlashblocks 等)は拒否された。Chainstack の説明では Flashblocks は

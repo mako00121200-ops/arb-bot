@@ -22,7 +22,7 @@
 // 対して上に凸の曲線なので、直線で補間すると実際より少なめに出る(安全側)。
 
 import { ethers } from "ethers";
-import { callWithRpc } from "./onchain-reserves.js";
+import { callWithRpc, readBlockTag } from "./onchain-reserves.js";
 import { quoteV3Batch, quoteV3ByPoolBatch } from "./multicall-reserves.js";
 import { getAnyChainConfig } from "../chain-config.js";
 
@@ -234,7 +234,7 @@ export async function quoteV3Exact({ chain, tokenIn, tokenOut, amountIn, feeTier
         amountIn,
         fee: feeTier,
         sqrtPriceLimitX96: 0,
-      }), priority);
+      }, { blockTag: readBlockTag(chain) }), priority);
     const amountOut = result[0];
     return amountOut > 0n ? amountOut : null;
   } catch (e) {
