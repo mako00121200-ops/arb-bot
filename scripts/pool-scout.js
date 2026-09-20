@@ -22,7 +22,8 @@
 // そこで「今の監視ペアを深くする」ものだけ載せる:
 //   ① 両方のトークンが手書きの一覧にある      → 必ず載せる(壁が下がる)
 //   ② 片方が一覧にあり、そのペアが既に地図にある → 載せる(比べる相手が増える)
-//   ③ それ以外                                  → 載せずに件数だけ報告する
+//   ③ 片方が一覧にあり、取引が最も多い上位             → 載せる(価格は相手から導出)
+//   ④ それ以外                                  → 載せずに件数と上位だけ報告する
 // ③ は「次に広げる候補」を数字で見るためのもので、判断してから足す。
 
 import { ethers } from "ethers";
@@ -48,6 +49,17 @@ const SCOUT_MAX_REQUESTS = parseInt(process.env.SCOUT_MAX_REQUESTS || "40", 10);
 const SCOUT_MAX_NEW_POOLS = parseInt(process.env.SCOUT_MAX_NEW_POOLS || "150", 10);
 /// 正体を調べるプールの上限(Swapの多い順)。
 const SCOUT_MAX_IDENTIFY = parseInt(process.env.SCOUT_MAX_IDENTIFY || "300", 10);
+/// 「片方だけ既知」の新しいペアを取り込む上限(取引の多い順の順位)。
+///
+/// [なぜ順位で切るか(2026年9月20日の実測)]
+/// 初回の発見で、Optimism の**最も取引の多いプール(100分で4,181回)**が
+/// 「新しいペア(片方だけ既知)」として見送られていた。相手のトークンが
+/// 手書きの一覧に無いだけで、取引はチェーンで一番厚い。価格は相手側
+/// (USDC等)から自動で導出できるので、価格の推測は要らない。
+/// ただしプールを増やすと受信がそのままRPCの消費になるため、
+/// **取引の多い上位だけ**に絞る。件数ではなく順位で切ると、
+/// チェーンの活発さが変わっても増え方が読める。
+const SCOUT_ONE_KNOWN_TOP = parseInt(process.env.SCOUT_ONE_KNOWN_TOP || "8", 10);
 
 // Uniswap V3形式の Swap。Ramses系・Slipstream系のCLプールも同じ形。
 const V3_SWAP_TOPIC = ethers.id("Swap(address,address,int256,int256,uint160,uint128,int24)");
@@ -182,7 +194,8 @@ async function identifyPools(chain, addresses) {
 }
 
 /// そのプールを地図に載せてよいか。載せない理由も返す。
-function decide(chain, address, entry, knownSet) {
+/// rank は取引の多い順の順位(0が最多)。
+function decide(chain, address, entry, knownSet, rank) {
   if (isKnownIncompatiblePool(chain, address)) return { take: false, why: "過去に不適合" };
   if (getPool(chain, address)) return { take: false, why: "既に地図にある" };
   if (!entry.token0 || !entry.token1 || entry.token0 === entry.token1) return { take: false, why: "トークンが読めず" };
@@ -197,9 +210,14 @@ function decide(chain, address, entry, knownSet) {
   const k1 = knownSet.has(entry.token1);
   if (k0 && k1) return { take: true, why: "両方が手書きの通貨" };
   if (k0 || k1) {
-    // 片方だけの時は、そのペアが既に地図にある場合だけ載せる(比べる相手が増える)。
+    // 片方だけの時は、そのペアが既に地図にあれば載せる(比べる相手が増える)。
     if (getPoolsForPair(chain, entry.token0, entry.token1).length > 0) {
       return { take: true, why: "既にあるペアを深くする" };
+    }
+    // 新しいペアでも、取引の多い上位なら載せる。相手が既知なので価格は
+    // そのプールから導出でき、価格を推測せずに始点として使えるようになる。
+    if (rank < SCOUT_ONE_KNOWN_TOP) {
+      return { take: true, why: "新しいペア(取引が多い上位)" };
     }
     return { take: false, why: "新しいペア(片方だけ既知)" };
   }
@@ -225,12 +243,13 @@ export async function scoutChain(chain) {
 
   const skipped = {};
   const candidates = []; // 載せずに保留した「次の候補」
-  let added = 0, v2Added = 0, v3Added = 0;
+  let added = 0, v2Added = 0, v3Added = 0, addedSwaps = 0;
 
-  for (const [address, swaps] of ranked) {
+  for (let rank = 0; rank < ranked.length; rank++) {
+    const [address, swaps] = ranked[rank];
     const entry = info.get(address);
     if (!entry) { skipped["正体が読めず"] = (skipped["正体が読めず"] || 0) + 1; continue; }
-    const { take, why } = decide(key, address, entry, knownSet);
+    const { take, why } = decide(key, address, entry, knownSet, rank);
     if (!take) {
       skipped[why] = (skipped[why] || 0) + 1;
       if (why.startsWith("新しいペア")) candidates.push({ address, swaps, entry });
@@ -252,16 +271,17 @@ export async function scoutChain(chain) {
       updatedAt: 0,
     });
     added++;
+    addedSwaps += swaps;
     if (isV3) v3Added++; else v2Added++;
   }
 
   const skipLine = Object.entries(skipped).map(([k, n]) => `${k}${n}`).join(" / ") || "なし";
-  console.log(`[プール発見] ${key}: ${scanned.toLocaleString()}ブロックで${counts.size}プールが稼働。${ranked.length}件を調べ、**${added}件**を地図に追加(V3 ${v3Added} / V2 ${v2Added})。見送り: ${skipLine}。RPC${requestsUsed}回`);
+  console.log(`[プール発見] ${key}: ${scanned.toLocaleString()}ブロックで${counts.size}プールが稼働。${ranked.length}件を調べ、**${added}件**を地図に追加(V3 ${v3Added} / V2 ${v2Added})。見送り: ${skipLine}。RPC${requestsUsed}回。追加分の取引${addedSwaps.toLocaleString()}回/${scanned.toLocaleString()}ブロック`);
 
   // 次に広げる候補を、取引の多い順に数件だけ出す。判断の材料にする。
   if (candidates.length > 0) {
     const top = candidates.slice(0, 5).map((c) =>
-      `${c.address.slice(0, 10)}…(${c.swaps}回 ${c.entry.token0.slice(0, 8)}…/${c.entry.token1.slice(0, 8)}…)`).join(" ");
+      `${c.address.slice(0, 10)}…(${c.swaps}回 ${c.entry.token0}/${c.entry.token1})`).join(" ");
     console.log(`[プール発見] ${key}: 未採用で取引の多いペア上位: ${top}`);
   }
   return { added, scanned, active: counts.size, skipped };
