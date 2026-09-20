@@ -31,7 +31,7 @@ import { getChainConfig } from "../chain-config.js";
 import { getProviderForChain, callWithRpc, poolHasAmountOut } from "./onchain-reserves.js";
 import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
 import { recordRealExecution } from "./real-execution-log.js";
-import { estimateGasCostUsd, gasUnitsToUsd, weiToUsd, getEstimatedGasPriceWei, recordActualGasPrice } from "./gas-cost.js";
+import { estimateGasCostUsd, gasUnitsToUsd, weiToUsd, getEstimatedGasPriceWei, recordActualGasPrice, isOpStackChain, estimateL1FeeWei, readL1FeeFromReceipt, recordActualL1Fee } from "./gas-cost.js";
 import { getTokenDecimals, getTokenPriceUsd, getPool, KIND_V3 } from "./pool-registry.js";
 import { quoteV3ByPoolBatch, fetchReservesBatch } from "./multicall-reserves.js";
 import { clearQuoteTable, quoteV3Exact, isForkFactory } from "./v3-pools.js";
@@ -454,7 +454,16 @@ async function executeOpportunityInner(opp) {
   // 余裕の20%をそのまま費用に足していたため、見積もりが2割過大になり、
   // その分ハードルが上がって本物の機会を捨てていた(2026年9月19日に修正)。
   const gasWithBuffer = (gasUnits * 120n) / 100n;
-  const measuredGasUsd = await gasUnitsToUsd(chain, gasUnits);
+  // OP Stack(Optimism / Base)では、実際の呼び出しデータで L1 データ手数料を聞いて足す。
+  // 聞けなければ代表値(gasUnitsToUsd の中で補う)。
+  let l1FeeWei = null;
+  if (isOpStackChain(chain)) {
+    try {
+      const callData = contract.interface.encodeFunctionData("executeRoute", [asset, amountIn, legArgs, minProfit]);
+      l1FeeWei = await estimateL1FeeWei(chain, contractAddress, callData, gasWithBuffer);
+    } catch (e) {}
+  }
+  const measuredGasUsd = await gasUnitsToUsd(chain, gasUnits, l1FeeWei);
   if (measuredGasUsd != null) gasCostUsd = measuredGasUsd;
   // 単価の学習に使うため、この時点の見積もり単価を控えておく。
   const estimatedGasPriceWei = await getEstimatedGasPriceWei(chain);
@@ -498,9 +507,19 @@ async function executeOpportunityInner(opp) {
 
   // 実際に払ったガス代。receipt.gasPrice は実効単価(ethers v6)。
   // 事前の見積もりではなく、この確定値で手元に残る額を出す。
+  // OP Stack では receipt の l1Fee(L1 データ手数料)も払っているので足す。
   let actualGasCostUsd = null;
+  let actualL1FeeUsd = null;
   try {
-    actualGasCostUsd = await weiToUsd(chain, receipt.gasUsed * receipt.gasPrice);
+    let l1Wei = 0n;
+    if (isOpStackChain(chain)) {
+      l1Wei = await readL1FeeFromReceipt(chain, tx.hash);
+      if (l1Wei > 0n) {
+        recordActualL1Fee(chain, l1Wei);
+        actualL1FeeUsd = await weiToUsd(chain, l1Wei);
+      }
+    }
+    actualGasCostUsd = await weiToUsd(chain, receipt.gasUsed * receipt.gasPrice + l1Wei);
   } catch (e) {}
   const actualNetProfitUsd = actualProfitUsd != null && actualGasCostUsd != null
     ? actualProfitUsd - actualGasCostUsd
@@ -516,7 +535,8 @@ async function executeOpportunityInner(opp) {
   } catch (e) {}
 
   if (actualNetProfitUsd != null) {
-    console.log(`[実行] 確定: 粗利+$${actualProfitUsd.toFixed(4)} − ガス$${actualGasCostUsd.toFixed(4)} = 純利益+$${actualNetProfitUsd.toFixed(4)}(見積もりガス$${gasCostUsd.toFixed(4)})`);
+    const l1Note = actualL1FeeUsd != null ? `、うちL1データ$${actualL1FeeUsd.toFixed(4)}` : "";
+    console.log(`[実行] 確定: 粗利+$${actualProfitUsd.toFixed(4)} − ガス$${actualGasCostUsd.toFixed(4)} = 純利益+$${actualNetProfitUsd.toFixed(4)}(見積もりガス$${gasCostUsd.toFixed(4)}${l1Note})`);
   } else if (actualProfitUsd != null) {
     console.log(`[実行] 確定: 粗利+$${actualProfitUsd.toFixed(4)}(ガス代を確定できず)`);
   }
@@ -536,6 +556,7 @@ async function executeOpportunityInner(opp) {
     predictedProfitUsd: grossProfitUsd - gasCostUsd,
     actualProfitUsd,
     actualGasCostUsd,
+    actualL1FeeUsd,
     actualNetProfitUsd,
     gasUsed: receipt.gasUsed.toString(),
     gasCostUsd,
