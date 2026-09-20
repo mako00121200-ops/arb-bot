@@ -220,6 +220,32 @@ function simulateRoute(amountIn, legs) {
   return amount;
 }
 
+/// 判定に使った準備量ではなく、**今のプール地図**で同じ経路を計算し直す。
+///
+/// [なぜ要るか(2026年9月20日に本番ログで判明)]
+/// 段ごとの答え合わせで avalanche の3段目 pangolin が −190.0bps と出たが、
+/// 内訳は「判定後に地図が −190.0bps / 地図とチェーンの差 0.0bps」だった。
+/// **地図は正確で、遅れていたのは経路の方**。経路を作った時に写し取った
+/// 準備量のまま、確認と送信まで持ち回っていたことになる。
+///
+/// 地図は Syncイベントで更新され続けているので、この計算にRPCは一切要らない。
+/// まずは「どれくらい動いているか」を測るために使う。
+export function revalueRouteFromMap(opp) {
+  if (!opp || !Array.isArray(opp.legs) || opp.legs.length === 0) return null;
+  if (!(opp.amountIn > 0n)) return null;
+  const fresh = [];
+  for (const leg of opp.legs) {
+    const pool = getPool(opp.chain, leg.pool);
+    if (!pool) return null;
+    const l = orient(pool, leg.tokenIn);
+    if (!legIsUsable(l)) return null;
+    fresh.push(l);
+  }
+  const amountOut = simulateRoute(opp.amountIn, fresh);
+  if (!(amountOut > 0n)) return null;
+  return { amountOut };
+}
+
 /// 経路全体で使える投入額の上限。V3の価格表の範囲を超える額は判定できない。
 function routeMaxAmountIn(maxAmountIn, legs) {
   const first = legs[0];
