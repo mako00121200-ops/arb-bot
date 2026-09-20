@@ -85,9 +85,10 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
     v3Jobs.length ? quoteV3ByPoolBatch(chain, contractAddress, v3Jobs, true).catch(() => []) : [],
     v2Addrs.length ? fetchReservesBatch(chain, v2Addrs.map((a) => ({ address: a })), true).catch(() => new Map()) : new Map(),
   ]);
+  const ownQuoted = new Array(legs.length).fill(false);
   for (let k = 0; k < v3Index.length; k++) {
     const out = v3Outs[k];
-    if (out != null && out > 0n) actual[v3Index[k]] = out;
+    if (out != null && out > 0n) { actual[v3Index[k]] = out; ownQuoted[v3Index[k]] = true; }
   }
 
   // 自前の quoteV3 が使えないチェーンへの備え(2026年9月19日)。
@@ -99,9 +100,15 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
   // 公式の QuoterV2 は**公式ファクトリーのプールなら**引けるので、
   // 読めなかった段だけそちらで埋める。フォークは公式では引けない
   // (別のプールの価格が返る)ので対象外。
+  // [公式 Quoter との突き合わせ(2026年9月20日)]
+  // Optimism で送信直前の赤字が続き、答え合わせは毎回「0.30% の Uniswap プールが
+  // −14〜−15bps」と同じ幅で名指しした。価格表(公式 QuoterV2 で作る)と自前の
+  // quoteV3 のどちらがずれているのかを切り分けるため、公式で引けるプールは
+  // 自前の値が取れていても公式の値を並べて出す。両者が一致すれば価格表の古さ、
+  // 食い違えば見積もり側(コントラクトか手数料帯の取り違え)が原因と分かる。
+  const official = new Array(legs.length).fill(null);
   for (let k = 0; k < v3Index.length; k++) {
     const i = v3Index[k];
-    if (actual[i] != null) continue;
     const leg = legs[i];
     const pool = getPool(chain, leg.pool);
     if (!pool || leg.feeTier == null) continue;
@@ -111,7 +118,10 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
         chain, tokenIn: leg.tokenIn, tokenOut: leg.tokenOut,
         amountIn: expected[i].in, feeTier: leg.feeTier, priority: true,
       });
-      if (out != null && out > 0n) actual[i] = out;
+      if (out != null && out > 0n) {
+        official[i] = out;
+        if (actual[i] == null) actual[i] = out;
+      }
     } catch (e) {}
   }
   for (let k = 0; k < v2Index.length; k++) {
@@ -132,7 +142,10 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
     if (actual[i] == null) { parts.push(`${i + 1}段目 ${legs[i].dexId}:読めず`); continue; }
     const diff = bpsDiff(expected[i].out, actual[i]);
     if (diff == null) { parts.push(`${i + 1}段目 ${legs[i].dexId}:比較不能`); continue; }
-    parts.push(`${i + 1}段目 ${legs[i].dexId}(${legs[i].kind}) ${diff >= 0 ? "+" : ""}${diff.toFixed(1)}bps`);
+    // 自前と公式の両方が取れた段は、公式との差も並べる(一致なら価格表の古さが原因)。
+    const offDiff = ownQuoted[i] && official[i] != null ? bpsDiff(expected[i].out, official[i]) : null;
+    const offNote = offDiff != null ? `(公式${offDiff >= 0 ? "+" : ""}${offDiff.toFixed(1)}bps)` : "";
+    parts.push(`${i + 1}段目 ${legs[i].dexId}(${legs[i].kind}) ${diff >= 0 ? "+" : ""}${diff.toFixed(1)}bps${offNote}`);
     if (worst == null || diff < worst.diff) worst = { i, diff, leg: legs[i] };
   }
   if (parts.length === 0) return;
