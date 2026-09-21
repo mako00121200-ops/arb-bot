@@ -45,7 +45,7 @@ import {
   fetchReservesBatch, fetchPoolTokensBatch, fetchTokenDecimalsBatch,
   fetchV3StatesBatch, getMulticallStats, findV3PoolsBatch,
 } from "./scripts/multicall-reserves.js";
-import { estimateGasCostUsd, getGasCostStatus, exportGasPriceRatios, importGasPriceRatios, getGasPriceRatio } from "./scripts/gas-cost.js";
+import { estimateGasCostUsd, getGasCostStatus, exportGasPriceRatios, importGasPriceRatios, getGasPriceRatio, weiToUsd } from "./scripts/gas-cost.js";
 import { discoverFactory, discoverPoolsFromFactory } from "./scripts/pool-discovery.js";
 import {
   registerPool, removePool, pruneToCandidates, getSubscribedAddresses,
@@ -1752,9 +1752,15 @@ function heartbeat() {
 const ALERT_ALL_DOWN_MS = parseInt(process.env.ALERT_ALL_DOWN_MS || String(10 * 60 * 1000), 10);
 /// RPCの月末見込がこれを超えたら知らせる(%)。枠を使い切ると全部止まる。
 const ALERT_QUOTA_PERCENT = parseFloat(process.env.ALERT_QUOTA_PERCENT || "70");
-/// 送信用ウォレットのガス残高がこれを下回ったら知らせる(そのチェーンの通貨)。
-/// 残高が尽きると送信できなくなる。補充はオーナーにしかできない。
-const ALERT_MIN_GAS_NATIVE = parseFloat(process.env.ALERT_MIN_GAS_NATIVE || "0.002");
+/// 送信用ウォレットのガス残高が「あと何回送れるか」でこれを下回ったら知らせる。
+///
+/// [通貨の量で決めてはいけない(2026年9月21日に誤報で判明)]
+/// 最初は「0.002(そのチェーンの通貨)」で決めていたが、これは雑すぎた。
+/// 0.002 ETH は約$5(arbitrum で340回ぶん)なのに、0.002 MATIC は約$0.001
+/// (polygon で0回ぶん)。同じ数字が意味する余裕が桁違いに違う。
+/// 実際、arbitrum の残高 0.0017 ETH で「足りません」と誤報した。
+/// **あと何回送れるか**なら、通貨にもガス相場にも左右されない。
+const ALERT_MIN_REMAINING_SENDS = parseInt(process.env.ALERT_MIN_REMAINING_SENDS || "100", 10);
 /// ガス残高を確かめる間隔(ミリ秒)。1チェーンにつき1回の呼び出し。
 const GAS_BALANCE_CHECK_MS = parseInt(process.env.GAS_BALANCE_CHECK_MS || String(30 * 60 * 1000), 10);
 /// 送信後の失敗がこの数を続けて超えたら知らせる(お金が減っている)。
@@ -1817,7 +1823,7 @@ function checkOwnerAlerts(usage) {
   }
 }
 
-/// 各チェーンの送信用ウォレットのガス残高を確かめる。
+/// 各チェーンの送信用ウォレットのガス残高を「あと何回送れるか」で確かめる。
 async function checkGasBalances() {
   const address = process.env.MAINNET_BOT_ADDRESS;
   if (!address) return;
@@ -1826,10 +1832,16 @@ async function checkGasBalances() {
       const provider = getProviderForChain(chain);
       if (!provider) continue;
       const wei = await provider.getBalance(address);
-      const native = parseFloat(ethers.formatEther(wei));
-      if (native < ALERT_MIN_GAS_NATIVE) {
-        alertOwner(`gas-balance:${chain}`, `${chain} のガス残高が足りません`,
-          `送信用ウォレットの残高が ${native.toFixed(5)} です(下限 ${ALERT_MIN_GAS_NATIVE})。\n` +
+      // 残高と、1回あたりのガス代を、どちらもUSDに直して比べる。
+      const balanceUsd = await weiToUsd(chain, wei);
+      const perSendUsd = await estimateGasCostUsd(chain, "2step");
+      if (balanceUsd == null || !(perSendUsd > 0)) continue;
+      const remaining = Math.floor(balanceUsd / perSendUsd);
+      if (remaining < ALERT_MIN_REMAINING_SENDS) {
+        const native = parseFloat(ethers.formatEther(wei));
+        alertOwner(`gas-balance:${chain}`, `${chain} のガス残高が残り少ないです`,
+          `あと約${remaining}回ぶんしか送れません(下限 ${ALERT_MIN_REMAINING_SENDS}回)。\n` +
+          `残高 ${native.toFixed(5)}(約$${balanceUsd.toFixed(2)})/ 1回あたり約$${perSendUsd.toFixed(4)}。\n` +
           `尽きると ${chain} で取引を送れなくなります。\n` +
           `補充をお願いします: ${address}`);
       }

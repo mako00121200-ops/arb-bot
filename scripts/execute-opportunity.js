@@ -386,11 +386,10 @@ function buildLegArgs(chain, opp, version) {
 
 /// コントラクトに経路を最後まで回させて、戻ってきた量と返済額を受け取る。
 /// 戻り値: { returned, owed } または { error: 拒否理由 }
-async function simulate(chain, contractAddress, from, asset, amountIn, legArgs, iface) {
-  const data = iface.encodeFunctionData("simulateRoute", [asset, amountIn, legArgs]);
+/// 確認の本体。blockTag を指定して1回だけ問い合わせる。
+async function simulateAt(chain, contractAddress, from, data, iface, blockTag) {
   try {
-    // Flashblocks のチェーンでは確定前(pending)の状態で確認する(判定に使った状態と揃える)。
-    await callWithRpc(chain, (p) => p.call({ to: contractAddress, from, data, blockTag: readBlockTag(chain) }), true);
+    await callWithRpc(chain, (p) => p.call({ to: contractAddress, from, data, blockTag }), true);
     return { error: "結果が返りませんでした" };
   } catch (e) {
     const revertData = e?.data ?? e?.info?.error?.data ?? e?.error?.data ?? null;
@@ -402,8 +401,49 @@ async function simulate(chain, contractAddress, from, asset, amountIn, legArgs, 
         }
       } catch (inner) {}
     }
-    return { error: (e?.shortMessage || e?.reason || e?.message || "").slice(0, 160) };
+    return { error: (e?.shortMessage || e?.reason || e?.message || "").slice(0, 160), raw: e };
   }
+}
+
+/// 「revert の中身が返ってこなかった」を表す誤り。
+///
+/// この確認は**わざと revert させて結果を受け取る**作りなので、revert の中身
+/// (SimulationResult)が返らないと何も分からない。端点やブロックの指定によっては
+/// 中身が落ちることがある。
+/// **狭く判定する。** 本物の revert(理由つき)で聞き直すと、無駄な問い合わせが
+/// 増えるだけで何も分からない。実際に見た症状だけを対象にする。
+function isMissingRevertData(msg) {
+  return (msg || "").toLowerCase().includes("missing revert data");
+}
+
+/// 確認していない端点の挙動を、実測で切り分けた記録。
+/// chain -> "pending" / "latest"(どちらで中身が返るか)
+const simulateBlockTag = new Map();
+
+async function simulate(chain, contractAddress, from, asset, amountIn, legArgs, iface) {
+  const data = iface.encodeFunctionData("simulateRoute", [asset, amountIn, legArgs]);
+  const preferred = simulateBlockTag.get(chain) || readBlockTag(chain);
+  const first = await simulateAt(chain, contractAddress, from, data, iface, preferred);
+  if (!first.error) return first;
+
+  // [2026年9月21日に追加]
+  // Base を pending で読むようにした直後、確認が3件続けて
+  // 「missing revert data」で失敗した(いずれも純利益 +$0.36〜+$0.49 という、
+  // 今までの50倍の機会)。原因が「コントラクトが旧版だから」なのか
+  // 「pending ブロックでは revert の中身が返らない端点だから」なのかを、
+  // 推測ではなく**実測で切り分ける**。
+  // pending で中身が返らなかった時だけ latest で聞き直し、返ればそのチェーンは
+  // 以降 latest を使う(判定に使った状態とは少しずれるが、確認できない方が悪い)。
+  if (preferred === "pending" && isMissingRevertData(first.error)) {
+    const retry = await simulateAt(chain, contractAddress, from, data, iface, "latest");
+    if (!retry.error) {
+      simulateBlockTag.set(chain, "latest");
+      console.log(`[実行] ${chain}: pending では revert の中身が返りませんでした。latest で確認できたので、以降このチェーンは latest で確認します`);
+      return retry;
+    }
+    return { error: `${first.error}(latest でも同じ: ${retry.error})` };
+  }
+  return first;
 }
 
 function clearV3TablesOfRoute(chain, opp) {
