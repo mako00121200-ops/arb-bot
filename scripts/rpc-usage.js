@@ -109,7 +109,7 @@ function summarize(data) {
   const remainingMin = Math.max(0, (monthEnd - now.getTime()) / 60000);
   const projected = data.total + perMinute * remainingMin;
 
-  return {
+  lastUsage = {
     month: data.month,
     total: data.total,
     calls: data.calls,
@@ -126,7 +126,14 @@ function summarize(data) {
     // 計測はこのファイルが出来てからの分だけ。それ以前の使用は含まれない。
     measuredFrom: data.startedAt,
   };
+  return lastUsage;
 }
+
+/// いちばん最近の集計。**枠の使いすぎを他の仕組みが自分で止めるため**に置く。
+/// (2026年9月21日: 監視するプールを増やす時、枠が危なくなったら
+///  自動で採用を止められるようにした)
+let lastUsage = null;
+export function getLastRpcUsage() { return lastUsage; }
 
 /// 生存ログ用の1行。枠に対する位置づけが一目で分かる形にする。
 export function formatRpcUsageLine(s) {
