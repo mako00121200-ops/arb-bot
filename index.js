@@ -35,6 +35,7 @@ import { ethers } from "ethers";
 import { startOnchainFeeds, getSyncStats, isChainWsEnabled, isChainHealthy, setWatchedAddresses, getPendingStats } from "./dex-onchain-realtime.js";
 import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
 import { runPoolSurvey } from "./scripts/pool-survey.js";
+import { runMainnetDepthSurvey } from "./scripts/mainnet-depth-survey.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
 import { scoutAllChains, getScoutChains, SCOUT_INTERVAL_MS } from "./scripts/pool-scout.js";
@@ -2708,6 +2709,15 @@ async function main() {
   const surveyTarget = process.env.RUN_POOL_SURVEY;
   if (surveyTarget && surveyTarget !== "false") {
     try { await runPoolSurvey(surveyTarget); } catch (e) { console.error("[プール調査] 失敗:", e.message); }
+  }
+
+  // Ethereum メインネットの**深さ**を1回だけ測る(読み取りのみ・送信しない)。
+  // 今の5チェーンは取引量$1.00が天井で、原因がプールの深さだと実測で確定した
+  // (2026年9月21日)。深い場所へ移る価値があるかを、推測ではなく数字で決める。
+  // 既存の裁定には一切触れない(専用のプロバイダで、この1回きり)。
+  const mainnetSurvey = process.env.RUN_MAINNET_SURVEY;
+  if (mainnetSurvey && mainnetSurvey !== "false") {
+    try { await runMainnetDepthSurvey(); } catch (e) { console.error("[メインネット調査] 失敗:", e.message); }
   }
 
   stats.journalLoaded = loadJournal();
