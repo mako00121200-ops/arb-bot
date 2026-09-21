@@ -3847,7 +3847,7 @@ USDC や WETH と組んだ、100分で75〜132回も取引されるプールを�
 | 1 | `scripts/liquidation-monitor.js`(名簿・健全度・価格更新・候補の組) | **入れた。ログで確認中** |
 | 2 | `contracts/AaveLiquidator.sol`(flashLoanSimple → liquidationCall → DEX売却)+ `simulateLiquidation` | **書いてコンパイル済み(12,404バイト)** |
 | 2 | `scripts/liquidation-executor.js`(経路探し → eth_call で確認 → 送信) | **入れた** |
-| 2 | `RUN_LIQUIDATOR_DEPLOY=avalanche` でデプロイ → `LIQUIDATOR_CONTRACT_ADDRESS_AVALANCHE` | 次 |
+| 2 | `RUN_LIQUIDATOR_DEPLOY=avalanche` でデプロイ → `LIQUIDATOR_CONTRACT_ADDRESS_AVALANCHE` | **済(2026年9月21日 10:13 UTC)。住所 `0x45f8a3199752e6598D8C7f50eE52a707e943084b`** |
 | 2 | DRY_RUN で `simulateLiquidation` の数字を確認 | 未 |
 | 3 | 本番送信(`LIQUIDATION_DRY_RUN=false`)| **オーナーの了承待ち** |
 
