@@ -38,8 +38,9 @@ import { runPoolSurvey } from "./scripts/pool-survey.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
 import { scoutAllChains, getScoutChains, SCOUT_INTERVAL_MS } from "./scripts/pool-scout.js";
-import { probePoolFeeBps, isFeeProbeOnHold, getRpcStatus, getRpcCallTotals, callWithRpc, probePendingState } from "./scripts/onchain-reserves.js";
+import { probePoolFeeBps, isFeeProbeOnHold, getRpcStatus, getRpcCallTotals, callWithRpc, probePendingState, getProviderForChain } from "./scripts/onchain-reserves.js";
 import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
+import { alertOwner, getAlertStats } from "./scripts/owner-alert.js";
 import {
   fetchReservesBatch, fetchPoolTokensBatch, fetchTokenDecimalsBatch,
   fetchV3StatesBatch, getMulticallStats, findV3PoolsBatch,
@@ -1601,12 +1602,17 @@ function heartbeat() {
   // 生存ログは稼働の健全性を見る唯一の手段なので、使用量の計測が失敗しても
   // ログ自体は必ず出るようにする。
   let usageLine = "";
+  let usageSummary = null;
   try {
     const wsEvents = Object.values(sync).reduce((sum, v) => sum + (v.received || 0), 0);
-    usageLine = " " + formatRpcUsageLine(updateRpcUsage(getRpcCallTotals().total, wsEvents));
+    usageSummary = updateRpcUsage(getRpcCallTotals().total, wsEvents);
+    usageLine = " " + formatRpcUsageLine(usageSummary);
   } catch (e) {
     usageLine = " 枠[計測できず: " + e.message + "]";
   }
+  // オーナーが動かないと解決しないことだけを見張る(通知は LINE)。
+  try { checkOwnerAlerts(usageSummary); } catch (e) {}
+
   // 価格表は「プール×方向」ごとに要る。分母が無いと揃っているように見えてしまう。
   // V3の段は価格表が無いと使えないので、欠けている分はそのまま経路が組めない。
   let v3Total = 0;
@@ -1723,6 +1729,102 @@ function heartbeat() {
       if (parts) console.log(`[試算] ${chain}: ${parts}${detail}`);
     }
   } catch (e) {}
+}
+
+// ===== オーナーの判断が要ることだけを見張る(2026年9月21日) =====
+//
+// [方針]
+// 普段の失敗・機会ゼロ・静かな市況は通知しない。こちらで対処できるため。
+// 通知が多いと読まれなくなり、本当に必要な1通が埋もれる。
+// **オーナーが動かないと解決しないこと**だけを送る。
+
+/// 全チェーンが止まってからこれだけ経ったら知らせる(ミリ秒)。
+const ALERT_ALL_DOWN_MS = parseInt(process.env.ALERT_ALL_DOWN_MS || String(10 * 60 * 1000), 10);
+/// RPCの月末見込がこれを超えたら知らせる(%)。枠を使い切ると全部止まる。
+const ALERT_QUOTA_PERCENT = parseFloat(process.env.ALERT_QUOTA_PERCENT || "70");
+/// 送信用ウォレットのガス残高がこれを下回ったら知らせる(そのチェーンの通貨)。
+/// 残高が尽きると送信できなくなる。補充はオーナーにしかできない。
+const ALERT_MIN_GAS_NATIVE = parseFloat(process.env.ALERT_MIN_GAS_NATIVE || "0.002");
+/// ガス残高を確かめる間隔(ミリ秒)。1チェーンにつき1回の呼び出し。
+const GAS_BALANCE_CHECK_MS = parseInt(process.env.GAS_BALANCE_CHECK_MS || String(30 * 60 * 1000), 10);
+/// 送信後の失敗がこの数を続けて超えたら知らせる(お金が減っている)。
+const ALERT_CONSECUTIVE_SEND_FAILS = parseInt(process.env.ALERT_CONSECUTIVE_SEND_FAILS || "5", 10);
+
+let allDownSince = null;
+let lastGasBalanceCheck = 0;
+let lastFailedCount = 0;
+let consecutiveSendFails = 0;
+
+/// 生存ログのたびに呼ぶ。条件に当てはまった時だけ通知する。
+function checkOwnerAlerts(usage) {
+  const now = Date.now();
+
+  // ① 全チェーンが止まった。bot が働いていない = 機会をすべて失っている。
+  if (chainReady.size === 0) {
+    if (allDownSince == null) allDownSince = now;
+    if (now - allDownSince >= ALERT_ALL_DOWN_MS) {
+      const mins = Math.round((now - allDownSince) / 60000);
+      alertOwner("all-down", "botが止まっています",
+        `全チェーンが${mins}分間、稼働していません。\n` +
+        `Railway のログを見て再起動が要るかもしれません。\n` +
+        `画面: https://secure-amazement-production-5364.up.railway.app/`);
+    }
+  } else {
+    allDownSince = null;
+  }
+
+  // ② RPC の枠。使い切ると全部止まるので、超える前に手を打つ必要がある。
+  //    計測時間が足りないうちの見込みは当てにならないので使わない。
+  if (usage && usage.reliable && usage.projectedPercent > ALERT_QUOTA_PERCENT) {
+    alertOwner("quota", "RPCの枠が足りなくなりそうです",
+      `今の速度だと月末に枠の${usage.projectedPercent.toFixed(0)}%を使います(現在${usage.percent.toFixed(1)}%)。\n` +
+      `このままだと月末前に止まります。\n` +
+      `監視するプールを減らすか、プランを上げるかの判断をお願いします。`);
+  }
+
+  // ③ 送信用ウォレットのガス残高。尽きると送信できなくなる。
+  //    補充はオーナーにしかできないので、これは必ず知らせる。
+  if (process.env.MAINNET_BOT_ADDRESS && now - lastGasBalanceCheck >= GAS_BALANCE_CHECK_MS) {
+    lastGasBalanceCheck = now;
+    checkGasBalances().catch(() => {});
+  }
+
+  // ④ 送信後の失敗が続いている。送ったのに確定しない = ガス代だけ失っている。
+  const newFails = stats.failed - lastFailedCount;
+  lastFailedCount = stats.failed;
+  if (newFails > 0) {
+    consecutiveSendFails += newFails;
+    if (consecutiveSendFails >= ALERT_CONSECUTIVE_SEND_FAILS) {
+      alertOwner("send-fails", "送信の失敗が続いています",
+        `直近で${consecutiveSendFails}件の失敗が積み上がりました。\n` +
+        `ガス代だけを失っている可能性があります。原因はこちらで調べて直しますが、` +
+        `続くようなら一度止める判断が要るかもしれません。`);
+      consecutiveSendFails = 0;
+    }
+  } else if (stats.executed > 0) {
+    // 成功が出たら連続の数え直し。
+    consecutiveSendFails = 0;
+  }
+}
+
+/// 各チェーンの送信用ウォレットのガス残高を確かめる。
+async function checkGasBalances() {
+  const address = process.env.MAINNET_BOT_ADDRESS;
+  if (!address) return;
+  for (const chain of chainReady) {
+    try {
+      const provider = getProviderForChain(chain);
+      if (!provider) continue;
+      const wei = await provider.getBalance(address);
+      const native = parseFloat(ethers.formatEther(wei));
+      if (native < ALERT_MIN_GAS_NATIVE) {
+        alertOwner(`gas-balance:${chain}`, `${chain} のガス残高が足りません`,
+          `送信用ウォレットの残高が ${native.toFixed(5)} です(下限 ${ALERT_MIN_GAS_NATIVE})。\n` +
+          `尽きると ${chain} で取引を送れなくなります。\n` +
+          `補充をお願いします: ${address}`);
+      }
+    } catch (e) {}
+  }
 }
 
 // ===== ダッシュボード =====
