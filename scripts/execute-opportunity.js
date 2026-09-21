@@ -35,7 +35,7 @@ import { estimateGasCostUsd, gasUnitsToUsd, weiToUsd, getEstimatedGasPriceWei, r
 import { getTokenDecimals, getTokenPriceUsd, getPool, KIND_V3 } from "./pool-registry.js";
 import { quoteV3ByPoolBatch, fetchReservesBatch } from "./multicall-reserves.js";
 import { clearQuoteTable, quoteV3Exact, isForkFactory } from "./v3-pools.js";
-import { markRouteRejected, markRouteConfirmed, notePoolBlame, revalueRouteFromMap } from "./opportunity-scanner.js";
+import { markRouteRejected, markRouteConfirmed, notePoolBlame, revalueRouteFromMap, forceFeeReprobe } from "./opportunity-scanner.js";
 import { scheduleCompetitorCheck } from "./competitor-check.js";
 
 // ===== 赤字と確定した経路の、段ごとの答え合わせ(2026年9月19日に追加) =====
@@ -408,9 +408,31 @@ export class ExecutionError extends Error {
 }
 
 /// K検算による拒否。V2の手数料の実測値が実際より低かったことを示す。
+/// K検算での拒否か。**「受取量が多すぎる」= こちらの計算が物理的に不可能**。
+///
+/// [なぜ一度も発動していなかったか(2026年9月21日、実測で判明)]
+/// この判定は文字列だけを見ていた。`require(..., 'K')` を使う
+/// 古い Uniswap V2 フォークなら `reverted: K` という文字列が返るので引っかかる。
+///
+/// しかし **Aerodrome / Velodrome(Solidly系)は custom error `K()` を使う**。
+/// これは文字列を一切返さず、`execution reverted (unknown custom error)` としか
+/// 出ない。**だからこの判定は一度も true にならなかった。**
+///
+/// その結果、Base の `uniswap-v3(X%)→aerodrome→sync発見` が
+/// 見込み $0.12〜$0.49(今の平均の20〜50倍)で**何度も落ち続けていた**のに、
+/// 手数料の見直しに繋がらず、ただの「確認失敗」として捨てられていた。
+///
+/// **正しい処理は最初から書いてあった。見分けられなかっただけ。**
+/// セレクタで見分ける(`ethers.id("K()").slice(0,10)` で確認済み)。
+const K_REVERT_SELECTORS = [
+  "0xa932492f", // K()          — Solidly系。受取量が多すぎる
+  "0x438d3ade", // BelowMinimumK() — 同上
+];
+
 function isKRevert(message) {
-  const m = message || "";
-  return /: K\b/.test(m) || /["']K["']/.test(m);
+  const m = (message || "").toLowerCase();
+  if (K_REVERT_SELECTORS.some((sel) => m.includes(sel))) return true;
+  return /: k\b/.test(m) || /["']k["']/.test(m) || /\bk\(\)/.test(m);
 }
 
 /// コントラクトに渡す経路。version はコントラクトの版(1: 旧版、2: ガス削減版)。
@@ -665,8 +687,12 @@ async function executeOpportunityInner(opp) {
   if (sim.error) {
     const msg = sim.error;
     if (isKRevert(msg)) {
+      // **1回で手数料の前提を外す。** 赤字(利益が足りない)は「惜しかった」の
+      // 可能性があるので2回待つが、K検算での拒否は**こちらの計算が
+      // 物理的に不可能な量を出した証拠**なので、待つ理由が無い。
+      forceFeeReprobe(opp, "K検算で拒否(受取量が多すぎる)");
       markRouteRejected(opp);
-      throw new ExecutionError(`V2の手数料の実測値が実際より低い(K検算で拒否): ${msg.slice(0, 100)}`, { reverted: true, stage: "feeMismatch" });
+      throw new ExecutionError(`V2の手数料の前提が実際より低い(K検算で拒否): ${msg.slice(0, 120)}`, { reverted: true, stage: "feeMismatch" });
     }
     throw new ExecutionError(msg, { reverted: true, stage: "simulate" });
   }

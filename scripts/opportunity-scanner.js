@@ -92,6 +92,21 @@ function noteRejectionForFeeCheck(opp) {
   }
 }
 
+/// **待たずに**手数料の前提を外す。K検算での拒否のように、
+/// 「こちらの計算が物理的に不可能」と分かった時に使う。
+export function forceFeeReprobe(opp, why) {
+  let cleared = 0;
+  for (const leg of opp.legs || []) {
+    if (leg.kind === KIND_V3) continue;
+    if (clearFeeProbed(opp.chain, leg.pool)) {
+      cleared++;
+      rejectionsByPool.set(`${opp.chain}::${(leg.pool || "").toLowerCase()}`, 0);
+      console.log(`[手数料の見直し] ${opp.chain} ${leg.dexId}:${(leg.pool || "").slice(0, 10)}…: ${why}。手数料${leg.feeBps}bpsの前提を外し、実測し直します`);
+    }
+  }
+  return cleared;
+}
+
 /// 送信直前の正確な見積もりで赤字と確定した経路を記録する。
 export function markRouteRejected(opp) {
   if (!opp || !opp.poolAddresses) return;
