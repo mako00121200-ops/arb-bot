@@ -41,6 +41,7 @@ import { scoutAllChains, getScoutChains, SCOUT_INTERVAL_MS } from "./scripts/poo
 import { probePoolFeeBps, isFeeProbeOnHold, getRpcStatus, getRpcCallTotals, callWithRpc, probePendingState, getProviderForChain } from "./scripts/onchain-reserves.js";
 import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
 import { alertOwner, getAlertStats, sendPendingQuestions } from "./scripts/owner-alert.js";
+import { verifyAaveChains, getAaveChains, sweepAll as aaveSweepAll, checkWatchAll as aaveCheckWatchAll, formatAaveLine, AAVE_SWEEP_INTERVAL_MS, AAVE_WATCH_INTERVAL_MS } from "./scripts/aave-liquidation.js";
 import {
   fetchReservesBatch, fetchPoolTokensBatch, fetchTokenDecimalsBatch,
   fetchV3StatesBatch, getMulticallStats, findV3PoolsBatch,
@@ -1628,7 +1629,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${alertLine}`);
+  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${formatAaveLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
@@ -2268,6 +2269,21 @@ async function main() {
   // 起動時に1回と、送れなかった分の再試行のため10分ごと。
   sendPendingQuestions().catch(() => {});
   setInterval(() => { sendPendingQuestions().catch(() => {}); }, 10 * 60 * 1000);
+
+  // Aave V3 の清算の機会を**測るだけ**(第1段。送信は一切しない)。
+  // 住所は公開情報だが、応答するかを実測で確かめてから見張る。
+  try {
+    const aaveChains = await verifyAaveChains(Object.keys(CHAIN_CONFIG));
+    if (aaveChains.length > 0) {
+      setInterval(() => { aaveSweepAll().catch(() => {}); }, AAVE_SWEEP_INTERVAL_MS);
+      setInterval(() => { aaveCheckWatchAll().catch(() => {}); }, AAVE_WATCH_INTERVAL_MS);
+      // 最初の1回は起動が落ち着いてから(裁定の準備を邪魔しない)。
+      setTimeout(() => { aaveSweepAll().catch(() => {}); }, 60 * 1000);
+      console.log(`[清算] 見張りを始めます: ${aaveChains.join(",")}(${AAVE_SWEEP_INTERVAL_MS / 60000}分ごとに全員、${AAVE_WATCH_INTERVAL_MS / 1000}秒ごとに危ない人だけ)`);
+    }
+  } catch (e) {
+    console.warn(`[清算] 見張りを始められませんでした: ${(e.message || "").slice(0, 100)}`);
+  }
   // 新しく出来たプールを定期的に拾う。見つかったら、そのチェーンだけ
   // 桁数・状態・購読を作り直す(判定は止めない)。
   if (getScoutChains().length > 0 && SCOUT_INTERVAL_MS > 0) {
