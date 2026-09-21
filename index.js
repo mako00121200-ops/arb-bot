@@ -47,7 +47,7 @@ import { startLiquidationMonitor, setCandidateHandler, formatLiquidationLine, ge
 import { handleLiquidationCandidate, selfCheckLiquidationExecutor } from "./scripts/liquidation-executor.js";
 import { runLiquidatorDeploy } from "./scripts/liquidator-deploy.js";
 import { readPoolFeeOnchain } from "./scripts/pool-fee-onchain.js";
-import { minProfitUsd, describeMinProfit, isBelowDefaultFloor } from "./scripts/min-profit.js";
+import { requiredMinProfitUsd, describeMinProfit, noteSendOutcome, formatMinProfitLine } from "./scripts/min-profit.js";
 // 画面とログの時刻は**すべて日本時間**に揃える(保存は UTC のまま)。
 import { TZ_LABEL, formatJst as formatLocalTime, nowJst } from "./scripts/jst.js";
 import {
@@ -227,7 +227,7 @@ function noteBelowMin(opp) {
   if (!belowMinLastSampleAt[opp.chain] || now - belowMinLastSampleAt[opp.chain] > 5 * 60 * 1000) {
     belowMinLastSampleAt[opp.chain] = now;
     const gas = (opp.grossProfitUsd ?? 0) - (opp.netProfitUsd ?? 0);
-    console.log(`[下限] ${opp.kind} ${opp.chain} ${opp.label}: 投入$${(opp.tradeAmountUsd ?? 0).toFixed(2)} 粗利$${(opp.grossProfitUsd ?? 0).toFixed(4)} − ガス$${gas.toFixed(4)} = 純利$${(opp.netProfitUsd ?? 0).toFixed(4)}(最低$${minProfitUsd(opp.chain)})`);
+    console.log(`[下限] ${opp.kind} ${opp.chain} ${opp.label}: 投入$${(opp.tradeAmountUsd ?? 0).toFixed(2)} 粗利$${(opp.grossProfitUsd ?? 0).toFixed(4)} − ガス$${gas.toFixed(4)} = 純利$${(opp.netProfitUsd ?? 0).toFixed(4)}(必要$${requiredMinProfitUsd(opp.chain, opp.gasCostUsd).toFixed(4)} = ガス×(1−勝率)÷勝率)`);
   }
 }
 function belowMinSummary() {
@@ -257,9 +257,6 @@ const stats = {
   v3VerifyCapped: 0, v3VerifyUnderCount: 0,
   disabledFromFile: 0, disabledRuntime: 0,
   prunedKept: 0,
-  // **下限を下げたおかげで取れたか**を測る(2026年9月21日)。
-  // 昔の一律の下限($0.01)を下回る見込みで送った件数と、その結果。
-  lowFloorTried: 0, lowFloorWon: 0, lowFloorUsd: 0,
   recent: [], disabled: 0,
   latencies: [], feeProbed: 0, feeProbePending: 0, lastHeartbeat: null, journalLoaded: 0,
 };
@@ -1791,7 +1788,7 @@ async function handleOpportunity(opp, meta = {}) {
   if (opp.hasV3) stats.v3Opportunities++;
   stats.recent = [{ ...opp, at: new Date().toISOString(), ...meta }, ...stats.recent.filter((r) => r.label !== opp.label)].slice(0, 20);
 
-  if (opp.netProfitUsd < minProfitUsd(opp.chain)) {
+  if (opp.netProfitUsd < requiredMinProfitUsd(opp.chain, opp.gasCostUsd)) {
     reasons.belowMin++;
     record(opp, "below_min", meta);
     noteBelowMin(opp);
@@ -1807,10 +1804,6 @@ async function handleOpportunity(opp, meta = {}) {
     noteBigOutcome(opp, "send_busy", `同時${inFlight}本`);
     return;
   }
-  // **そのチェーンだけ下げたからこそ送れた機会か**(下げた効果の集計用)。
-  // 固定値と比べると、元から通っていた分まで成果に数えてしまう。
-  const lowFloor = isBelowDefaultFloor(opp.chain, opp.netProfitUsd ?? 0);
-  if (lowFloor) stats.lowFloorTried++;
   executing.add(key);
   for (const k of lockKeys) executingPools.add(k);
   inFlightByChain.set(opp.chain, inFlight + 1);
@@ -1822,7 +1815,8 @@ async function handleOpportunity(opp, meta = {}) {
     ]);
     if (ok) {
       stats.executed++; reasons.success++;
-      if (lowFloor) { stats.lowFloorWon++; stats.lowFloorUsd += opp.actualNetProfitUsd ?? 0; }
+      // **勝率の実測。** これが次の「手数料負けの線」を決める。
+      noteSendOutcome(opp.chain, true);
       cooldownUntil.delete(key);
       record(opp, "success", meta);
       noteBigOutcome(opp, "success");
@@ -1844,6 +1838,10 @@ async function handleOpportunity(opp, meta = {}) {
     // 制限時間超過など、送信側の catch を通らない失敗でも手元の nonce を
     // 鎖上の値に合わせ直す。放置すると以降の送信が詰まる。
     try { resetNonce(opp.chain); } catch (inner) {}
+    // **勝率の実測(負けた側)。**
+    // ガス代を失うのは `wait`(送った後に取り消された)だけ。
+    // simulate / estimateGas / send での失敗はガス代がかからないので数えない。
+    if (stage === "wait") noteSendOutcome(opp.chain, false);
     // **「失敗」と「負け」を同じ箱に入れない。**
     // `wait`(確定待ちで取り消された)は、送った後に他者が先に取った時に起きる。
     // 直し方が「取り消しの中身から原因を特定する」ではなく「速さ」なので分ける。
@@ -2015,7 +2013,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${sizeLine()}${lowFloorLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${alertLine}`);
+  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${sizeLine()}${formatMinProfitLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
@@ -2296,12 +2294,6 @@ a{color:#6fae62}.footerlink{margin-top:18px;font-size:11px}`;
 /// 取引量の余裕を1行で出す。**「上限を上げれば大きく取れるのか」への答え。**
 /// 最適額が上限のごく一部で、4倍にすると利益が大きく落ちるなら、
 /// 制限しているのは設定ではなく**プールの深さ**。上限を上げても意味がない。
-/// 下限を下げた効果。**次の見回りが「続けるか戻すか」を決めるための数字。**
-function lowFloorLine() {
-  if (!stats.lowFloorTried) return "";
-  return ` 低ハードル[試み${stats.lowFloorTried} 成立${stats.lowFloorWon} 純利$${stats.lowFloorUsd.toFixed(4)}]`;
-}
-
 function sizeLine() {
   const s = getSizeCurveStats();
   if (!s.samples) return "";
@@ -2316,7 +2308,7 @@ function shortenLabel(label) {
 
 const REASON_LABEL = {
   disabled: "無効化済みのプールを含む", taxToken: "税トークン", cooldown: "冷却中(直近に失敗)",
-  trap: "罠または計算の誤差", belowMin: `最低利益(${describeMinProfit()})未満`, executing: "実行中で重複",
+  trap: "罠または計算の誤差", belowMin: "手数料負けの線に届かず(失敗時のガス代を取り返せない)", executing: "実行中で重複",
   notSent: "送信条件を満たさず", failed: "送信に失敗", success: "送信成功",
 };
 const STAGE_LABEL = {

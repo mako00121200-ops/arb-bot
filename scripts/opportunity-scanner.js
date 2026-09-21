@@ -911,7 +911,7 @@ function measureSpotScreen(chain, tokenA, tokenB, pools, capUsd, gasCostUsd) {
           } else if (netUsd > prevNet) {
             spotScreen.routeNet.set(key, netUsd);
           }
-          if (netUsd > screenMinProfitUsd(chain)) {
+          if (netUsd > screenMinProfitUsd(chain, gasCostUsd)) {
             spotScreen.needQuote++;
             if (isFresh) spotScreen.freshNeedQuote++;
 
@@ -1103,7 +1103,7 @@ function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, p
     amountIn: best.amountIn,
     amountOutEstimated: best.amountOut,
     amountOwed: best.amountIn,
-    tradeAmountUsd, grossProfitUsd, netProfitUsd,
+    tradeAmountUsd, grossProfitUsd, netProfitUsd, gasCostUsd,
     feeWallPercent: wallBps / 100,
     profitable: netProfitUsd > 0,
   };
