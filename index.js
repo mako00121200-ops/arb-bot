@@ -117,6 +117,12 @@ const EXECUTION_TIMEOUT_MS = parseInt(process.env.EXECUTION_TIMEOUT_MS || "20000
 const GAS_REFRESH_INTERVAL_MS = parseInt(process.env.GAS_REFRESH_INTERVAL_MS || "60000", 10);
 const FAILURE_COOLDOWN_MS = 10 * 60 * 1000;
 const DISABLE_AFTER_FAILURES = 3;
+/// 送信失敗を数える窓。**この窓の外の失敗は忘れる。**
+/// 窓が無いと、何時間も動かすうちに失敗が積み上がり、
+/// 「たまたま3回負けた」だけのプールが永久に消える。
+const FAILURE_WINDOW_MS = parseInt(process.env.FAILURE_WINDOW_MS || String(30 * 60 * 1000), 10);
+/// 送信失敗が続いたプールを外す時間。**永久にはしない。**
+const FAILURE_DISABLE_MS = parseInt(process.env.FAILURE_DISABLE_MS || String(60 * 60 * 1000), 10);
 const MAX_SANE_RETURN_RATIO = parseFloat(process.env.MAX_SANE_RETURN_RATIO || "0.20");
 const BIG_MOVE_PCT = parseFloat(process.env.BIG_MOVE_PCT || "0.5");
 const V3_VERIFY_INTERVAL_MS = parseInt(process.env.V3_VERIFY_INTERVAL_MS || "120000", 10);
@@ -238,6 +244,7 @@ const stats = {
   skippedCooldown: 0, trapsRejected: 0, taxTokensRejected: 0, staleRejected: 0, bigMoves: 0,
   v3Found: 0, v3Matched: 0, v3Opportunities: 0, v3LiquidityEvents: 0, scoutAdded: 0,
   quoteTablesBuilt: 0, quoteTablesPending: 0, quoteRebuildsFromPolling: 0, quoteTablesOnDemand: 0,
+  temporarilyDisabled: 0, raceLost: 0,
   v3VerifyCount: 0, v3VerifyWorst: null, v3VerifyRecent: [], v3VerifyDropped: 0,
   v3VerifyCapped: 0, v3VerifyUnderCount: 0,
   disabledFromFile: 0, disabledRuntime: 0,
@@ -260,13 +267,53 @@ function anyReady() { return chainReady.size > 0; }
 
 // ===== 失敗の抑制と無効化 =====
 const cooldownUntil = new Map();
+/// key -> { times: [失敗した時刻] }。窓の外は捨てる。
 const poolFailures = new Map();
+/// key -> 期限(ms)。送信失敗で一時的に外したプール。
+const temporarilyDisabled = new Map();
 const disabledPools = new Set();
 
 function poolKeyOf(chain, address) { return `${chain}::${address.toLowerCase()}`; }
 
-function disablePool(chain, address, reason, fromFile = false) {
+/// 生存ログ用。永久に外した数・一時的に外して今も外れている数・先を越された数。
+/// **「先を越された」は失敗ではなく競争の結果**なので、別に数える。
+function disableLine() {
+  const now = Date.now();
+  let active = 0;
+  for (const until of temporarilyDisabled.values()) if (until > now) active++;
+  if (!disabledPools.size && !active && !stats.raceLost) return "";
+  return ` 外した[永久${disabledPools.size} 一時${active} 先越され${stats.raceLost}]`;
+}
+
+/// [永久か一時か(2026年9月21日に判明)]
+/// 「送信失敗3回」でプールを**永久に**無効化していた。しかし `wait` の失敗
+/// (確定待ちで取り消された)は、**他者に先を越された**時に必ず起きる。
+/// つまり**競争が激しいプールほど早く消える**。大きな機会があるのは
+/// まさにそういうプールなので、**取りたい場所から順に地図から消していた**。
+///
+/// さらに今朝、不適合リストを /tmp からボリュームへ移したため、
+/// **今まで再デプロイで消えていたこの誤判定が、永久に残るようになっていた**。
+/// 自分の修正が、別の欠陥を悪化させていた。
+///
+/// 永久に外してよいのは、**プールやトークンの性質として変わらないもの**だけ。
+///
+/// **理由の文面で判定しない。** 最初そう書いたところ、自分の検算で
+/// 「送金時に税を取るトークン」が「税トークン」に一致せず、
+/// **税トークンが一時扱いになる**バグが出た。日本語の文面は書き換わる。
+/// 呼ぶ側が `permanent` で明示する。
+function disablePool(chain, address, reason, { fromFile = false, permanent = false } = {}) {
   const key = poolKeyOf(chain, address);
+
+  // 送信失敗のような**移ろう理由**では、期限付きで外すだけにする。
+  if (!fromFile && !permanent) {
+    if (temporarilyDisabled.get(key) > Date.now()) return;
+    temporarilyDisabled.set(key, Date.now() + FAILURE_DISABLE_MS);
+    stats.temporarilyDisabled++;
+    clearPoolState(getPool(chain, address));
+    console.log(`[一時無効] ${chain} ${address.slice(0, 10)}…: ${reason.slice(0, 70)} → ${Math.round(FAILURE_DISABLE_MS / 60000)}分だけ外します(永久ではありません)`);
+    return;
+  }
+
   if (disabledPools.has(key)) return;
   disabledPools.add(key);
   stats.disabled++;
@@ -274,7 +321,7 @@ function disablePool(chain, address, reason, fromFile = false) {
   clearPoolState(getPool(chain, address));
   clearQuoteTable(chain, address);
   if (!fromFile) {
-    recordIncompatiblePool(chain, address, reason);
+    recordIncompatiblePool(chain, address, reason, { permanent: true });
     console.log(`[無効化] ${chain} ${address.slice(0, 10)}…: ${reason.slice(0, 70)}`);
   }
 }
@@ -293,7 +340,7 @@ function noteExecutionFailure(opp, error) {
     stats.taxTokensRejected++;
     const targets = error.taxPools?.length ? error.taxPools : opp.poolAddresses;
     for (const address of targets) {
-      disablePool(opp.chain, address, `送金時に税を取るトークン(手数料${TAX_TOKEN_FEE_BPS}bps超)`);
+      disablePool(opp.chain, address, `送金時に税を取るトークン(手数料${TAX_TOKEN_FEE_BPS}bps超)`, { permanent: true });
     }
     return;
   }
@@ -302,21 +349,47 @@ function noteExecutionFailure(opp, error) {
     return;
   }
 
+  // **他者に先を越された失敗は、プールのせいではない。**
+  // `wait`(確定待ちで取り消された)は、送った後に価格が動いた時に起きる。
+  // 「誰が取ったか」の集計でも、他者の裁定や通常取引が原因だと実測できている。
+  // これを「価格が信用できないプール」として数えると、
+  // **競争が激しい=機会が大きいプールから順に消えていく。**
+  const raceLost = stage === "wait";
+  if (raceLost) {
+    stats.raceLost++;
+    return; // 冷却(上で設定済み)だけで十分。失敗回数には数えない
+  }
+
   const scam = isScamRevert(reason);
+  const now = Date.now();
   for (const address of opp.poolAddresses) {
     const key = poolKeyOf(opp.chain, address);
-    const n = (poolFailures.get(key) || 0) + 1;
-    poolFailures.set(key, n);
+    const entry = poolFailures.get(key) || { times: [] };
+    // **窓の外の失敗は忘れる。** 積み上げると、長く動かすほど地図が痩せる。
+    entry.times = entry.times.filter((t) => now - t < FAILURE_WINDOW_MS);
+    entry.times.push(now);
+    poolFailures.set(key, entry);
+    const n = entry.times.length;
     if (scam) {
-      disablePool(opp.chain, address, `詐欺トークン: ${reason}`);
+      disablePool(opp.chain, address, `詐欺トークン: ${reason}`, { permanent: true });
     } else if (n >= DISABLE_AFTER_FAILURES) {
-      disablePool(opp.chain, address, `送信失敗${n}回(価格が信用できない): ${reason}`);
+      entry.times = []; // 外したので数え直す
+      disablePool(opp.chain, address, `送信失敗${n}回(${Math.round(FAILURE_WINDOW_MS / 60000)}分以内): ${reason}`);
     }
   }
 }
 
 function hasDisabledPool(opp) {
-  return opp.poolAddresses.some((a) => disabledPools.has(poolKeyOf(opp.chain, a)));
+  const now = Date.now();
+  return opp.poolAddresses.some((a) => {
+    const key = poolKeyOf(opp.chain, a);
+    if (disabledPools.has(key)) return true;
+    const until = temporarilyDisabled.get(key);
+    if (until == null) return false;
+    if (until > now) return true;
+    temporarilyDisabled.delete(key); // 期限切れ。地図に戻す
+    return false;
+  });
 }
 
 function pruneTaxTokenPools(opp) {
@@ -326,7 +399,7 @@ function pruneTaxTokenPools(opp) {
     if (!pool || pool.kind === KIND_V3 || !pool.feeProbed) continue;
     if (pool.feeBps > TAX_TOKEN_FEE_BPS) {
       stats.taxTokensRejected++;
-      disablePool(opp.chain, address, `実測手数料${pool.feeBps}bps(税トークン)`);
+      disablePool(opp.chain, address, `実測手数料${pool.feeBps}bps(税トークン)`, { permanent: true });
       found = true;
     }
   }
@@ -345,7 +418,7 @@ function rejectIfTrap(opp) {
     return true;
   }
   console.log(`[罠] ${opp.kind} ${opp.chain} ${opp.label}: ${reason}(投入$${opp.tradeAmountUsd.toFixed(2)}→利益$${opp.netProfitUsd.toFixed(2)})。無効化します`);
-  for (const address of opp.poolAddresses) disablePool(opp.chain, address, reason);
+  for (const address of opp.poolAddresses) disablePool(opp.chain, address, reason, { permanent: true });
   return true;
 }
 
@@ -1309,7 +1382,7 @@ async function preparePoolMap() {
 
   for (const [chain, addresses] of Object.entries(getAllPoolAddressesByChain())) {
     for (const address of addresses) {
-      if (isKnownIncompatiblePool(chain, address)) disablePool(chain, address, "過去の記録から復元", true);
+      if (isKnownIncompatiblePool(chain, address)) disablePool(chain, address, "過去の記録から復元", { fromFile: true });
     }
   }
   console.log(`[無効化] 過去の記録から${stats.disabledFromFile}件を復元しました`);
@@ -1404,7 +1477,7 @@ async function probeFeesGradually() {
         stats.feeProbed++;
         if (fee > TAX_TOKEN_FEE_BPS) {
           stats.taxTokensRejected++;
-          disablePool(chain, address, `実測手数料${fee}bps(税トークン)`);
+          disablePool(chain, address, `実測手数料${fee}bps(税トークン)`, { permanent: true });
         }
       }
     } catch (e) {}
@@ -1684,7 +1757,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${formatBigLine()}${formatAaveLine()}${alertLine}`);
+  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${disableLine()}${formatBigLine()}${formatAaveLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
