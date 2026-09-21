@@ -498,9 +498,42 @@ export async function checkContractVersions(chains) {
 
 // 最低利益は**チェーンごと**(ガス代が25倍違うため。scripts/min-profit.js)。
 export const TAX_TOKEN_FEE_BPS = parseInt(process.env.TAX_TOKEN_FEE_BPS || "100", 10);
-// 送信から確定までに価格が少し動いても取り消されないよう、コントラクトに渡す
-// 最低利益は「確認した利益」のこの割合にする(残りは値動きの余裕)。
-const MIN_PROFIT_SHARE_BPS = BigInt(parseInt(process.env.MIN_PROFIT_SHARE_BPS || "5000", 10));
+/// コントラクトに渡す最低利益の、**取り消しが得になる境目**。
+///
+/// [「確認した利益の50%」をやめた(2026年9月21日、polygon の赤字の本当の原因)]
+/// 今までは `minProfit = 確認した利益 × 50%` だった。つまり送信から確定までに
+/// 利益が半分以上削られた瞬間に**取り消し**になり、**ガス代を満額失う**。
+///
+/// ところが、**取り消しても実行してもガス代はほぼ同じ**。
+/// コントラクトの取り消しは**全部の段を回した後**(`returned >= owed + minProfit`)に
+/// 起きるので、swap のガスは全部払い済み。実行の方が最後の送金と記録のぶんだけ
+/// 約9%高いだけ。
+///
+///   実行した方が得 ⟺ 残った利益 > ガス代 × (1 − 取り消し時のガス比率)
+///                  ≒ 残った利益 > ガス代 × 10%
+///
+/// polygon(ガス$0.0123)なら境目は**$0.0012**。それ以上の利益が残るなら、
+/// 半分削られていようが**実行した方が損が小さい**。
+/// 50%という余裕は、**守っているつもりで損を増やしていた**。
+///
+/// この値より小さい利益しか残らない時だけ、取り消す(その時は取り消しの方が安い)。
+const REVERT_GAS_SHARE = parseFloat(process.env.REVERT_GAS_SHARE || "0.10");
+/// ガス代か粗利が分からない時に使う割合(bps)。**昔の50%ではなく小さめ。**
+const MIN_PROFIT_SHARE_BPS = BigInt(parseInt(process.env.MIN_PROFIT_SHARE_BPS || "500", 10));
+
+/// 送信時にコントラクトへ渡す最低利益を決める。
+/// **通貨の桁数で割らずに、粗利に対する比で出す**(18桁の割り算で精度を失わないため)。
+function decideMinProfit(profitRaw, grossProfitUsd, gasCostUsd) {
+  if (!(profitRaw > 0n)) return 0n;
+  const gas = Number(gasCostUsd), gross = Number(grossProfitUsd);
+  if (!Number.isFinite(gas) || !Number.isFinite(gross) || gas <= 0 || gross <= 0) {
+    return (profitRaw * MIN_PROFIT_SHARE_BPS) / 10000n;
+  }
+  const floorUsd = gas * REVERT_GAS_SHARE;
+  // 粗利に対する比(bps)。0〜10000 に収める(粗利を超える要求はしない)。
+  const bps = Math.min(10000, Math.max(0, Math.round((floorUsd / gross) * 10000)));
+  return (profitRaw * BigInt(bps)) / 10000n;
+}
 
 // 旧版の kind。
 const CONTRACT_KIND_V2 = 0;
@@ -835,8 +868,8 @@ async function executeOpportunityInner(opp) {
     return false;
   }
 
-  // 2. 送信。値動きの余裕として、確認した利益の一部だけを最低利益にする。
-  const minProfit = (profitRaw * MIN_PROFIT_SHARE_BPS) / 10000n;
+  // 2. 送信。**取り消しの方が安くなる線**だけを最低利益にする(上の decideMinProfit)。
+  const minProfit = decideMinProfit(profitRaw, grossProfitUsd, gasCostUsd);
   // ガス量は上で確認と同時に投げてある。ここでは結果を受け取るだけ。
   if (!gasResult.ok) {
     const e = gasResult.error;
