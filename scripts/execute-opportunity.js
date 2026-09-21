@@ -34,7 +34,7 @@ import { recordRealExecution } from "./real-execution-log.js";
 import { estimateGasCostUsd, gasUnitsToUsd, weiToUsd, getEstimatedGasPriceWei, recordActualGasPrice, isOpStackChain, readL1FeeFromReceipt, recordActualL1Fee } from "./gas-cost.js";
 import { getTokenDecimals, getTokenPriceUsd, getPool, KIND_V3 } from "./pool-registry.js";
 import { quoteV3ByPoolBatch, fetchReservesBatch } from "./multicall-reserves.js";
-import { clearQuoteTable, quoteV3Exact, isForkFactory } from "./v3-pools.js";
+import { clearQuoteTable, quoteV3Exact, isForkFactory, setTableTrustedMax, getTableTrustedMax, getTableRange } from "./v3-pools.js";
 import { markRouteRejected, markRouteConfirmed, notePoolBlame, revalueRouteFromMap, forceFeeReprobe } from "./opportunity-scanner.js";
 import { scheduleCompetitorCheck } from "./competitor-check.js";
 
@@ -59,6 +59,52 @@ const DRIFT_MIN_BPS = parseFloat(process.env.DRIFT_MIN_BPS || "5");
 function bpsDiff(expected, actual) {
   if (expected <= 0n) return null;
   return Number(((actual - expected) * 10000n) / expected);
+}
+
+/// 答え合わせで「表が過大」と分かった時に、投入量の上限を下げる閾値(bps)。
+/// 狙う利幅が5〜50bpsなので、それと同じ尺度にする。
+const LEARN_CAP_BPS = parseFloat(process.env.LEARN_CAP_BPS || "20");
+
+/// 答え合わせで分かった誤差を、価格表の「信用できる上限」に反映する。
+///
+/// [なぜ要るか(2026年9月21日、オーナーの指摘)]
+/// 「段ごとの答え合わせ」は**公式Quoterと突き合わせて**、その段の見込みが
+/// 何bpsずれていたかを**実際に使った投入量で**測っている。
+/// これは定期検証(2分に1プール)より、はるかに濃い情報:
+///
+///   ・**本当に取ろうとした経路**の、**本当に使った額**での誤差
+///   ・定期検証は $5/$20/$200/$700 の固定点でしか測らない
+///
+/// なのに今まで**ログに出すだけで捨てていた**。
+/// 「測っているのに使っていない値」の4件目。
+///
+/// `bpsDiff(expected, actual)` は (actual - expected) / expected なので、
+/// **負 = 見込みの方が大きい = 表が過大**。これが危ない向き。
+/// その額では信用できないので、**半分まで**上限を下げる。
+/// (定期検証が通れば上限は外れるので、行き過ぎても戻れる)
+function learnTrustedMaxFromDiff(chain, leg, amountIn, offDiffBps) {
+  if (leg.kind !== KIND_V3 || offDiffBps == null) return false;
+  if (offDiffBps > -LEARN_CAP_BPS) return false;   // 過小・軽微は触らない
+  if (!(amountIn > 0n)) return false;
+
+  const pool = getPool(chain, leg.pool);
+  if (!pool || !pool.token0) return false;
+  const zeroForOne = pool.token0.toLowerCase() === (leg.tokenIn || "").toLowerCase();
+
+  const next = amountIn / 2n;
+  if (!(next > 0n)) return false;
+  const current = getTableTrustedMax(chain, leg.pool, zeroForOne);
+  if (current != null && current <= next) return false; // すでにもっと厳しい
+
+  setTableTrustedMax(chain, leg.pool, zeroForOne, next);
+  const range = getTableRange(chain, leg.pool, zeroForOne);
+  console.log(
+    `[表の上限/学習] ${chain} ${leg.dexId}:${leg.pool.slice(0, 10)}…: ` +
+    `投入${amountIn} で表が**${Math.abs(offDiffBps).toFixed(1)}bps 過大**(公式との差)。` +
+    `信用できる上限を ${next} に下げました` +
+    (range ? "" : "(最小点も下回ったため、このプールはこの向きでは判定しません)")
+  );
+  return true;
 }
 
 /// 赤字だった経路について、段ごとの誤差をログに出す。失敗しても判定は止めない。
@@ -167,6 +213,8 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
     // 自前と公式の両方が取れた段は、公式との差も並べる(一致なら価格表の古さが原因)。
     const offDiff = ownQuoted[i] && official[i] != null ? bpsDiff(expected[i].out, official[i]) : null;
     const offNote = offDiff != null ? `(公式${offDiff >= 0 ? "+" : ""}${offDiff.toFixed(1)}bps)` : "";
+    // **測った誤差を、その場で表の上限に反映する。**
+    try { learnTrustedMaxFromDiff(chain, legs[i], expected[i].in, offDiff); } catch (e) {}
     // V2の段は、差を「判定してから地図が動いた分」と「地図とチェーンの差」に分ける。
     let splitNote = "";
     if (storedOut[i] != null) {
