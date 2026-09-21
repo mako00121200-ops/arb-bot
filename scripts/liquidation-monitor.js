@@ -43,7 +43,14 @@ const DATA_PROVIDER_ADDRESS = AaveV3Avalanche.AAVE_PROTOCOL_DATA_PROVIDER;
 const ENABLED = process.env.LIQUIDATION_ENABLED !== "false";
 /// 既定は**送らない**。候補の検出と確認(eth_call)までを行い、ログと画面に出す。
 export const DRY_RUN = process.env.LIQUIDATION_DRY_RUN !== "false";
-export const MIN_PROFIT_USD = Number(process.env.LIQUIDATION_MIN_PROFIT_USD || "0.5");
+/// 清算の最低利益。**オーナーの決定で $0.5 → $0.00001(2026年9月21日)。**
+///
+/// [なぜ下げたか]
+/// $0.5 は私が手で決めた数字で、**$0.5未満の清算候補を確認すらせずに捨てていた**。
+/// 清算の狙いは「小口は放置されている」なので、その小口を自分で捨てていたことになる。
+/// 送るかどうかは `simulateLiquidation`(eth_call)で出た**実際の利益**が
+/// ガス代を上回るかで決める。それが「手数料負けするなら見送る」。
+export const MIN_PROFIT_USD = Number(process.env.LIQUIDATION_MIN_PROFIT_USD || "0.00001");
 export const MAX_DEBT_USD = Number(process.env.LIQUIDATION_MAX_DEBT_USD || "2000");
 /// 担保を売る時の滑りがこれを超える組は見送る。
 export const MAX_SLIPPAGE_BPS = parseInt(process.env.LIQUIDATION_MAX_SLIPPAGE_BPS || "300", 10);

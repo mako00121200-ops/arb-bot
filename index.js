@@ -47,7 +47,7 @@ import { startLiquidationMonitor, setCandidateHandler, formatLiquidationLine, ge
 import { handleLiquidationCandidate, selfCheckLiquidationExecutor } from "./scripts/liquidation-executor.js";
 import { runLiquidatorDeploy } from "./scripts/liquidator-deploy.js";
 import { readPoolFeeOnchain } from "./scripts/pool-fee-onchain.js";
-import { requiredMinProfitUsd, describeMinProfit, noteSendOutcome, formatMinProfitLine } from "./scripts/min-profit.js";
+import { minProfitUsd, describeMinProfit, noteSendOutcome, formatSendBalanceLine } from "./scripts/min-profit.js";
 // 画面とログの時刻は**すべて日本時間**に揃える(保存は UTC のまま)。
 import { TZ_LABEL, formatJst as formatLocalTime, nowJst } from "./scripts/jst.js";
 import {
@@ -227,7 +227,7 @@ function noteBelowMin(opp) {
   if (!belowMinLastSampleAt[opp.chain] || now - belowMinLastSampleAt[opp.chain] > 5 * 60 * 1000) {
     belowMinLastSampleAt[opp.chain] = now;
     const gas = (opp.grossProfitUsd ?? 0) - (opp.netProfitUsd ?? 0);
-    console.log(`[下限] ${opp.kind} ${opp.chain} ${opp.label}: 投入$${(opp.tradeAmountUsd ?? 0).toFixed(2)} 粗利$${(opp.grossProfitUsd ?? 0).toFixed(4)} − ガス$${gas.toFixed(4)} = 純利$${(opp.netProfitUsd ?? 0).toFixed(4)}(必要$${requiredMinProfitUsd(opp.chain, opp.gasCostUsd).toFixed(4)} = ガス×(1−勝率)÷勝率)`);
+    console.log(`[下限] ${opp.kind} ${opp.chain} ${opp.label}: 投入$${(opp.tradeAmountUsd ?? 0).toFixed(2)} 粗利$${(opp.grossProfitUsd ?? 0).toFixed(4)} − ガス$${gas.toFixed(4)} = 純利$${(opp.netProfitUsd ?? 0).toFixed(4)}(手数料負け)`);
   }
 }
 function belowMinSummary() {
@@ -1788,7 +1788,7 @@ async function handleOpportunity(opp, meta = {}) {
   if (opp.hasV3) stats.v3Opportunities++;
   stats.recent = [{ ...opp, at: new Date().toISOString(), ...meta }, ...stats.recent.filter((r) => r.label !== opp.label)].slice(0, 20);
 
-  if (opp.netProfitUsd < requiredMinProfitUsd(opp.chain, opp.gasCostUsd)) {
+  if (opp.netProfitUsd < minProfitUsd()) {
     reasons.belowMin++;
     record(opp, "below_min", meta);
     noteBelowMin(opp);
@@ -1815,8 +1815,8 @@ async function handleOpportunity(opp, meta = {}) {
     ]);
     if (ok) {
       stats.executed++; reasons.success++;
-      // **勝率の実測。** これが次の「手数料負けの線」を決める。
-      noteSendOutcome(opp.chain, true);
+      // **収支の実測。** 手元に残った純利益を足す。
+      noteSendOutcome(opp.chain, true, opp.actualNetProfitUsd ?? opp.netProfitUsd ?? 0);
       cooldownUntil.delete(key);
       record(opp, "success", meta);
       noteBigOutcome(opp, "success");
@@ -1841,7 +1841,7 @@ async function handleOpportunity(opp, meta = {}) {
     // **勝率の実測(負けた側)。**
     // ガス代を失うのは `wait`(送った後に取り消された)だけ。
     // simulate / estimateGas / send での失敗はガス代がかからないので数えない。
-    if (stage === "wait") noteSendOutcome(opp.chain, false);
+    if (stage === "wait") noteSendOutcome(opp.chain, false, opp.gasCostUsd ?? 0);
     // **「失敗」と「負け」を同じ箱に入れない。**
     // `wait`(確定待ちで取り消された)は、送った後に他者が先に取った時に起きる。
     // 直し方が「取り消しの中身から原因を特定する」ではなく「速さ」なので分ける。
@@ -2013,7 +2013,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${sizeLine()}${formatMinProfitLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${alertLine}`);
+  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${sizeLine()}${formatSendBalanceLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
@@ -2308,7 +2308,7 @@ function shortenLabel(label) {
 
 const REASON_LABEL = {
   disabled: "無効化済みのプールを含む", taxToken: "税トークン", cooldown: "冷却中(直近に失敗)",
-  trap: "罠または計算の誤差", belowMin: "手数料負けの線に届かず(失敗時のガス代を取り返せない)", executing: "実行中で重複",
+  trap: "罠または計算の誤差", belowMin: "手数料負け(粗利がガス代に届かない)", executing: "実行中で重複",
   notSent: "送信条件を満たさず", failed: "送信に失敗", success: "送信成功",
 };
 const STAGE_LABEL = {

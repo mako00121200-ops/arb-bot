@@ -911,7 +911,7 @@ function measureSpotScreen(chain, tokenA, tokenB, pools, capUsd, gasCostUsd) {
           } else if (netUsd > prevNet) {
             spotScreen.routeNet.set(key, netUsd);
           }
-          if (netUsd > screenMinProfitUsd(chain, gasCostUsd)) {
+          if (netUsd > screenMinProfitUsd()) {
             spotScreen.needQuote++;
             if (isFresh) spotScreen.freshNeedQuote++;
 
