@@ -374,4 +374,39 @@ export async function handleLiquidationCandidate(plan) {
   return { summary: `成立 +$${(actualNetProfitUsd ?? 0).toFixed(2)}`, sent: true, ok: true };
 }
 
+/// 起動時の自己点検(読み取りのみ)。候補が出るまで実行の道筋が一度も通らないので、
+/// コントラクトの住所・所有者・Pool と、典型的な組(WAVAX→USDC)の経路探しをここで確かめる。
+/// 失敗しても起動は止めない。
+export async function selfCheckLiquidationExecutor() {
+  const address = contractAddress();
+  if (!address) {
+    console.log(`[清算AVAX/契約] ${liquidatorAddressEnvVar(CHAIN)} が未設定です。候補はログに出すだけで、確認も送信もしません`);
+    stats.noContract = true;
+    return;
+  }
+  try {
+    const owner = await ensureOwner(address);
+    const raw = await callWithRpc(CHAIN, (p) => p.call({ to: address, data: LIQUIDATOR_IFACE.encodeFunctionData("POOL", []) }), true);
+    const pool = LIQUIDATOR_IFACE.decodeFunctionResult("POOL", raw)[0];
+    const wallet = process.env.MAINNET_BOT_PRIVATE_KEY ? new ethers.Wallet(process.env.MAINNET_BOT_PRIVATE_KEY).address : null;
+    const ownerOk = wallet ? owner.toLowerCase() === wallet.toLowerCase() : null;
+    console.log(`[清算AVAX/契約] Pool ${pool} / 所有者は bot のウォレット${ownerOk === null ? "(鍵が無いので未確認)" : ownerOk ? "と一致" : "と**不一致**(送信は全て拒否されます)"}`);
+  } catch (e) {
+    console.warn(`[清算AVAX/契約] ${address} を読めません: ${(e.message || "").slice(0, 100)}`);
+    return;
+  }
+  // 典型的な組で経路探しを通す。清算する額の想定は $500 ぶんの WAVAX。
+  try {
+    const wavax = AaveV3Avalanche.ASSETS.WAVAX.UNDERLYING, usdc = AaveV3Avalanche.ASSETS.USDC.UNDERLYING;
+    const rc = getReserveInfo(wavax);
+    if (!rc || rc.price === 0n) { console.log("[清算AVAX/自己点検] WAVAX の価格がまだ無いので経路の点検は省きます"); return; }
+    const seized = (500n * 10n ** 8n * 10n ** BigInt(rc.decimals)) / rc.price;
+    const routes = await buildRoutes(wavax, usdc, seized);
+    const line = routes.slice(0, 4).map((r) => `${r.label} → ${ethers.formatUnits(r.estimatedOut, 6)} USDC`).join(" / ");
+    console.log(`[清算AVAX/自己点検] WAVAX $500ぶん → USDC の経路 ${routes.length}本${routes.length ? `: ${line}` : "(**見つからず**。ファクトリーの住所か地図を確かめること)"}`);
+  } catch (e) {
+    console.warn(`[清算AVAX/自己点検] 経路探しに失敗: ${(e.message || "").slice(0, 120)}`);
+  }
+}
+
 export function getLiquidationExecutorStats() { return { ...stats }; }

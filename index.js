@@ -44,7 +44,7 @@ import { alertOwner, getAlertStats, sendPendingQuestions } from "./scripts/owner
 import { verifyAaveChains, getAaveChains, sweepAll as aaveSweepAll, checkWatchAll as aaveCheckWatchAll, formatAaveLine, AAVE_SWEEP_INTERVAL_MS, AAVE_WATCH_INTERVAL_MS } from "./scripts/aave-liquidation.js";
 import { noteBigOutcome, formatBigLine, formatBigSummary } from "./scripts/big-opportunities.js";
 import { startLiquidationMonitor, setCandidateHandler, formatLiquidationLine, getLiquidationDashboard, CHAIN as LIQUIDATION_CHAIN } from "./scripts/liquidation-monitor.js";
-import { handleLiquidationCandidate } from "./scripts/liquidation-executor.js";
+import { handleLiquidationCandidate, selfCheckLiquidationExecutor } from "./scripts/liquidation-executor.js";
 import { runLiquidatorDeploy } from "./scripts/liquidator-deploy.js";
 import { readPoolFeeOnchain } from "./scripts/pool-fee-onchain.js";
 import {
@@ -2696,7 +2696,11 @@ async function main() {
   try {
     liquidationStarted = await startLiquidationMonitor(Object.keys(CHAIN_CONFIG));
     // 候補が出た時の処理(経路探し → eth_call で確認 → DRY_RUN でなければ送信)。
-    if (liquidationStarted) setCandidateHandler(handleLiquidationCandidate);
+    if (liquidationStarted) {
+      setCandidateHandler(handleLiquidationCandidate);
+      // 実行の道筋(契約の住所・所有者・経路探し)を起動時に一度通しておく(読み取りのみ)。
+      setTimeout(() => { selfCheckLiquidationExecutor().catch(() => {}); }, 90 * 1000);
+    }
   } catch (e) {
     console.warn(`[清算AVAX] 始められませんでした: ${(e.message || "").slice(0, 100)}`);
   }
