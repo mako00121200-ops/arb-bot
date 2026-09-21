@@ -48,6 +48,7 @@ $1〜30しか吸えず、掛け算の答えが常に小さい(競争で価格差
 | `contracts/AaveLiquidator.sol` | **清算コントラクト(裁定とは別)。** `flashLoanSimple` → `liquidationCall` → DEX で売却 → 返済。`simulateLiquidation` | 300 |
 | `scripts/liquidator-deploy.js` | 清算コントラクトの配置(`RUN_LIQUIDATOR_DEPLOY`) | 60 |
 | `scripts/jst.js` | **画面とログの時刻を日本時間に揃える**(保存は UTC のまま)。`DISPLAY_TIMEZONE` | 50 |
+| `scripts/min-profit.js` | **チェーンごとの最低利益。** ガス代が25倍違うため一律にしない。ふるいと実行の両方がここを見る | 85 |
 | `scripts/owner-alert.js` | LINE 通知(未設定)。`docs/owner-questions.json` の転送 | 210 |
 | `scripts/pool-survey.js` | 手動の調査ツール(`RUN_POOL_SURVEY`)。普段は動かない | 400 |
 | `scripts/mainnet-deploy.js` / `compile-contract.js` | コントラクトの配置(`RUN_MAINNET_DEPLOY`)とコンパイル | 110 |
@@ -171,6 +172,7 @@ V3表[確認N 上限制限M(今K本) …] … 価格表の検証と上限
 | チェーン上 | `returned >= owed + minProfit` | 最後の砦 |
 | 送信前 | `simulateRoute` + `estimateGas` を同時に | 赤字なら送らない |
 | 送信前 | 実測ガスで純利益を確かめ直す | `MIN_PROFIT_USD=0.01` |
+| 送信前 | 最低利益は**チェーンごと**(損益分岐の勝率から決める) | 既定$0.01 / avalanche$0.001 |
 | 判定 | 罠(利回り20%超は幻) | `MAX_SANE_RETURN_RATIO=0.20` |
 | 判定 | 税トークン(手数料100bps超は永久除外) | `TAX_TOKEN_FEE_BPS=100` |
 | 判定 | 価格表の信用できる上限(過大が20bps超で投入額を制限) | `VERIFY_DROP_TABLE_BPS=20` / `LEARN_CAP_BPS=20` |
