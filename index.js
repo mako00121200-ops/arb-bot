@@ -886,7 +886,42 @@ let v3VerifyCursor = 0;
 /// 価格表のずれがこれを超えたら、その表を捨てて作り直させる(bps)。
 /// 20bps は「出す」閾値で、そこで捨てると作り直しが増えすぎる。
 /// 狙う利幅の上限(50bps)を超えたら、その表は判定に使えないと見なす。
-const VERIFY_DROP_TABLE_BPS = parseFloat(process.env.VERIFY_DROP_TABLE_BPS || "50");
+/// 補間が公式より**過大**な時に、投入量の上限を下げる閾値(bps)。
+///
+/// [なぜ50から20へ下げたか(2026年9月21日、オーナーの指摘)]
+/// 「投入額を上げると失敗している。大きい額での手数料の計算が合っていないのでは」
+/// —— 実測がこれを裏付けていた。
+///
+///   avalanche 0xd18384F4(1.00%): $20 誤差20bps以内 / $200 28.3bps / $700 92.2bps
+///   avalanche 0x27b571f3(0.30%): $20 誤差20bps以内 / $200 84.8bps
+///   optimism 3段V3 投入$276: 判定+$0.4833 → 実測 **-30.9bps**
+///
+/// **誤差は投入額とともに増える。** 表の点と点を直線で結んでいるので、
+/// 小額では曲線とほぼ重なるが、大きくなるほど離れる。
+///
+/// そして**狙う利幅は5〜50bps**。50bpsで切っていては、
+/// 「利幅と同じだけ間違っている表」を通してしまう。**利幅の尺度に合わせる。**
+const VERIFY_DROP_TABLE_BPS = parseFloat(process.env.VERIFY_DROP_TABLE_BPS || "20");
+
+/// 直近の機会で実際に使ったV3プール。**確かめる順番をここから決める。**
+///
+/// [なぜ要るか]
+/// 今までは全V3プールを順ぐりに確かめていた。表が約240本あり2分に1本なので、
+/// **一周に約8時間**。大きな機会を運んでいるプールが、何時間も確かめられない。
+/// 「使っているプールから確かめる」だけで、上限の制限が効くまでの時間が桁で縮む。
+const recentlyUsedV3 = new Map(); // "chain::pool" -> 最後に使った時刻
+const RECENT_USE_MS = parseInt(process.env.RECENT_USE_MS || String(30 * 60 * 1000), 10);
+
+function noteV3PoolsUsed(opp) {
+  const now = Date.now();
+  for (const leg of opp.legs || []) {
+    if (leg.kind !== KIND_V3 || !leg.pool) continue;
+    recentlyUsedV3.set(poolKeyOf(opp.chain, leg.pool), now);
+  }
+  if (recentlyUsedV3.size > 500) {
+    for (const [k, t] of recentlyUsedV3) if (now - t > RECENT_USE_MS) recentlyUsedV3.delete(k);
+  }
+}
 
 /// 確かめる投入額。**実際の取引額($1〜30)を含む点を必ず入れる。**
 /// 以前は最小が$20で、$200/$700 のずれだけを理由に価格表を捨てていた。
@@ -932,7 +967,15 @@ async function verifyV3Calculations() {
     }
   }
   if (candidates.length === 0) return;
-  const pool = candidates[v3VerifyCursor % candidates.length];
+
+  // **使っているプールを先に確かめる。** 使っていないプールの精度は利益に効かない。
+  const now = Date.now();
+  const used = candidates.filter((p) => {
+    const t = recentlyUsedV3.get(poolKeyOf(p.chain, p.address));
+    return t != null && now - t < RECENT_USE_MS;
+  });
+  const list = used.length > 0 ? used : candidates;
+  const pool = list[v3VerifyCursor % list.length];
   v3VerifyCursor++;
 
   // **小さい順に確かめ、「どこまでなら信用できるか」を決める。**
@@ -957,6 +1000,7 @@ async function verifyV3Calculations() {
   const amounts = [...VERIFY_AMOUNTS_USD].sort((a, b) => a - b);
   let lastOkAmountIn = null;   // ここまでは信用できる、と分かった投入量
   let cappedAt = null;         // 過大が出た投入額($)
+  const curve = [];            // 投入額ごとの誤差(大きさとの関係を見るため)
 
   for (const usd of amounts) {
     // 表の点そのものではなく、点と点の間の値で確かめる。
@@ -1002,8 +1046,14 @@ async function verifyV3Calculations() {
     const tooHigh = bps > VERIFY_DROP_TABLE_BPS;
     if (bps < -VERIFY_DROP_TABLE_BPS) stats.v3VerifyUnderCount++;
 
+    curve.push(`$${usd}:${bps >= 0 ? "+" : ""}${bps.toFixed(1)}bps`);
     if (tooHigh) { cappedAt = usd; break; }
     lastOkAmountIn = amountIn;   // ここまでは信用してよい
+  }
+
+  // **どの額から壊れるかを1行で残す。** これが「大きい額で失敗する」の証拠になる。
+  if (curve.length > 1) {
+    console.log(`[V3検証/大きさ] ${pool.chain} ${pool.address.slice(0, 10)}…(${(pool.feeBps / 100).toFixed(2)}%): ${curve.join(" / ")}${cappedAt != null ? ` → **$${cappedAt}で過大**` : ""}`);
   }
 
   if (cappedAt != null) {
@@ -1609,6 +1659,7 @@ function poolLockKeys(opp) {
 
 async function handleOpportunity(opp, meta = {}) {
   stats.examined++;
+  noteV3PoolsUsed(opp);
   // **捨てる道すべてで大物を数える。** 記録の無い道があると、
   // 「大きな機会が消えた」を後から確かめられない(2026年9月21日に判明)。
   if (hasDisabledPool(opp)) { reasons.disabled++; noteBigOutcome(opp, "disabled"); return; }
