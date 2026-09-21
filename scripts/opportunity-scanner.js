@@ -297,6 +297,53 @@ export function getRouteCalcStats() { return { ...routeCalcStats }; }
 const WHATIF_DROPS = (process.env.WHATIF_WALL_DROPS || "29,50,100")
   .split(",").map((v) => parseInt(v.trim(), 10)).filter((v) => v > 0);
 
+// ===== 取引量を増やせるかを測る(2026年9月21日、オーナーの指示)=====
+//
+// [なぜ測るか]
+// オーナーの目標は「1回あたりの取引量を増やす」。ところが今の実行は投入$1.00で、
+// 取引上限は$2,000。**2,000倍の余裕があるのに使っていない。**
+// 理由は2つのどちらかで、対策が正反対になる。
+//   ① プールが浅く、大きく入れると値が動いて利益が減る → **上限を上げても無駄**。
+//      深いプールを見つけるしかない
+//   ② こちらの都合(価格表の範囲・刻み)で大きい額を試していない → **直せる**
+//
+// `findBestAmount` は既に15通りの投入額で利益を計算しているのに、
+// **一番良かった1つ以外を捨てている**。捨てている値がそのまま答えになる。
+// RPCは1回も増えない(全部その場の計算)。
+//
+// 測るのは3つ:
+//   ・最適額が「使える上限」の何%か(小さいほど浅い)
+//   ・最適額の4倍にすると利益が何%になるか(高いほど余裕がある)
+//   ・上限に張り付いた回数(こちらの都合で切られている証拠)
+const SIZE_SAMPLES_MAX = 600;
+const sizeCurve = { bestPct: [], at4xPct: [] };
+
+function noteSizeCurve(best, cap, at4) {
+  if (cap <= 0n || best.amountIn <= 0n || best.profit <= 0n) return;
+  sizeCurve.bestPct.push(Number((best.amountIn * 10000n) / cap) / 100);
+  if (at4) sizeCurve.at4xPct.push(Number((at4.profit * 1000n) / best.profit) / 10);
+  // 増え続けないように、古い方から間引く。
+  for (const arr of [sizeCurve.bestPct, sizeCurve.at4xPct]) {
+    if (arr.length > SIZE_SAMPLES_MAX) arr.splice(0, arr.length - SIZE_SAMPLES_MAX);
+  }
+}
+
+function medianOf(arr) {
+  if (arr.length === 0) return null;
+  const a = [...arr].sort((x, y) => x - y);
+  return a[Math.floor(a.length / 2)];
+}
+
+/// 取引量の余裕。null は「まだ測れていない」。
+export function getSizeCurveStats() {
+  return {
+    samples: sizeCurve.bestPct.length,
+    bestPctMedian: medianOf(sizeCurve.bestPct),
+    at4xPctMedian: medianOf(sizeCurve.at4xPct),
+    hitCap: routeCalcStats.hitCap,
+  };
+}
+
 function findBestAmount(maxAmountIn, legs) {
   let best = { amountIn: 0n, amountOut: 0n, profit: 0n, returnBps: null };
   const cap = routeMaxAmountIn(maxAmountIn, legs);
@@ -331,12 +378,15 @@ function findBestAmount(maxAmountIn, legs) {
     0.0005, 0.001, 0.002, 0.004, 0.008, 0.015, 0.03, 0.06,
     0.12, 0.2, 0.3, 0.45, 0.6, 0.8, 1.0,
   ];
+  // 試した額と利益を控える(今までは一番良い1つ以外を捨てていた)。
+  const evals = [];
   for (const r of ratios) {
     const amountIn = (cap * BigInt(Math.round(r * 100000))) / 100000n;
     if (amountIn <= 0n) continue;
     const amountOut = simulateRoute(amountIn, legs);
     const profit = amountOut - amountIn;
     note(amountIn, amountOut, profit);
+    evals.push({ amountIn, profit });
     if (profit > best.profit) best = { amountIn, amountOut, profit, returnBps: null };
   }
   if (best.amountIn > 0n) {
@@ -351,6 +401,17 @@ function findBestAmount(maxAmountIn, legs) {
   }
   // 一番良かった額が上限のすぐ下なら、上限で切られていた可能性がある。
   if (best.amountIn > 0n && best.amountIn * 100n >= cap * 95n) routeCalcStats.hitCap++;
+  // **捨てていた値で「もっと大きく入れられるか」を測る。**
+  // 最適額の4倍以上を試した中で、いちばん4倍に近いものと比べる。
+  if (best.profit > 0n) {
+    const target = best.amountIn * 4n;
+    let at4 = null;
+    for (const e of evals) {
+      if (e.amountIn < target) continue;
+      if (at4 == null || e.amountIn < at4.amountIn) at4 = e;
+    }
+    noteSizeCurve(best, cap, at4);
+  }
   return { ...best, returnBps: bestReturnBps, whatIf };
 }
 
