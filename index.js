@@ -246,7 +246,7 @@ const stats = {
   skippedCooldown: 0, trapsRejected: 0, taxTokensRejected: 0, staleRejected: 0, bigMoves: 0,
   v3Found: 0, v3Matched: 0, v3Opportunities: 0, v3LiquidityEvents: 0, scoutAdded: 0,
   quoteTablesBuilt: 0, quoteTablesPending: 0, quoteRebuildsFromPolling: 0, quoteTablesOnDemand: 0,
-  temporarilyDisabled: 0, raceLost: 0, feeFixedOnchain: 0, feeUnreadable: 0,
+  temporarilyDisabled: 0, raceLost: 0, feeFixedOnchain: 0, feeUnreadable: 0, feeLearned: 0,
   v3VerifyCount: 0, v3VerifyWorst: null, v3VerifyRecent: [], v3VerifyDropped: 0,
   v3VerifyCapped: 0, v3VerifyUnderCount: 0,
   disabledFromFile: 0, disabledRuntime: 0,
@@ -1555,9 +1555,8 @@ async function runOnchainFeeFixes() {
     if (!info) {
       const safe = Math.max(pool.feeBps || 0, UNREADABLE_FEE_BPS);
       setPoolFee(chain, address, safe);
-      markFeeFromChain(chain, address);
-      stats.feeUnreadable++;
-      console.warn(`[手数料/直読み] ${chain} ${address.slice(0, 10)}…: 手数料も stable も読めません。**安全側の${safe}bps**に固定します`);
+      stats.feeUnreadable++;  // 印は付けない(当て推量なので訂正されるべき)
+      console.warn(`[手数料/直読み] ${chain} ${address.slice(0, 10)}…: 手数料も stable も読めません。**当て推量の${safe}bps**を当てます(実測で訂正されます)`);
       continue;
     }
     // stable プールは x³y+y³x 曲線。**x·y=k の式では値段を出せない。**
@@ -1573,9 +1572,10 @@ async function runOnchainFeeFixes() {
       // 読めないプールに楽観的な既定を当てると、送信を無駄にし続ける。
       const safe = Math.max(pool.feeBps || 0, UNREADABLE_FEE_BPS);
       setPoolFee(chain, address, safe);
-      markFeeFromChain(chain, address);
+      // **印は付けない。** これはチェーンから読んだ値ではなく**当て推量**。
+      // 一次情報の印を付けると訂正できなくなる(実際そうしてしまっていた)。
       stats.feeUnreadable++;
-      console.warn(`[手数料/直読み] ${chain} ${address.slice(0, 10)}…: 手数料を読めません(${info.source})。**安全側の${safe}bps**に固定します(低すぎるとK検算で拒否され続けるため)`);
+      console.warn(`[手数料/直読み] ${chain} ${address.slice(0, 10)}…: 手数料を読めません(${info.source})。**当て推量の${safe}bps**を当てます(実測で訂正されます)`);
       continue;
     }
     const before = pool.feeBps;
@@ -1589,6 +1589,59 @@ async function runOnchainFeeFixes() {
       stats.taxTokensRejected++;
       disablePool(chain, address, `実測手数料${info.feeBps}bps(税トークン)`, { permanent: true });
     }
+  }
+}
+
+// ===== 送信直前の実測の「不足」から、V2の手数料を学ぶ =====
+//
+// [なぜ要るか(2026年9月21日の実測)]
+// base の `uniswap-v3(X%)→aerodrome→sync発見` が、V3側の手数料帯を
+// 0.01% / 0.05% / 0.30% と変えても **不足 -248.9 / -256.2 / -260.5bps** と
+// ほぼ同じだった。**V3の段を変えても誤差が変わらない = 誤差はV2の段にある。**
+//
+// Aerodrome は工場から 30bps と読めている。残るのは `sync発見` の
+// 0xde66c35e で、**このプールは stable() も factory() も fee() も答えない**。
+// つまり当て推量の 50bps を当てていた。50 + 250 ≈ **300bps**。
+//
+// `[段ごとの答え合わせ]` はV2の段の手数料誤差を**見られない**。
+// 見込みも実測も**同じ手数料の前提**で計算しているので差が出ない
+// (実際、全部の段が +0.0bps と出ていた)。
+// **不足の実測(simulateRoute の結果)だけが、この誤差を知っている。**
+const LEARN_FEE_MIN_BPS = parseFloat(process.env.LEARN_FEE_MIN_BPS || "50");
+const LEARN_FEE_MAX_BPS = parseInt(process.env.LEARN_FEE_MAX_BPS || "2000", 10);
+
+/// 不足の実測から、手数料の分からないV2プールの手数料を引き上げる。
+/// **原因を1つに絞れる時だけ**行う(未確定のV2が1本だけの経路)。
+function learnV2FeeFromShortfall(opp) {
+  const short = Number(opp?.shortfallBps);
+  if (!Number.isFinite(short) || short > -LEARN_FEE_MIN_BPS) return;
+
+  const unknown = [];
+  for (const leg of opp.legs || []) {
+    if (leg.kind === KIND_V3 || !leg.pool) continue;
+    const pool = getPool(opp.chain, leg.pool);
+    if (!pool || pool.feeFromChain) continue;   // 確かな値は触らない
+    unknown.push({ leg, pool });
+  }
+  // **2本以上あると、どちらのせいか決められない。** 決められない時は何もしない。
+  if (unknown.length !== 1) return;
+
+  const { leg, pool } = unknown[0];
+  const before = pool.feeBps || 0;
+  const next = Math.min(LEARN_FEE_MAX_BPS, before + Math.round(Math.abs(short)));
+  if (next <= before) return;
+
+  setPoolFee(opp.chain, leg.pool, next);
+  stats.feeLearned++;
+  console.log(
+    `[手数料/不足から学習] ${opp.chain} ${leg.dexId}:${leg.pool.slice(0, 10)}…: ` +
+    `実測で**${Math.abs(short).toFixed(1)}bps 不足**。手数料 ${before}bps → **${next}bps** に引き上げます` +
+    `(この経路で手数料が未確定のV2はこの1本だけ)`
+  );
+  if (next > TAX_TOKEN_FEE_BPS) {
+    stats.taxTokensRejected++;
+    disablePool(opp.chain, leg.pool, `実測手数料${next}bps(税トークン)`, { permanent: true });
+    console.log(`[手数料/不足から学習] ${opp.chain} ${leg.pool.slice(0, 10)}…: ${next}bps は上限${TAX_TOKEN_FEE_BPS}bpsを超えるため、**税トークンとして外します**`);
   }
 }
 
@@ -1726,6 +1779,8 @@ async function handleOpportunity(opp, meta = {}) {
       cooldownUntil.set(key, Date.now() + 30 * 1000);
       record(opp, "not_sent", meta);
       noteBigOutcome(opp, "not_sent", opp.shortfallBps != null ? `不足${opp.shortfallBps.toFixed(1)}bps` : "");
+      // **不足の実測は、V2の手数料の誤差を知っている唯一の情報。** 捨てない。
+      try { learnV2FeeFromShortfall(opp); } catch (e) {}
     }
   } catch (e) {
     stats.failed++; reasons.failed++;
@@ -1910,7 +1965,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${disableLine()}${formatBigLine()}${formatAaveLine()}${alertLine}`);
+  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${disableLine()}${formatBigLine()}${formatAaveLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
