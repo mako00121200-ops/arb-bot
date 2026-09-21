@@ -326,27 +326,42 @@ async function probeRevertData(chain, contractAddress, iface) {
   const notOwner = "0x0000000000000000000000000000000000000001";
   const data = iface.encodeFunctionData("simulateRoute", [ethers.ZeroAddress, 0n, []]);
 
-  const hasRevertData = async (blockTag) => {
+  // 「取り消されなかった」と「取り消されたが中身が無い」は原因が全く違う。
+  //   取り消されない → その住所に中身が無いか、別のコントラクト
+  //   中身が無い     → 端点が中身を落としているか、理由なしで取り消している
+  // 分けて報せないと、次に何をすればいいか決められない。
+  const probe = async (blockTag) => {
     try {
-      await callWithRpc(chain, (p) => p.call({ to: contractAddress, from: notOwner, data, blockTag }), true);
-      return false; // revert しなかった(想定外)
+      const ret = await callWithRpc(chain, (p) => p.call({ to: contractAddress, from: notOwner, data, blockTag }), true);
+      return { kind: "returned", detail: String(ret).slice(0, 20) };
     } catch (e) {
       const d = e?.data ?? e?.info?.error?.data ?? e?.error?.data ?? null;
-      return typeof d === "string" && d.startsWith("0x") && d.length > 2;
+      if (typeof d === "string" && d.startsWith("0x") && d.length > 2) {
+        let reason = d.slice(0, 20);
+        try { reason = ethers.toUtf8String("0x" + d.slice(138)).replace(/\0/g, "") || reason; } catch (inner) {}
+        return { kind: "revertWithData", detail: reason };
+      }
+      return { kind: "revertNoData", detail: (e?.shortMessage || e?.message || "").slice(0, 80) };
     }
   };
 
   try {
-    if (await hasRevertData("pending")) {
-      console.log(`[確認の下調べ] ${chain}: pending でも revert の中身が返ります(このままで大丈夫)`);
+    const atPending = await probe("pending");
+    if (atPending.kind === "revertWithData") {
+      console.log(`[確認の下調べ] ${chain}: pending でも revert の中身が返ります(「${atPending.detail}」)。このままで大丈夫`);
       return;
     }
-    if (await hasRevertData("latest")) {
+    const atLatest = await probe("latest");
+    if (atLatest.kind === "revertWithData") {
       simulateBlockTag.set(chain, "latest");
-      console.warn(`[確認の下調べ] ${chain}: **pending では revert の中身が返りません**。latest では返るので、以降このチェーンの確認は latest で行います(判定に使う状態とは少しずれますが、確認できない方が悪いため)`);
+      console.warn(`[確認の下調べ] ${chain}: **pending では revert の中身が返りません**(${atPending.kind})。latest では返るので、以降このチェーンの確認は latest で行います`);
       return;
     }
-    console.warn(`[確認の下調べ] ${chain}: pending でも latest でも revert の中身が返りません。コントラクトか端点の問題です`);
+    if (atPending.kind === "returned" || atLatest.kind === "returned") {
+      console.warn(`[確認の下調べ] ${chain}: **所有者以外の呼び出しが取り消されませんでした**(返り値「${(atPending.detail || atLatest.detail)}」)。住所 ${contractAddress} に中身が無いか、別のコントラクトです。住所の設定を確認してください`);
+      return;
+    }
+    console.warn(`[確認の下調べ] ${chain}: **取り消されたのに理由が返りません**(pending: ${atPending.detail} / latest: ${atLatest.detail})。bot が期待する版のコントラクトではありません。再デプロイが要ります`);
   } catch (e) {
     console.warn(`[確認の下調べ] ${chain}: 確かめられませんでした: ${(e.message || "").slice(0, 100)}`);
   }
