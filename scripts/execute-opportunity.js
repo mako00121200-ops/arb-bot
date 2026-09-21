@@ -53,6 +53,18 @@ import { scheduleCompetitorCheck } from "./competitor-check.js";
 // 赤字の確定は1日329件。1件につきV3用とV2用で最大2回の束ね呼び出し。
 // 月に約2万回で、枠2,000万の0.1%。
 const DIAGNOSE_MIN_BPS = parseFloat(process.env.DIAGNOSE_MIN_BPS || "5");
+
+/// プールの責任を問う(一時除外につながる)閾値。**ログに出す閾値とは別にする。**
+///
+/// [なぜ分けたか(2026年9月21日の実測)]
+///   一時除外[のべ1 今1 **飛ばした経路699**]   (549 → 603 → 699 と増加中)
+/// **たった1つのプールのせいで699本の経路が判定を飛ばされていた。**
+///
+/// 責任を問う条件が `-5bps` と緩すぎた。うちの模型の誤差は普通に10〜30bps出るので、
+/// **ほぼ全ての赤字経路で誰かが犯人にされていた**。しかも経路に多く現れる
+/// 主要プール(WETH/USDC 等)ほど犯人になりやすい。
+/// **取引が多い = 機会が多いプールから順に外していた**ことになる。
+const BLAME_MIN_BPS = parseFloat(process.env.BLAME_MIN_BPS || "30");
 // 「判定からの動き」を記録する下限(bps)。小さな揺れは出さない。
 const DRIFT_MIN_BPS = parseFloat(process.env.DRIFT_MIN_BPS || "5");
 
@@ -205,7 +217,8 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
   }
 
   const parts = [];
-  let worst = null;
+  let worst = null;       // 表示用: いちばん差の大きかった段
+  let blameWorst = null;  // 責任用: **こちらの模型が間違っていると示せた**段だけ
   for (let i = 0; i < legs.length; i++) {
     if (actual[i] == null) { parts.push(`${i + 1}段目 ${legs[i].dexId}:読めず`); continue; }
     const diff = bpsDiff(expected[i].out, actual[i]);
@@ -217,24 +230,42 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
     try { learnTrustedMaxFromDiff(chain, legs[i], expected[i].in, offDiff); } catch (e) {}
     // V2の段は、差を「判定してから地図が動いた分」と「地図とチェーンの差」に分ける。
     let splitNote = "";
+    let gapBps = null;
     if (storedOut[i] != null) {
       const moved = bpsDiff(expected[i].out, storedOut[i]); // ①判定時 → ②今の地図
       const gap = bpsDiff(storedOut[i], actual[i]);         // ②今の地図 → ③チェーン
       if (moved != null && gap != null) {
+        gapBps = gap;
         splitNote = `(判定後に地図が${moved >= 0 ? "+" : ""}${moved.toFixed(1)}bps / 地図とチェーンの差${gap >= 0 ? "+" : ""}${gap.toFixed(1)}bps 手数料${legs[i].feeBps}bps)`;
       }
     }
     parts.push(`${i + 1}段目 ${legs[i].dexId}(${legs[i].kind}) ${diff >= 0 ? "+" : ""}${diff.toFixed(1)}bps${offNote}${splitNote}`);
     if (worst == null || diff < worst.diff) worst = { i, diff, leg: legs[i] };
+
+    // **責任を問うのは「こちらの模型が間違っている」と示せた段だけ。**
+    //
+    //   判定してから価格が動いた   → **他人が先に取った**。プールのせいではない
+    //   地図とチェーンの差(gap)   → こちらの地図が古い/間違っている
+    //   公式Quoterとの差(offDiff) → こちらの価格表が間違っている
+    //
+    // 全体の差(diff)には「価格が動いた分」が混ざるので、**責任には使わない**。
+    // 「失敗」と「負け」を同じ箱に入れない(9月21日に同じ型の欠陥を1件直した)。
+    const modelBps = gapBps != null ? gapBps : offDiff;
+    if (modelBps != null && (blameWorst == null || modelBps < blameWorst.bps)) {
+      blameWorst = { i, bps: modelBps, leg: legs[i] };
+    }
   }
   if (parts.length === 0) return;
-  const blame = worst && worst.diff <= -DIAGNOSE_MIN_BPS
-    ? ` ← ${worst.i + 1}段目 ${worst.leg.dexId}:${worst.leg.pool.slice(0, 10)}… が原因`
+  // 表示は今までどおり「いちばん差の大きかった段」を出す(原因を探す手掛かり)。
+  const note = worst && worst.diff <= -DIAGNOSE_MIN_BPS
+    ? ` ← ${worst.i + 1}段目 ${worst.leg.dexId}:${worst.leg.pool.slice(0, 10)}… が最大のずれ`
     : "";
-  console.log(`[段ごとの答え合わせ] ${chain} ${opp.label} 投入${opp.amountIn}: ${parts.join(" / ")}${blame}`);
-  // 犯人が名指しできた時だけ記録する。繰り返せば一時除外される。
-  if (blame) {
-    try { notePoolBlame(chain, worst.leg.pool, worst.diff); } catch (e) {}
+  console.log(`[段ごとの答え合わせ] ${chain} ${opp.label} 投入${opp.amountIn}: ${parts.join(" / ")}${note}`);
+
+  // **責任を問うのは、模型の誤りが大きいと示せた時だけ。**
+  if (blameWorst && blameWorst.bps <= -BLAME_MIN_BPS) {
+    console.log(`[答え合わせ/責任] ${chain} ${blameWorst.i + 1}段目 ${blameWorst.leg.dexId}:${blameWorst.leg.pool.slice(0, 10)}…: 地図が**${Math.abs(blameWorst.bps).toFixed(1)}bps**ずれている(価格の動きではない)`);
+    try { notePoolBlame(chain, blameWorst.leg.pool, blameWorst.bps); } catch (e) {}
   }
 }
 
