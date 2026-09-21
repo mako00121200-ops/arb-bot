@@ -43,6 +43,7 @@ import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
 import { alertOwner, getAlertStats, sendPendingQuestions } from "./scripts/owner-alert.js";
 import { verifyAaveChains, getAaveChains, sweepAll as aaveSweepAll, checkWatchAll as aaveCheckWatchAll, formatAaveLine, AAVE_SWEEP_INTERVAL_MS, AAVE_WATCH_INTERVAL_MS } from "./scripts/aave-liquidation.js";
 import { noteBigOutcome, formatBigLine, formatBigSummary } from "./scripts/big-opportunities.js";
+import { readPoolFeeOnchain } from "./scripts/pool-fee-onchain.js";
 import {
   fetchReservesBatch, fetchPoolTokensBatch, fetchTokenDecimalsBatch,
   fetchV3StatesBatch, getMulticallStats, findV3PoolsBatch,
@@ -244,7 +245,7 @@ const stats = {
   skippedCooldown: 0, trapsRejected: 0, taxTokensRejected: 0, staleRejected: 0, bigMoves: 0,
   v3Found: 0, v3Matched: 0, v3Opportunities: 0, v3LiquidityEvents: 0, scoutAdded: 0,
   quoteTablesBuilt: 0, quoteTablesPending: 0, quoteRebuildsFromPolling: 0, quoteTablesOnDemand: 0,
-  temporarilyDisabled: 0, raceLost: 0,
+  temporarilyDisabled: 0, raceLost: 0, feeFixedOnchain: 0,
   v3VerifyCount: 0, v3VerifyWorst: null, v3VerifyRecent: [], v3VerifyDropped: 0,
   v3VerifyCapped: 0, v3VerifyUnderCount: 0,
   disabledFromFile: 0, disabledRuntime: 0,
@@ -356,6 +357,9 @@ function noteExecutionFailure(opp, error) {
   // 「誰が取ったか」の集計でも、他者の裁定や通常取引が原因だと実測できている。
   // これを「価格が信用できないプール」として数えると、
   // **競争が激しい=機会が大きいプールから順に消えていく。**
+  // K検算での拒否は「手数料の前提が低すぎる」の確証。**チェーンから読み直す。**
+  if (stage === "feeMismatch") queueOnchainFeeFix(opp);
+
   const raceLost = stage === "wait";
   if (raceLost) {
     stats.raceLost++;
@@ -1442,6 +1446,76 @@ async function preparePoolMap() {
 }
 
 // ===== V2の手数料の実測 =====
+// ===== K検算で拒否された経路の手数料を、チェーンから読み直す =====
+//
+// [なぜ要るか(2026年9月21日、実測で判明)]
+// K() で拒否 → `forceFeeReprobe` → `clearFeeProbed` と繋いだが、**何も起きなかった**。
+// `clearFeeProbed` は「実測済み」の印を**外す**関数で、
+// このプールは**一度も実測されていなかった**(生存ログ `手数料1(残0)`)。
+// **外す印が無いので、空振りしていた。**
+//
+// 既存の実測はスワップのログから逆算する方式で、Aerodrome では当たらない。
+// **プール自身と工場に聞けば、推測も逆算も要らない。**
+const feeFixQueue = new Map(); // key -> { chain, address }
+const feeFixDone = new Set();  // 一度読んだプールは繰り返さない
+const FEE_FIX_INTERVAL_MS = parseInt(process.env.FEE_FIX_INTERVAL_MS || "15000", 10);
+const FEE_FIX_PER_TICK = parseInt(process.env.FEE_FIX_PER_TICK || "2", 10);
+
+/// K検算で拒否された経路の V2 プールを、チェーン読み直しの列に積む。
+function queueOnchainFeeFix(opp) {
+  for (const leg of opp.legs || []) {
+    if (leg.kind === KIND_V3 || !leg.pool) continue;
+    const key = poolKeyOf(opp.chain, leg.pool);
+    if (feeFixDone.has(key) || feeFixQueue.has(key)) continue;
+    feeFixQueue.set(key, { chain: opp.chain, address: leg.pool });
+  }
+}
+
+/// 積まれたプールの手数料をチェーンから読み、地図に入れる。
+async function runOnchainFeeFixes() {
+  if (feeFixQueue.size === 0) return;
+  const batch = [...feeFixQueue.entries()].slice(0, FEE_FIX_PER_TICK);
+  for (const [key] of batch) feeFixQueue.delete(key);
+
+  for (const [key, { chain, address }] of batch) {
+    feeFixDone.add(key);
+    const pool = getPool(chain, address);
+    if (!pool) continue;
+    let info = null;
+    try {
+      info = await readPoolFeeOnchain(chain, address, pool.factory);
+    } catch (e) {
+      console.warn(`[手数料/直読み] ${chain} ${address.slice(0, 10)}…: 読めません(${(e.message || "").slice(0, 60)})`);
+      continue;
+    }
+    if (!info) {
+      console.warn(`[手数料/直読み] ${chain} ${address.slice(0, 10)}…: 手数料も stable も読めませんでした`);
+      continue;
+    }
+    // stable プールは x³y+y³x 曲線。**x·y=k の式では値段を出せない。**
+    // 手数料をいくら直しても合わないので、地図から外す。
+    if (info.stable) {
+      disablePool(chain, address, `stable曲線のプール(x·y=kの式が通用しない)`, { permanent: true });
+      console.log(`[手数料/直読み] ${chain} ${address.slice(0, 10)}…: **stable曲線**と判明。判定に使えないので外します`);
+      continue;
+    }
+    if (info.feeBps == null) {
+      console.warn(`[手数料/直読み] ${chain} ${address.slice(0, 10)}…: volatile だが手数料を読めませんでした(${info.source})`);
+      continue;
+    }
+    const before = pool.feeBps;
+    setPoolFee(chain, address, info.feeBps);
+    pool.feeProbed = true;
+    stats.feeProbed++;
+    stats.feeFixedOnchain++;
+    console.log(`[手数料/直読み] ${chain} ${address.slice(0, 10)}…: ${before}bps → **${info.feeBps}bps**(${info.source})。K検算で拒否されていた経路が通るようになります`);
+    if (info.feeBps > TAX_TOKEN_FEE_BPS) {
+      stats.taxTokensRejected++;
+      disablePool(chain, address, `実測手数料${info.feeBps}bps(税トークン)`, { permanent: true });
+    }
+  }
+}
+
 let feeProbeQueue = [];
 async function probeFeesGradually() {
   if (!anyReady()) return;
@@ -1759,7 +1833,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${disableLine()}${formatBigLine()}${formatAaveLine()}${alertLine}`);
+  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${disableLine()}${formatBigLine()}${formatAaveLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
@@ -2424,6 +2498,7 @@ async function main() {
   }
 
   setInterval(probeFeesGradually, FEE_PROBE_INTERVAL_MS);
+  setInterval(() => { runOnchainFeeFixes().catch(() => {}); }, FEE_FIX_INTERVAL_MS);
   setInterval(refreshStaleReserves, REFRESH_STALE_SEC * 1000);
   setInterval(refreshV3States, 20000);
   setInterval(refreshQuoteTables, QUOTE_TABLE_INTERVAL_MS);
