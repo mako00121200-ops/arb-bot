@@ -30,6 +30,8 @@ import { recordRealExecution } from "./real-execution-log.js";
 import { alertOwner } from "./owner-alert.js";
 import { CHAIN, DRY_RUN, MIN_PROFIT_USD, MAX_SLIPPAGE_BPS, getReserveInfo, noteSimulation } from "./liquidation-monitor.js";
 import { liquidatorAddressEnvVar } from "./liquidator-deploy.js";
+// お金に関わる行は、Railway の UTC ではなく**日本時間**で読めるようにする。
+import { nowJst } from "./jst.js";
 
 // ===== 設定 =====
 /// ガス量は固定値 + 余裕(オーナーの指示)。費用の見積もりには GAS_UNITS、送信の上限には GAS_LIMIT。
@@ -297,10 +299,10 @@ export async function handleLiquidationCandidate(plan) {
   let best = null;
   for (const r of okRoutes.slice(0, SIMULATE_TOP_N)) {
     const sim = await simulate(address, from, liq, r.legs);
-    if (sim.error) { console.log(`[清算AVAX/確認] ${short(plan.user)} ${r.label}: 取り消し(${sim.error})`); continue; }
+    if (sim.error) { console.log(`[清算AVAX/確認 ${nowJst()}] ${short(plan.user)} ${r.label}: 取り消し(${sim.error})`); continue; }
     const profitRaw = sim.returned - sim.owed;
     const profitUsd = (Number(profitRaw) / Math.pow(10, rd.decimals)) * (Number(rd.price) / 1e8);
-    console.log(`[清算AVAX/確認] ${short(plan.user)} ${r.label}: 戻り${ethers.formatUnits(sim.returned, rd.decimals)} 返済${ethers.formatUnits(sim.owed, rd.decimals)} ${sym(plan.debtAsset)} → 返済後の利益$${profitUsd.toFixed(4)}`);
+    console.log(`[清算AVAX/確認 ${nowJst()}] ${short(plan.user)} ${r.label}: 戻り${ethers.formatUnits(sim.returned, rd.decimals)} 返済${ethers.formatUnits(sim.owed, rd.decimals)} ${sym(plan.debtAsset)} → 返済後の利益$${profitUsd.toFixed(4)}`);
     if (!best || profitRaw > best.profitRaw) best = { route: r, sim, profitRaw, profitUsd };
   }
   if (!best) return { summary: "確認で全て取り消し" };
@@ -308,7 +310,7 @@ export async function handleLiquidationCandidate(plan) {
   const gasUsd = (await gasUnitsToUsd(CHAIN, GAS_UNITS)) ?? 0.03;
   const netUsd = best.profitUsd - gasUsd;
   const verdict = netUsd >= MIN_PROFIT_USD ? "送る" : `下限$${MIN_PROFIT_USD}未満`;
-  console.log(`[清算AVAX/判断] ${short(plan.user)} ${best.route.label}: 利益$${best.profitUsd.toFixed(4)} − ガス$${gasUsd.toFixed(4)} = 純利$${netUsd.toFixed(4)} → ${verdict}${DRY_RUN ? "(DRY_RUN なので送りません)" : ""}`);
+  console.log(`[清算AVAX/判断 ${nowJst()}] ${short(plan.user)} ${best.route.label}: 利益$${best.profitUsd.toFixed(4)} − ガス$${gasUsd.toFixed(4)} = 純利$${netUsd.toFixed(4)} → ${verdict}${DRY_RUN ? "(DRY_RUN なので送りません)" : ""}`);
   if (netUsd < MIN_PROFIT_USD) return { summary: `純利$${netUsd.toFixed(2)} 下限未満` };
   if (DRY_RUN) return { summary: `DRY_RUN 純利$${netUsd.toFixed(2)}` };
 
@@ -322,7 +324,7 @@ export async function handleLiquidationCandidate(plan) {
   const legs = best.route.legs.map(({ pool, tokenOut, flags, feeBps }) => ({ pool, tokenOut, flags, feeBps }));
   const startedAt = Date.now();
   stats.sends++;
-  console.log(`[清算AVAX/送信] ${short(plan.user)} ${best.route.label}: 肩代わり$${plan.coverUsd.toFixed(2)} 最低利益${ethers.formatUnits(minProfit, rd.decimals)} ${sym(plan.debtAsset)} 送信します`);
+  console.log(`[清算AVAX/送信 ${nowJst()}] ${short(plan.user)} ${best.route.label}: 肩代わり$${plan.coverUsd.toFixed(2)} 最低利益${ethers.formatUnits(minProfit, rd.decimals)} ${sym(plan.debtAsset)} 送信します`);
   let tx;
   try {
     tx = await contract.liquidate({ ...liq, minProfit }, legs, { gasLimit: GAS_LIMIT });
@@ -358,7 +360,7 @@ export async function handleLiquidationCandidate(plan) {
   try { actualGasCostUsd = await weiToUsd(CHAIN, receipt.gasUsed * receipt.gasPrice); } catch (e) {}
   const actualNetProfitUsd = actualProfitUsd != null && actualGasCostUsd != null ? actualProfitUsd - actualGasCostUsd : null;
   try { recordActualGasPrice(CHAIN, estimatedGasPriceWei, receipt.gasPrice); } catch (e) {}
-  console.log(`[清算AVAX/確定] ブロック${receipt.blockNumber} ガス${receipt.gasUsed} 肩代わり${coveredTokens ?? "?"} ${sym(plan.debtAsset)} 受取${seizedTokens ?? "?"} ${sym(plan.collateralAsset)} 粗利+$${(actualProfitUsd ?? 0).toFixed(4)} − ガス$${(actualGasCostUsd ?? 0).toFixed(4)} = 純利益+$${(actualNetProfitUsd ?? 0).toFixed(4)}(${Date.now() - startedAt}ms)`);
+  console.log(`[清算AVAX/確定 ${nowJst()}] ブロック${receipt.blockNumber} ガス${receipt.gasUsed} 肩代わり${coveredTokens ?? "?"} ${sym(plan.debtAsset)} 受取${seizedTokens ?? "?"} ${sym(plan.collateralAsset)} 粗利+$${(actualProfitUsd ?? 0).toFixed(4)} − ガス$${(actualGasCostUsd ?? 0).toFixed(4)} = 純利益+$${(actualNetProfitUsd ?? 0).toFixed(4)}(${Date.now() - startedAt}ms)`);
   recordRealExecution({
     timestamp: new Date().toISOString(),
     pairLabel: `liquidation ${CHAIN} ${sym(plan.collateralAsset)}→${sym(plan.debtAsset)} ${short(plan.user)}`,

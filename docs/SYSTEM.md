@@ -47,6 +47,7 @@ $1〜30しか吸えず、掛け算の答えが常に小さい(競争で価格差
 | `scripts/liquidation-executor.js` | 清算の**実行**。担保を売る経路探し(地図 + ファクトリー)→ `simulateLiquidation`(eth_call)→ 送信。記録簿は裁定と共通 | 330 |
 | `contracts/AaveLiquidator.sol` | **清算コントラクト(裁定とは別)。** `flashLoanSimple` → `liquidationCall` → DEX で売却 → 返済。`simulateLiquidation` | 300 |
 | `scripts/liquidator-deploy.js` | 清算コントラクトの配置(`RUN_LIQUIDATOR_DEPLOY`) | 60 |
+| `scripts/jst.js` | **画面とログの時刻を日本時間に揃える**(保存は UTC のまま)。`DISPLAY_TIMEZONE` | 50 |
 | `scripts/owner-alert.js` | LINE 通知(未設定)。`docs/owner-questions.json` の転送 | 210 |
 | `scripts/pool-survey.js` | 手動の調査ツール(`RUN_POOL_SURVEY`)。普段は動かない | 400 |
 | `scripts/mainnet-deploy.js` / `compile-contract.js` | コントラクトの配置(`RUN_MAINNET_DEPLOY`)とコンパイル | 110 |
