@@ -47,7 +47,7 @@ import { startLiquidationMonitor, setCandidateHandler, formatLiquidationLine, ge
 import { handleLiquidationCandidate, selfCheckLiquidationExecutor } from "./scripts/liquidation-executor.js";
 import { runLiquidatorDeploy } from "./scripts/liquidator-deploy.js";
 import { readPoolFeeOnchain } from "./scripts/pool-fee-onchain.js";
-import { minProfitUsd, describeMinProfit, LEGACY_FLOOR_USD } from "./scripts/min-profit.js";
+import { minProfitUsd, describeMinProfit, isBelowDefaultFloor } from "./scripts/min-profit.js";
 // 画面とログの時刻は**すべて日本時間**に揃える(保存は UTC のまま)。
 import { TZ_LABEL, formatJst as formatLocalTime, nowJst } from "./scripts/jst.js";
 import {
@@ -1807,8 +1807,9 @@ async function handleOpportunity(opp, meta = {}) {
     noteBigOutcome(opp, "send_busy", `同時${inFlight}本`);
     return;
   }
-  // 昔の一律の下限を下回る機会か(下げた効果の集計用)。
-  const lowFloor = (opp.netProfitUsd ?? 0) < LEGACY_FLOOR_USD;
+  // **そのチェーンだけ下げたからこそ送れた機会か**(下げた効果の集計用)。
+  // 固定値と比べると、元から通っていた分まで成果に数えてしまう。
+  const lowFloor = isBelowDefaultFloor(opp.chain, opp.netProfitUsd ?? 0);
   if (lowFloor) stats.lowFloorTried++;
   executing.add(key);
   for (const k of lockKeys) executingPools.add(k);
