@@ -374,13 +374,15 @@ export function getTrustedMaxCount() { return trustedMaxIn.size; }
 
 /// 価格表から受取量を求める。表に無い投入額は、最も近い2点から補間する。
 /// 表の範囲外(最大点より大きい)は判定に使わない(過大評価を避けるため)。
-export function quoteFromTable({ chain, pool, zeroForOne, amountIn }) {
+/// @param ignoreTrusted 検証専用。**自分で付けた上限を無視して表そのものを測る。**
+///   (判定では絶対に true にしない。上限は判定を守るためにある)
+export function quoteFromTable({ chain, pool, zeroForOne, amountIn, ignoreTrusted = false }) {
   const t = quoteTables.get(tableKey(chain, pool, zeroForOne));
   if (!t || t.points.length === 0 || amountIn <= 0n) return 0n;
   // 検証で「ここまでしか信用できない」と分かっている範囲では答えない。
   // **小額の分岐より手前に置く。** 後ろに置くと、上限が最小点より小さい時に
   // すり抜ける。
-  const trusted = trustedMaxIn.get(tableKey(chain, pool, zeroForOne));
+  const trusted = ignoreTrusted ? null : trustedMaxIn.get(tableKey(chain, pool, zeroForOne));
   if (trusted != null && amountIn > trusted) return 0n;
   const pts = t.points;
 
@@ -447,8 +449,18 @@ export function importQuoteTable(key, points, at) {
 }
 
 /// 価格表と公式Quoterの一致を確かめる(表の中間の値で検証する)。
+/// 表と公式Quoterを突き合わせる。**上限は無視して表そのものを測る。**
+///
+/// [なぜ無視するか(2026年9月21日、実測で判明)]
+/// ここが上限を尊重していたため、**上限より大きい額は `estimated=0` で
+/// 「測れなかった」扱いになり、飛ばされていた**。
+/// その結果、呼び出し側は「全部の額で通った」と判断して**上限を外していた**。
+/// 上限を付けた当の額を一度も測り直さずに外すので、
+///   上限を付ける → 次の検証が黙って外す → また同じ額で落ちる
+/// の堂々巡りになっていた(生存ログ `V3表[… 上限制限0(今0本)]` が証拠)。
+/// 検証の仕事は**表を測ること**なので、自分で付けた上限には従わない。
 export async function verifyQuoteTable({ chain, pool, zeroForOne, tokenIn, tokenOut, feeTier, amountIn }) {
-  const estimated = quoteFromTable({ chain, pool, zeroForOne, amountIn });
+  const estimated = quoteFromTable({ chain, pool, zeroForOne, amountIn, ignoreTrusted: true });
   if (estimated <= 0n) return null;
   const exact = await quoteV3Exact({ chain, tokenIn, tokenOut, amountIn, feeTier, priority: false });
   if (!exact || exact <= 0n) return null;

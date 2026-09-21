@@ -94,8 +94,26 @@ const SANE_RETURN_RATIO = parseFloat(process.env.MAX_SANE_RETURN_RATIO || "0.20"
 ///
 /// 幻は「取り逃した金額」ではなく、**計算が壊れている経路の一覧**として出す。
 /// そちらの方が直す手掛かりになる。
+/// 送信直前の実測が「これだけ足りなかった」なら、その判定は**取れるはずが無かった**。
+///
+/// [なぜ要るか(2026年9月21日、オーナーの指摘)]
+/// 画面の「取れた可能性 +$77.89」の上位2件が
+///   uniswap-v3(1.00%)→sync発見 実測**-632.9bps** 判定+$24.97
+///   同じ経路           実測**-192.0bps** 判定+$3.58
+/// だった。合わせて**$28.5(全体の37%)**。
+/// -632.9bps は「6.3%足りない」という意味で、**そんな機会は最初から無かった**
+/// (送金時に税を取るトークンの形。2段で3%×2に一致する)。
+/// 利回りは$24.97/$276 = 9%で、利回りの罠判定(20%)には引っかからない。
+///
+/// **不足の実測は、利回りより直接的な「幻」の証拠**なので、こちらでも判定する。
+/// こちらの模型の誤差は普通10〜30bps、価格の動きでも50〜100bps。
+/// 150bpsを超える不足は、どちらでも説明がつかない。
+const PHANTOM_SHORTFALL_BPS = parseFloat(process.env.PHANTOM_SHORTFALL_BPS || "-150");
+
 function isPhantom(r) {
   if (r.outcome === "trap" || r.outcome === "tax_token") return true;
+  const shortfall = Number(r.shortfallBps);
+  if (Number.isFinite(shortfall) && shortfall <= PHANTOM_SHORTFALL_BPS) return true;
   const trade = Number(r.tradeAmountUsd) || 0;
   const net = Number(r.netProfitUsd) || 0;
   if (trade <= 0) return false;
