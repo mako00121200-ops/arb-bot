@@ -95,7 +95,7 @@ const stats = {
   episodes: new Array(EDGE_EDGES.length).fill(0),
   msAbove: new Array(EDGE_EDGES.length).fill(0),
   bestBps: null, bestLabel: null,
-  startedAt: null, watched: 0, dropped: 0,
+  startedAt: null, watched: 0, dropped: 0, lastEventAt: 0, connects: 0,
 };
 
 /// ペアごとの「今どの段より上にいるか」。跨いだ瞬間だけを数えるために要る。
@@ -304,6 +304,83 @@ function note(pairKey, netBps, label) {
   }
 }
 
+// ===== つなぎ直し(2026年9月22日 04:22 JST の実測で必要と分かった) =====
+//
+// [切れたのに気づけなかった]
+// 受信が **1,172件のまま1時間まったく増えなかった**。WebSocket が切れても
+// `ethers.WebSocketProvider` は自分でつなぎ直さないので、見張りは黙って
+// 止まったままになる。しかも「歪みは毎時N回」の分母だけが増え続けるので、
+// **数字は静かに嘘になる**(実際、毎時47回が23回に半減して見えていた)。
+//
+// dex-onchain-realtime.js は最初からこれを持っていた(待ち時間を倍にしながら
+// つなぎ直し、一定時間つながり続けたら初期化)。**同じものをここにも置く。**
+// 併せて「最終受信」を生存ログに出し、次からは黙って止まっても気づけるようにする。
+let wsProvider = null;
+let reconnectTimer = null;
+let reconnectDelayMs = 5000;
+const MAX_RECONNECT_DELAY_MS = 5 * 60 * 1000;
+/// これだけ何も届かなければ、切れたとみなしてつなぎ直す。
+const SILENCE_MS = parseInt(process.env.MAINNET_WATCH_SILENCE_MS || "600000", 10);
+
+function onLog(log) {
+  if (stats.stoppedForCap) return;
+  stats.events++;
+  stats.lastEventAt = Date.now();
+  if (stats.events > MAX_EVENTS) {
+    stats.stoppedForCap = true;
+    console.warn(`[メインネット頻度] 受信が上限${MAX_EVENTS.toLocaleString()}件に達したので数えるのを止めます`);
+    try { wsProvider?.removeAllListeners(); } catch (e) {}
+    return;
+  }
+  const p = pools.get((log.address || "").toLowerCase());
+  if (!p) return;
+  const sqrtPriceX96 = sqrtFromSwapData(log.data);
+  if (!sqrtPriceX96) return;
+  const price = priceFromSqrt(sqrtPriceX96, p.dec0, p.dec1);
+  if (!price) return;
+  p.price = price;
+  const best = bestNetEdgeBps(p.pairKey);
+  if (!best) return;
+  note(p.pairKey, best.netBps, best.label);
+  // **bpsでは判断しない。** 見えている歪みが本当に取れるのかを実際に聞く。
+  if (best.netBps >= VERIFY_MIN_BPS) {
+    verifyEpisode(best.buy, best.sell, best.label, log.blockNumber).catch(() => { verify.errors++; });
+  }
+}
+
+function connect(wsUrl, addresses) {
+  try {
+    wsProvider = new ethers.WebSocketProvider(wsUrl, 1, { staticNetwork: true });
+    wsProvider.on({ address: addresses, topics: [V3_SWAP_TOPIC] }, onLog);
+    const sock = wsProvider.websocket;
+    sock?.addEventListener?.("close", () => reconnect(wsUrl, addresses, "切断された"));
+    sock?.addEventListener?.("error", () => reconnect(wsUrl, addresses, "接続でエラー"));
+    stats.connects++;
+  } catch (e) {
+    reconnect(wsUrl, addresses, `つなげません: ${(e.message || "").slice(0, 60)}`);
+  }
+}
+
+function reconnect(wsUrl, addresses, why) {
+  if (stats.stoppedForCap || reconnectTimer) return;
+  const old = wsProvider;
+  wsProvider = null;
+  try { old?.removeAllListeners(); } catch (e) {}
+  try { old?.destroy(); } catch (e) {}
+  const delay = reconnectDelayMs;
+  console.warn(`[メインネット頻度] ${why}。${Math.round(delay / 1000)}秒後につなぎ直します(再接続${stats.connects}回目)`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    // つながった直後にまた切れる状態で暴走しないよう、待ち時間は倍にしていく。
+    reconnectDelayMs = Math.min(reconnectDelayMs * 2, MAX_RECONNECT_DELAY_MS);
+    connect(wsUrl, addresses);
+    // しばらく持ちこたえたら待ち時間を戻す。
+    setTimeout(() => {
+      if (wsProvider) reconnectDelayMs = 5000;
+    }, 60 * 1000);
+  }, delay);
+}
+
 /// 見張るプールを実物で探す。**同じペアに2つ以上見つかった時だけ**対象にする。
 async function discoverPools(provider) {
   const factory = new ethers.Contract(UNIV3_FACTORY, FACTORY_ABI, provider);
@@ -413,32 +490,15 @@ export async function startMainnetEdgeWatch() {
   const pairLines = [...byPair.entries()].map(([k, v]) => `${k}:${v.length}本`).join(" ");
   console.log(`[メインネット頻度 ${nowJst()}] ${pools.size}プール(${pairLines})を見張ります。数えるだけで送信しません`);
 
-  const ws = new ethers.WebSocketProvider(wsUrl, 1, { staticNetwork: true });
-  ws.on({ address: addresses, topics: [V3_SWAP_TOPIC] }, (log) => {
-    if (stats.stoppedForCap) return;
-    stats.events++;
-    if (stats.events > MAX_EVENTS) {
-      stats.stoppedForCap = true;
-      console.warn(`[メインネット頻度] 受信が上限${MAX_EVENTS.toLocaleString()}件に達したので数えるのを止めます`);
-      try { ws.removeAllListeners(); } catch (e) {}
-      return;
-    }
-    const p = pools.get((log.address || "").toLowerCase());
-    if (!p) return;
-    const sqrtPriceX96 = sqrtFromSwapData(log.data);
-    if (!sqrtPriceX96) return;
-    const price = priceFromSqrt(sqrtPriceX96, p.dec0, p.dec1);
-    if (!price) return;
-    p.price = price;
-    const best = bestNetEdgeBps(p.pairKey);
-    if (!best) return;
-    note(p.pairKey, best.netBps, best.label);
-    // **bpsでは判断しない。** 見えている歪みが本当に取れるのかを実際に聞く。
-    if (best.netBps >= VERIFY_MIN_BPS) {
-      verifyEpisode(best.buy, best.sell, best.label, log.blockNumber).catch(() => { verify.errors++; });
-    }
-  });
-  ws.websocket?.addEventListener?.("error", () => {});
+  connect(wsUrl, addresses);
+
+  // **黙って止まるのを防ぐ見張り。**
+  // 一定時間まったく届かなければ、つなぎ直す(下の「切れたら気づけなかった」)。
+  setInterval(() => {
+    if (stats.stoppedForCap || !stats.started) return;
+    const since = Date.now() - (stats.lastEventAt || stats.startedAt || 0);
+    if (since > SILENCE_MS) reconnect(wsUrl, addresses, `${Math.round(since / 60000)}分間まったく届かない`);
+  }, 60 * 1000);
 
   stats.started = true;
   stats.watched = pools.size;
@@ -476,7 +536,11 @@ export function formatMainnetEdgeLine() {
   const v = verify.tried > 0
     ? ` 確認${verify.tried}件[同ブロックで黒字${verify.profitableAtBlock}(うち今も残る${verify.profitable}/消えた${verify.vanished}) 取れた合計$${verify.totalUsd.toFixed(2)}${verify.bestUsd > 0 ? ` 最良$${verify.bestUsd.toFixed(2)}(${verify.bestLabel})` : ""}]`
     : " 確認まだ0件";
-  return ` メインネット歪み[毎時 ${parts} 最大${best} 見張り${stats.watched}本(薄い${stats.dropped}本除外) 受信${stats.events.toLocaleString()}${stats.stoppedForCap ? " 上限で停止" : ""}${v}]`;
+  // **最終受信を必ず出す。** これが無かったせいで、WebSocketが切れて
+  // 1時間まったく届いていないのに気づけなかった(2026年9月22日 04:22 JST)。
+  const silent = stats.lastEventAt ? Math.round((Date.now() - stats.lastEventAt) / 60000) : null;
+  const health = silent == null ? " まだ1件も届かず" : ` 最終受信${silent}分前${stats.connects > 1 ? `(再接続${stats.connects - 1}回)` : ""}`;
+  return ` メインネット歪み[毎時 ${parts} 最大${best} 見張り${stats.watched}本(薄い${stats.dropped}本除外) 受信${stats.events.toLocaleString()}${health}${stats.stoppedForCap ? " 上限で停止" : ""}${v}]`;
 }
 
 /// 画面・診断用。
