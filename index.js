@@ -38,7 +38,7 @@ import { runPoolSurvey } from "./scripts/pool-survey.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
 import { scoutAllChains, getScoutChains, SCOUT_INTERVAL_MS } from "./scripts/pool-scout.js";
-import { probePoolFeeBps, isFeeProbeOnHold, getRpcStatus, getRpcCallTotals, callWithRpc, probePendingState, getProviderForChain , getFeeProbeStats } from "./scripts/onchain-reserves.js";
+import { probePoolFeeBps, isFeeProbeOnHold, getRpcStatus, getRpcCallTotals, callWithRpc, probePendingState, getProviderForChain , getFeeProbeStats, ensureAmountOutFlag } from "./scripts/onchain-reserves.js";
 import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
 import { alertOwner, getAlertStats, sendPendingQuestions } from "./scripts/owner-alert.js";
 import { verifyAaveChains, getAaveChains, sweepAll as aaveSweepAll, checkWatchAll as aaveCheckWatchAll, formatAaveLine, AAVE_SWEEP_INTERVAL_MS, AAVE_WATCH_INTERVAL_MS } from "./scripts/aave-liquidation.js";
@@ -360,7 +360,27 @@ function noteExecutionFailure(opp, error) {
   // これを「価格が信用できないプール」として数えると、
   // **競争が激しい=機会が大きいプールから順に消えていく。**
   // K検算での拒否は「手数料の前提が低すぎる」の確証。**チェーンから読み直す。**
-  if (stage === "feeMismatch") queueOnchainFeeFix(opp);
+  //
+  // あわせて、**そのプールが `getAmountOut` を持つかを確かめる**(2026年9月21日)。
+  // 持っていればコントラクトがプール自身に受取量を聞くので、
+  // **手数料を当てる必要がそもそも無くなり、K検算で落ちなくなる。**
+  // 手数料がどの方法でも読めないプール(dystopia:0x60c08823… 等)は、
+  // これが唯一の出口。
+  if (stage === "feeMismatch") {
+    queueOnchainFeeFix(opp);
+    for (const leg of opp.legs || []) {
+      if (leg.kind === KIND_V3 || !leg.pool) continue;
+      const pool = getPool(opp.chain, leg.pool);
+      if (!pool) continue;
+      const inIsToken0 = pool.token0 === (leg.tokenIn || "").toLowerCase();
+      const reserveIn = inIsToken0 ? pool.raw0 : pool.raw1;
+      ensureAmountOutFlag(opp.chain, leg.pool, leg.tokenIn, reserveIn)
+        .then((ok) => {
+          if (ok) console.log(`[K検算の出口] ${opp.chain} ${leg.dexId}:${leg.pool.slice(0, 10)}…: getAmountOut を持っていました。以降はプール自身に受取量を聞くので、手数料を当てる必要がありません`);
+        })
+        .catch(() => {});
+    }
+  }
 
   const raceLost = stage === "wait";
   if (raceLost) {
@@ -979,7 +999,7 @@ function quarantineFeeLine() {
   try {
     const q = getQuarantineStats();
     if (q && (q.quarantined || q.active || q.skippedRoutes)) {
-      out += ` 一時除外[のべ${q.quarantined} 今${q.active} 飛ばした経路${(q.skippedRoutes || 0).toLocaleString()}]`;
+      out += ` 一時除外[のべ${q.quarantined} 今${q.active} 飛ばした経路${(q.skippedRoutes || 0).toLocaleString()}本(のべ${(q.skippedEvals || 0).toLocaleString()}回)]`;
     }
   } catch (e) {}
   try {

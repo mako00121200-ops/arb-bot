@@ -503,6 +503,50 @@ export async function probePoolFeeBps({ chain, pairAddress, tokenInAddress, rese
   }
 }
 
+/// **そのプールが `getAmountOut` を持つかだけを、その場で確かめる。**
+///
+/// [なぜ要るか(2026年9月21日、K検算の実測)]
+/// polygon の `dystopia:0x60c08823…` が `execution reverted: "DystPair: K"` で
+/// 繰り返し拒否されていた。K検算での拒否は「**こちらが要求した受取量が多すぎる**」、
+/// つまり手数料の前提が実際より低いという意味。
+///
+/// ところがこのプールは手数料が**どの方法でも読めなかった**:
+///   ・`pool.fee()` なし / 工場の `getFee` 系も全滅(`stable()のみ`)
+///   ・直近の取引が無く、スワップの記録からも逆算できない(`取引なしで保留`)
+/// そのため当て推量の50bpsのまま、**永遠にK検算で落ち続ける**状態だった。
+///
+/// **しかし Solidly系は `getAmountOut` を持っている。**
+/// 持っていればコントラクトが**プール自身に受取量を聞く**ので、
+/// **手数料を当てる必要がそもそも無い**(`FLAG_HAS_QUOTE`)。
+/// 手数料の実測(`probePoolFeeBps`)の中でしかこの印を立てていなかったため、
+/// 手数料が測れないプールは印も立たないままだった。**印だけを立てに行く。**
+///
+/// RPCは1回。持たないと分かったプールは二度と聞かない。
+export async function ensureAmountOutFlag(chain, address, tokenInAddress, reserveIn) {
+  if (!ethers.isAddress(address) || !ethers.isAddress(tokenInAddress || "")) return false;
+  const addr = ethers.getAddress(address);
+  const key = feeKey(chain, addr);
+  const state = feeProbeState.get(key);
+  if (state && state.byAmountOut) return true;          // もう分かっている
+  if (noAmountOutPools.has(key)) return false;          // 持たないと分かっている
+  if (!(typeof reserveIn === "bigint" && reserveIn > 0n)) return false;
+  const amountIn = reserveIn / 1_000_000n;
+  if (amountIn <= 0n) return false;
+  try {
+    const amountOut = await callWithRpc(chain, (p) =>
+      new ethers.Contract(addr, PAIR_ABI, p).getAmountOut(amountIn, ethers.getAddress(tokenInAddress)));
+    if (amountOut > 0n) {
+      // 手数料の値そのものは使わない(ここでは印だけが目的)。
+      feeProbeState.set(key, { ...(state || {}), byAmountOut: true });
+      return true;
+    }
+    noAmountOutPools.add(key);
+  } catch (e) {
+    if (isContractLevelError(e.message || "")) noAmountOutPools.add(key);
+  }
+  return false;
+}
+
 /// そのプールが getAmountOut を持つ(手数料の実測がそれで取れた)かどうか。
 /// ガス削減版コントラクトの Leg.flags(FLAG_HAS_QUOTE)に使う。分からなければ
 /// false で、コントラクトは準備量と手数料から計算する(旧版と同じ動き)。

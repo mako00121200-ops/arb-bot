@@ -1002,7 +1002,18 @@ const BLAME_QUARANTINE_AFTER = parseInt(process.env.BLAME_QUARANTINE_AFTER || "2
 const BLAME_QUARANTINE_MINUTES = parseFloat(process.env.BLAME_QUARANTINE_MINUTES || "60");
 const BLAME_WINDOW_MINUTES = parseFloat(process.env.BLAME_WINDOW_MINUTES || "360");
 const blamedPools = new Map(); // "chain::pool" -> { times: [ms...], until: ms }
-const quarantineStats = { quarantined: 0, skippedRoutes: 0 };
+const quarantineStats = { quarantined: 0, skippedEvals: 0 };
+/// **飛ばした「本数」**を数えるための入れ物(2026年9月21日に直した)。
+///
+/// [なぜ直したか]
+/// 今までの `skippedRoutes` は **finalize が呼ばれた回数**を数えていた。
+/// finalize はイベントが届くたびに同じ経路を何度も評価するので、
+/// polygon のように毎分数百件イベントが来るチェーンでは**数千まで簡単に育つ**。
+/// 生存ログの `飛ばした経路5,077` を見て、私は「1つのプールが5,077本を潰している」と
+/// 誤読し、オーナーにもそう報告してしまった。**本当は同じ数本を何度も数えていただけ。**
+/// 惜しさの統計(recordNearMiss)は最初から「同じ経路は1本」で数えている。揃える。
+const skippedRouteKeys = new Set();
+const SKIPPED_KEYS_MAX = 5000;
 
 /// 答え合わせで犯人と名指しされたプールを記録する。回数が閾値に達したら一時除外。
 export function notePoolBlame(chain, pool, diffBps) {
@@ -1031,13 +1042,17 @@ export function getQuarantineStats() {
   let active = 0;
   const now = Date.now();
   for (const e of blamedPools.values()) if (now < e.until) active++;
-  return { ...quarantineStats, active };
+  // skippedRoutes は**本数**、skippedEvals は**評価の回数**。名前で取り違えない。
+  return { ...quarantineStats, active, skippedRoutes: skippedRouteKeys.size };
 }
 
 function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, poolAddresses }) {
   // 答え合わせで繰り返し犯人になったプールを含む経路は、しばらく判定しない。
   if (poolAddresses.some((a) => isPoolQuarantined(chain, a))) {
-    quarantineStats.skippedRoutes++;
+    quarantineStats.skippedEvals++;
+    if (skippedRouteKeys.size < SKIPPED_KEYS_MAX) {
+      skippedRouteKeys.add(routeKeyOf(chain, tokenA, poolAddresses));
+    }
     return null;
   }
   // V3を1段も含まない経路は判定しない。
