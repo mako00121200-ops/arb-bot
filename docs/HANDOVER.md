@@ -3361,6 +3361,88 @@ AAVE_EXTRA_POOLS="base:0x……:seamless,base:0x……:zerolend"
 
 ---
 
+## 【要・再デプロイ】清算をコントラクトに足した(2026年9月21日)
+
+> **`contracts/DexArbFlashLoan.sol` を変更した。5チェーンの再デプロイが必要。**
+> **まだデプロイしていない。稼働中のコントラクトは変わっていない。**
+
+### 入れたもの
+
+```solidity
+struct Liq {
+    address pool;            // Aave V3 の Pool(またはフォーク)
+    address collateralAsset; // 受け取る担保
+    address debtAsset;       // 肩代わりする借金(= legs[0].tokenOut)
+    address user;            // 清算される人
+}
+
+function liquidateRoute(address asset, uint256 amount, Leg[] calldata legs,
+                        uint256 minProfit, Liq calldata liq) external onlyOwner;
+function simulateLiquidate(address asset, uint256 amount, Leg[] calldata legs,
+                           Liq calldata liq) external onlyOwner;
+```
+
+**流れは既存とほぼ同じ。1段目と2段目の間に清算が1手入るだけ。**
+
+```
+legs[0] で debtAsset を借りる(フラッシュスワップ)
+  → その全額で liquidationCall(担保をボーナスぶん多く受け取る)
+  → legs[1..] で担保を売って asset に戻す
+  → 返済と利益の判定は**既存のまま**
+```
+
+コンパイル成功。**18,482バイト**(上限24,576)。
+
+### 安全のために決めたこと
+
+| | 決めたこと | 理由 |
+|---|---|---|
+| **debtToCover** | 構造体に**持たない**。1段目が運んできた量をそのまま使う | 額を2箇所で管理すると必ずずれる |
+| **受取量** | Aave の戻り値を信じず、**残高の差で測る** | 既存の全段と同じ作法。税トークンでも壊れない |
+| **承認** | 0 → 必要量 → 0。**残さない** | 0以外からの上書きを拒む通貨(USDT等)にも対応 |
+| **担保 = 借金** | **禁じる** | 出入りが相殺されて、受け取った量を残高の差で測れなくなる |
+| **Pool の住所** | 埋め込まず**引数で受け取る** | `onlyOwner` なので bot のウォレットしか呼べない。チェーンを増やすたびの再デプロイを避ける |
+| **再入** | 既存の守りがそのまま効く | 清算中は `inFlashSwap=false`、`activePool` は1段目のプール。コールバックは通らない |
+
+### 自分で見つけた穴を2つ直した
+
+**① Aave が全額を使わないことがある**
+
+Aave は「一度に返せる上限」(HF≥0.95 なら借金の50%)で頭打ちにする。
+**渡した額より少ししか使われないことがある。** その場合、余った借金の通貨が
+コントラクトに残り、売る段は担保しか売らないので**換金されない**。
+
+損にはならない(チェーン上の `returned >= owed + minProfit` が守る)が、
+**利益は目減りする**。だから **bot 側が「上限ぴったり」で借りる**必要がある。
+
+**実際に使われた額を測って `Liquidated` に残す。** ずれていればログで分かる。
+
+**② その測定式を最初に間違えた**
+
+```solidity
+uint256 debtUsed = debtBefore + debtToCover - balanceOf(debt);  // ← 二重に数えている
+```
+
+`debtBefore` は**1段目が運んできた後**の残高なので、既に `debtToCover` を含む。
+足し直すと二重。**引くだけでよい。**
+
+数字で検算して直した:
+
+```
+✓ 全額使われた       手持ち0 + 受取1000、Aaveが1000使用 → 測定1000
+✓ 半分しか使われない 手持ち0 + 受取1000、Aaveが500使用  → 測定500
+✓ 元から残高があった 手持ち300 + 受取1000、Aaveが700使用 → 測定700
+```
+
+### まだ残っていること(デプロイ前にやる)
+
+1. **bot 側の呼び出しを書く**(`simulateLiquidate` → `liquidateRoute`)
+2. **「上限ぴったり」の借入額の計算**(HF<0.95 なら100%、それ以外50%)
+3. **担保を売る経路の探索**(既存の `legAmountOut` が使える)
+4. **ローカルの EVM で Aave をフォークして試験**
+
+---
+
 ## 進行中の計画
 1. 済: V3型プールをDEX別に数える調査(scripts/pool-survey.js)。Polygon /
    Base / Optimism で実施し、未監視ファクトリーの活動量と、監視ペアの
