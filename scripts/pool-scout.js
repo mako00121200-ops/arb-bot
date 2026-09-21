@@ -298,11 +298,26 @@ export async function scoutChain(chain) {
     return { added: 0, scanned, active: counts.size, skipped: { "枠が危ない": ranked.length } };
   }
 
+  // **順位は「まだ地図に無いプール」の中で数える。**
+  //
+  // [なぜ(2026年9月21日、上位8→50に広げた直後の実測で判明)]
+  //   [プール発見] optimism: 364プールが稼働。300件を調べ、17件を追加。
+  //     見送り: **既に地図にある115** / …… / **新しいペア(片方だけ既知)131**
+  //
+  // 順位は「取引の多い順」で全プールに振っていた。だが上位は
+  // **既に地図にあるプールが占める**(取引が多いから先に採用されている)。
+  // つまり**地図が育つほど、新しいプールの順位が押し下げられて入れなくなる**。
+  // 増やすための仕組みが、増えるほど効かなくなる**逆向きのラチェット**だった。
+  //
+  // 「上位50まで」は「**新しいプールの中で上位50まで**」の意味にする。
+  let newRank = 0;
   for (let rank = 0; rank < ranked.length; rank++) {
     const [address, swaps] = ranked[rank];
     const entry = info.get(address);
     if (!entry) { skipped["正体が読めず"] = (skipped["正体が読めず"] || 0) + 1; continue; }
-    const { take, why } = decide(key, address, entry, knownSet, rank);
+    const alreadyMapped = !!getPool(key, address);
+    const { take, why } = decide(key, address, entry, knownSet, newRank);
+    if (!alreadyMapped) newRank++;
     if (!take) {
       skipped[why] = (skipped[why] || 0) + 1;
       if (why.startsWith("新しいペア")) candidates.push({ address, swaps, entry });
