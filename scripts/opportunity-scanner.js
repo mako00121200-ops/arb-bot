@@ -37,6 +37,8 @@ import {
   KIND_V2, KIND_V3,
 } from "./pool-registry.js";
 import { quoteFromTable, hasQuoteTable, getTableRange } from "./v3-pools.js";
+// 最低利益は**チェーンごと**(ガス代が25倍違うため)。
+import { screenMinProfitUsd } from "./min-profit.js";
 
 const MIN_TRADE_USD = parseFloat(process.env.MIN_TRADE_USD || "0");
 // 手数料が未実測のV2プールに当てる想定値。30bpsは楽観的すぎることが多い。
@@ -689,11 +691,8 @@ const SPOT_ROUTE_LABELS = ["0〜5bps", "5〜10bps", "10〜30bps", "30〜100bps",
 /// **永久に正確な判定を受けられない**。
 ///
 /// 送信の基準と揃える。捨てるのは「送っても基準に満たない」経路だけにする。
-const SPOT_SCREEN_MIN_PROFIT_USD = parseFloat(
-  process.env.SPOT_SCREEN_MIN_PROFIT_USD || process.env.MIN_PROFIT_USD || "0.01",
-);
-
-export function getScreenMinProfitUsd() { return SPOT_SCREEN_MIN_PROFIT_USD; }
+// ふるいの下限は**チェーンごと**(scripts/min-profit.js の screenMinProfitUsd)。
+// ここを下げ忘れると実行側を下げても何も変わらない(価格表が作られないため)。
 
 /// 金額の見積もりで試す投入額(取引上限に対する比率)。
 /// findBestAmount と同じ考え方だが、ふるいなので点数を減らしている。
@@ -912,7 +911,7 @@ function measureSpotScreen(chain, tokenA, tokenB, pools, capUsd, gasCostUsd) {
           } else if (netUsd > prevNet) {
             spotScreen.routeNet.set(key, netUsd);
           }
-          if (netUsd > SPOT_SCREEN_MIN_PROFIT_USD) {
+          if (netUsd > screenMinProfitUsd(chain)) {
             spotScreen.needQuote++;
             if (isFresh) spotScreen.freshNeedQuote++;
 
@@ -981,7 +980,6 @@ export function getSpotScreenStats() {
     netLabels: [...SPOT_NET_LABELS],
     netCounts,
     samples: spotScreen.samples.map((x) => ({ ...x })),
-    minProfitUsd: SPOT_SCREEN_MIN_PROFIT_USD,
     capped: spotScreen.capped,
   };
 }
