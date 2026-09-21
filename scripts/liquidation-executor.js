@@ -37,8 +37,12 @@ import { nowJst } from "./jst.js";
 /// ガス量は固定値 + 余裕(オーナーの指示)。費用の見積もりには GAS_UNITS、送信の上限には GAS_LIMIT。
 const GAS_UNITS = BigInt(process.env.LIQUIDATION_GAS_UNITS || "1200000");
 const GAS_LIMIT = BigInt(process.env.LIQUIDATION_GAS_LIMIT || "2000000");
-/// 確認した利益のうち、最低利益として鎖上に要求する割合(値動きの余裕)。
-const MIN_PROFIT_SHARE_BPS = BigInt(process.env.LIQUIDATION_MIN_PROFIT_SHARE_BPS || "5000");
+/// 鎖上に要求する最低利益の、**取り消しが得になる境目**(裁定側と同じ考え方)。
+/// 取り消しても実行してもガス代はほぼ同じなので、少しでも利益が残るなら実行した方が損が小さい。
+/// 境目はガス代の約10%。詳しくは scripts/execute-opportunity.js の REVERT_GAS_SHARE。
+const REVERT_GAS_SHARE = parseFloat(process.env.REVERT_GAS_SHARE || "0.10");
+/// ガス代か利益が分からない時の割合(bps)。
+const MIN_PROFIT_SHARE_BPS = BigInt(process.env.LIQUIDATION_MIN_PROFIT_SHARE_BPS || "500");
 /// 見積もりで並べた経路のうち、eth_call で確かめる本数。
 const SIMULATE_TOP_N = parseInt(process.env.LIQUIDATION_SIMULATE_TOP_N || "3", 10);
 /// V3 のファクトリーに聞く手数料帯。
@@ -319,7 +323,14 @@ export async function handleLiquidationCandidate(plan) {
   if (!privateKey) return { summary: "鍵なし" };
   const { signer } = getSigner(CHAIN, privateKey);
   const contract = new ethers.Contract(address, LIQUIDATOR_ABI, signer);
-  const minProfit = (best.profitRaw * MIN_PROFIT_SHARE_BPS) / 10000n;
+  const minProfit = (() => {
+    if (!(best.profitRaw > 0n)) return 0n;
+    if (!Number.isFinite(gasUsd) || gasUsd <= 0 || !(best.profitUsd > 0)) {
+      return (best.profitRaw * MIN_PROFIT_SHARE_BPS) / 10000n;
+    }
+    const bps = Math.min(10000, Math.max(0, Math.round(((gasUsd * REVERT_GAS_SHARE) / best.profitUsd) * 10000)));
+    return (best.profitRaw * BigInt(bps)) / 10000n;
+  })();
   const estimatedGasPriceWei = await getEstimatedGasPriceWei(CHAIN);
   const legs = best.route.legs.map(({ pool, tokenOut, flags, feeBps }) => ({ pool, tokenOut, flags, feeBps }));
   const startedAt = Date.now();
