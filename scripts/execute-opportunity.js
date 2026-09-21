@@ -538,6 +538,28 @@ async function executeOpportunityInner(opp) {
   }
   const measuredGasUsd = await gasUnitsToUsd(chain, gasUnits, l1FeeWei);
   if (measuredGasUsd != null) gasCostUsd = measuredGasUsd;
+
+  // 実測のガス代でもう一度、下限を確かめる(2026年9月21日に追加)。
+  //
+  // [なぜ要るか(本番で赤字を送った)]
+  // 上の下限の確認は「そのチェーン・その段数の典型的なガス量」で行っている。
+  // その後に eth_estimateGas でこの経路の実際のガス量が分かり、gasCostUsd を
+  // 置き換えるが、**置き換えた後に確かめ直していなかった**。
+  // 2026年9月21日 00:03 UTC、polygon の2件がこの隙間を通った:
+  //   sync発見→algebra-a  粗利$0.0122 に対し実測ガス$0.0173 → 送信 → 純利 -$0.0065
+  //   polyzap→algebra-a   粗利$0.0117 に対し実測ガス$0.0181 → 送信 → 純利 -$0.0064
+  // ログの「送信します」の行には既に 粗利 < ガス が書かれていた。
+  // 最低利益を $0.005 から $0.002 に下げたことで、典型値と実測値の差を
+  // 吸収していた余裕が無くなり、隙間が表に出た。
+  {
+    const netAfterMeasured = grossProfitUsd - gasCostUsd;
+    if (netAfterMeasured < MIN_PROFIT_USD) {
+      markRouteRejected(opp);
+      opp.sendResult = "below_gas";
+      console.log(`[実行] ${opp.label}: 実測のガス代$${gasCostUsd.toFixed(4)}(典型値の見積もりより高い)を引くと純利$${netAfterMeasured.toFixed(4)}で下限未満のため見送り(粗利$${grossProfitUsd.toFixed(4)})`);
+      return false;
+    }
+  }
   // 単価の学習に使うため、この時点の見積もり単価を控えておく。
   const estimatedGasPriceWei = await getEstimatedGasPriceWei(chain);
 
