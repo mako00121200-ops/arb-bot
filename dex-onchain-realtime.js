@@ -155,6 +155,16 @@ const pendingSubIds = {};      // chain -> Set(購読ID) 確定前の押し出�
 const pendingPushOk = {};      // chain -> bool 押し出しが通ったか
 const pendingSubTry = {};      // chain -> 何番目の名前を試しているか
 const pendingSubError = {};    // chain -> 最後の拒否理由
+const pendingLastEventAt = {}; // chain -> 押し出しで最後にイベントが届いた時刻
+/// 押し出しが通ったのに、これだけの間イベントが1件も届かなければ、
+/// 「受理はされたが実際には配信されない」と見なして定期取得に戻す。
+///
+/// [なぜ要るか(2026年9月21日)]
+/// 購読が受理されたかどうかは返事で分かるが、**受理されても何も届かない**
+/// 端点があり得る。その場合、定期取得は止まっているので**先読みが黙って死ぬ**。
+/// 先読みはこの bot の主な強みなので、黙って失うのが最悪。
+/// 確定後のイベントは届いているのに確定前が来ない、という状態を見張る。
+const PENDING_PUSH_SILENCE_MS = parseInt(process.env.PENDING_PUSH_SILENCE_MS || "90000", 10);
 const pendingInFlight = {};    // chain -> bool
 const pendingStats = {};       // chain -> { polls, errors, events, sealedHits, leadTotalMs, leadMaxMs }
 
@@ -389,6 +399,7 @@ function connectChain(chainName, wsUrl) {
               pendingSubIds[chainName].add(msg.result);
               if (!pendingPushOk[chainName]) {
                 pendingPushOk[chainName] = true;
+                pendingLastEventAt[chainName] = Date.now();
                 // 押し出しが通ったので、取りに行くのをやめる(遅れもRPCの消費も消える)。
                 stopPendingPolling(chainName);
                 console.log(`[Flashblocks/押し出し] ${chainName}: 確定前のイベントを押し出しで受け取ります。定期取得は止めました`);
@@ -411,7 +422,10 @@ function connectChain(chainName, wsUrl) {
         // どちらの購読から来たかで、確定前か確定後かを決める。
         const subId = msg.params.subscription;
         const isPending = !!(subId && pendingSubIds[chainName]?.has(subId));
-        if (isPending) pendingStatsFor(chainName).polls++; // 押し出しの受信回数として数える
+        if (isPending) {
+          pendingStatsFor(chainName).polls++; // 押し出しの受信回数として数える
+          pendingLastEventAt[chainName] = receivedAt;
+        }
         dispatchLog(chainName, msg.params.result, receivedAt, isPending ? "pending" : "sealed");
       } catch (e) {}
     });
@@ -449,6 +463,20 @@ function connectChain(chainName, wsUrl) {
 
   if (chainWatchdogTimers[chainName]) clearInterval(chainWatchdogTimers[chainName]);
   chainWatchdogTimers[chainName] = setInterval(() => {
+    // 押し出しが通ったのに確定前のイベントが来ない状態を見張る。
+    // 確定後のイベントは届いているのに確定前だけ来ないなら、配信されていない。
+    if (pendingPushOk[chainName]) {
+      const lastPending = pendingLastEventAt[chainName] ?? 0;
+      const lastSealed = chainLastEventAt[chainName] ?? 0;
+      const silence = Date.now() - lastPending;
+      if (silence > PENDING_PUSH_SILENCE_MS && lastSealed > lastPending) {
+        pendingPushOk[chainName] = false;
+        pendingSubIds[chainName]?.clear();
+        pendingSubTry[chainName] = PENDING_SUB_METHODS.length; // もう試さない
+        startPendingPolling(chainName);
+        console.warn(`[Flashblocks/押し出し] ${chainName}: 購読は通ったのに確定前のイベントが${Math.round(silence / 1000)}秒来ません。定期取得に戻します`);
+      }
+    }
     const last = chainLastDataAt[chainName] ?? Date.now();
     if (Date.now() - last > DATA_TIMEOUT_MS) {
       console.log(`[オンチェーン] ${chainName}: 無応答を検知。強制再接続します…`);
