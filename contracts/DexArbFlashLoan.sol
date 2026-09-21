@@ -6,6 +6,26 @@ pragma solidity ^0.8.28;
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+// Aave V3 の Pool。フォーク(Seamless 等)も同じ形。
+//
+// [なぜ清算を足すのか(2026年9月21日)]
+// 裁定の利益は「価格の差」で、誰でも取れるので競争で差そのものが消える。
+// 実測でも深いプールは0bps、浅いプールは$1〜30しか吸えなかった。
+// 清算の利益は**プロトコルが決めた固定のボーナス(5〜10%)**で、
+// **競争しても額が変わらない**。競争は「誰が取るか」の競走になるだけ。
+// base の実測では2日で $1,000超の清算が4回、清算した人は6人・上位1者22%
+// (独占されていない)。1回の粗利 $25〜50。
+interface IAavePool {
+    function liquidationCall(
+        address collateralAsset,
+        address debtAsset,
+        address user,
+        uint256 debtToCover,
+        bool receiveAToken
+    ) external;
 }
 
 // Uniswap V2形式(Solidly形式も同じ)。
@@ -98,6 +118,16 @@ contract DexArbFlashLoan {
         uint256 minProfit;
     }
 
+    /// @dev 清算の1手ぶんの指定。
+    /// debtToCover は**持たない**。1段目のフラッシュスワップで受け取った量を
+    /// そのまま肩代わりする。額を2箇所で管理すると必ずずれる。
+    struct Liq {
+        address pool;            // Aave V3 の Pool(またはフォーク)
+        address collateralAsset; // 受け取る担保
+        address debtAsset;       // 肩代わりする借金(= legs[0].tokenOut)
+        address user;            // 清算される人
+    }
+
     error SimulationResult(uint256 returned, uint256 owed);
     /// @dev quoteV3 の結果。QuoterV2 と同じで、わざと失敗させて値を返す。
     error QuoteResult(uint256 amountOut);
@@ -110,7 +140,15 @@ contract DexArbFlashLoan {
     bool private transient simulating;
     bool private transient quoting;
 
+    // 清算の指定。一時記憶なので取引の終わりに勝手に消える。
+    // (構造体は transient に置けないので、住所4つに分けて持つ)
+    address private transient liqPool;
+    address private transient liqCollateral;
+    address private transient liqDebt;
+    address private transient liqUser;
+
     event RouteExecuted(address indexed asset, uint256 amountIn, uint256 profit, uint8 legCount);
+    event Liquidated(address indexed user, address indexed debtAsset, address indexed collateralAsset, uint256 debtCovered, uint256 seized);
     event Withdrawn(address indexed token, uint256 amount);
 
     constructor() {
@@ -133,6 +171,64 @@ contract DexArbFlashLoan {
         simulating = true;
         _start(asset, amount, legs, 0);
         revert("DexArbFlashLoan: simulation did not finish");
+    }
+
+    /// @notice 清算して、受け取った担保を売り、フラッシュスワップを返す。
+    ///
+    /// 流れは executeRoute とほぼ同じで、**1段目と2段目の間に清算が1手入るだけ**。
+    ///   legs[0] で debtAsset を借りる(フラッシュスワップ)
+    ///     → その全額で liquidationCall(担保をボーナスぶん多く受け取る)
+    ///     → legs[1..] で担保を売って asset に戻す
+    ///     → 返済と利益の判定は既存のまま
+    ///
+    /// @param liq 清算の指定。`liq.debtAsset` は `legs[0].tokenOut` と一致すること。
+    function liquidateRoute(
+        address asset,
+        uint256 amount,
+        Leg[] calldata legs,
+        uint256 minProfit,
+        Liq calldata liq
+    ) external onlyOwner {
+        _setLiq(liq, legs);
+        _start(asset, amount, legs, minProfit);
+    }
+
+    /// @notice 清算つきの経路を最後まで実行し、結果を SimulationResult で返して取り消す。
+    /// eth_call で呼び、実際に送信はしない。**送る前に必ずこれで確かめる。**
+    function simulateLiquidate(
+        address asset,
+        uint256 amount,
+        Leg[] calldata legs,
+        Liq calldata liq
+    ) external onlyOwner {
+        simulating = true;
+        _setLiq(liq, legs);
+        _start(asset, amount, legs, 0);
+        revert("DexArbFlashLoan: simulation did not finish");
+    }
+
+    /// @dev 清算の指定を確かめて一時記憶に置く。
+    ///
+    /// [なぜ Pool の住所を引数で受け取るのか]
+    /// 埋め込むとチェーンを増やすたびに再デプロイが要る。呼べるのは
+    /// `onlyOwner`、つまり bot のウォレットだけなので、住所は bot 側で管理し、
+    /// **起動時に実測で確かめる**方が安全で柔軟。
+    function _setLiq(Liq calldata liq, Leg[] calldata legs) internal {
+        require(liq.pool != address(0), "DexArbFlashLoan: liq pool required");
+        require(liq.user != address(0), "DexArbFlashLoan: liq user required");
+        require(liq.collateralAsset != address(0) && liq.debtAsset != address(0), "DexArbFlashLoan: liq assets required");
+        // 借金と担保が同じだと、受け取った担保の量を残高の差で測れなくなる
+        // (出ていく借金と入ってくる担保が相殺される)。測れないものは扱わない。
+        require(liq.collateralAsset != liq.debtAsset, "DexArbFlashLoan: collateral must differ from debt");
+        // 1段目が運んでくる通貨で肩代わりする。食い違えば何も清算できない。
+        require(legs[0].tokenOut == liq.debtAsset, "DexArbFlashLoan: first leg must deliver debtAsset");
+        // 担保を売る段が最低1つ要る(_start でも 2〜4段を確かめている)。
+        require(legs.length >= 2, "DexArbFlashLoan: need a leg to sell collateral");
+
+        liqPool = liq.pool;
+        liqCollateral = liq.collateralAsset;
+        liqDebt = liq.debtAsset;
+        liqUser = liq.user;
     }
 
     /// @notice プールを指定して受取量を求める。eth_call 専用で、送信はしない。
@@ -255,6 +351,14 @@ contract DexArbFlashLoan {
         require(running > 0, "DexArbFlashLoan: nothing received");
 
         address tokenIn = legs[0].tokenOut;
+
+        // 清算が指定されていれば、ここで1手だけ差し込む。
+        // 以降は「担保を売る経路」として、既存の処理がそのまま続く。
+        if (liqPool != address(0)) {
+            running = _liquidate(running);
+            tokenIn = liqCollateral;
+        }
+
         for (uint256 i = 1; i < legs.length; i++) {
             running = _swapLeg(legs[i], tokenIn, running);
             tokenIn = legs[i].tokenOut;
@@ -268,6 +372,54 @@ contract DexArbFlashLoan {
         require(returned >= owed + ctx.minProfit, "DexArbFlashLoan: not profitable, reverting");
         _safeTransfer(asset, legs[0].pool, owed);
         emit RouteExecuted(asset, ctx.amountIn, returned - owed, uint8(legs.length));
+    }
+
+    /// @dev 借金を肩代わりし、受け取った担保の量を返す。
+    ///
+    /// 受け取った量は**必ず残高の差で測る**。Aave の戻り値を信じない。
+    /// (担保の通貨が送金時に手数料を取る種類でも、実際に増えた量で進める)
+    function _liquidate(uint256 debtToCover) internal returns (uint256 seized) {
+        require(debtToCover > 0, "DexArbFlashLoan: zero debt to cover");
+        address pool = liqPool;
+        address collateral = liqCollateral;
+        address debt = liqDebt;
+
+        uint256 before = IERC20(collateral).balanceOf(address(this));
+        uint256 debtBefore = IERC20(debt).balanceOf(address(this));
+
+        // **使う分だけ承認し、直後に0へ戻す。** 残したままにしない。
+        // 先に0を入れるのは、0以外からの上書きを拒む通貨(USDT等)のため。
+        _safeApprove(debt, pool, 0);
+        _safeApprove(debt, pool, debtToCover);
+        IAavePool(pool).liquidationCall(collateral, debt, liqUser, debtToCover, false);
+        _safeApprove(debt, pool, 0);
+
+        seized = IERC20(collateral).balanceOf(address(this)) - before;
+        require(seized > 0, "DexArbFlashLoan: nothing seized");
+
+        // **実際にいくら使われたかを測る。** 渡した額を信じない。
+        //
+        // Aave は「一度に返せる上限」(HF≥0.95 なら借金の50%)で頭打ちにするので、
+        // **こちらが渡した額より少ししか使われないことがある**。
+        // その場合、余った借金の通貨がこの中に残る。
+        // 売る段(legs[1..])は担保の通貨しか売らないので、**余りは換金されない**。
+        //
+        // 損にはならない(チェーン上の `returned >= owed + minProfit` が守る。
+        // 足りなければ取り消されるだけで、余りは引き出せる)が、
+        // **利益は目減りする**。だから bot 側が「上限ぴったり」で借りる必要がある。
+        // 実際に使われた額を残しておけば、ずれていた時にログで分かる。
+        // debtBefore は1段目が運んできた後の残高なので、既に debtToCover を含む。
+        // 足し直すと二重に数える(最初そう書いてしまった)。**引くだけでよい。**
+        // 担保と借金が別の通貨であることは _setLiq で確かめてあるので、
+        // 担保が入ってきても借金側の残高は動かない。
+        uint256 debtUsed = debtBefore - IERC20(debt).balanceOf(address(this));
+        emit Liquidated(liqUser, debt, collateral, debtUsed, seized);
+    }
+
+    /// @dev 戻り値の無い通貨(USDT等)にも対応した承認。
+    function _safeApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory ret) = token.call(abi.encodeWithSelector(IERC20.approve.selector, spender, amount));
+        require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "DexArbFlashLoan: approve failed");
     }
 
     /// @dev 1段をスワップし、受け取った量を返す。V3はプールが返す量、V2は残高の差分。
