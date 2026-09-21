@@ -1832,6 +1832,13 @@ function heartbeat() {
   // どれくらい惜しかったかの分布。機会が0件でも「壁さえ低ければ届いていた」
   // のか「そもそも価格が動いていない」のかを区別できるようにする。
   try {
+    // 大物(既定$0.10以上)の行く先のまとめ。**チェーンごとの繰り返しの外で1回だけ。**
+    // (最初は繰り返しの中に置いてしまい、同じ行が5〜6回流れていた)
+    {
+      const bigLine = formatBigSummary();
+      if (bigLine) console.log(bigLine);
+    }
+
     const W = NEAR_MISS_REACHABLE_WALL_BPS;
     const all = getNearMissStats();
     const near = getNearMissStats(W);
@@ -1844,11 +1851,6 @@ function heartbeat() {
       const parts = r
         ? r.labels.map((l, i) => `${l}:${r.counts[i].toLocaleString()}`).join(" ")
         : "壁の低い経路なし";
-      // 大物(既定$0.10以上)の行く先のまとめ。何も無ければ出ない。
-      {
-        const bigLine = formatBigSummary();
-        if (bigLine) console.log(bigLine);
-      }
       console.log(`[惜しい] ${chain}: ${head} / 壁${W}bps以下の内訳 ${parts} / 壁が${WALL_DROP_BPS}bps下がれば+${countIfWallDrops(chain, WALL_DROP_BPS, W).toLocaleString()}本`);
     }
   } catch (e) {}
@@ -2112,6 +2114,33 @@ function renderPage() {
     <td style="text-align:right;color:#e8a33d;font-weight:600">+$${(m.netProfitUsd ?? 0).toFixed(4)}</td></tr>`).join('')
     || `<tr><td colspan="5" style="color:#888">取り逃した黒字はありません</td></tr>`;
 
+  // 原因ごとの「直せば取れる額」。**金額の大きい順**に並べ、直し方まで書く。
+  const CAUSE_FIX = {
+    failed: "送信は届いたが失敗。取り消しの中身(セレクタ)から原因を特定する",
+    not_sent: "判定と実測のずれ。価格表の精度か、反応の遅れ",
+    below_min: "ガス代に埋もれている。投入額を増やせるかが鍵",
+    skipped_cooldown: "直前の失敗で冷却中。失敗の原因を直せば冷却も減る",
+    cooldown: "直前の失敗で冷却中。失敗の原因を直せば冷却も減る",
+    not_profitable_onchain: "チェーン上で赤字。判定の精度",
+    unprofitable: "チェーン上で赤字。判定の精度",
+  };
+  const causeRows = Object.entries(sum.missedByOutcome || {})
+    .sort((a, b) => b[1].usd - a[1].usd)
+    .map(([k, v]) => `<tr><td>${OUTCOME_LABEL[k] || k}</td>
+      <td style="text-align:right">${v.count.toLocaleString()}</td>
+      <td style="text-align:right;color:#e8a33d;font-weight:600">+$${v.usd.toFixed(4)}</td>
+      <td style="font-size:9px;color:#888">${CAUSE_FIX[k] || ""}</td></tr>`).join('')
+    || `<tr><td colspan="4" style="color:#888">取り逃しはありません</td></tr>`;
+
+  const phantomRows = (sum.topPhantom || []).map((m, i) => {
+    const ratio = (m.tradeAmountUsd > 0 ? (m.netProfitUsd / m.tradeAmountUsd) * 100 : 0);
+    return `<tr><td>${i+1}</td>
+    <td style="font-size:9px">${m.kind || ''} ${m.chain || ''}<br>${shortenLabel(m.label)}</td>
+    <td style="text-align:right">$${(m.tradeAmountUsd ?? 0).toFixed(2)}</td>
+    <td style="text-align:right;color:#888">+$${(m.netProfitUsd ?? 0).toFixed(4)}</td>
+    <td style="text-align:right;color:#e74c3c;font-weight:600">${ratio.toFixed(0)}%</td></tr>`;
+  }).join('') || `<tr><td colspan="5" style="color:#888">壊れた経路はありません</td></tr>`;
+
   const oppRows = stats.recent.slice(0, 10).map((o, i) => `<tr><td>${i+1}</td>
     <td style="font-size:9px">${o.kind} ${o.chain}${o.hasV3 ? ' <span style="color:#6fae62">V3</span>' : ''}<br>${shortenLabel(o.label)}</td>
     <td style="text-align:right">${o.feeWallPercent.toFixed(2)}%</td>
@@ -2246,16 +2275,23 @@ ${whatIfRows(chain)}`;
 手数料の未実測: 残${stats.feeProbePending.toLocaleString()}プール</div></div>
 
 <div class="card"><h2>📒 24時間の記録簿</h2>
-<div class="stat"><div><div class="v">${sum.count.toLocaleString()}</div><div class="l">記録件数</div></div>
-<div><div class="v" style="color:#e8a33d">+$${sum.profitableUsd.toFixed(3)}</div><div class="l">黒字判定の合計</div></div>
-<div><div class="v" style="color:#2ecc71">+$${sum.realizedUsd.toFixed(4)}</div><div class="l">実際に得た利益</div></div>
-<div><div class="v">${stats.bigMoves.toLocaleString()}</div><div class="l">大口取引の検知</div></div></div>
+<div class="stat"><div><div class="v" style="color:#2ecc71">+$${sum.realizedUsd.toFixed(4)}</div><div class="l">実際に得た利益</div></div>
+<div><div class="v" style="color:#e8a33d">+$${sum.missedUsd.toFixed(4)}</div><div class="l">取れた可能性がある額</div></div>
+<div><div class="v">${sum.count.toLocaleString()}</div><div class="l">記録件数</div></div>
+<div><div class="v" style="color:${sum.phantomCount ? '#e74c3c' : '#888'}">${sum.phantomCount.toLocaleString()}</div><div class="l">計算が壊れた経路</div></div></div>
 <div class="note">なぜそうなったか: ${outcomeLine}<br>
-送信まで進んだ判定額: +$${sum.sentUsd.toFixed(4)}<br>
-<span style="color:#e8a33d">「黒字判定の合計」は同じ経路の再検知を何度も足した値で、送信直前の実測では赤字になる分も含みます。取り逃した金額ではありません。</span></div>
+送信まで進んだ判定額: +$${sum.sentUsd.toFixed(4)}</div>
 
-<h2 style="margin-top:14px">黒字と判定したのに取れなかった上位</h2>
+<h2 style="margin-top:14px">直せば取れる額(原因べつ)</h2>
+<div class="note" style="margin-top:0;border-top:none;padding-top:0"><b>ここが次に直す場所です。</b>金額の大きい原因から手を付けます。有り得ない利回りの判定(下の「計算が壊れた経路」)は除いてあります。</div>
+<table class="t-num"><thead><tr><th>原因</th><th style="text-align:right">件数</th><th style="text-align:right">取れた可能性</th><th>直し方</th></tr></thead><tbody>${causeRows}</tbody></table>
+
+<h2 style="margin-top:14px">取れたはずの上位</h2>
 <table class="t-num"><thead><tr><th>#</th><th>経路</th><th>理由</th><th style="text-align:right">投入</th><th style="text-align:right">判定額</th></tr></thead><tbody>${missedRows}</tbody></table>
+
+<h2 style="margin-top:14px">計算が壊れた経路(取り逃しではありません)</h2>
+<div class="note" style="margin-top:0;border-top:none;padding-top:0">投入額に対して<b>有り得ない利回り</b>を出した判定です。合計 +$${sum.phantomUsd.toFixed(2)}。<br><b>これは取り逃した金額ではなく、こちらの計算が壊れている証拠です。</b>金額として数えると、本当に直すべきものが埋もれます。</div>
+<table class="t-num"><thead><tr><th>#</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">判定額</th><th style="text-align:right">利回り</th></tr></thead><tbody>${phantomRows}</tbody></table>
 
 <h2 style="margin-top:14px">直近に検知した機会</h2>
 <table class="t-num"><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table></div>
