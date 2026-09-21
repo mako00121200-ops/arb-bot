@@ -235,7 +235,7 @@ const stats = {
   skippedCooldown: 0, trapsRejected: 0, taxTokensRejected: 0, staleRejected: 0, bigMoves: 0,
   v3Found: 0, v3Matched: 0, v3Opportunities: 0, v3LiquidityEvents: 0, scoutAdded: 0,
   quoteTablesBuilt: 0, quoteTablesPending: 0, quoteRebuildsFromPolling: 0, quoteTablesOnDemand: 0,
-  v3VerifyCount: 0, v3VerifyWorst: null, v3VerifyRecent: [],
+  v3VerifyCount: 0, v3VerifyWorst: null, v3VerifyRecent: [], v3VerifyDropped: 0,
   disabledFromFile: 0, disabledRuntime: 0,
   prunedTotal: 0, prunedKept: 0,
   decimalsKnown: 0, pricedTokens: 0,
@@ -800,6 +800,11 @@ let v3VerifyCursor = 0;
 /// 一方、実際に赤字と確定した取引は $102 と $276、つまり「$100〜$300」という
 /// 広い区間にある。**いちばん簡単な点だけを測っていた。**
 /// 区間の広さごとに誤差がどう変わるかを見るため、複数の額で測る。
+/// 価格表のずれがこれを超えたら、その表を捨てて作り直させる(bps)。
+/// 20bps は「出す」閾値で、そこで捨てると作り直しが増えすぎる。
+/// 狙う利幅の上限(50bps)を超えたら、その表は判定に使えないと見なす。
+const VERIFY_DROP_TABLE_BPS = parseFloat(process.env.VERIFY_DROP_TABLE_BPS || "50");
+
 const VERIFY_AMOUNTS_USD = (process.env.VERIFY_AMOUNTS_USD || "20,200,700")
   .split(",").map((v) => parseFloat(v.trim())).filter((v) => v > 0);
 
@@ -876,6 +881,27 @@ async function verifyV3Calculations() {
     // 閾値は1%(100bps)では粗すぎた。狙う利幅が5〜50bpsなので20bpsで出す。
     if (Math.abs(bps) > 20) {
       console.log(`[V3検証] ${pool.chain} ${pool.address.slice(0, 10)}…(${(pool.feeBps / 100).toFixed(2)}%) 投入$${usd}: 補間が公式より${bps > 0 ? "過大" : "過小"}${Math.abs(bps).toFixed(1)}bps`);
+    }
+    // ずれが大きい表は捨てて、次に必要になった時に作り直させる。
+    //
+    // [なぜ要るか(2026年9月21日に実測で判明)]
+    // この検証は今まで**測って出すだけ**で、結果を使っていなかった。
+    //   [V3検証] avalanche 0xd18384F4…(1.00%) 投入$200: 補間が公式より過小28.5bps
+    //   [V3検証] avalanche 0xd18384F4…(1.00%) 投入$700: 補間が公式より過小92.7bps
+    // 手数料1%の帯は tick の刻みが広く、流動性が塊で置かれているため、
+    // 表の点と点の間を直線で結ぶと大きく外れる。しかも**投入額が大きいほど
+    // 外れる**($200で28.5bps → $700で92.7bps)。
+    // 同じ時間帯に arbitrum の 1.00% の経路が3本続けて「判定は+$0.0126〜
+    // +$0.0417、チェーン上では −1.2〜−7.8bps」になり、答え合わせは毎回
+    // 1段目のV3を名指しした(公式Quoterとも一致)。狙いたい大口の帯が、
+    // まさにこの表の誤差で幻の機会になっていた。
+    // 捨てても損はしない。次に要求された時に作り直されるだけで、
+    // 作り直しは今の仕組み(要求で作成)がそのまま担う。
+    if (Math.abs(bps) > VERIFY_DROP_TABLE_BPS) {
+      clearQuoteTable(pool.chain, pool.address);
+      stats.v3VerifyDropped++;
+      console.log(`[V3検証] ${pool.chain} ${pool.address.slice(0, 10)}…(${(pool.feeBps / 100).toFixed(2)}%): ずれ${Math.abs(bps).toFixed(1)}bpsは大きすぎるため価格表を捨てました(次に要求された時に作り直します)`);
+      break; // この表はもう無いので、残りの投入額で測る意味がない
     }
   }
 }
