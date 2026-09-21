@@ -2072,6 +2072,48 @@ Base を稼働に加えた初回の起動でこう出た。
 上の `pendingLogs` が Base で通らなかった場合は、`newFlashblocks` の配信
 (部分ブロックそのもの)から受領証のイベントを取り出す実装に進む。
 
+## オーナーの判断が要る時だけ LINE に通知する(2026年9月21日)
+
+### 前提
+- **LINE Notify は2025年3月31日に終了**した。代わりに Messaging API の
+  プッシュメッセージを使う
+- 無料枠は**月200通**(宛先数 × 通数)
+- Claude の作業環境からは `api.line.me` に届かない(外向き通信が遮断されている)。
+  **bot 自身(Railway)から送る**
+
+### 方針:通知するのは「オーナーが動かないと解決しないこと」だけ
+普段の失敗・機会ゼロ・静かな市況は通知しない。こちらで対処できるため。
+通知が多いと読まれなくなり、**本当に必要な1通が埋もれる**。
+
+| 送る | なぜ |
+|---|---|
+| 全チェーンが10分以上止まった | 機会をすべて失っている |
+| RPCの枠の月末見込が70%超 | 使い切ると全部止まる。プランか監視範囲の判断が要る |
+| 送信用ウォレットのガス残高が下限割れ | **補充はオーナーにしかできない** |
+| 送信後の失敗が5件積み上がった | ガス代だけを失っている可能性 |
+
+| 送らない | なぜ |
+|---|---|
+| 通常の失敗・機会ゼロ・閑散 | 正常な範囲 |
+| こちらのコード修正 | 事後に報告すれば足りる |
+
+### 実装
+- `scripts/owner-alert.js`: `alertOwner(key, title, body)`。用件ごとに冷却
+  (既定6時間)、1日の上限(既定10通)。**未設定なら何もしない**(ログにだけ出す)
+  ので、設定前でも安全に動く
+- `index.js`: 生存ログのたびに `checkOwnerAlerts()` が条件を確かめる。
+  ガス残高だけは30分に1回、チェーンごとに1回の呼び出しで読む
+
+### 必要な環境変数(Railway)
+| 変数名 | 取り方 |
+|---|---|
+| `LINE_CHANNEL_ACCESS_TOKEN` | LINE Developers → チャネル → Messaging API タブ → チャネルアクセストークン(長期) |
+| `LINE_USER_ID` | 同 → Basic settings タブ → Your user ID |
+
+調整用: `ALERT_ENABLED`(false で停止) / `ALERT_COOLDOWN_MS` /
+`ALERT_MAX_PER_DAY` / `ALERT_QUOTA_PERCENT` / `ALERT_MIN_GAS_NATIVE` /
+`ALERT_ALL_DOWN_MS` / `ALERT_CONSECUTIVE_SEND_FAILS`
+
 ## 進行中の計画
 1. 済: V3型プールをDEX別に数える調査(scripts/pool-survey.js)。Polygon /
    Base / Optimism で実施し、未監視ファクトリーの活動量と、監視ペアの
