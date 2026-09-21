@@ -310,7 +310,9 @@ function disablePool(chain, address, reason, { fromFile = false, permanent = fal
     temporarilyDisabled.set(key, Date.now() + FAILURE_DISABLE_MS);
     stats.temporarilyDisabled++;
     clearPoolState(getPool(chain, address));
-    console.log(`[一時無効] ${chain} ${address.slice(0, 10)}…: ${reason.slice(0, 70)} → ${Math.round(FAILURE_DISABLE_MS / 60000)}分だけ外します(永久ではありません)`);
+    // 理由は**切り詰めすぎない**。70文字で切ると、いちばん知りたい
+    // 取り消しのセレクタが消える(実際に消えていた)。
+    console.log(`[一時無効] ${chain} ${address.slice(0, 10)}…: ${reason.slice(0, 140)} → ${Math.round(FAILURE_DISABLE_MS / 60000)}分だけ外します(永久ではありません)`);
     return;
   }
 
