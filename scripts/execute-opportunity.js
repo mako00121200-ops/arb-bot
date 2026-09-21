@@ -31,7 +31,7 @@ import { getChainConfig } from "../chain-config.js";
 import { getProviderForChain, callWithRpc, poolHasAmountOut, readBlockTag, isPendingReadChain } from "./onchain-reserves.js";
 import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
 import { recordRealExecution } from "./real-execution-log.js";
-import { estimateGasCostUsd, gasUnitsToUsd, weiToUsd, getEstimatedGasPriceWei, recordActualGasPrice, isOpStackChain, estimateL1FeeWei, readL1FeeFromReceipt, recordActualL1Fee } from "./gas-cost.js";
+import { estimateGasCostUsd, gasUnitsToUsd, weiToUsd, getEstimatedGasPriceWei, recordActualGasPrice, isOpStackChain, readL1FeeFromReceipt, recordActualL1Fee } from "./gas-cost.js";
 import { getTokenDecimals, getTokenPriceUsd, getPool, KIND_V3 } from "./pool-registry.js";
 import { quoteV3ByPoolBatch, fetchReservesBatch } from "./multicall-reserves.js";
 import { clearQuoteTable, quoteV3Exact, isForkFactory } from "./v3-pools.js";
@@ -188,6 +188,22 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
   if (blame) {
     try { notePoolBlame(chain, worst.leg.pool, worst.diff); } catch (e) {}
   }
+}
+
+/// ガス量だけを見積もる。**minProfit は 0 で聞く**。
+///
+/// minProfit は「受取がこれを下回ったら revert する」という最後の比較にしか
+/// 使われないので、0 にしてもガス量はほとんど変わらない。0 で聞くことで、
+/// 確認(eth_call)の結果を待たずに投げられるようになり、1往復ぶん速くなる。
+/// 実際に送る時は、確認の結果から作った本物の minProfit を渡す。
+async function estimateGasUnits(chain, contract, fromAddress, contractAddress, asset, amountIn, legArgs) {
+  if (isPendingReadChain(chain)) {
+    // ethers の estimateGas はブロックの指定を送らないので、pending を明示して生で呼ぶ。
+    const callData = contract.interface.encodeFunctionData("executeRoute", [asset, amountIn, legArgs, 0n]);
+    const hex = await callWithRpc(chain, (p) => p.send("eth_estimateGas", [{ from: fromAddress, to: contractAddress, data: callData }, "pending"]), true);
+    return BigInt(hex);
+  }
+  return await contract.executeRoute.estimateGas(asset, amountIn, legArgs, 0n, { from: fromAddress });
 }
 
 // ===== 送信用の署名者(チェーンごとに1つ、nonceを手元で管理)=====
@@ -467,8 +483,29 @@ async function executeOpportunityInner(opp) {
     }
   } catch (e) {}
 
-  // 1. 結果の問い合わせ(1回)
-  const sim = await simulate(chain, contractAddress, wallet.address, asset, amountIn, legArgs, contractVersion.iface);
+  // 1. 結果の問い合わせと、ガス量の見積もりを**同時に**投げる。
+  //
+  // [なぜ同時にするか(2026年9月21日)]
+  // 実測のループは Flashblocks の取得200ms + 確認85〜170ms + 準備177〜620ms で
+  // 合計600〜800ms。Flashblock は200msごとに配られるので、**3〜4個ぶん遅れて**
+  // 撃っていることになる。先読みで1秒早く見えている優位を、自分で食い潰していた。
+  //
+  // 確認(eth_call)とガス量の見積もり(eth_estimateGas)は、どちらも
+  // 「今の状態でこの取引を実行したらどうなるか」を聞いている。順番に待つ
+  // 理由は「見積もりに minProfit が要る」からだけで、その minProfit は
+  // **ガス量をほとんど変えない**(比較が1回増えるだけ)。見積もりだけ
+  // minProfit=0 で先に投げれば、1往復まるごと(85〜170ms)削れる。
+  //
+  // 安全性は落とさない。送信の可否は今までどおり確認(sim)の結果で決め、
+  // 実際に送る時の minProfit も今までどおり確認の結果から作る。
+  const simPromise = simulate(chain, contractAddress, wallet.address, asset, amountIn, legArgs, contractVersion.iface);
+  const contract = new ethers.Contract(contractAddress, contractVersion.abi, signer);
+  // 失敗しても Promise.all を倒さないように包む(確認の失敗の方を先に報せたい)。
+  const gasPromise = estimateGasUnits(chain, contract, wallet.address, contractAddress, asset, amountIn, legArgs)
+    .then((v) => ({ ok: true, value: v }))
+    .catch((e) => ({ ok: false, error: e }));
+
+  const [sim, gasResult] = await Promise.all([simPromise, gasPromise]);
   const simMs = Date.now() - startedAt;
 
   if (sim.error) {
@@ -506,36 +543,30 @@ async function executeOpportunityInner(opp) {
 
   // 2. 送信。値動きの余裕として、確認した利益の一部だけを最低利益にする。
   const minProfit = (profitRaw * MIN_PROFIT_SHARE_BPS) / 10000n;
-  const contract = new ethers.Contract(contractAddress, contractVersion.abi, signer);
-  let gasUnits;
-  try {
-    if (isPendingReadChain(chain)) {
-      // ethers の estimateGas はブロックの指定を送らないので、pending を明示して生で呼ぶ。
-      const callData = contract.interface.encodeFunctionData("executeRoute", [asset, amountIn, legArgs, minProfit]);
-      const hex = await callWithRpc(chain, (p) => p.send("eth_estimateGas", [{ from: wallet.address, to: contractAddress, data: callData }, "pending"]), true);
-      gasUnits = BigInt(hex);
-    } else {
-      gasUnits = await contract.executeRoute.estimateGas(asset, amountIn, legArgs, minProfit);
-    }
-  } catch (e) {
+  // ガス量は上で確認と同時に投げてある。ここでは結果を受け取るだけ。
+  if (!gasResult.ok) {
+    const e = gasResult.error;
     const msg = (e?.shortMessage || e?.message || "").slice(0, 160);
     markRouteRejected(opp);
     throw new ExecutionError(`確認後に状況が変わり拒否: ${msg}`, { reverted: true, staleReserves: true, stage: "estimateGas" });
   }
+  const gasUnits = gasResult.value;
   // 上限(gasLimit)には余裕を持たせるが、**費用の見積もりには使わない**。
   // EVMは使わなかったガスを請求しないので、払うのは gasUnits の分だけ。
   // 余裕の20%をそのまま費用に足していたため、見積もりが2割過大になり、
   // その分ハードルが上がって本物の機会を捨てていた(2026年9月19日に修正)。
   const gasWithBuffer = (gasUnits * 120n) / 100n;
-  // OP Stack(Optimism / Base)では、実際の呼び出しデータで L1 データ手数料を聞いて足す。
-  // 聞けなければ代表値(gasUnitsToUsd の中で補う)。
-  let l1FeeWei = null;
-  if (isOpStackChain(chain)) {
-    try {
-      const callData = contract.interface.encodeFunctionData("executeRoute", [asset, amountIn, legArgs, minProfit]);
-      l1FeeWei = await estimateL1FeeWei(chain, contractAddress, callData, gasWithBuffer);
-    } catch (e) {}
-  }
+  // OP Stack(Optimism / Base)の L1 データ手数料。
+  //
+  // [1件ごとに聞くのをやめた(2026年9月21日)]
+  // 以前は送信のたびに GasPriceOracle に聞いていたが、**1往復(約100ms)かけて
+  // 測っている額が $0.000003** だった(2026年9月20日の実測)。Optimism の
+  // ガス代$0.005 に対して 0.06% で、判定には何の影響もない。
+  // 一方その100msは、Flashblock の半個ぶんの遅れになる。
+  // 代表値(受領証から学んだ実測の平均。recordActualL1Fee が更新している)で
+  // 十分なので、そちらに任せて1往復まるごと削る。
+  // gasUnitsToUsd は l1FeeWei に null を渡すと getTypicalL1FeeWei を使う。
+  const l1FeeWei = null;
   const measuredGasUsd = await gasUnitsToUsd(chain, gasUnits, l1FeeWei);
   if (measuredGasUsd != null) gasCostUsd = measuredGasUsd;
 
