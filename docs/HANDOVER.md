@@ -3835,6 +3835,94 @@ USDC や WETH と組んだ、100分で75〜132回も取引されるプールを�
 
 ---
 
+## Avalanche の Aave V3 清算モジュール(第2段・2026年9月21日)
+
+> **オーナーの指示で実装。計測は済んでいるので調査は省き、監視 → コントラクト → DRY_RUN 確認の順に進める。**
+> 本番送信への切り替えは**オーナーの了承を待つ**。
+
+### 何を作ったか(この節は進めるたびに更新する)
+
+| 段 | もの | 状態 |
+|---|---|---|
+| 1 | `scripts/liquidation-monitor.js`(名簿・健全度・価格更新・候補の組) | **入れた。ログで確認中** |
+| 2 | `contracts/AaveLiquidator.sol`(flashLoanSimple → liquidationCall → DEX売却)+ `simulateLiquidation` | 未 |
+| 2 | `RUN_LIQUIDATOR_DEPLOY=avalanche` でデプロイ → `LIQUIDATOR_CONTRACT_ADDRESS_AVALANCHE` | 未 |
+| 2 | DRY_RUN で `simulateLiquidation` の数字を確認 | 未 |
+| 3 | 本番送信(`LIQUIDATION_DRY_RUN=false`)| **オーナーの了承待ち** |
+
+### 仕組み(監視)
+
+- **対象は avalanche のみ。** Pool / Oracle / DataProvider の住所は `@aave-dao/aave-address-book` の
+  `AaveV3Avalanche` から取る(思い込みで書かない)。起動時に `getUserAccountData` で応答を確かめる
+- **名簿**: 起動時に過去60日の `Borrow` を**新しい方から少しずつ遡る**(5秒ごとに3回まで。幅は端点の
+  制限に合わせて自動で広げ縮め)。進み具合は保存するので、再デプロイでやり直さない。
+  以後は `Borrow / Supply / Repay / Withdraw / LiquidationCall` で名簿を更新し、その人を即測り直す。
+  借金の無い人は名簿から外す(借りたら Borrow で戻る)
+- **健全度**: Multicall3 で150人ずつ束ねて `getUserAccountData`。HF<1.05 は「要注意」で20秒ごと、
+  全員は5分ごと。5分ごとの巡回は WebSocket の取りこぼしを `getLogs` で埋める役も兼ねる
+- **価格更新**: Aave のオラクルから資産ごとの出どころ(`getSourceOfAsset`)を辿り、
+  `aggregator()` / `ASSET_TO_USD_AGGREGATOR()` / `BASE_TO_USD_AGGREGATOR()` で **AnswerUpdated を
+  出す本体**まで辿る。辿れなくても出どころ自身を購読する(安全側)。更新が来たら、その資産を担保か
+  借金に持つ要注意の人を即測り直す
+- **WebSocket は裁定と別の接続**(`AVALANCHE_WSS_URL` を既定に使う)。既存の DEX 購読には触らない。
+  受けるのは Aave の Pool と価格フィードだけで、1日数千件
+- **候補**: HF<1 の人は担保・借金の内訳を `getUserReserveData` で読み、**借金は最大の1種、担保は
+  (有効で借金と別の)最大の1種**を選ぶ。debtToCover は Aave v3.3 の規則で「上限ぴったり」:
+  - HF<0.95、**または借金か担保がその通貨で$2,000未満なら100%**、それ以外は50%
+  - 担保で払える上限(担保の価値 ÷ (1+ボーナス))で頭打ち
+  - うちの上限 `LIQUIDATION_MAX_DEBT_USD` で頭打ち。その時、借金の残りが$1,000未満になる形は
+    Aave に拒否される(MUST_NOT_LEAVE_DUST)ので、残りを$1,000にする
+- **既存の計測(`aave-liquidation.js`)から avalanche を外した**(同じ読み取りを二重にしない)。
+  他4チェーンの計測はそのまま。生存ログの `清算[…]` は4チェーン分、`清算AVAX[…]` が新しい方
+
+### 環境変数(すべて `LIQUIDATION_` で始める)
+
+| 名前 | 既定 | 意味 |
+|---|---|---|
+| `LIQUIDATION_ENABLED` | true | false で完全に止める |
+| `LIQUIDATION_DRY_RUN` | **true** | true の間は候補の検出と確認(eth_call)まで。**送らない** |
+| `LIQUIDATION_MIN_PROFIT_USD` | 0.5 | これ未満の見込みは送らない |
+| `LIQUIDATION_MAX_DEBT_USD` | 2000 | 1回に肩代わりする借金の上限 |
+| `LIQUIDATION_MAX_SLIPPAGE_BPS` | 300 | 担保の売却で滑りがこれを超える組は見送る(第2段で使う) |
+| `LIQUIDATION_COOLDOWN_MS` | 300000 | 同じ借り手への連続実行の冷却時間 |
+| `LIQUIDATION_ROSTER_DAYS` | 60 | 名簿を作る時に遡る日数 |
+| `LIQUIDATION_WATCH_HF` | 1.05 | 要注意にする健全度 |
+| `LIQUIDATION_WATCH_INTERVAL_MS` | 20000 | 要注意の測り直し間隔 |
+| `LIQUIDATION_SWEEP_INTERVAL_MS` | 300000 | 全員の測定間隔 |
+| `LIQUIDATION_BACKFILL_INTERVAL_MS` / `LIQUIDATION_BACKFILL_CHUNKS` | 5000 / 3 | 名簿の遡りの間隔と1回の getLogs 回数 |
+| `LIQUIDATION_LOG_CHUNK_BLOCKS` / `LIQUIDATION_LOG_CHUNK_MAX` | 2000 / 100000 | getLogs のブロック幅の出発点と上限 |
+| `LIQUIDATION_USERS_PER_CALL` / `LIQUIDATION_MAX_SWEEP_CALLS` | 150 / 80 | 束ねの人数と、全員測定の束ねの上限 |
+| `LIQUIDATION_MAX_ROSTER` | 12000 | 名簿の上限(古い順に捨てる) |
+| `LIQUIDATION_MAX_BREAKDOWN_USERS` | 60 | 内訳を一度に読む人数の上限 |
+| `LIQUIDATION_WSS_URL` | (`AVALANCHE_WSS_URL`) | 清算用の WebSocket。未設定なら裁定と同じ端点へ別接続 |
+| `LIQUIDATION_STATE_FILE` | ボリュームの `liquidation-avalanche.json` | 名簿と遡りの進み具合の保存先 |
+| `RUN_LIQUIDATOR_DEPLOY` | (無し) | `avalanche` でコントラクトをデプロイ(第2段) |
+| `LIQUIDATOR_CONTRACT_ADDRESS_AVALANCHE` | (無し) | デプロイしたコントラクトの住所(第2段) |
+
+### RPC の枠(上限から計算)
+
+| | 毎分 |
+|---|---|
+| 全員の測定(名簿12,000人の上限で80束ね/5分) | 16 |
+| 要注意(20秒ごとに1〜2束ね) | 3〜6 |
+| 遡り(完了まで。5秒ごとに3回) | 36(完了後0) |
+| 価格・追いつき・内訳 | 2〜4 |
+
+遡りが終われば **毎分25回前後 = 月110万 = 枠の5.5%**。月末見込26% → 約31%。
+
+### ログの見方
+
+- `[清算AVAX/資産]` … 資産ごとのボーナスと価格(起動時)
+- `[清算AVAX/価格] 出どころN件 → 購読する住所M件(本体まで辿れたK件 …)` … 辿れなかった資産があれば名前が出る
+- `[清算AVAX/名簿] 60日ぶんの Borrow を遡ります` / `遡りが完了しました: 名簿N人`
+- `[清算AVAX/要注意] N人が HF<1.05 に入りました`
+- `[清算AVAX/価格] WAVAX が更新 → 要注意N人を測り直します` … **③が動いている証拠**
+- `[清算AVAX/候補] … 肩代わり$X(100%) ボーナス5.0% 見込み粗利$Y` … 組めた
+- `[清算AVAX/他者]` / `[清算AVAX/回復]` … 候補がその後どうなったか
+- 生存ログ: `清算AVAX[名簿N(遡りX%) 要注意M 候補C 他者T 回復R 価格更新P(即Q) Pool受信E WS接続 RPCn]`
+
+---
+
 ## 進行中の計画
 1. 済: V3型プールをDEX別に数える調査(scripts/pool-survey.js)。Polygon /
    Base / Optimism で実施し、未監視ファクトリーの活動量と、監視ペアの

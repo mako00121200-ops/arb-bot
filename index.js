@@ -43,6 +43,7 @@ import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
 import { alertOwner, getAlertStats, sendPendingQuestions } from "./scripts/owner-alert.js";
 import { verifyAaveChains, getAaveChains, sweepAll as aaveSweepAll, checkWatchAll as aaveCheckWatchAll, formatAaveLine, AAVE_SWEEP_INTERVAL_MS, AAVE_WATCH_INTERVAL_MS } from "./scripts/aave-liquidation.js";
 import { noteBigOutcome, formatBigLine, formatBigSummary } from "./scripts/big-opportunities.js";
+import { startLiquidationMonitor, formatLiquidationLine, getLiquidationDashboard, CHAIN as LIQUIDATION_CHAIN } from "./scripts/liquidation-monitor.js";
 import { readPoolFeeOnchain } from "./scripts/pool-fee-onchain.js";
 import {
   fetchReservesBatch, fetchPoolTokensBatch, fetchTokenDecimalsBatch,
@@ -1973,7 +1974,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${formatBigLine()}${formatAaveLine()}${alertLine}`);
+  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
@@ -2490,6 +2491,8 @@ ${whatIfRows(chain)}`;
 無効化${stats.disabled}件(過去の記録${stats.disabledFromFile} / 今回${stats.disabledRuntime})<br>
 手数料の未実測: 残${stats.feeProbePending.toLocaleString()}プール</div></div>
 
+${renderLiquidationCard()}
+
 <div class="card"><h2>📒 24時間の記録簿</h2>
 <div class="stat"><div><div class="v" style="color:#2ecc71">+$${sum.realizedUsd.toFixed(4)}</div><div class="l">実際に得た利益</div></div>
 <div><div class="v" style="color:#e8a33d">+$${sum.missedUsd.toFixed(4)}</div><div class="l">取れた可能性がある額</div></div>
@@ -2517,6 +2520,30 @@ ${whatIfRows(chain)}`;
 ${nearMissBlocks}</div>
 
 <div class="footerlink"><a href="/about">→ 仕組みについて</a></div></body></html>`;
+}
+
+/// Avalanche の Aave 清算の見張りの状態。画面の1枚。
+function renderLiquidationCard() {
+  const d = getLiquidationDashboard();
+  if (!d.enabled) return "";
+  const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const ago = (ms) => (ms ? `${Math.round((Date.now() - ms) / 1000)}秒前` : "まだ");
+  const watchRows = d.watching.length
+    ? d.watching.map((w) => `<tr><td>${esc(w.user.slice(0, 10))}…</td><td style="text-align:right;color:${w.hf < 1 ? "#e74c3c" : "#e8a33d"}">${w.hf.toFixed(4)}</td><td style="text-align:right">$${w.debtUsd.toFixed(2)}</td></tr>`).join("")
+    : `<tr><td colspan="3" style="color:#888">HF&lt;1.05 の人はいません</td></tr>`;
+  const recentRows = d.recent.length
+    ? d.recent.map((r) => `<tr><td>${esc(r.at.slice(5, 16).replace("T", " "))}</td><td>${esc(r.user.slice(0, 10))}…</td><td>${esc(r.pair)}</td><td style="text-align:right">${r.hf.toFixed(4)}</td><td style="text-align:right">$${r.coverUsd.toFixed(2)}</td><td style="text-align:right">$${r.grossUsd.toFixed(2)}</td><td>${esc(r.result)}</td></tr>`).join("")
+    : `<tr><td colspan="7" style="color:#888">まだ候補はありません</td></tr>`;
+  return `<div class="card"><h2>🏦 Aave 清算(Avalanche)${d.dryRun ? ' <span style="color:#e8a33d;font-size:0.8em">DRY_RUN(送信しない)</span>' : ' <span style="color:#e74c3c;font-size:0.8em">本番送信</span>'}</h2>
+<div class="stat"><div><div class="v">${d.roster.toLocaleString()}</div><div class="l">借り手の名簿(遡り${d.backfillPct}%)</div></div>
+<div><div class="v" style="color:#e8a33d">${d.watch}</div><div class="l">要注意(HF&lt;1.05)</div></div>
+<div><div class="v" style="color:#e74c3c">${d.found}</div><div class="l">清算できた候補</div></div>
+<div><div class="v">${d.priceEvents.toLocaleString()}</div><div class="l">価格更新の受信</div></div></div>
+<div class="note">${d.verified ? "Pool 応答あり" : "Pool 応答なし"} / WebSocket ${d.wsUrlSet ? (d.wsConnected ? "接続中" : "切断") : "未設定"} / 価格フィード${d.feeds}件(辿れず${d.feedsUnresolved}) / Pool イベント受信${d.poolEvents.toLocaleString()} / 他者が先に清算${d.takenByOthers} / 自力で回復${d.recovered} / 確認${d.simulated} 送信${d.sent}(成功${d.sentOk})<br>
+最低利益$${d.minProfitUsd} / 肩代わりの上限$${d.maxDebtUsd} / 全員の測定 ${ago(d.lastSweepAt)} / 最後の価格更新 ${ago(d.lastPriceEventAt)} / RPC${d.rpcCalls.toLocaleString()}回${d.errors ? ` / 失敗${d.errors}(${esc(d.lastError)})` : ""}</div>
+<table class="t-num"><thead><tr><th>要注意の人</th><th style="text-align:right">HF</th><th style="text-align:right">借金</th></tr></thead><tbody>${watchRows}</tbody></table>
+<h2 style="margin-top:14px">候補の記録</h2>
+<table class="t-num"><thead><tr><th>時刻(UTC)</th><th>借り手</th><th>担保→借金</th><th style="text-align:right">HF</th><th style="text-align:right">肩代わり</th><th style="text-align:right">見込み粗利</th><th>結果</th></tr></thead><tbody>${recentRows}</tbody></table></div>`;
 }
 
 function renderAbout() {
@@ -2656,10 +2683,21 @@ async function main() {
   sendPendingQuestions().catch(() => {});
   setInterval(() => { sendPendingQuestions().catch(() => {}); }, 10 * 60 * 1000);
 
+  // Avalanche の Aave V3 清算(第2段の本体。既定は LIQUIDATION_DRY_RUN=true で送らない)。
+  // 失敗しても裁定は止めない。
+  let liquidationStarted = false;
+  try {
+    liquidationStarted = await startLiquidationMonitor(Object.keys(CHAIN_CONFIG));
+  } catch (e) {
+    console.warn(`[清算AVAX] 始められませんでした: ${(e.message || "").slice(0, 100)}`);
+  }
+
   // Aave V3 の清算の機会を**測るだけ**(第1段。送信は一切しない)。
   // 住所は公開情報だが、応答するかを実測で確かめてから見張る。
+  // avalanche は上の見張りに移したので、計測からは外す(同じ読み取りを二重にしない)。
   try {
-    const aaveChains = await verifyAaveChains(Object.keys(CHAIN_CONFIG));
+    const measureChains = Object.keys(CHAIN_CONFIG).filter((c) => !(liquidationStarted && c === LIQUIDATION_CHAIN));
+    const aaveChains = await verifyAaveChains(measureChains);
     if (aaveChains.length > 0) {
       setInterval(() => { aaveSweepAll().catch(() => {}); }, AAVE_SWEEP_INTERVAL_MS);
       setInterval(() => { aaveCheckWatchAll().catch(() => {}); }, AAVE_WATCH_INTERVAL_MS);

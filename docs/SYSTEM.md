@@ -43,6 +43,7 @@ $1〜30しか吸えず、掛け算の答えが常に小さい(競争で価格差
 | `scripts/incompatible-pools.js` | **永久に**外すプールの記録(税トークン・詐欺のみ。送信失敗は書かない) | 80 |
 | `scripts/borrowable-tokens.js` | 経路の始点に使える通貨の判定(桁数と価格が揃っているか) | 105 |
 | `scripts/aave-liquidation.js` | **Aave 清算の第1段(読み取りのみ)。** 名簿・健全度・実績・追跡。市場単位(フォーク対応) | 930 |
+| `scripts/liquidation-monitor.js` | **Avalanche の Aave 清算の本体(第2段)。** 60日の名簿・HF の2段階監視・Chainlink 更新の即時再評価・清算する組の決定。**既定は DRY_RUN** | 640 |
 | `scripts/owner-alert.js` | LINE 通知(未設定)。`docs/owner-questions.json` の転送 | 210 |
 | `scripts/pool-survey.js` | 手動の調査ツール(`RUN_POOL_SURVEY`)。普段は動かない | 400 |
 | `scripts/mainnet-deploy.js` / `compile-contract.js` | コントラクトの配置(`RUN_MAINNET_DEPLOY`)とコンパイル | 110 |
@@ -181,7 +182,8 @@ V3表[確認N 上限制限M(今K本) …] … 価格表の検証と上限
 
 | | 状態 | 次に要るもの |
 |---|---|---|
-| **Aave 清算 第1段** | 5チェーンで測定中。base で $1,000超が1日2回、見つけた2 | 1〜3日の実測 |
+| **Aave 清算 第1段** | 4チェーンで測定中(avalanche は第2段へ移した)。base で $1,000超が1日2回 | 1〜3日の実測 |
+| **Aave 清算 第2段(avalanche)** | `liquidation-monitor.js` の監視を**入れた**(DRY_RUN)。ログで名簿・要注意・価格更新を確認中 | `AaveLiquidator.sol` → `RUN_LIQUIDATOR_DEPLOY` → DRY_RUN で確認 → **本番はオーナー了承** |
 | **清算のコントラクト** | `liquidateRoute` / `simulateLiquidate` を**書いてコンパイル済み**。**未配置** | bot 側の呼び出し・借入額の計算・経路探索・フォーク試験 → **再デプロイ(立ち会い)** |
 | LINE 通知 | 未設定 | オーナーが `LINE_CHANNEL_ACCESS_TOKEN` / `LINE_USER_ID` を Railway に設定 |
 | プール採用の拡大 | 上位50(新しいものの中で)に広げた | 枠と成立件数を見て100へ |
