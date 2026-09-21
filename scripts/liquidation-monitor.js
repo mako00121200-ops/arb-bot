@@ -208,6 +208,8 @@ async function multicall(calls, priority = false) {
 }
 
 let chunkBlocks = LOG_CHUNK_BLOCKS;
+/// 「幅が広すぎる」と断られた幅の直下を天井にする。同じ幅で何度も断られない。
+let chunkCeiling = LOG_CHUNK_MAX;
 function isRangeRefusal(msg) {
   const m = (msg || "").toLowerCase();
   return m.includes("range") || m.includes("limit") || m.includes("too many")
@@ -225,13 +227,15 @@ async function tryGetLogs(params, fromBlock, toBlock) {
       fromBlock: "0x" + fromBlock.toString(16),
       toBlock: "0x" + toBlock.toString(16),
     }]));
-    if (span >= chunkBlocks) chunkBlocks = Math.min(LOG_CHUNK_MAX, chunkBlocks * 2);
+    if (span >= chunkBlocks) chunkBlocks = Math.min(chunkCeiling, chunkBlocks * 2);
     return logs || [];
   } catch (e) {
     const msg = (e.message || "").slice(0, 120);
     chunkBlocks = Math.max(LOG_CHUNK_MIN, Math.floor(chunkBlocks / 2));
-    if (isRangeRefusal(msg)) stats.shrinks++;
-    else { stats.errors++; stats.lastError = msg.slice(0, 80); }
+    if (isRangeRefusal(msg)) {
+      stats.shrinks++;
+      chunkCeiling = Math.max(LOG_CHUNK_MIN, Math.min(chunkCeiling, span - 1));
+    } else { stats.errors++; stats.lastError = msg.slice(0, 80); }
     return null;
   }
 }
@@ -899,7 +903,7 @@ export function formatLiquidationLine() {
   if (!stats.enabled) return "";
   if (!stats.verified) return " 清算AVAX[応答なし]";
   const ws = WSS_URL ? (stats.wsConnected ? "接続" : "切断") : "WSなし";
-  return ` 清算AVAX[名簿${roster.size.toLocaleString()}(遡り${backfillProgressPct()}%) 要注意${watch.size} 候補${stats.found} 他者${stats.takenByOthers} 回復${stats.recovered} 価格更新${stats.priceEvents}(即${stats.priceRechecks}) Pool受信${stats.poolEvents} WS${ws}${stats.simulated ? ` 確認${stats.simulated}` : ""}${stats.sent ? ` 送信${stats.sent}/${stats.sentOk}` : ""} RPC${stats.rpcCalls}${stats.errors ? ` 失敗${stats.errors}` : ""}]`;
+  return ` 清算AVAX[名簿${roster.size.toLocaleString()}(遡り${backfillProgressPct()}%${backfill.done ? "" : ` 幅${chunkBlocks.toLocaleString()}`}) 要注意${watch.size} 候補${stats.found} 他者${stats.takenByOthers} 回復${stats.recovered} 価格更新${stats.priceEvents}(即${stats.priceRechecks}) Pool受信${stats.poolEvents} WS${ws}${stats.simulated ? ` 確認${stats.simulated}` : ""}${stats.sent ? ` 送信${stats.sent}/${stats.sentOk}` : ""} RPC${stats.rpcCalls}${stats.errors ? ` 失敗${stats.errors}` : ""}]`;
 }
 
 /// 画面用。

@@ -43,7 +43,9 @@ import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
 import { alertOwner, getAlertStats, sendPendingQuestions } from "./scripts/owner-alert.js";
 import { verifyAaveChains, getAaveChains, sweepAll as aaveSweepAll, checkWatchAll as aaveCheckWatchAll, formatAaveLine, AAVE_SWEEP_INTERVAL_MS, AAVE_WATCH_INTERVAL_MS } from "./scripts/aave-liquidation.js";
 import { noteBigOutcome, formatBigLine, formatBigSummary } from "./scripts/big-opportunities.js";
-import { startLiquidationMonitor, formatLiquidationLine, getLiquidationDashboard, CHAIN as LIQUIDATION_CHAIN } from "./scripts/liquidation-monitor.js";
+import { startLiquidationMonitor, setCandidateHandler, formatLiquidationLine, getLiquidationDashboard, CHAIN as LIQUIDATION_CHAIN } from "./scripts/liquidation-monitor.js";
+import { handleLiquidationCandidate } from "./scripts/liquidation-executor.js";
+import { runLiquidatorDeploy } from "./scripts/liquidator-deploy.js";
 import { readPoolFeeOnchain } from "./scripts/pool-fee-onchain.js";
 import {
   fetchReservesBatch, fetchPoolTokensBatch, fetchTokenDecimalsBatch,
@@ -2631,6 +2633,11 @@ async function main() {
   if (deployTarget && deployTarget !== "false") {
     try { await runMainnetDeploy(deployTarget); } catch (e) { console.error("[本番デプロイ] 失敗:", e.message); }
   }
+  // 清算コントラクト(AaveLiquidator)のデプロイ。仕組みは上と同じ。
+  const liquidatorTarget = process.env.RUN_LIQUIDATOR_DEPLOY;
+  if (liquidatorTarget && liquidatorTarget !== "false") {
+    try { await runLiquidatorDeploy(liquidatorTarget); } catch (e) { console.error("[清算デプロイ] 失敗:", e.message); }
+  }
 
   // 環境変数 RUN_POOL_SURVEY にチェーン名を入れた時だけ、V3型プールの調査を一度だけ行う。
   // 未監視のDEXに、いま取引しているペアのプールがあるかを確かめるための読み取り専用の処理。
@@ -2688,6 +2695,8 @@ async function main() {
   let liquidationStarted = false;
   try {
     liquidationStarted = await startLiquidationMonitor(Object.keys(CHAIN_CONFIG));
+    // 候補が出た時の処理(経路探し → eth_call で確認 → DRY_RUN でなければ送信)。
+    if (liquidationStarted) setCandidateHandler(handleLiquidationCandidate);
   } catch (e) {
     console.warn(`[清算AVAX] 始められませんでした: ${(e.message || "").slice(0, 100)}`);
   }
