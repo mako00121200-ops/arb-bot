@@ -175,7 +175,7 @@ const VERIFY_GAS_USD = parseFloat(process.env.MAINNET_VERIFY_GAS_USD || "0.90");
 
 let verifyProvider = null;
 let lastVerifyAt = 0;
-const verify = { tried: 0, profitable: 0, bestUsd: 0, bestLabel: null, totalUsd: 0, errors: 0 };
+const verify = { tried: 0, profitable: 0, profitableAtBlock: 0, vanished: 0, bestUsd: 0, bestLabel: null, totalUsd: 0, errors: 0 };
 
 /// トークンのUSD価格。安定通貨は$1、それ以外は見張っているプールの価格から出す。
 function usdPriceOf(sym) {
@@ -211,7 +211,21 @@ function toRaw(usd, priceUsd, decimals) {
 
 /// **本当に取れるのかを実際に聞く。** buy で token0 を買い、sell で売り戻す。
 /// 戻り値は「実際に残ったはずの純利益(USD)」。取れなければ負の数。
-async function verifyEpisode(buy, sell, label) {
+async function quoteRoute(quoter, buy, sell, amountIn, blockTag) {
+  const opts = blockTag == null ? {} : { blockTag };
+  const leg1 = await quoter.quoteExactInputSingle.staticCall({
+    tokenIn: buy.token1, tokenOut: buy.token0, amountIn, fee: buy.feeTier, sqrtPriceLimitX96: 0,
+  }, opts);
+  const mid = BigInt(leg1[0]);
+  if (mid <= 0n) return null;
+  const leg2 = await quoter.quoteExactInputSingle.staticCall({
+    tokenIn: sell.token0, tokenOut: sell.token1, amountIn: mid, fee: sell.feeTier, sqrtPriceLimitX96: 0,
+  }, opts);
+  const back = BigInt(leg2[0]);
+  return back > 0n ? back : null;
+}
+
+async function verifyEpisode(buy, sell, label, blockNumber) {
   if (!verifyProvider) return;
   const now = Date.now();
   if (now - lastVerifyAt < VERIFY_INTERVAL_MS) return;
@@ -221,37 +235,50 @@ async function verifyEpisode(buy, sell, label) {
   const priceUsd = usdPriceOf(buy.sym1);
   if (!priceUsd) return;
   const quoter = new ethers.Contract(QUOTER_V2, QUOTER_ABI, verifyProvider);
+
+  // ① **歪みが見えたその瞬間のブロック**で聞く。
+  //    ここが黒字で「今」が赤字なら、機会は在ったが数秒で消えたことになる。
+  //    それは**同じブロックに入る仕組み(バンドル)が要る**という証拠になる。
   let best = null;
   for (const usd of VERIFY_SIZES_USD) {
     const amountIn = toRaw(usd, priceUsd, buy.dec1);
     if (amountIn <= 0n) continue;
     try {
-      const leg1 = await quoter.quoteExactInputSingle.staticCall({
-        tokenIn: buy.token1, tokenOut: buy.token0, amountIn, fee: buy.feeTier, sqrtPriceLimitX96: 0,
-      });
-      const mid = BigInt(leg1[0]);
-      if (mid <= 0n) continue;
-      const leg2 = await quoter.quoteExactInputSingle.staticCall({
-        tokenIn: sell.token0, tokenOut: sell.token1, amountIn: mid, fee: sell.feeTier, sqrtPriceLimitX96: 0,
-      });
-      const back = BigInt(leg2[0]);
-      if (back <= 0n) continue;
-      const profitTokens = Number(back - amountIn) / Math.pow(10, buy.dec1);
-      const netUsd = profitTokens * priceUsd - VERIFY_GAS_USD;
-      if (best == null || netUsd > best.netUsd) best = { usd, netUsd };
+      const back = await quoteRoute(quoter, buy, sell, amountIn, blockNumber);
+      if (back == null) continue;
+      const netUsd = (Number(back - amountIn) / Math.pow(10, buy.dec1)) * priceUsd - VERIFY_GAS_USD;
+      if (best == null || netUsd > best.netUsd) best = { usd, amountIn, netUsd };
     } catch (e) {
       verify.errors++;
     }
   }
   if (best == null) return;
   verify.tried++;
+
+  // ② 同じ額を**今の状態**でも聞く。①との差が「消えるまでの速さ」そのもの。
+  let nowNetUsd = null;
+  try {
+    const back = await quoteRoute(quoter, buy, sell, best.amountIn, null);
+    if (back != null) {
+      nowNetUsd = (Number(back - best.amountIn) / Math.pow(10, buy.dec1)) * priceUsd - VERIFY_GAS_USD;
+    }
+  } catch (e) { verify.errors++; }
+
+  const sizeText = `投入$${best.usd.toLocaleString()}`;
+  const nowText = nowNetUsd == null ? "今は測れず" : `今$${nowNetUsd.toFixed(2)}`;
   if (best.netUsd > 0) {
-    verify.profitable++;
-    verify.totalUsd += best.netUsd;
+    verify.profitableAtBlock++;
     if (best.netUsd > verify.bestUsd) { verify.bestUsd = best.netUsd; verify.bestLabel = label; }
-    console.log(`[メインネット確認 ${nowJst()}] ${label}: 投入$${best.usd.toLocaleString()} で 純利$${best.netUsd.toFixed(2)}(ガス$${VERIFY_GAS_USD}を引いた後)`);
+    if (nowNetUsd != null && nowNetUsd > 0) {
+      verify.profitable++;
+      verify.totalUsd += nowNetUsd;
+      console.log(`[メインネット確認 ${nowJst()}] ${label}: ${sizeText} 同ブロック$${best.netUsd.toFixed(2)} / ${nowText} → **まだ残っている**`);
+    } else {
+      verify.vanished++;
+      console.log(`[メインネット確認 ${nowJst()}] ${label}: ${sizeText} 同ブロック$${best.netUsd.toFixed(2)} / ${nowText} → **在ったが消えた(同じブロックに入る仕組みが要る)**`);
+    }
   } else {
-    console.log(`[メインネット確認 ${nowJst()}] ${label}: 実際に聞くと赤字($${best.netUsd.toFixed(2)})。価格差は見えても取れない`);
+    console.log(`[メインネット確認 ${nowJst()}] ${label}: ${sizeText} 同ブロックでも赤字($${best.netUsd.toFixed(2)})。価格差は見えても最初から取れない`);
   }
 }
 
@@ -408,7 +435,7 @@ export async function startMainnetEdgeWatch() {
     note(p.pairKey, best.netBps, best.label);
     // **bpsでは判断しない。** 見えている歪みが本当に取れるのかを実際に聞く。
     if (best.netBps >= VERIFY_MIN_BPS) {
-      verifyEpisode(best.buy, best.sell, best.label).catch(() => { verify.errors++; });
+      verifyEpisode(best.buy, best.sell, best.label, log.blockNumber).catch(() => { verify.errors++; });
     }
   });
   ws.websocket?.addEventListener?.("error", () => {});
@@ -447,7 +474,7 @@ export function formatMainnetEdgeLine() {
   const best = stats.bestBps == null ? "-" : `${stats.bestBps.toFixed(2)}bps(${stats.bestLabel})`;
   // **これが唯一の本物の数字。** bpsは見えても取れるとは限らない。
   const v = verify.tried > 0
-    ? ` 確認${verify.tried}件中${verify.profitable}件が黒字 合計$${verify.totalUsd.toFixed(2)}${verify.bestUsd > 0 ? ` 最良$${verify.bestUsd.toFixed(2)}(${verify.bestLabel})` : ""}`
+    ? ` 確認${verify.tried}件[同ブロックで黒字${verify.profitableAtBlock}(うち今も残る${verify.profitable}/消えた${verify.vanished}) 取れた合計$${verify.totalUsd.toFixed(2)}${verify.bestUsd > 0 ? ` 最良$${verify.bestUsd.toFixed(2)}(${verify.bestLabel})` : ""}]`
     : " 確認まだ0件";
   return ` メインネット歪み[毎時 ${parts} 最大${best} 見張り${stats.watched}本(薄い${stats.dropped}本除外) 受信${stats.events.toLocaleString()}${stats.stoppedForCap ? " 上限で停止" : ""}${v}]`;
 }
