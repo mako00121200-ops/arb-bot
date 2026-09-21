@@ -128,7 +128,7 @@ function priceFromSqrt(sqrtPriceX96, dec0, dec1) {
 function bestNetEdgeBps(pairKey) {
   const list = (byPair.get(pairKey) || []).map((a) => pools.get(a)).filter((p) => p && p.price > 0);
   if (list.length < 2) return null;
-  let best = null, bestLabel = null;
+  let best = null;
   for (const buy of list) {
     for (const sell of list) {
       if (buy === sell) continue;
@@ -136,13 +136,123 @@ function bestNetEdgeBps(pairKey) {
       const rawBps = (sell.price / buy.price - 1) * 10000;
       if (!Number.isFinite(rawBps) || rawBps <= 0) continue;
       const netBps = rawBps - buy.feeBps - sell.feeBps;
-      if (best == null || netBps > best) {
-        best = netBps;
-        bestLabel = `${pairKey} ${buy.feeBps / 100}%→${sell.feeBps / 100}%`;
+      if (best == null || netBps > best.netBps) {
+        best = { netBps, buy, sell, label: `${pairKey} ${buy.feeBps / 100}%→${sell.feeBps / 100}%` };
       }
     }
   }
-  return best == null ? null : { netBps: best, label: bestLabel };
+  return best;
+}
+
+// ===== 確認: 本当に取れるのかを Quoter に実際に聞く(2026年9月22日に追加) =====
+//
+// [なぜ要るか(01:22 JST の実測で分かった)]
+// 数え方と薄いプールを直した後でも、最大が
+//   `USDC/WETH 0.05%→0.01%` で **117.20bps**
+// と出た。メインネットで最も見られているペアで117bpsが放置される訳がない。
+//
+// 正体は「価格が動いたのに、その手数料帯では誰も取引していないので値が古いまま」。
+// **チェーン上の値としては本物**だが、その値段で買える量がほとんど無い
+// (V3は価格帯ごとに流動性が分かれており、離れた価格帯には板が無い)。
+// 起動時に読んだ `liquidity()` は**今いる価格帯の板**なので、
+// 価格が離れた後の実際の厚みを表していない。
+//
+// **だから bps では判断しない。Quoterに「$X入れたら$いくら返るか」を聞く。**
+// これは9月16日に学んだ教訓(近似式ではなく公式Quoterで測る)と同じ。
+// 返ってくるのは「実際に取れたはずの金額(USD)」で、これが欲しかった数字。
+const QUOTER_V2 = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e";
+const QUOTER_ABI = [
+  "function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountOut,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)",
+];
+/// 確認で試す投入額(USD)。深さの調査で最適が$37,000〜$40,000だったので、その前後。
+const VERIFY_SIZES_USD = [5000, 50000];
+/// 確認の間隔。**RPCの枠を守る。** 1回につき4回問い合わせる。
+const VERIFY_INTERVAL_MS = parseInt(process.env.MAINNET_VERIFY_INTERVAL_MS || "60000", 10);
+/// 確認を始める歪み(bps)。採算の分かれ目(約2.1bps)より少し上。
+const VERIFY_MIN_BPS = parseFloat(process.env.MAINNET_VERIFY_MIN_BPS || "3");
+/// メインネットのガス代の目安(USD)。深さの調査の実測値。
+const VERIFY_GAS_USD = parseFloat(process.env.MAINNET_VERIFY_GAS_USD || "0.90");
+
+let verifyProvider = null;
+let lastVerifyAt = 0;
+const verify = { tried: 0, profitable: 0, bestUsd: 0, bestLabel: null, totalUsd: 0, errors: 0 };
+
+/// トークンのUSD価格。安定通貨は$1、それ以外は見張っているプールの価格から出す。
+function usdPriceOf(sym) {
+  if (sym === "USDC" || sym === "USDT" || sym === "DAI") return 1;
+  if (sym === "WETH") {
+    // USDC/WETH のいちばん深いプールの価格(WETH per USDC)から逆算する。
+    for (const p of pools.values()) {
+      if (p.pairKey !== "USDC/WETH" || !(p.price > 0)) continue;
+      // price は token1/token0。USDC が token0 なので price = WETH per USDC。
+      return p.sym0 === "USDC" ? 1 / p.price : p.price;
+    }
+    return null;
+  }
+  if (sym === "WBTC") {
+    const eth = usdPriceOf("WETH");
+    if (!eth) return null;
+    for (const p of pools.values()) {
+      if (p.pairKey !== "WBTC/WETH" || !(p.price > 0)) continue;
+      // WBTC 1つあたりの WETH を求めて、ETHの価格を掛ける。
+      const wethPerWbtc = p.sym0 === "WBTC" ? p.price : 1 / p.price;
+      return wethPerWbtc * eth;
+    }
+    return null;
+  }
+  return null;
+}
+
+function toRaw(usd, priceUsd, decimals) {
+  const amount = usd / priceUsd;
+  const [i, f = ""] = amount.toFixed(Math.min(decimals, 18)).split(".");
+  try { return BigInt(i + f.padEnd(decimals, "0").slice(0, decimals)); } catch (e) { return 0n; }
+}
+
+/// **本当に取れるのかを実際に聞く。** buy で token0 を買い、sell で売り戻す。
+/// 戻り値は「実際に残ったはずの純利益(USD)」。取れなければ負の数。
+async function verifyEpisode(buy, sell, label) {
+  if (!verifyProvider) return;
+  const now = Date.now();
+  if (now - lastVerifyAt < VERIFY_INTERVAL_MS) return;
+  lastVerifyAt = now;
+
+  // 始点は token1(これを出して token0 を買い、売り戻して token1 を増やす)。
+  const priceUsd = usdPriceOf(buy.sym1);
+  if (!priceUsd) return;
+  const quoter = new ethers.Contract(QUOTER_V2, QUOTER_ABI, verifyProvider);
+  let best = null;
+  for (const usd of VERIFY_SIZES_USD) {
+    const amountIn = toRaw(usd, priceUsd, buy.dec1);
+    if (amountIn <= 0n) continue;
+    try {
+      const leg1 = await quoter.quoteExactInputSingle.staticCall({
+        tokenIn: buy.token1, tokenOut: buy.token0, amountIn, fee: buy.feeTier, sqrtPriceLimitX96: 0,
+      });
+      const mid = BigInt(leg1[0]);
+      if (mid <= 0n) continue;
+      const leg2 = await quoter.quoteExactInputSingle.staticCall({
+        tokenIn: sell.token0, tokenOut: sell.token1, amountIn: mid, fee: sell.feeTier, sqrtPriceLimitX96: 0,
+      });
+      const back = BigInt(leg2[0]);
+      if (back <= 0n) continue;
+      const profitTokens = Number(back - amountIn) / Math.pow(10, buy.dec1);
+      const netUsd = profitTokens * priceUsd - VERIFY_GAS_USD;
+      if (best == null || netUsd > best.netUsd) best = { usd, netUsd };
+    } catch (e) {
+      verify.errors++;
+    }
+  }
+  if (best == null) return;
+  verify.tried++;
+  if (best.netUsd > 0) {
+    verify.profitable++;
+    verify.totalUsd += best.netUsd;
+    if (best.netUsd > verify.bestUsd) { verify.bestUsd = best.netUsd; verify.bestLabel = label; }
+    console.log(`[メインネット確認 ${nowJst()}] ${label}: 投入$${best.usd.toLocaleString()} で 純利$${best.netUsd.toFixed(2)}(ガス$${VERIFY_GAS_USD}を引いた後)`);
+  } else {
+    console.log(`[メインネット確認 ${nowJst()}] ${label}: 実際に聞くと赤字($${best.netUsd.toFixed(2)})。価格差は見えても取れない`);
+  }
 }
 
 /// **跨いだ瞬間だけを数える。** 同じ歪みが続いている間は数え直さない。
@@ -180,9 +290,14 @@ async function discoverPools(provider) {
       // token0 は住所の小さい方(Uniswap V3 の決まり)。桁の補正に要る。
       const aIsToken0 = ta.address.toLowerCase() < tb.address.toLowerCase();
       found.push({
-        address: address.toLowerCase(), feeBps: feeToBps(fee),
+        address: address.toLowerCase(), feeBps: feeToBps(fee), feeTier: fee,
         dec0: aIsToken0 ? ta.decimals : tb.decimals,
         dec1: aIsToken0 ? tb.decimals : ta.decimals,
+        // 確認(Quoterに実際に聞く)に要る。
+        token0: aIsToken0 ? ta.address : tb.address,
+        token1: aIsToken0 ? tb.address : ta.address,
+        sym0: aIsToken0 ? pair.a : pair.b,
+        sym1: aIsToken0 ? pair.b : pair.a,
       });
     }
     if (found.length < 2) continue; // 1つしか無いペアは裁定にならない
@@ -259,6 +374,7 @@ export async function startMainnetEdgeWatch() {
     console.warn("[メインネット頻度] 2つ以上プールのあるペアが見つかりませんでした");
     return false;
   }
+  verifyProvider = provider;
   await loadInitialState(provider);
   stats.dropped = dropThinPools();
   if (pools.size === 0) {
@@ -288,7 +404,12 @@ export async function startMainnetEdgeWatch() {
     if (!price) return;
     p.price = price;
     const best = bestNetEdgeBps(p.pairKey);
-    if (best) note(p.pairKey, best.netBps, best.label);
+    if (!best) return;
+    note(p.pairKey, best.netBps, best.label);
+    // **bpsでは判断しない。** 見えている歪みが本当に取れるのかを実際に聞く。
+    if (best.netBps >= VERIFY_MIN_BPS) {
+      verifyEpisode(best.buy, best.sell, best.label).catch(() => { verify.errors++; });
+    }
   });
   ws.websocket?.addEventListener?.("error", () => {});
 
@@ -324,7 +445,11 @@ export function formatMainnetEdgeLine() {
     return `${e}bps超:${perHour(stats.episodes[i])}回(${pct.toFixed(0)}%)`;
   }).join(" ");
   const best = stats.bestBps == null ? "-" : `${stats.bestBps.toFixed(2)}bps(${stats.bestLabel})`;
-  return ` メインネット歪み[毎時 ${parts} 最大${best} 見張り${stats.watched}本(薄い${stats.dropped}本除外) 受信${stats.events.toLocaleString()}${stats.stoppedForCap ? " 上限で停止" : ""}]`;
+  // **これが唯一の本物の数字。** bpsは見えても取れるとは限らない。
+  const v = verify.tried > 0
+    ? ` 確認${verify.tried}件中${verify.profitable}件が黒字 合計$${verify.totalUsd.toFixed(2)}${verify.bestUsd > 0 ? ` 最良$${verify.bestUsd.toFixed(2)}(${verify.bestLabel})` : ""}`
+    : " 確認まだ0件";
+  return ` メインネット歪み[毎時 ${parts} 最大${best} 見張り${stats.watched}本(薄い${stats.dropped}本除外) 受信${stats.events.toLocaleString()}${stats.stoppedForCap ? " 上限で停止" : ""}${v}]`;
 }
 
 /// 画面・診断用。
