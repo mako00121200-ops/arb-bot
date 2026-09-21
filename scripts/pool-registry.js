@@ -276,7 +276,26 @@ export function setPoolFee(chain, address, feeBps) {
 export function clearFeeProbed(chain, address) {
   const pool = pools.get(poolKey(chain, address));
   if (!pool || pool.kind !== KIND_V2 || !pool.feeProbed) return false;
+  // **チェーンから直接読んだ値は外さない。**
+  //
+  // [なぜ(2026年9月21日の実測)]
+  // 工場に聞いて 30bps と確定した直後、「2回続けてチェーン上で赤字」の
+  // 判断でこの印が外され、**安全側の既定45bpsに戻されていた**。
+  // 赤字だったのは手数料以外の理由(価格が動いた等)かもしれないのに、
+  // **一次情報を推測で上書きしていた**ことになる。
+  //
+  // 工場が答えた値より確かな情報は無い。赤字が続くなら原因は別にある。
+  if (pool.feeFromChain) return false;
   pool.feeProbed = false;
+  return true;
+}
+
+/// チェーンから直接読んだ手数料として印を付ける(以降は推測で上書きされない)。
+export function markFeeFromChain(chain, address) {
+  const pool = pools.get(poolKey(chain, address));
+  if (!pool) return false;
+  pool.feeFromChain = true;
+  pool.feeProbed = true;
   return true;
 }
 
