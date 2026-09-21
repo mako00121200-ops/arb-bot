@@ -274,7 +274,38 @@ function isReady(chain) { return chainReady.has(chain); }
 function anyReady() { return chainReady.size > 0; }
 
 // ===== 失敗の抑制と無効化 =====
+/// key(経路のプール一覧) -> { until, sticky }
+///
+/// [2種類ある。混ぜてはいけない(2026年9月22日 05:22 JST の実測で判明)]
+/// `sticky: true`  … 送信して失敗した / 罠の疑い。**プールそのものが疑わしい**ので
+///                   10分は時間で寝かせる。価格が動いても解かない。
+/// `sticky: false` … 送信直前の確認で赤字だっただけ。**価格の問題**なので、
+///                   経路のどれかのプールが動いたら**その場で解く**。
+///
+/// [なぜ分けたか]
+/// 大物(見込み$0.10以上)の内訳:
+///   152件検知 → 成立0件 / 逃した152件(見込み$34.04)
+///   [冷却中:113 同じ経路を送信中:26 送信直前で見送り:7 同じプールが使用中:5 送信して失敗:1]
+/// **74%が「冷却中」で捨てられていた。**
+///
+/// しかも捨てていたのは「本当に見るべきもの」だった。判定側には既に
+/// `isSuppressed` があり、**経路のプールが1つも動いていない間は再判定しない**。
+/// つまり handleOpportunity まで届いた時点で「どれかのプールが動いた」が確定している。
+/// そこへ30秒の時間切れを重ねると、**より賢い仕組みが「見る価値がある」と判断した
+/// ものだけを、時計で捨てる**ことになる。
 const cooldownUntil = new Map();
+
+/// そのプールを含む経路の冷却を解く(価格が原因の冷却だけ)。
+/// 送信して失敗した冷却(sticky)はそのまま残す。
+function clearPriceCooldownForPool(poolAddress) {
+  if (cooldownUntil.size === 0) return;
+  const needle = (poolAddress || "").toLowerCase();
+  if (!needle) return;
+  for (const [key, e] of cooldownUntil) {
+    if (e && e.sticky) continue;
+    if (key.includes(needle)) cooldownUntil.delete(key);
+  }
+}
 /// key -> { times: [失敗した時刻] }。窓の外は捨てる。
 const poolFailures = new Map();
 /// key -> 期限(ms)。送信失敗で一時的に外したプール。
@@ -343,7 +374,7 @@ function noteExecutionFailure(opp, error) {
   const reason = error?.message || String(error);
   const stage = error instanceof ExecutionError ? error.stage : "unknown";
   failStages[stage] = (failStages[stage] || 0) + 1;
-  cooldownUntil.set(opp.poolAddresses.join("|").toLowerCase(), Date.now() + FAILURE_COOLDOWN_MS);
+  cooldownUntil.set(opp.poolAddresses.join("|").toLowerCase(), { until: Date.now() + FAILURE_COOLDOWN_MS, sticky: true });
 
   if (error instanceof ExecutionError && error.taxToken) {
     const targets = error.taxPools?.length ? error.taxPools : opp.poolAddresses;
@@ -442,7 +473,7 @@ function rejectIfTrap(opp) {
   const reason = `異常なリターン${(ratio * 100).toFixed(0)}%`;
   if (opp.hasV3) {
     console.log(`[罠の疑い] ${opp.kind} ${opp.chain} ${opp.label}: ${reason}。見送ります`);
-    cooldownUntil.set(opp.poolAddresses.join("|").toLowerCase(), Date.now() + FAILURE_COOLDOWN_MS);
+    cooldownUntil.set(opp.poolAddresses.join("|").toLowerCase(), { until: Date.now() + FAILURE_COOLDOWN_MS, sticky: true });
     return true;
   }
   console.log(`[罠] ${opp.kind} ${opp.chain} ${opp.label}: ${reason}(投入$${opp.tradeAmountUsd.toFixed(2)}→利益$${opp.netProfitUsd.toFixed(2)})。無効化します`);
@@ -1796,12 +1827,13 @@ async function handleOpportunity(opp, meta = {}) {
   if (pruneTaxTokenPools(opp)) { reasons.taxToken++; record(opp, "tax_token"); noteBigOutcome(opp, "tax_token"); return; }
 
   const key = opp.poolAddresses.join("|").toLowerCase();
-  const until = cooldownUntil.get(key);
-  if (until && Date.now() < until) {
+  const cool = cooldownUntil.get(key);
+  if (cool && Date.now() < cool.until) {
     reasons.cooldown++;
-    noteBigOutcome(opp, "cooldown", `あと${Math.ceil((until - Date.now()) / 1000)}秒`);
+    noteBigOutcome(opp, "cooldown", `あと${Math.ceil((cool.until - Date.now()) / 1000)}秒${cool.sticky ? "(送信失敗)" : ""}`);
     return;
   }
+  if (cool) cooldownUntil.delete(key);
 
   if (rejectIfTrap(opp)) { reasons.trap++; record(opp, "trap"); noteBigOutcome(opp, "trap"); return; }
   if (!opp.profitable) return;
@@ -1844,7 +1876,8 @@ async function handleOpportunity(opp, meta = {}) {
       noteBigOutcome(opp, "success");
     } else {
       reasons.notSent++;
-      cooldownUntil.set(key, Date.now() + 30 * 1000);
+      // 価格が原因なので、経路のプールが動けば上の clearPriceCooldownForPool が解く。
+      cooldownUntil.set(key, { until: Date.now() + 30 * 1000, sticky: false });
       record(opp, notSentOutcome(opp), meta);
       noteBigOutcome(opp, "not_sent", opp.shortfallBps != null ? `不足${opp.shortfallBps.toFixed(1)}bps` : "");
       // **不足の実測は、V2の手数料の誤差を知っている唯一の情報。** 捨てない。
@@ -1878,6 +1911,8 @@ async function handleOpportunity(opp, meta = {}) {
 function reactToPoolChange(chain, poolAddress, pool, receivedAt, source) {
   if (!isReady(chain)) return;
   const movePct = pool.lastMovePct || 0;
+  // **このプールが動いた。** 価格が理由で寝かせていた経路は、もう寝かせる理由がない。
+  clearPriceCooldownForPool(poolAddress);
   try {
     const opp = scanForChangedPool({
       chain, poolAddress, capUsd: getCurrentTradeCapUsd(),
