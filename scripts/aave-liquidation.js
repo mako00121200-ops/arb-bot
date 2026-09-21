@@ -36,9 +36,60 @@ const AAVE_POOLS = {
   base: "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
 };
 
-/// 対象チェーン。まず少なく始めて、実測を見てから広げる。
-const AAVE_CHAINS = (process.env.AAVE_CHAINS ?? "base,optimism")
+/// 対象。**5チェーン全部に広げた(2026年9月21日)。**
+///
+/// [なぜ広げるか]
+/// 清算はプロトコルが決めた固定のボーナス(5〜10%)が利益で、
+/// **競争で額が削れない**。競争は「誰が取るか」の競走になるだけ。
+/// だから **$50/日 に必要なのは「速さ」ではなく「市場の数」**。
+/// base だけで1日2件($1,000超)なら、5チェーンで10件前後になるはず。
+/// まず**測って**確かめる(第1段は読み取りのみ・送信しない)。
+const AAVE_CHAINS = (process.env.AAVE_CHAINS ?? "base,optimism,arbitrum,polygon,avalanche")
   .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+
+/// Aave V3 の**フォーク**を足すための設定。
+///
+/// [なぜ要るか]
+/// Seamless(Base)などは Aave V3 のフォークで、**同じ `getUserAccountData` と
+/// 同じ `LiquidationCall`** を持つ。つまり**このコードがそのまま使える**。
+/// 新しく小さい市場ほど清算者が少ない —— 裁定で見つけた
+/// 「浅い帯は他者の裁定0件」の清算版。**市場を足すたびに積み上がる。**
+///
+/// 住所は**思い込みで書かない**。環境変数で渡し、起動時に実測で確かめる。
+///   AAVE_EXTRA_POOLS="base:0x……:seamless,base:0x……:zerolend"
+///
+/// 応答しない住所は自動で外れるので、間違えても害は無い。
+const AAVE_EXTRA_POOLS = (process.env.AAVE_EXTRA_POOLS || "")
+  .split(",").map((v) => v.trim()).filter(Boolean)
+  .map((v) => {
+    const [chain, pool, name] = v.split(":").map((x) => (x || "").trim());
+    if (!chain || !pool || !/^0x[0-9a-fA-F]{40}$/.test(pool)) return null;
+    return { chain: chain.toLowerCase(), pool, name: (name || "fork").toLowerCase() };
+  })
+  .filter(Boolean);
+
+// ===== 「市場」を単位にする(1チェーンに複数の貸出市場があるため)=====
+//
+// 鍵は既定の市場なら**チェーン名そのもの**、フォークなら `base#seamless` の形。
+// 既存の保存ファイルとログの形をそのまま保てる。
+const marketPool = new Map();   // 市場の鍵 -> Pool の住所
+const marketChain = new Map();  // 市場の鍵 -> 実際のチェーン名(RPCを投げる先)
+
+function registerMarkets() {
+  for (const [chain, pool] of Object.entries(AAVE_POOLS)) {
+    marketPool.set(chain, pool);
+    marketChain.set(chain, chain);
+  }
+  for (const { chain, pool, name } of AAVE_EXTRA_POOLS) {
+    const key = `${chain}#${name}`;
+    marketPool.set(key, pool);
+    marketChain.set(key, chain);
+  }
+}
+registerMarkets();
+
+/// 市場の鍵から、RPCを投げる実際のチェーン名を得る。
+function chainOf(key) { return marketChain.get(key) || key; }
 
 /// 清算の見張りを行うか。false で完全に止まる。
 const AAVE_ENABLED = process.env.AAVE_ENABLED !== "false";
@@ -234,8 +285,8 @@ function normalizeHist(h) {
   };
 }
 
-function poolFor(chain) {
-  return AAVE_POOLS[chain] || null;
+function poolFor(key) {
+  return marketPool.get(key) || null;
 }
 
 /// オラクルの基準通貨(USD、8桁)を普通の数に直す。
@@ -289,7 +340,7 @@ async function tryGetLogs(chain, key, params, fromBlock, toBlock) {
   const span = toBlock - fromBlock + 1;
   stats.rpcCalls++;
   try {
-    const logs = await callWithRpc(chain, (p) => p.send("eth_getLogs", [{
+    const logs = await callWithRpc(chainOf(chain), (p) => p.send("eth_getLogs", [{
       ...params,
       fromBlock: "0x" + fromBlock.toString(16),
       toBlock: "0x" + toBlock.toString(16),
@@ -319,12 +370,12 @@ async function refreshRoster(chain) {
   const pool = poolFor(chain);
   if (!pool) return;
   const st = stateFor(chain);
-  const provider = getProviderForChain(chain);
+  const provider = getProviderForChain(chainOf(chain));
   if (!provider) return;
 
   let latest;
   try {
-    latest = await callWithRpc(chain, (p) => p.getBlockNumber());
+    latest = await callWithRpc(chainOf(chain), (p) => p.getBlockNumber());
     stats.rpcCalls++;
   } catch (e) {
     stats.errors++; stats.lastError = (e.message || "").slice(0, 80);
@@ -418,13 +469,13 @@ async function ensureOracle(chain) {
   let oracle = null;
   try {
     stats.rpcCalls++;
-    const r1 = await callWithRpc(chain, (p) => p.call({
+    const r1 = await callWithRpc(chainOf(chain), (p) => p.call({
       to: poolFor(chain),
       data: ADDRESSES_PROVIDER_IFACE.encodeFunctionData("ADDRESSES_PROVIDER"),
     }));
     const provider = ADDRESSES_PROVIDER_IFACE.decodeFunctionResult("ADDRESSES_PROVIDER", r1)[0];
     stats.rpcCalls++;
-    const r2 = await callWithRpc(chain, (p) => p.call({
+    const r2 = await callWithRpc(chainOf(chain), (p) => p.call({
       to: provider,
       data: PRICE_ORACLE_LOCATOR_IFACE.encodeFunctionData("getPriceOracle"),
     }));
@@ -455,7 +506,7 @@ async function resolveAssets(chain, addrs) {
   }
   try {
     stats.rpcCalls++;
-    const ret = await callWithRpc(chain, (p) =>
+    const ret = await callWithRpc(chainOf(chain), (p) =>
       new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, p).aggregate3(calls));
     for (let i = 0; i < missing.length; i++) {
       let decimals = null, symbol = "", priceUsd = null;
@@ -477,7 +528,7 @@ async function daysSinceBlock(chain, block) {
   if (cached && cached.block === block) return (Date.now() / 1000 - cached.ts) / 86400;
   try {
     stats.rpcCalls++;
-    const b = await callWithRpc(chain, (p) => p.getBlock(block));
+    const b = await callWithRpc(chainOf(chain), (p) => p.getBlock(block));
     if (!b) return null;
     oldestTs.set(chain, { block, ts: Number(b.timestamp) });
     return (Date.now() / 1000 - Number(b.timestamp)) / 86400;
@@ -521,7 +572,7 @@ export async function scanLiquidationHistory(chain) {
 
   let latest;
   try {
-    latest = await callWithRpc(chain, (p) => p.getBlockNumber());
+    latest = await callWithRpc(chainOf(chain), (p) => p.getBlockNumber());
     stats.rpcCalls++;
   } catch (e) {
     stats.errors++; stats.lastError = (e.message || "").slice(0, 80);
@@ -678,7 +729,7 @@ async function readHealth(chain, users, maxCalls) {
     try {
       calls++;
       stats.rpcCalls++;
-      const returned = await callWithRpc(chain, (p) =>
+      const returned = await callWithRpc(chainOf(chain), (p) =>
         new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, p).aggregate3(batch));
       for (let j = 0; j < slice.length; j++) {
         const r = returned[j];
@@ -797,13 +848,17 @@ export async function checkWatchChain(chain) {
 export async function verifyAaveChains(activeChains) {
   if (!AAVE_ENABLED) return [];
   loadState();
-  const targets = AAVE_CHAINS.filter((c) => activeChains.includes(c) && poolFor(c));
+  // 既定の市場(チェーン名そのもの)と、フォークの市場の両方を対象にする。
+  const targets = [
+    ...AAVE_CHAINS.filter((c) => activeChains.includes(c) && poolFor(c)),
+    ...AAVE_EXTRA_POOLS.filter((e) => activeChains.includes(e.chain)).map((e) => `${e.chain}#${e.name}`),
+  ];
   const ok = [];
   for (const chain of targets) {
     try {
       // 誰でもよいので1人分読む。住所が違えば取り消されるか空が返る。
       const data = POOL_IFACE.encodeFunctionData("getUserAccountData", [ethers.ZeroAddress]);
-      const ret = await callWithRpc(chain, (p) => p.call({ to: poolFor(chain), data }));
+      const ret = await callWithRpc(chainOf(chain), (p) => p.call({ to: poolFor(chain), data }));
       stats.rpcCalls++;
       if (!ret || ret === "0x") throw new Error("空が返りました");
       POOL_IFACE.decodeFunctionResult("getUserAccountData", ret);
