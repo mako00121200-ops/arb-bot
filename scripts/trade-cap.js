@@ -9,8 +9,21 @@
 // 初期上限$50でこれが実際に起きたため、$500から始める。
 
 import fs from "fs";
+import path from "path";
 
-const SUCCESS_COUNT_FILE = process.env.SUCCESS_COUNT_FILE || "/tmp/execution-success-count.json";
+/// 成功回数の保存先。
+///
+/// [不具合(2026年9月21日に判明)]
+/// ここは /tmp を既定にしていた。**/tmp は再デプロイのたびに消える。**
+/// つまり成功回数がいつも0に戻り、**上限は$500から一度も上がっていなかった**。
+/// 3回成功すれば$1,000、8回で$2,000に上がる仕組みを作っておきながら、
+/// その条件が永久に満たされない状態だった。
+/// ガス単価の補正比が同じ理由で消えていたのを9月20日に直したのに、
+/// **同じ間違いがここに残っていた**。プール地図と同じ場所(ボリューム)に置く。
+const SUCCESS_COUNT_FILE = process.env.SUCCESS_COUNT_FILE
+  || (process.env.POOL_MAP_FILE
+      ? path.join(path.dirname(process.env.POOL_MAP_FILE), "execution-success-count.json")
+      : "/tmp/execution-success-count.json");
 
 const CAP_STAGES = [
   { minSuccesses: 0, maxTradeUsd: 500 },

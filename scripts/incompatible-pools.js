@@ -6,8 +6,16 @@
 // 同じ失敗を繰り返さないようにする。
 
 import fs from "fs";
+import path from "path";
 
-const INCOMPATIBLE_POOLS_FILE = process.env.INCOMPATIBLE_POOLS_FILE || "/tmp/incompatible-pools.json";
+/// 保存先。**/tmp は再デプロイのたびに消える。**
+/// 専用の環境変数が設定されていなければ、プール地図と同じ場所(ボリューム)に置く。
+/// (2026年9月21日: 取引上限の成功回数が /tmp にあり、上限が$500から
+///  一度も上がっていなかった。同じ形の場所を全部探して揃えた)
+const INCOMPATIBLE_POOLS_FILE = process.env.INCOMPATIBLE_POOLS_FILE
+  || (process.env.POOL_MAP_FILE
+      ? path.join(path.dirname(process.env.POOL_MAP_FILE), "incompatible-pools.json")
+      : "/tmp/incompatible-pools.json");
 
 function loadIncompatiblePools() {
   try {

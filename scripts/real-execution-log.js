@@ -17,8 +17,16 @@
 // 事前判定に使う。想定値のずれが機会の取りこぼしに直結するため。
 
 import fs from "fs";
+import path from "path";
 
-const REAL_EXECUTION_LOG_FILE = process.env.REAL_EXECUTION_LOG_FILE || "/tmp/real-executions.json";
+/// 保存先。**/tmp は再デプロイのたびに消える。**
+/// 専用の環境変数が設定されていなければ、プール地図と同じ場所(ボリューム)に置く。
+/// (2026年9月21日: 取引上限の成功回数が /tmp にあり、上限が$500から
+///  一度も上がっていなかった。同じ形の場所を全部探して揃えた)
+const REAL_EXECUTION_LOG_FILE = process.env.REAL_EXECUTION_LOG_FILE
+  || (process.env.POOL_MAP_FILE
+      ? path.join(path.dirname(process.env.POOL_MAP_FILE), "real-executions.json")
+      : "/tmp/real-executions.json");
 /// 平均を取る対象の件数(直近から数える)。
 const GAS_AVERAGE_SAMPLES = 20;
 

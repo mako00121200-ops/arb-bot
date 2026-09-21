@@ -42,6 +42,7 @@ import { probePoolFeeBps, isFeeProbeOnHold, getRpcStatus, getRpcCallTotals, call
 import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
 import { alertOwner, getAlertStats, sendPendingQuestions } from "./scripts/owner-alert.js";
 import { verifyAaveChains, getAaveChains, sweepAll as aaveSweepAll, checkWatchAll as aaveCheckWatchAll, formatAaveLine, AAVE_SWEEP_INTERVAL_MS, AAVE_WATCH_INTERVAL_MS } from "./scripts/aave-liquidation.js";
+import { noteBigOutcome, formatBigLine, formatBigSummary } from "./scripts/big-opportunities.js";
 import {
   fetchReservesBatch, fetchPoolTokensBatch, fetchTokenDecimalsBatch,
   fetchV3StatesBatch, getMulticallStats, findV3PoolsBatch,
@@ -1400,14 +1401,20 @@ function poolLockKeys(opp) {
 
 async function handleOpportunity(opp, meta = {}) {
   stats.examined++;
-  if (hasDisabledPool(opp)) { reasons.disabled++; return; }
-  if (pruneTaxTokenPools(opp)) { reasons.taxToken++; record(opp, "tax_token"); return; }
+  // **捨てる道すべてで大物を数える。** 記録の無い道があると、
+  // 「大きな機会が消えた」を後から確かめられない(2026年9月21日に判明)。
+  if (hasDisabledPool(opp)) { reasons.disabled++; noteBigOutcome(opp, "disabled"); return; }
+  if (pruneTaxTokenPools(opp)) { reasons.taxToken++; record(opp, "tax_token"); noteBigOutcome(opp, "tax_token"); return; }
 
   const key = opp.poolAddresses.join("|").toLowerCase();
   const until = cooldownUntil.get(key);
-  if (until && Date.now() < until) { reasons.cooldown++; stats.skippedCooldown++; return; }
+  if (until && Date.now() < until) {
+    reasons.cooldown++; stats.skippedCooldown++;
+    noteBigOutcome(opp, "cooldown", `あと${Math.ceil((until - Date.now()) / 1000)}秒`);
+    return;
+  }
 
-  if (rejectIfTrap(opp)) { reasons.trap++; record(opp, "trap"); return; }
+  if (rejectIfTrap(opp)) { reasons.trap++; record(opp, "trap"); noteBigOutcome(opp, "trap"); return; }
   if (!opp.profitable) return;
 
   stats.profitableFound++;
@@ -1419,14 +1426,16 @@ async function handleOpportunity(opp, meta = {}) {
     reasons.belowMin++;
     record(opp, "below_min", meta);
     noteBelowMin(opp);
+    noteBigOutcome(opp, "below_min");
     return;
   }
-  if (executing.has(key)) { reasons.executing++; return; }
+  if (executing.has(key)) { reasons.executing++; noteBigOutcome(opp, "executing"); return; }
   // 同じプールを使う送信が進行中か、同時送信の上限に達していれば見送る。
   const lockKeys = poolLockKeys(opp);
   const inFlight = inFlightByChain.get(opp.chain) || 0;
   if (inFlight >= MAX_PARALLEL_SENDS_PER_CHAIN || lockKeys.some((k) => executingPools.has(k))) {
     reasons.sendBusy++;
+    noteBigOutcome(opp, "send_busy", `同時${inFlight}本`);
     return;
   }
   executing.add(key);
@@ -1442,10 +1451,12 @@ async function handleOpportunity(opp, meta = {}) {
       stats.executed++; reasons.success++;
       cooldownUntil.delete(key);
       record(opp, "success", meta);
+      noteBigOutcome(opp, "success");
     } else {
       reasons.notSent++;
       cooldownUntil.set(key, Date.now() + 30 * 1000);
       record(opp, "not_sent", meta);
+      noteBigOutcome(opp, "not_sent", opp.shortfallBps != null ? `不足${opp.shortfallBps.toFixed(1)}bps` : "");
     }
   } catch (e) {
     stats.failed++; reasons.failed++;
@@ -1453,6 +1464,7 @@ async function handleOpportunity(opp, meta = {}) {
     const stage = e instanceof ExecutionError ? e.stage : "unknown";
     console.warn(`[実行] 失敗(${stage}): ${msg}`);
     noteExecutionFailure(opp, e);
+    noteBigOutcome(opp, "failed", stage);
     // 制限時間超過など、送信側の catch を通らない失敗でも手元の nonce を
     // 鎖上の値に合わせ直す。放置すると以降の送信が詰まる。
     try { resetNonce(opp.chain); } catch (inner) {}
@@ -1629,7 +1641,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${formatAaveLine()}${alertLine}`);
+  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${formatBigLine()}${formatAaveLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
@@ -1716,6 +1728,11 @@ function heartbeat() {
       const parts = r
         ? r.labels.map((l, i) => `${l}:${r.counts[i].toLocaleString()}`).join(" ")
         : "壁の低い経路なし";
+      // 大物(既定$0.10以上)の行く先のまとめ。何も無ければ出ない。
+      {
+        const bigLine = formatBigSummary();
+        if (bigLine) console.log(bigLine);
+      }
       console.log(`[惜しい] ${chain}: ${head} / 壁${W}bps以下の内訳 ${parts} / 壁が${WALL_DROP_BPS}bps下がれば+${countIfWallDrops(chain, WALL_DROP_BPS, W).toLocaleString()}本`);
     }
   } catch (e) {}

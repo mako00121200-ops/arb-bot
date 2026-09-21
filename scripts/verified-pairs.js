@@ -12,8 +12,16 @@
 // 観測時にこの値を使うことで、実行直前の判定とのズレを無くす。
 
 import fs from "fs";
+import path from "path";
 
-const VERIFIED_PAIRS_FILE = process.env.VERIFIED_PAIRS_FILE || "/tmp/verified-pairs.json";
+/// 保存先。**/tmp は再デプロイのたびに消える。**
+/// 専用の環境変数が設定されていなければ、プール地図と同じ場所(ボリューム)に置く。
+/// (2026年9月21日: 取引上限の成功回数が /tmp にあり、上限が$500から
+///  一度も上がっていなかった。同じ形の場所を全部探して揃えた)
+const VERIFIED_PAIRS_FILE = process.env.VERIFIED_PAIRS_FILE
+  || (process.env.POOL_MAP_FILE
+      ? path.join(path.dirname(process.env.POOL_MAP_FILE), "verified-pairs.json")
+      : "/tmp/verified-pairs.json");
 
 function load() {
   try {
