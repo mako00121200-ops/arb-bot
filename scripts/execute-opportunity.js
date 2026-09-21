@@ -301,13 +301,66 @@ async function detectContractVersion(chain, address) {
 /// 判別は送信時にも行うが、再デプロイ直後に「住所が正しく、中身がある」ことを
 /// 最初の機会を待たずに確認できるようにする(2026年9月20日、Optimism の展開で
 /// RPC が "already known" を返し、住所の裏付けが要った)。失敗しても起動は止めない。
+/// 確認していない端点の挙動を、実測で切り分けた記録。
+/// chain -> "pending" / "latest"(どちらで中身が返るか)
+const simulateBlockTag = new Map();
+
+/// 「わざと revert させた中身」が、その端点・そのブロック指定で返るかを確かめる。
+///
+/// [なぜ要るか(2026年9月21日)]
+/// 確認(simulateRoute)は**わざと revert させて SimulationResult を受け取る**
+/// 作りなので、revert の中身が返らない端点では一切機能しない。
+/// Base を pending で読むようにした直後、確認が3件続けて
+/// `missing revert data` になった(いずれも純利益 +$0.36〜+$0.49 の大きな機会)。
+///
+/// 機会が来るのを待って切り分けるのでは遅い。**起動時に自分で確かめる。**
+/// simulateRoute には onlyOwner があり、所有者以外が呼べば必ず
+/// `"DexArbFlashLoan: not owner"` で revert する。状態に一切依存しない、
+/// 決まった答えが返る試験になる。
+///
+/// pending で中身が返らず latest で返るなら、そのチェーンは以降 latest で確認する。
+async function probeRevertData(chain, contractAddress, iface) {
+  const tag = readBlockTag(chain);
+  if (tag !== "pending") return; // latest しか使わないチェーンは確かめる意味がない
+  // 所有者ではない住所から呼ぶ(必ず onlyOwner で弾かれる)。
+  const notOwner = "0x0000000000000000000000000000000000000001";
+  const data = iface.encodeFunctionData("simulateRoute", [ethers.ZeroAddress, 0n, []]);
+
+  const hasRevertData = async (blockTag) => {
+    try {
+      await callWithRpc(chain, (p) => p.call({ to: contractAddress, from: notOwner, data, blockTag }), true);
+      return false; // revert しなかった(想定外)
+    } catch (e) {
+      const d = e?.data ?? e?.info?.error?.data ?? e?.error?.data ?? null;
+      return typeof d === "string" && d.startsWith("0x") && d.length > 2;
+    }
+  };
+
+  try {
+    if (await hasRevertData("pending")) {
+      console.log(`[確認の下調べ] ${chain}: pending でも revert の中身が返ります(このままで大丈夫)`);
+      return;
+    }
+    if (await hasRevertData("latest")) {
+      simulateBlockTag.set(chain, "latest");
+      console.warn(`[確認の下調べ] ${chain}: **pending では revert の中身が返りません**。latest では返るので、以降このチェーンの確認は latest で行います(判定に使う状態とは少しずれますが、確認できない方が悪いため)`);
+      return;
+    }
+    console.warn(`[確認の下調べ] ${chain}: pending でも latest でも revert の中身が返りません。コントラクトか端点の問題です`);
+  } catch (e) {
+    console.warn(`[確認の下調べ] ${chain}: 確かめられませんでした: ${(e.message || "").slice(0, 100)}`);
+  }
+}
+
 export async function checkContractVersions(chains) {
   for (const chain of chains) {
     const chainConfig = getChainConfig(chain);
     const address = chainConfig ? process.env[chainConfig.contractAddressEnvVar] : null;
     if (!address) { console.log(`[コントラクト] ${chain}: 住所が未設定です`); continue; }
     try {
-      await detectContractVersion(chain, address);
+      const v = await detectContractVersion(chain, address);
+      // 確認(eth_call)がそのチェーンで機能するかを、ここで確かめておく。
+      await probeRevertData(chain, address, v.iface);
     } catch (e) {
       console.warn(`[コントラクト] ${chain} ${address}: 確認できず: ${(e.message || "").slice(0, 120)}`);
     }
@@ -415,10 +468,6 @@ async function simulateAt(chain, contractAddress, from, data, iface, blockTag) {
 function isMissingRevertData(msg) {
   return (msg || "").toLowerCase().includes("missing revert data");
 }
-
-/// 確認していない端点の挙動を、実測で切り分けた記録。
-/// chain -> "pending" / "latest"(どちらで中身が返るか)
-const simulateBlockTag = new Map();
 
 async function simulate(chain, contractAddress, from, asset, amountIn, legArgs, iface) {
   const data = iface.encodeFunctionData("simulateRoute", [asset, amountIn, legArgs]);

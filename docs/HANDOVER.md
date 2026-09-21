@@ -2178,6 +2178,26 @@ Aerodrome は Base の出来高の50〜63%を握る DEX で、そこに絡む経
 - latest で通る → 原因は 2(端点の挙動)。再デプロイは要らない
 - latest でも同じ → 原因は 1(旧版)。**Base の再デプロイをオーナーに依頼する**
 
+### 機会を待たずに起動時に確かめる(同日に追加)
+上の切り分けは「次の機会が来るまで答えが出ない」。Base の大きな機会は
+数分〜数十分に1回しか出ないので、偶然待ちでは遅い。
+
+**決定的な試験がある。** `simulateRoute` には `onlyOwner` が付いていて、
+所有者以外が呼べば必ず `require(msg.sender == owner, "DexArbFlashLoan: not owner")`
+で revert する。**状態に一切依存せず、決まった答えが返る。**
+
+`probeRevertData()`: 所有者ではない住所(0x…01)から `simulateRoute` を
+`pending` で呼び、revert の中身が返るかを見る。返らなければ `latest` でも試す。
+`latest` で返れば、そのチェーンは以降 `latest` で確認する。
+起動時の `checkContractVersions` から、pending を使うチェーンだけ呼ぶ
+(1チェーンにつき最大2回の呼び出し)。
+
+ログ:
+- `[確認の下調べ] base: pending でも revert の中身が返ります(このままで大丈夫)`
+  → 原因は旧版のコントラクト。再デプロイを依頼する
+- `[確認の下調べ] base: **pending では revert の中身が返りません**。latest で…`
+  → 原因は端点。自動で latest に切り替わるので再デプロイ不要
+
 判定は狭くする(`missing revert data` の文字だけ)。本物の revert で聞き直すと
 無駄な問い合わせが増えるだけで何も分からない。
 
