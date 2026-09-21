@@ -1594,7 +1594,7 @@ function heartbeat() {
   const sync = getSyncStats();
   // 確定前(pending)のイベントの先読み統計。取れているチェーンだけ出す。
   const pendingLine = Object.entries(getPendingStats()).filter(([, p]) => p.polls > 0).map(([c, p]) =>
-    `${c}:事前${p.events}件 確定で照合${p.sealedHits}件 先行平均${p.leadAvgMs ?? "-"}ms(最大${p.leadMaxMs}ms) 取得${p.polls}回 失敗${p.errors}`).join(" ");
+    `${c}:事前${p.events}件 確定で照合${p.sealedHits}件 先行平均${p.leadAvgMs ?? "-"}ms(最大${p.leadMaxMs}ms) ${p.push ? "押し出し" : "取得"}${p.polls}回 失敗${p.errors}`).join(" ");
   const ev = Object.entries(sync).map(([c, v]) => `${c}:${v.received}`).join(" ") || "なし";
   const mc = getMulticallStats();
   // RPCの月間使用量を更新する。呼び出しとWebSocket受信の両方が枠を消費する。

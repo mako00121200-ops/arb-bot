@@ -62,6 +62,15 @@ const DATA_TIMEOUT_MS = 120 * 1000;
 const PING_INTERVAL_MS = 20 * 1000;
 const PING_REQUEST_ID = 999;
 const SUBSCRIBE_REQUEST_ID_BASE = 100;
+// 確定前(Flashblocks)のイベントを**押し出しで**受け取る購読の id の範囲。
+// 確定後の "logs" の購読と区別するため、別の範囲にする。
+const PENDING_SUBSCRIBE_REQUEST_ID_BASE = 500;
+/// 確定前のイベントを押し出しで受け取るのを試すか。
+/// 端点が対応していなければ拒否されるので、その時は今までどおり取りに行く。
+const PENDING_PUSH = process.env.PENDING_PUSH !== "false";
+/// 試す購読の名前。端点によって名前が違うので、上から順に試す。
+const PENDING_SUB_METHODS = (process.env.PENDING_SUB_METHODS || "pendingLogs,preconfLogs")
+  .split(",").map((s) => s.trim()).filter(Boolean);
 const HEALTHY_EVENT_WINDOW_MS = parseInt(process.env.HEALTHY_EVENT_WINDOW_MS || "300000", 10);
 const STABLE_CONNECTION_MS = 30 * 1000;
 const MAX_RECONNECT_DELAY_MS = 5 * 60 * 1000;
@@ -134,6 +143,10 @@ const FLASHBLOCKS_POLL_MS = parseInt(process.env.FLASHBLOCKS_POLL_MS || "400", 1
 const SEEN_LOG_LIMIT = 20000;
 const seenLogs = {};           // chain -> Map(key -> pendingSeenAt)
 const pendingTimers = {};      // chain -> interval
+const pendingSubIds = {};      // chain -> Set(購読ID) 確定前の押し出しの購読
+const pendingPushOk = {};      // chain -> bool 押し出しが通ったか
+const pendingSubTry = {};      // chain -> 何番目の名前を試しているか
+const pendingSubError = {};    // chain -> 最後の拒否理由
 const pendingInFlight = {};    // chain -> bool
 const pendingStats = {};       // chain -> { polls, errors, events, sealedHits, leadTotalMs, leadMaxMs }
 
@@ -197,9 +210,18 @@ function dispatchLog(chainName, log, receivedAt, source) {
   }
 }
 
+/// 確定前のイベントを取りに行くのを止める(押し出しが通った時)。
+function stopPendingPolling(chainName) {
+  if (!pendingTimers[chainName]) return;
+  clearInterval(pendingTimers[chainName]);
+  pendingTimers[chainName] = null;
+}
+
 /// pending のイベントを一定間隔で取りに行く。監視対象が決まった後に始める。
+/// 押し出し(sendPendingSubscription)が通っているチェーンでは動かさない。
 function startPendingPolling(chainName) {
   if (!isPendingReadChain(chainName) || pendingTimers[chainName]) return;
+  if (pendingPushOk[chainName]) return;
   if (!(FLASHBLOCKS_POLL_MS > 0)) return;
   console.log(`[Flashblocks/pending] ${chainName}: 確定前のイベントを ${FLASHBLOCKS_POLL_MS}ms ごとに取りに行きます`);
   pendingTimers[chainName] = setInterval(async () => {
@@ -232,7 +254,11 @@ function startPendingPolling(chainName) {
 export function getPendingStats() {
   const out = {};
   for (const [chain, st] of Object.entries(pendingStats)) {
-    out[chain] = { ...st, leadAvgMs: st.sealedHits ? Math.round(st.leadTotalMs / st.sealedHits) : null };
+    out[chain] = {
+      ...st,
+      leadAvgMs: st.sealedHits ? Math.round(st.leadTotalMs / st.sealedHits) : null,
+      push: !!pendingPushOk[chain], // 押し出しで受け取れているか(取りに行っていないか)
+    };
   }
   return out;
 }
@@ -267,6 +293,40 @@ function sendSubscription(chainName) {
   }
   chainSubCounts[chainName] = sent;
   console.log(`[オンチェーン] ${chainName}: ${addresses.length}プールを${sent}回の購読で監視します`);
+  sendPendingSubscription(chainName);
+}
+
+/// 確定前(Flashblocks)のイベントを**押し出しで**受け取る購読を試す。
+///
+/// [なぜ要るか(2026年9月21日)]
+/// 今は 400ms ごとに eth_getLogs(pending) を取りに行っている。Flashblock は
+/// 200〜250ms ごとに配られるので、**平均200msの取りこぼし遅れ**が必ず乗る。
+/// しかも1日216,000回・月650万回(枠2,000万の3割)をこれだけで使っている。
+/// 押し出しで受け取れれば、遅れも RPC の消費も同時に消える。
+///
+/// 端点が対応していなければ購読は拒否される。その時は今までどおり
+/// 取りに行くので、動きは変わらない(安全側)。
+function sendPendingSubscription(chainName) {
+  if (!PENDING_PUSH || !isPendingReadChain(chainName)) return;
+  const socket = chainSockets[chainName];
+  if (!socket || socket.readyState !== 1) return;
+  const addresses = chainAddresses[chainName] || [];
+  if (addresses.length === 0) return;
+  const tryIndex = pendingSubTry[chainName] ?? 0;
+  if (tryIndex >= PENDING_SUB_METHODS.length) return; // 全部だめだった
+  const method = PENDING_SUB_METHODS[tryIndex];
+  let sent = 0;
+  for (let i = 0; i < addresses.length; i += ADDRESSES_PER_SUBSCRIPTION) {
+    const chunk = addresses.slice(i, i + ADDRESSES_PER_SUBSCRIPTION);
+    try {
+      socket.send(JSON.stringify({
+        jsonrpc: "2.0", id: PENDING_SUBSCRIBE_REQUEST_ID_BASE + sent, method: "eth_subscribe",
+        params: [method, { address: chunk, topics: [ALL_TOPICS] }],
+      }));
+      sent++;
+    } catch (e) { break; }
+  }
+  if (sent > 0) console.log(`[Flashblocks/押し出し] ${chainName}: "${method}" で確定前のイベントの購読を${sent}回試します`);
 }
 
 function sendPing(chainName) {
@@ -303,6 +363,30 @@ function connectChain(chainName, wsUrl) {
         const msg = JSON.parse(event.data);
         if (msg.id !== undefined) {
           chainLastDataAt[chainName] = receivedAt;
+          // 確定前の押し出しの購読への返事。
+          if (msg.id >= PENDING_SUBSCRIBE_REQUEST_ID_BASE) {
+            if (msg.error) {
+              pendingSubError[chainName] = JSON.stringify(msg.error).slice(0, 120);
+              const tried = pendingSubTry[chainName] ?? 0;
+              pendingSubTry[chainName] = tried + 1;
+              if (pendingSubTry[chainName] < PENDING_SUB_METHODS.length) {
+                console.log(`[Flashblocks/押し出し] ${chainName}: "${PENDING_SUB_METHODS[tried]}" は拒否されました(${pendingSubError[chainName]})。次の名前を試します`);
+                sendPendingSubscription(chainName);
+              } else {
+                console.log(`[Flashblocks/押し出し] ${chainName}: 対応していませんでした(${pendingSubError[chainName]})。今までどおり${FLASHBLOCKS_POLL_MS}msごとに取りに行きます`);
+              }
+            } else if (msg.result) {
+              if (!pendingSubIds[chainName]) pendingSubIds[chainName] = new Set();
+              pendingSubIds[chainName].add(msg.result);
+              if (!pendingPushOk[chainName]) {
+                pendingPushOk[chainName] = true;
+                // 押し出しが通ったので、取りに行くのをやめる(遅れもRPCの消費も消える)。
+                stopPendingPolling(chainName);
+                console.log(`[Flashblocks/押し出し] ${chainName}: 確定前のイベントを押し出しで受け取ります。定期取得は止めました`);
+              }
+            }
+            return;
+          }
           if (msg.id >= SUBSCRIBE_REQUEST_ID_BASE && msg.error) {
             chainSubscribeErrors[chainName] = JSON.stringify(msg.error).slice(0, 120);
             console.warn(`[オンチェーン] ${chainName}: 購読が拒否されました: ${chainSubscribeErrors[chainName]}`);
@@ -315,12 +399,23 @@ function connectChain(chainName, wsUrl) {
         chainLastEventAt[chainName] = receivedAt;
         chainEventCounts[chainName] = (chainEventCounts[chainName] || 0) + 1;
 
-        dispatchLog(chainName, msg.params.result, receivedAt, "sealed");
+        // どちらの購読から来たかで、確定前か確定後かを決める。
+        const subId = msg.params.subscription;
+        const isPending = !!(subId && pendingSubIds[chainName]?.has(subId));
+        if (isPending) pendingStatsFor(chainName).polls++; // 押し出しの受信回数として数える
+        dispatchLog(chainName, msg.params.result, receivedAt, isPending ? "pending" : "sealed");
       } catch (e) {}
     });
 
     socket.addEventListener("close", () => {
       if (chainPingTimers[chainName]) clearInterval(chainPingTimers[chainName]);
+      // 押し出しの購読は切れている。取りこぼさないよう、取りに行くのを再開する。
+      // 再接続して購読し直せれば、また止まる。
+      if (pendingPushOk[chainName]) {
+        pendingPushOk[chainName] = false;
+        pendingSubIds[chainName]?.clear();
+        startPendingPolling(chainName);
+      }
       if (chainIntentionalClose[chainName]) {
         chainIntentionalClose[chainName] = false;
         return;
