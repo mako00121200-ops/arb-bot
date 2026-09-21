@@ -73,7 +73,7 @@ import { isKnownIncompatiblePool, recordIncompatiblePool } from "./scripts/incom
 import { journal, loadJournal, trimJournalIfNeeded, summarize } from "./scripts/opportunity-journal.js";
 import {
   activeV3Factories, isForkFactory, V3_FEE_TIERS, findV3Pool, feeTierToBps,
-  buildQuoteTablesBatch, hasQuoteTable, clearQuoteTable, countQuoteTables,
+  buildQuoteTablesBatch, hasQuoteTable, clearQuoteTable, clearQuoteTableDirection, setTableTrustedMax, countQuoteTables,
   verifyQuoteTable, QUOTE_SAMPLES_USD, exportQuoteTables, importQuoteTable,
 } from "./scripts/v3-pools.js";
 import { CHAIN_CONFIG } from "./chain-config.js";
@@ -239,6 +239,7 @@ const stats = {
   v3Found: 0, v3Matched: 0, v3Opportunities: 0, v3LiquidityEvents: 0, scoutAdded: 0,
   quoteTablesBuilt: 0, quoteTablesPending: 0, quoteRebuildsFromPolling: 0, quoteTablesOnDemand: 0,
   v3VerifyCount: 0, v3VerifyWorst: null, v3VerifyRecent: [], v3VerifyDropped: 0,
+  v3VerifyCapped: 0, v3VerifyUnderCount: 0,
   disabledFromFile: 0, disabledRuntime: 0,
   prunedTotal: 0, prunedKept: 0,
   decimalsKnown: 0, pricedTokens: 0,
@@ -808,11 +809,20 @@ let v3VerifyCursor = 0;
 /// 狙う利幅の上限(50bps)を超えたら、その表は判定に使えないと見なす。
 const VERIFY_DROP_TABLE_BPS = parseFloat(process.env.VERIFY_DROP_TABLE_BPS || "50");
 
-const VERIFY_AMOUNTS_USD = (process.env.VERIFY_AMOUNTS_USD || "20,200,700")
+/// 確かめる投入額。**実際の取引額($1〜30)を含む点を必ず入れる。**
+/// 以前は最小が$20で、$200/$700 のずれだけを理由に価格表を捨てていた。
+/// 小さい側の点があると、制限をかける時の刻みも細かくなる。
+const VERIFY_AMOUNTS_USD = (process.env.VERIFY_AMOUNTS_USD || "5,20,200,700")
   .split(",").map((v) => parseFloat(v.trim())).filter((v) => v > 0);
 
 /// 投入額ごとの誤差(bps)。狙う利幅は5〜50bpsなので、%ではなくbpsで見る。
 const verifyErrorByUsd = new Map(); // usd -> { count, sumAbsBps, worstBps, overCount }
+
+/// 生存ログ用。価格表に制限をかけた数と、向きごと取り下げた数。
+function v3TableLine() {
+  if (!stats.v3VerifyCapped && !stats.v3VerifyDropped && !stats.v3VerifyUnderCount) return "";
+  return ` V3表[確認${stats.v3VerifyCount} 上限制限${stats.v3VerifyCapped} 取下${stats.v3VerifyDropped} 過小${stats.v3VerifyUnderCount}]`;
+}
 
 export function getVerifyErrorStats() {
   const out = [];
@@ -846,7 +856,30 @@ async function verifyV3Calculations() {
   const pool = candidates[v3VerifyCursor % candidates.length];
   v3VerifyCursor++;
 
-  for (const usd of VERIFY_AMOUNTS_USD) {
+  // **小さい順に確かめ、「どこまでなら信用できるか」を決める。**
+  //
+  // [なぜ捨てるのをやめたか(2026年9月21日の実測)]
+  // 前の版はずれが50bpsを超えると価格表を丸ごと捨てていた。実測で3つの欠陥が出た。
+  //
+  //  ① **使わない額のずれで捨てていた。** 捨てた2件とも $20 では誤差20bps以内で、
+  //     $200/$700 のずれだけが理由だった。実際の取引額は $1〜30。
+  //  ② **向きを区別していなかった。** 2件とも「補間が公式より過小」、つまり
+  //     **こちらの見積もりが辛い側**。この向きは機会を取り逃すだけで、
+  //     損はしない。危ないのは逆の「過大」(幻の利益)だけ。
+  //  ③ **測っていない向きの表まで消していた。** 検証は zeroForOne=true しか
+  //     測っていないのに、clearQuoteTable は両方向を消していた。
+  //
+  // そして根本の問題として、**捨ててもずれは直らない**。作り直しても同じ形の
+  // 補間なので、また捨てることになる(堂々巡り)。その間そのプールを通る経路は
+  // 1本も判定されない。
+  //
+  // 正しいのは、消すことではなく **信用できる範囲まで投入量を抑えること**。
+  // その仕組み(routeMaxAmountIn → getTableRange().max)は既にあった。
+  const amounts = [...VERIFY_AMOUNTS_USD].sort((a, b) => a - b);
+  let lastOkAmountIn = null;   // ここまでは信用できる、と分かった投入量
+  let cappedAt = null;         // 過大が出た投入額($)
+
+  for (const usd of amounts) {
     // 表の点そのものではなく、点と点の間の値で確かめる。
     const amountIn = usdToAmount(pool.chain, pool.token0, usd);
     if (!amountIn) continue;
@@ -885,27 +918,37 @@ async function verifyV3Calculations() {
     if (Math.abs(bps) > 20) {
       console.log(`[V3検証] ${pool.chain} ${pool.address.slice(0, 10)}…(${(pool.feeBps / 100).toFixed(2)}%) 投入$${usd}: 補間が公式より${bps > 0 ? "過大" : "過小"}${Math.abs(bps).toFixed(1)}bps`);
     }
-    // ずれが大きい表は捨てて、次に必要になった時に作り直させる。
-    //
-    // [なぜ要るか(2026年9月21日に実測で判明)]
-    // この検証は今まで**測って出すだけ**で、結果を使っていなかった。
-    //   [V3検証] avalanche 0xd18384F4…(1.00%) 投入$200: 補間が公式より過小28.5bps
-    //   [V3検証] avalanche 0xd18384F4…(1.00%) 投入$700: 補間が公式より過小92.7bps
-    // 手数料1%の帯は tick の刻みが広く、流動性が塊で置かれているため、
-    // 表の点と点の間を直線で結ぶと大きく外れる。しかも**投入額が大きいほど
-    // 外れる**($200で28.5bps → $700で92.7bps)。
-    // 同じ時間帯に arbitrum の 1.00% の経路が3本続けて「判定は+$0.0126〜
-    // +$0.0417、チェーン上では −1.2〜−7.8bps」になり、答え合わせは毎回
-    // 1段目のV3を名指しした(公式Quoterとも一致)。狙いたい大口の帯が、
-    // まさにこの表の誤差で幻の機会になっていた。
-    // 捨てても損はしない。次に要求された時に作り直されるだけで、
-    // 作り直しは今の仕組み(要求で作成)がそのまま担う。
-    if (Math.abs(bps) > VERIFY_DROP_TABLE_BPS) {
-      clearQuoteTable(pool.chain, pool.address);
+
+    // **過大だけが危ない。** 過小は見積もりが辛いだけで、損にはならない。
+    const tooHigh = bps > VERIFY_DROP_TABLE_BPS;
+    if (bps < -VERIFY_DROP_TABLE_BPS) stats.v3VerifyUnderCount++;
+
+    if (tooHigh) { cappedAt = usd; break; }
+    lastOkAmountIn = amountIn;   // ここまでは信用してよい
+  }
+
+  if (cappedAt != null) {
+    if (lastOkAmountIn != null) {
+      // 信用できるところまでで頭打ちにする。**プールは地図に残る。**
+      setTableTrustedMax(pool.chain, pool.address, true, lastOkAmountIn);
+      stats.v3VerifyCapped++;
+      console.log(
+        `[V3検証] ${pool.chain} ${pool.address.slice(0, 10)}…(${(pool.feeBps / 100).toFixed(2)}%): ` +
+        `投入$${cappedAt}で過大のため、**信用できる上限を$${amounts.filter((a) => a < cappedAt).pop()}相当に下げました**` +
+        `(プールは判定に使い続けます)`
+      );
+    } else {
+      // いちばん小さい額でも過大。この向きは使えないので、**その向きだけ**捨てる。
+      clearQuoteTableDirection(pool.chain, pool.address, true);
       stats.v3VerifyDropped++;
-      console.log(`[V3検証] ${pool.chain} ${pool.address.slice(0, 10)}…(${(pool.feeBps / 100).toFixed(2)}%): ずれ${Math.abs(bps).toFixed(1)}bpsは大きすぎるため価格表を捨てました(次に要求された時に作り直します)`);
-      break; // この表はもう無いので、残りの投入額で測る意味がない
+      console.log(
+        `[V3検証] ${pool.chain} ${pool.address.slice(0, 10)}…(${(pool.feeBps / 100).toFixed(2)}%): ` +
+        `最小の投入$${cappedAt}でも過大のため、この向きの価格表を捨てました(逆向きは残します)`
+      );
     }
+  } else if (lastOkAmountIn != null) {
+    // 全部通った。前に付けた制限があれば外す(流動性が改善した場合に戻せる)。
+    setTableTrustedMax(pool.chain, pool.address, true, null);
   }
 }
 
@@ -1641,7 +1684,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${formatBigLine()}${formatAaveLine()}${alertLine}`);
+  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${formatBigLine()}${formatAaveLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //

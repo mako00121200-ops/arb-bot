@@ -379,11 +379,54 @@ export function clearQuoteTable(chain, pool) {
   quoteTables.delete(tableKey(chain, pool, false));
 }
 
+/// 片方向だけ捨てる。**検証は片方向しか測っていない。**
+/// 測っていない向きまで巻き添えで消すと、確かめてもいない理由で
+/// プールが地図から消える(2026年9月21日に判明)。
+export function clearQuoteTableDirection(chain, pool, zeroForOne) {
+  quoteTables.delete(tableKey(chain, pool, zeroForOne));
+}
+
+// ===== 「ここまでなら信用できる」量(方向ごと)=====
+//
+// [なぜ捨てるのをやめたか(2026年9月21日の実測)]
+// 検証でずれが大きいと**価格表を丸ごと捨てて**いた。しかし:
+//
+//   ① 捨ててもずれは直らない。作り直しても同じ形の補間なので、また捨てる
+//      ことになる(堂々巡り)。その間、そのプールは地図から消えたままになる
+//   ② 消えている間、**そのプールを通る経路は1本も判定されない**
+//      (legIsUsable が価格表を要求するため)
+//
+// 実測では、捨てられた2件とも**$20では誤差20bps以内**で、
+// $200/$700 のずれだけで捨てられていた。**実際の取引額は$1〜30**なので、
+// 「使わない額での誤差」を理由に、使える額のプールを消していたことになる。
+//
+// 正しいのは、消すことではなく**信用できる範囲まで投入量を抑えること**。
+// その仕組み(routeMaxAmountIn → getTableRange().max)は既にある。
+const trustedMaxIn = new Map(); // tableKey -> BigInt
+
+/// 検証の結果を記録する。null を渡すと「制限なし」に戻す。
+export function setTableTrustedMax(chain, pool, zeroForOne, maxIn) {
+  const key = tableKey(chain, pool, zeroForOne);
+  if (maxIn == null) trustedMaxIn.delete(key);
+  else trustedMaxIn.set(key, maxIn);
+}
+
+export function getTableTrustedMax(chain, pool, zeroForOne) {
+  return trustedMaxIn.get(tableKey(chain, pool, zeroForOne)) ?? null;
+}
+
+export function getTrustedMaxCount() { return trustedMaxIn.size; }
+
 /// 価格表から受取量を求める。表に無い投入額は、最も近い2点から補間する。
 /// 表の範囲外(最大点より大きい)は判定に使わない(過大評価を避けるため)。
 export function quoteFromTable({ chain, pool, zeroForOne, amountIn }) {
   const t = quoteTables.get(tableKey(chain, pool, zeroForOne));
   if (!t || t.points.length === 0 || amountIn <= 0n) return 0n;
+  // 検証で「ここまでしか信用できない」と分かっている範囲では答えない。
+  // **小額の分岐より手前に置く。** 後ろに置くと、上限が最小点より小さい時に
+  // すり抜ける。
+  const trusted = trustedMaxIn.get(tableKey(chain, pool, zeroForOne));
+  if (trusted != null && amountIn > trusted) return 0n;
   const pts = t.points;
 
   // 最小点より小さい場合は、最小点の比率をそのまま使う(V3は小額なら線形)。
@@ -408,7 +451,12 @@ export function quoteFromTable({ chain, pool, zeroForOne, amountIn }) {
 export function getTableRange(chain, pool, zeroForOne) {
   const t = quoteTables.get(tableKey(chain, pool, zeroForOne));
   if (!t || t.points.length === 0) return null;
-  return { min: t.points[0].in, max: t.points[t.points.length - 1].in };
+  let max = t.points[t.points.length - 1].in;
+  // 検証で「ここまでしか信用できない」と分かっていれば、そこで頭を打つ。
+  const trusted = trustedMaxIn.get(tableKey(chain, pool, zeroForOne));
+  if (trusted != null && trusted < max) max = trusted;
+  if (max < t.points[0].in) return null; // 最小点すら信用できない
+  return { min: t.points[0].in, max };
 }
 
 /// 保存用に、いま持っている価格表を書き出す。
