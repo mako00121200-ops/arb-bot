@@ -57,6 +57,17 @@ const HIST_MAX_REQUESTS = parseInt(process.env.AAVE_HIST_MAX_REQUESTS || "6", 10
 const HIST_SIZE_SAMPLES = parseInt(process.env.AAVE_HIST_SIZE_SAMPLES || "3000", 10);
 /// 「清算した人」を何人ぶんまで覚えておくか。
 const HIST_MAX_LIQUIDATORS = parseInt(process.env.AAVE_HIST_MAX_LIQUIDATORS || "1000", 10);
+/// これ未満は「ごく少額」として小口と分けて数える。
+///
+/// [なぜ分けるか(2026年9月21日の実測)]
+/// optimism の初回集計が「$100未満 14件(100%) 中央$0.00」になった。
+/// 本当にダストばかりなのか、桁数か単価の読み違いで0に潰れているのかを、
+/// 合計した数字からは区別できない。**この「小口N%」が第2段に進むかを決める
+/// 数字なので、疑わしいものを小口に混ぜてはいけない。**
+/// 手数料が0bpsに見えた時(2026年9月20日)と同じ間違いを繰り返さない。
+const TINY_USD = Number(process.env.AAVE_TINY_USD || "0.01");
+/// 読み違いを見つけるため、1巡回あたり何件まで生の値をログに出すか。
+const HIST_SAMPLE_LOGS = parseInt(process.env.AAVE_HIST_SAMPLE_LOGS || "3", 10);
 /// 清算の実績を数えるか。false で止まる(名簿の方だけ動く)。
 const HIST_ENABLED = process.env.AAVE_HISTORY !== "false";
 /// 名簿に載せる人数の上限。これを超えたら古い順に捨てる。
@@ -359,7 +370,7 @@ async function refreshRoster(chain) {
   stats.rosterTotal = [...state.values()].reduce((n, v) => n + v.users.length, 0);
   if (added > 0 || requests > 0) {
     const backNote = st.backwardTo > 0
-      ? `。過去へ ${st.backwardTo.toLocaleString()} まで遡り済み(残り${(latest - st.backwardTo > 0 ? st.backwardTo : 0).toLocaleString()}ブロック 幅${chunkFor(key).toLocaleString()})`
+      ? `。過去へ ブロック${st.backwardTo.toLocaleString()} まで遡り済み(幅${chunkFor(key).toLocaleString()})`
       : "。**全期間を遡り終えました**";
     console.log(`[清算/名簿] ${chain}: 借り手 ${st.users.length.toLocaleString()}人(新規 ${added}人)。RPC ${requests}回${backNote}`);
   }
@@ -533,6 +544,7 @@ export async function scanLiquidationHistory(chain) {
   const records = found.map(decodeLiquidation).filter(Boolean);
   if (records.length > 0) {
     const known = await resolveAssets(chain, records.map((r) => r.debtAsset));
+    let samples = 0;
     for (const r of records) {
       hist.count++;
       hist.byLiquidator[r.liquidator] = (hist.byLiquidator[r.liquidator] || 0) + 1;
@@ -544,6 +556,17 @@ export async function scanLiquidationHistory(chain) {
       if (!Number.isFinite(usd)) { hist.unpriced++; continue; }
       hist.sumUsd += usd;
       hist.sizes.push(usd);
+
+      // **合計した数字が怪しい時に、何からできているかを見られるようにしておく。**
+      // ごく少額のものを優先して出す(潰れているなら、ここに出る)。
+      if (samples < HIST_SAMPLE_LOGS && (usd < TINY_USD || hist.sizes.length <= HIST_SAMPLE_LOGS)) {
+        samples++;
+        console.log(
+          `[清算/実績/内訳] ${chain} ブロック${r.block.toLocaleString()}: ` +
+          `${info.symbol || r.debtAsset.slice(0, 10)}(${info.decimals}桁 単価$${info.priceUsd.toFixed(4)}) ` +
+          `生の量 ${r.debtToCover.toString()} → $${usd < 0.01 ? usd.toFixed(6) : usd.toFixed(2)}`
+        );
+      }
     }
     if (hist.sizes.length > HIST_SIZE_SAMPLES) hist.sizes = hist.sizes.slice(-HIST_SIZE_SAMPLES);
     // 清算した人の記録も上限を付ける(保存ファイルが際限なく太らないように)。
@@ -575,7 +598,8 @@ async function reportHistory(chain, st, latest, requests, added) {
     return;
   }
 
-  const small = hist.sizes.filter((v) => v < 100).length;
+  const tiny = hist.sizes.filter((v) => v < TINY_USD).length;
+  const small = hist.sizes.filter((v) => v >= TINY_USD && v < 100).length;
   const mid = hist.sizes.filter((v) => v >= 100 && v < 1000).length;
   const large = hist.sizes.filter((v) => v >= 1000).length;
   const priced = hist.sizes.length || 1;
@@ -587,7 +611,8 @@ async function reportHistory(chain, st, latest, requests, added) {
   console.log(
     `[清算/実績] ${chain}: ${spanNote}で ${hist.count.toLocaleString()}件${doneNote}` +
     (perDay != null ? `(1日あたり${perDay.toFixed(1)}件)` : "") + `。新規${added}件。RPC ${requests}回\n` +
-    `  規模: $100未満 ${small}件(${((small / priced) * 100).toFixed(0)}%) / ` +
+    `  規模: ごく少額(<$${TINY_USD}) ${tiny}件 / ` +
+    `$${TINY_USD}〜100 ${small}件(${((small / priced) * 100).toFixed(0)}%) / ` +
     `$100〜1,000 ${mid}件 / $1,000超 ${large}件、中央$${median(hist.sizes).toFixed(2)}` +
     (hist.unpriced ? `(価格不明${hist.unpriced}件は除く)` : "") + `\n` +
     `  清算した人: ${tally.length}人、上位1者が${topShare.toFixed(0)}%` +
@@ -787,16 +812,17 @@ export function formatAaveLine() {
 
   // 実績(過去に実際に起きた清算)。**規模の分布がこの第1段の答えそのもの**なので、
   // 生存ログにも小口の割合まで出す。
-  let histCount = 0, histSmall = 0, histPriced = 0;
+  let histCount = 0, histSmall = 0, histTiny = 0, histPriced = 0;
   for (const v of state.values()) {
     const h = v.hist;
     if (!h) continue;
     histCount += h.count;
     histPriced += h.sizes.length;
-    histSmall += h.sizes.filter((x) => x < 100).length;
+    histTiny += h.sizes.filter((x) => x < TINY_USD).length;
+    histSmall += h.sizes.filter((x) => x >= TINY_USD && x < 100).length;
   }
   const histNote = histCount > 0
-    ? ` 実績${histCount.toLocaleString()}件${histPriced ? `(小口${Math.round((histSmall / histPriced) * 100)}%)` : ""}`
+    ? ` 実績${histCount.toLocaleString()}件${histPriced ? `(小口${Math.round((histSmall / histPriced) * 100)}% 極小${Math.round((histTiny / histPriced) * 100)}%)` : ""}`
     : "";
 
   return ` 清算[名簿${stats.rosterTotal.toLocaleString()} 見張り${watching} 見つけた${stats.found} 他者${stats.taken} 回復${stats.recovered}${histNote} RPC${stats.rpcCalls}${stats.errors ? ` 失敗${stats.errors}` : ""}]`;
