@@ -64,7 +64,15 @@ const PING_REQUEST_ID = 999;
 const SUBSCRIBE_REQUEST_ID_BASE = 100;
 // 確定前(Flashblocks)のイベントを**押し出しで**受け取る購読の id の範囲。
 // 確定後の "logs" の購読と区別するため、別の範囲にする。
-const PENDING_SUBSCRIBE_REQUEST_ID_BASE = 500;
+//
+// [2026年9月21日の不具合]
+// 最初 500 にしたところ、生存確認の ping(PING_REQUEST_ID = 999)の返事が
+// 「500以上」に当てはまり、**購読が成功したと誤認して定期取得を止めた**。
+// polygon / arbitrum / avalanche は Flashblocks の対象外で購読要求すら
+// 送っていないのに「押し出しで受け取ります」と出たのがその印。
+// ping より大きい値にし、さらに**上限も決めて範囲で判定する**。
+const PENDING_SUBSCRIBE_REQUEST_ID_BASE = 2000;
+const PENDING_SUBSCRIBE_REQUEST_ID_MAX = 2999;
 /// 確定前のイベントを押し出しで受け取るのを試すか。
 /// 端点が対応していなければ拒否されるので、その時は今までどおり取りに行く。
 const PENDING_PUSH = process.env.PENDING_PUSH !== "false";
@@ -363,8 +371,8 @@ function connectChain(chainName, wsUrl) {
         const msg = JSON.parse(event.data);
         if (msg.id !== undefined) {
           chainLastDataAt[chainName] = receivedAt;
-          // 確定前の押し出しの購読への返事。
-          if (msg.id >= PENDING_SUBSCRIBE_REQUEST_ID_BASE) {
+          // 確定前の押し出しの購読への返事。**範囲で判定する**(ping を拾わないため)。
+          if (msg.id >= PENDING_SUBSCRIBE_REQUEST_ID_BASE && msg.id <= PENDING_SUBSCRIBE_REQUEST_ID_MAX) {
             if (msg.error) {
               pendingSubError[chainName] = JSON.stringify(msg.error).slice(0, 120);
               const tried = pendingSubTry[chainName] ?? 0;
@@ -375,7 +383,8 @@ function connectChain(chainName, wsUrl) {
               } else {
                 console.log(`[Flashblocks/押し出し] ${chainName}: 対応していませんでした(${pendingSubError[chainName]})。今までどおり${FLASHBLOCKS_POLL_MS}msごとに取りに行きます`);
               }
-            } else if (msg.result) {
+            } else if (typeof msg.result === "string" && msg.result.length >= 18) {
+              // 購読IDは 0x + 32桁程度の十分に長い文字列。短い値(ブロック番号など)は拾わない。
               if (!pendingSubIds[chainName]) pendingSubIds[chainName] = new Set();
               pendingSubIds[chainName].add(msg.result);
               if (!pendingPushOk[chainName]) {
@@ -387,7 +396,7 @@ function connectChain(chainName, wsUrl) {
             }
             return;
           }
-          if (msg.id >= SUBSCRIBE_REQUEST_ID_BASE && msg.error) {
+          if (msg.id >= SUBSCRIBE_REQUEST_ID_BASE && msg.id < PING_REQUEST_ID && msg.error) {
             chainSubscribeErrors[chainName] = JSON.stringify(msg.error).slice(0, 120);
             console.warn(`[オンチェーン] ${chainName}: 購読が拒否されました: ${chainSubscribeErrors[chainName]}`);
           }
