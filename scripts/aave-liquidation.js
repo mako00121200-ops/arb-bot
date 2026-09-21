@@ -45,9 +45,20 @@ const AAVE_ENABLED = process.env.AAVE_ENABLED !== "false";
 
 // ===== RPC の上限(全部の入口に付ける)=====
 /// 名簿を伸ばす時、1回の巡回で投げる getLogs の上限。
-const MAX_LOG_REQUESTS = parseInt(process.env.AAVE_MAX_LOG_REQUESTS || "6", 10);
-/// getLogs 1回あたりのブロック数。端点の上限に当たらない範囲にする。
+const MAX_LOG_REQUESTS = parseInt(process.env.AAVE_MAX_LOG_REQUESTS || "10", 10);
+/// getLogs 1回あたりのブロック数の**出発点**。ここから実測で広げ縮めする。
 const LOG_CHUNK_BLOCKS = parseInt(process.env.AAVE_LOG_CHUNK_BLOCKS || "2000", 10);
+/// 読み取り幅の上下限。端点ごとに制限が違うので、決め打ちにしない。
+const LOG_CHUNK_MIN = parseInt(process.env.AAVE_LOG_CHUNK_MIN || "500", 10);
+const LOG_CHUNK_MAX = parseInt(process.env.AAVE_LOG_CHUNK_MAX || "50000", 10);
+/// 清算の実績を遡る時の、1回の巡回での読み取り回数の上限。
+const HIST_MAX_REQUESTS = parseInt(process.env.AAVE_HIST_MAX_REQUESTS || "6", 10);
+/// 中央値を出すために取っておく件数の上限(保存ファイルが太らないように)。
+const HIST_SIZE_SAMPLES = parseInt(process.env.AAVE_HIST_SIZE_SAMPLES || "3000", 10);
+/// 「清算した人」を何人ぶんまで覚えておくか。
+const HIST_MAX_LIQUIDATORS = parseInt(process.env.AAVE_HIST_MAX_LIQUIDATORS || "1000", 10);
+/// 清算の実績を数えるか。false で止まる(名簿の方だけ動く)。
+const HIST_ENABLED = process.env.AAVE_HISTORY !== "false";
 /// 名簿に載せる人数の上限。これを超えたら古い順に捨てる。
 const MAX_ROSTER = parseInt(process.env.AAVE_MAX_ROSTER || "5000", 10);
 /// 健全度を1回の束ねで何人ぶん読むか。
@@ -75,7 +86,7 @@ const ASSUMED_BONUS_BPS = parseInt(process.env.AAVE_ASSUMED_BONUS_BPS || "500", 
 /// Aave Pool は何年も前からあるので一度に全部は遡れない。毎回少しずつ伸ばし、
 /// **前へ追いつきながら後ろへも伸ばす**。第1段は「直近の借り手」から始まるので、
 /// 測った件数は**少なめに出る**ことを承知しておく。
-const BACKFILL_CHUNKS_PER_RUN = parseInt(process.env.AAVE_BACKFILL_CHUNKS || "2", 10);
+const BACKFILL_CHUNKS_PER_RUN = parseInt(process.env.AAVE_BACKFILL_CHUNKS || "4", 10);
 
 const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11";
 const MULTICALL3_ABI = [
@@ -89,6 +100,30 @@ const POOL_IFACE = new ethers.Interface([
 /// Borrow(address indexed reserve, address user, address indexed onBehalfOf,
 ///        uint256 amount, uint8 interestRateMode, uint256 borrowRate, uint16 indexed referralCode)
 const BORROW_TOPIC = "0xb3d084820fb1a9decffb176436bd02558d15fac9b0ddfed8c465bc7359d7dce0";
+
+/// Aave V3 の LiquidationCall。**実際に清算が起きた記録**。
+/// LiquidationCall(address indexed collateralAsset, address indexed debtAsset,
+///   address indexed user, uint256 debtToCover, uint256 liquidatedCollateralAmount,
+///   address liquidator, bool receiveAToken)
+/// 添字なしの4語が data に並ぶ: debtToCover / 受け取った担保 / 清算した人 / aToken受取
+/// (この topic0 は ethers.id() で計算して確かめた。思い込みで書いていない)
+const LIQUIDATION_TOPIC = "0xe413a321e8681d831f4dbccbca790d2952b56f977908e45be37335533e005286";
+
+/// 金額を USD に直すために使う。価格は **Aave 自身の価格オラクル**から取る
+/// (清算の判定に使われているのと同じ価格なので、他所から持ってくるより正しい)。
+const ADDRESSES_PROVIDER_IFACE = new ethers.Interface([
+  "function ADDRESSES_PROVIDER() view returns (address)",
+]);
+const PRICE_ORACLE_LOCATOR_IFACE = new ethers.Interface([
+  "function getPriceOracle() view returns (address)",
+]);
+const ORACLE_IFACE = new ethers.Interface([
+  "function getAssetPrice(address asset) view returns (uint256)",
+]);
+const ERC20_IFACE = new ethers.Interface([
+  "function decimals() view returns (uint8)",
+  "function symbol() view returns (string)",
+]);
 
 /// 名簿と進み具合の保存先。プール地図と同じ場所(ボリューム)に置く。
 const STATE_FILE = process.env.AAVE_STATE_FILE
@@ -107,7 +142,7 @@ const seenLiquidatable = new Map();
 
 const stats = {
   rosterTotal: 0, sweeps: 0, watchChecks: 0, found: 0, taken: 0, recovered: 0,
-  rpcCalls: 0, errors: 0, lastError: null, disabledChains: [],
+  rpcCalls: 0, errors: 0, lastError: null, disabledChains: [], shrinks: 0,
 };
 
 function loadState() {
@@ -119,6 +154,9 @@ function loadState() {
         users: Array.isArray(v.users) ? v.users : [],
         forwardFrom: Number(v.forwardFrom) || 0,
         backwardTo: Number(v.backwardTo) || 0,
+        histFrom: Number(v.histFrom) || 0,
+        histTo: Number(v.histTo) || 0,
+        hist: normalizeHist(v.hist),
       });
     }
   } catch (e) {
@@ -130,7 +168,10 @@ function saveState() {
   try {
     const chains = {};
     for (const [chain, v] of state.entries()) {
-      chains[chain] = { users: v.users, forwardFrom: v.forwardFrom, backwardTo: v.backwardTo };
+      chains[chain] = {
+        users: v.users, forwardFrom: v.forwardFrom, backwardTo: v.backwardTo,
+        histFrom: v.histFrom, histTo: v.histTo, hist: v.hist,
+      };
     }
     const tmp = STATE_FILE + ".tmp";
     fs.writeFileSync(tmp, JSON.stringify({ savedAt: new Date().toISOString(), chains }));
@@ -141,8 +182,30 @@ function saveState() {
 }
 
 function stateFor(chain) {
-  if (!state.has(chain)) state.set(chain, { users: [], forwardFrom: 0, backwardTo: 0 });
-  return state.get(chain);
+  if (!state.has(chain)) {
+    state.set(chain, { users: [], forwardFrom: 0, backwardTo: 0, histFrom: 0, histTo: 0, hist: emptyHist() });
+  }
+  const st = state.get(chain);
+  if (!st.hist) st.hist = emptyHist();
+  return st;
+}
+
+/// 清算の実績をためる入れ物。
+function emptyHist() {
+  return { count: 0, sumUsd: 0, sizes: [], byLiquidator: {}, oldestBlock: 0, newestBlock: 0, unpriced: 0 };
+}
+
+function normalizeHist(h) {
+  if (!h || typeof h !== "object") return emptyHist();
+  return {
+    count: Number(h.count) || 0,
+    sumUsd: Number(h.sumUsd) || 0,
+    sizes: Array.isArray(h.sizes) ? h.sizes.map(Number).filter((n) => Number.isFinite(n)).slice(-HIST_SIZE_SAMPLES) : [],
+    byLiquidator: (h.byLiquidator && typeof h.byLiquidator === "object") ? { ...h.byLiquidator } : {},
+    oldestBlock: Number(h.oldestBlock) || 0,
+    newestBlock: Number(h.newestBlock) || 0,
+    unpriced: Number(h.unpriced) || 0,
+  };
 }
 
 function poolFor(chain) {
@@ -159,6 +222,68 @@ function hfToNumber(hf) {
   // 借金が無い人は uint256 の最大値が返る。そのまま数にすると桁が溢れる。
   if (hf > 10n ** 30n) return Infinity;
   return Number(hf) / 1e18;
+}
+
+// ===== ログの読み取り幅を実測で合わせる =====
+//
+// [なぜ固定をやめたか(2026年9月21日の実測)]
+// 2,000ブロック固定で始めたところ、10分で4,000ブロックしか遡れず、
+// base の全期間(約4,920万ブロック)を遡るのに**約85日**かかる計算だった。
+// これでは「1〜3日測って判断する」が成立しない。
+// 端点が1回にどれだけ返せるかは端点ごとに違うので、**成功したら倍・
+// 断られたら半分**にして実測で合わせる。呼び出し回数は増えず、幅だけ広がる。
+
+/// 用途ごとの現在の読み取り幅。key は "チェーン:用途"。
+const chunkBlocks = new Map();
+
+function chunkFor(key) {
+  if (!chunkBlocks.has(key)) chunkBlocks.set(key, LOG_CHUNK_BLOCKS);
+  return chunkBlocks.get(key);
+}
+function growChunk(key) {
+  chunkBlocks.set(key, Math.min(LOG_CHUNK_MAX, Math.floor(chunkFor(key) * 2)));
+}
+function shrinkChunk(key) {
+  chunkBlocks.set(key, Math.max(LOG_CHUNK_MIN, Math.floor(chunkFor(key) / 2)));
+}
+
+/// 「幅が広すぎる」と断られた時の文言。端点ごとに違うので幅広く見る。
+/// **当てはまらない失敗は本当の失敗として数える**(通信障害を見逃さないため)。
+function isRangeRefusal(msg) {
+  const m = (msg || "").toLowerCase();
+  return m.includes("range") || m.includes("limit") || m.includes("too many")
+    || m.includes("exceed") || m.includes("too large") || m.includes("response size")
+    || m.includes("-32005") || m.includes("query timeout");
+}
+
+/// getLogs を1回投げる。断られたら幅を縮めて **null** を返す(呼ぶ側が狭めて再挑戦)。
+/// 成功したら幅を広げる。どちらも次回以降に効く。
+async function tryGetLogs(chain, key, params, fromBlock, toBlock) {
+  if (fromBlock > toBlock) return [];
+  const span = toBlock - fromBlock + 1;
+  stats.rpcCalls++;
+  try {
+    const logs = await callWithRpc(chain, (p) => p.send("eth_getLogs", [{
+      ...params,
+      fromBlock: "0x" + fromBlock.toString(16),
+      toBlock: "0x" + toBlock.toString(16),
+    }]));
+    // **今の幅いっぱいを読めた時だけ広げる。**
+    // 追いつき済みで数百ブロックしか読んでいない成功を「余裕がある証拠」にすると、
+    // 実力より広い幅まで育ってしまい、次の遡りで無駄に断られる。
+    if (span >= chunkFor(key)) growChunk(key);
+    return logs || [];
+  } catch (e) {
+    const msg = (e.message || "").slice(0, 120);
+    shrinkChunk(key);
+    if (isRangeRefusal(msg)) {
+      stats.shrinks++;  // 想定内。幅を合わせている最中
+    } else {
+      stats.errors++;
+      stats.lastError = msg.slice(0, 80);
+    }
+    return null;
+  }
 }
 
 // ===== ① 借り手の名簿を伸ばす =====
@@ -188,43 +313,43 @@ async function refreshRoster(chain) {
 
   const before = st.users.length;
   const known = new Set(st.users);
+  const key = `${chain}:roster`;
+  const params = { address: pool, topics: [BORROW_TOPIC] };
   let requests = 0;
 
-  const collect = async (fromBlock, toBlock) => {
-    if (requests >= MAX_LOG_REQUESTS || fromBlock > toBlock) return false;
-    requests++;
-    stats.rpcCalls++;
-    const logs = await callWithRpc(chain, (p) => p.send("eth_getLogs", [{
-      address: pool,
-      topics: [BORROW_TOPIC],
-      fromBlock: "0x" + fromBlock.toString(16),
-      toBlock: "0x" + toBlock.toString(16),
-    }]));
-    for (const log of logs || []) {
+  const absorb = (logs) => {
+    for (const log of logs) {
       // topics[2] が onBehalfOf。32バイトの右端20バイトが住所。
       const t = log?.topics?.[2];
       if (typeof t !== "string" || t.length < 66) continue;
       const addr = ethers.getAddress("0x" + t.slice(26));
       if (!known.has(addr)) { known.add(addr); st.users.push(addr); }
     }
-    return true;
   };
 
-  try {
-    // 前へ追いつく(新しく借りた人を拾う)。
-    while (st.forwardFrom < latest && requests < MAX_LOG_REQUESTS) {
-      const to = Math.min(latest, st.forwardFrom + LOG_CHUNK_BLOCKS - 1);
-      if (!(await collect(st.forwardFrom, to))) break;
-      st.forwardFrom = to + 1;
-    }
-    // 後ろへ伸ばす(昔から借りている人を拾う)。
-    for (let i = 0; i < BACKFILL_CHUNKS_PER_RUN && st.backwardTo > 0 && requests < MAX_LOG_REQUESTS; i++) {
-      const from = Math.max(0, st.backwardTo - LOG_CHUNK_BLOCKS);
-      if (!(await collect(from, st.backwardTo - 1))) break;
-      st.backwardTo = from;
-    }
-  } catch (e) {
-    stats.errors++; stats.lastError = (e.message || "").slice(0, 80);
+  // 前へ追いつく(新しく借りた人を拾う)。
+  // **後ろへ伸ばす枠を必ず残す。** 前へ追いつく処理に全部の予算を食わせると、
+  // 遅れを取り戻している間じゅう遡りが1ブロックも進まない
+  // (今回直した「名簿が完成しない」のと同じ形の詰まりになる)。
+  const forwardBudget = Math.max(1, MAX_LOG_REQUESTS - BACKFILL_CHUNKS_PER_RUN);
+  while (st.forwardFrom <= latest && requests < forwardBudget) {
+    const to = Math.min(latest, st.forwardFrom + chunkFor(key) - 1);
+    requests++;
+    const logs = await tryGetLogs(chain, key, params, st.forwardFrom, to);
+    if (logs === null) continue; // 幅を縮めて次の回で狭く読み直す
+    absorb(logs);
+    st.forwardFrom = to + 1;
+  }
+  // 後ろへ伸ばす(昔から借りている人を拾う)。
+  let backDone = 0;
+  while (backDone < BACKFILL_CHUNKS_PER_RUN && st.backwardTo > 0 && requests < MAX_LOG_REQUESTS) {
+    const from = Math.max(0, st.backwardTo - chunkFor(key));
+    requests++;
+    const logs = await tryGetLogs(chain, key, params, from, st.backwardTo - 1);
+    if (logs === null) continue;
+    absorb(logs);
+    st.backwardTo = from;
+    backDone++;
   }
 
   // 人数の上限。古い順(名簿の先頭)から捨てる。
@@ -233,9 +358,242 @@ async function refreshRoster(chain) {
   const added = st.users.length - before;
   stats.rosterTotal = [...state.values()].reduce((n, v) => n + v.users.length, 0);
   if (added > 0 || requests > 0) {
-    const backNote = st.backwardTo > 0 ? `。過去へ ${st.backwardTo} まで遡り済み` : "。全期間を遡り終えました";
+    const backNote = st.backwardTo > 0
+      ? `。過去へ ${st.backwardTo.toLocaleString()} まで遡り済み(残り${(latest - st.backwardTo > 0 ? st.backwardTo : 0).toLocaleString()}ブロック 幅${chunkFor(key).toLocaleString()})`
+      : "。**全期間を遡り終えました**";
     console.log(`[清算/名簿] ${chain}: 借り手 ${st.users.length.toLocaleString()}人(新規 ${added}人)。RPC ${requests}回${backNote}`);
   }
+}
+
+// ===== ①-2 実際に起きた清算を数える(名簿に頼らない測り方)=====
+//
+// [なぜこれを足したか(2026年9月21日)]
+// 名簿から「これから清算できそうな人」を探す作りは、名簿が完成するまで答えが出ない。
+// 実測では base で約85日かかる見込みだった。**「1〜3日測って決める」に間に合わない。**
+//
+// 一方 LiquidationCall は「**実際に起きた清算**」の記録で、滅多に起きないぶん
+// 1回の読み取りで何十万ブロックも見られる。第1段の問いにそのまま答えが出る。
+//   ① どれくらいの頻度で起きているか
+//   ② 規模はいくらか(= 小口は本当にあるのか)
+//   ③ 誰が取っているか(= 小口まで専業が押さえているのか)
+// 「小口は放置されている」は外部の研究からの**推定**でしかなかった。
+// ここを実績の分布で置き換える。
+
+/// chain -> 価格オラクルの住所(null は取れなかった)
+const oracleFor = new Map();
+/// chain -> Map(資産 -> { decimals, symbol, priceUsd })
+const assetInfo = new Map();
+/// chain -> { block, ts } いちばん古く読めたブロックの時刻(何日ぶん読めたかの計算用)
+const oldestTs = new Map();
+
+/// Aave の価格オラクルを Pool からたどる。**住所を決め打ちしない。**
+async function ensureOracle(chain) {
+  if (oracleFor.has(chain)) return oracleFor.get(chain);
+  let oracle = null;
+  try {
+    stats.rpcCalls++;
+    const r1 = await callWithRpc(chain, (p) => p.call({
+      to: poolFor(chain),
+      data: ADDRESSES_PROVIDER_IFACE.encodeFunctionData("ADDRESSES_PROVIDER"),
+    }));
+    const provider = ADDRESSES_PROVIDER_IFACE.decodeFunctionResult("ADDRESSES_PROVIDER", r1)[0];
+    stats.rpcCalls++;
+    const r2 = await callWithRpc(chain, (p) => p.call({
+      to: provider,
+      data: PRICE_ORACLE_LOCATOR_IFACE.encodeFunctionData("getPriceOracle"),
+    }));
+    oracle = PRICE_ORACLE_LOCATOR_IFACE.decodeFunctionResult("getPriceOracle", r2)[0];
+    console.log(`[清算] ${chain}: 価格オラクル ${oracle} を Pool からたどりました`);
+  } catch (e) {
+    stats.errors++; stats.lastError = (e.message || "").slice(0, 80);
+    console.warn(`[清算] ${chain}: 価格オラクルをたどれません(${(e.message || "").slice(0, 60)})。金額は数えません`);
+  }
+  oracleFor.set(chain, oracle);
+  return oracle;
+}
+
+/// 資産の桁数・記号・価格をまとめて読む。**1資産につき1回だけ**。
+async function resolveAssets(chain, addrs) {
+  if (!assetInfo.has(chain)) assetInfo.set(chain, new Map());
+  const known = assetInfo.get(chain);
+  const missing = [...new Set(addrs)].filter((a) => !known.has(a));
+  if (missing.length === 0) return known;
+
+  const oracle = await ensureOracle(chain);
+  const per = oracle ? 3 : 2;
+  const calls = [];
+  for (const a of missing) {
+    calls.push({ target: a, allowFailure: true, callData: ERC20_IFACE.encodeFunctionData("decimals") });
+    calls.push({ target: a, allowFailure: true, callData: ERC20_IFACE.encodeFunctionData("symbol") });
+    if (oracle) calls.push({ target: oracle, allowFailure: true, callData: ORACLE_IFACE.encodeFunctionData("getAssetPrice", [a]) });
+  }
+  try {
+    stats.rpcCalls++;
+    const ret = await callWithRpc(chain, (p) =>
+      new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, p).aggregate3(calls));
+    for (let i = 0; i < missing.length; i++) {
+      let decimals = null, symbol = "", priceUsd = null;
+      const d = ret[i * per], sy = ret[i * per + 1], pr = oracle ? ret[i * per + 2] : null;
+      try { if (d?.success) decimals = Number(ERC20_IFACE.decodeFunctionResult("decimals", d.returnData)[0]); } catch (e2) {}
+      try { if (sy?.success) symbol = String(ERC20_IFACE.decodeFunctionResult("symbol", sy.returnData)[0]).slice(0, 12); } catch (e2) {}
+      try { if (pr?.success) priceUsd = baseToUsd(ORACLE_IFACE.decodeFunctionResult("getAssetPrice", pr.returnData)[0]); } catch (e2) {}
+      known.set(missing[i], { decimals, symbol, priceUsd });
+    }
+  } catch (e) {
+    stats.errors++; stats.lastError = (e.message || "").slice(0, 80);
+  }
+  return known;
+}
+
+/// いちばん古く読めたブロックが何日前かを返す(読めなければ null)。
+async function daysSinceBlock(chain, block) {
+  const cached = oldestTs.get(chain);
+  if (cached && cached.block === block) return (Date.now() / 1000 - cached.ts) / 86400;
+  try {
+    stats.rpcCalls++;
+    const b = await callWithRpc(chain, (p) => p.getBlock(block));
+    if (!b) return null;
+    oldestTs.set(chain, { block, ts: Number(b.timestamp) });
+    return (Date.now() / 1000 - Number(b.timestamp)) / 86400;
+  } catch (e) {
+    return null;
+  }
+}
+
+/// LiquidationCall を1件ぶん読み解く。data は添字なしの4語。
+function decodeLiquidation(log) {
+  const t = log?.topics;
+  const data = log?.data;
+  if (!Array.isArray(t) || t.length < 4 || typeof data !== "string" || data.length < 2 + 64 * 4) return null;
+  try {
+    return {
+      block: Number(log.blockNumber),
+      collateralAsset: ethers.getAddress("0x" + t[1].slice(26)),
+      debtAsset: ethers.getAddress("0x" + t[2].slice(26)),
+      user: ethers.getAddress("0x" + t[3].slice(26)),
+      debtToCover: BigInt("0x" + data.slice(2, 66)),
+      liquidator: ethers.getAddress("0x" + data.slice(2 + 64 * 2 + 24, 2 + 64 * 3)),
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+function median(arr) {
+  if (arr.length === 0) return 0;
+  const a = [...arr].sort((x, y) => x - y);
+  const m = Math.floor(a.length / 2);
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+}
+
+/// 清算の実績を遡って数える。前へ(新しい清算)と後ろへ(過去)を両方進める。
+export async function scanLiquidationHistory(chain) {
+  if (!HIST_ENABLED) return;
+  const pool = poolFor(chain);
+  if (!pool) return;
+  const st = stateFor(chain);
+
+  let latest;
+  try {
+    latest = await callWithRpc(chain, (p) => p.getBlockNumber());
+    stats.rpcCalls++;
+  } catch (e) {
+    stats.errors++; stats.lastError = (e.message || "").slice(0, 80);
+    return;
+  }
+  if (!st.histFrom) { st.histFrom = latest; st.histTo = latest; }
+
+  const key = `${chain}:hist`;
+  const params = { address: pool, topics: [LIQUIDATION_TOPIC] };
+  let requests = 0;
+  const found = [];
+
+  // 前へ(新しく起きた清算を拾う)。こちらも遡る枠を必ず残す。
+  const histForwardBudget = Math.max(1, Math.floor(HIST_MAX_REQUESTS / 3));
+  while (st.histFrom <= latest && requests < histForwardBudget) {
+    const to = Math.min(latest, st.histFrom + chunkFor(key) - 1);
+    requests++;
+    const logs = await tryGetLogs(chain, key, params, st.histFrom, to);
+    if (logs === null) continue;
+    found.push(...logs);
+    st.histFrom = to + 1;
+  }
+  // 後ろへ(過去の清算を掘る)。
+  while (st.histTo > 0 && requests < HIST_MAX_REQUESTS) {
+    const from = Math.max(0, st.histTo - chunkFor(key));
+    requests++;
+    const logs = await tryGetLogs(chain, key, params, from, st.histTo - 1);
+    if (logs === null) continue;
+    found.push(...logs);
+    st.histTo = from;
+  }
+  if (requests === 0) return;
+
+  const hist = st.hist;
+  const records = found.map(decodeLiquidation).filter(Boolean);
+  if (records.length > 0) {
+    const known = await resolveAssets(chain, records.map((r) => r.debtAsset));
+    for (const r of records) {
+      hist.count++;
+      hist.byLiquidator[r.liquidator] = (hist.byLiquidator[r.liquidator] || 0) + 1;
+      if (!hist.oldestBlock || r.block < hist.oldestBlock) hist.oldestBlock = r.block;
+      if (r.block > hist.newestBlock) hist.newestBlock = r.block;
+      const info = known.get(r.debtAsset);
+      if (!info || info.decimals == null || info.priceUsd == null) { hist.unpriced++; continue; }
+      const usd = (Number(r.debtToCover) / 10 ** info.decimals) * info.priceUsd;
+      if (!Number.isFinite(usd)) { hist.unpriced++; continue; }
+      hist.sumUsd += usd;
+      hist.sizes.push(usd);
+    }
+    if (hist.sizes.length > HIST_SIZE_SAMPLES) hist.sizes = hist.sizes.slice(-HIST_SIZE_SAMPLES);
+    // 清算した人の記録も上限を付ける(保存ファイルが際限なく太らないように)。
+    // 実際は多くても数百人なので、まず当たらない歯止め。
+    const names = Object.keys(hist.byLiquidator);
+    if (names.length > HIST_MAX_LIQUIDATORS) {
+      const top = names.sort((a, b) => hist.byLiquidator[b] - hist.byLiquidator[a]).slice(0, HIST_MAX_LIQUIDATORS);
+      const kept = {};
+      for (const n of top) kept[n] = hist.byLiquidator[n];
+      hist.byLiquidator = kept;
+    }
+  }
+
+  await reportHistory(chain, st, latest, requests, records.length);
+}
+
+/// 数えた結果を1行で出す。**規模の分布と、誰が取っているかが要**。
+async function reportHistory(chain, st, latest, requests, added) {
+  const hist = st.hist;
+  // 全期間を読み終えた後は、Aave が無かった時期まで日数に入れないよう
+  // 「最初に見つけた清算」を起点にする。
+  const spanBlock = st.histTo > 0 ? st.histTo : (hist.oldestBlock || 0);
+  const days = await daysSinceBlock(chain, spanBlock);
+  const spanNote = days != null ? `約${days.toFixed(1)}日ぶん` : `ブロック${spanBlock.toLocaleString()}まで`;
+  const doneNote = st.histTo > 0 ? "" : "(**全期間を読み終えました**)";
+
+  if (hist.count === 0) {
+    console.log(`[清算/実績] ${chain}: ${spanNote}を読んで清算 0件${doneNote}。RPC ${requests}回 幅${chunkFor(`${chain}:hist`).toLocaleString()}`);
+    return;
+  }
+
+  const small = hist.sizes.filter((v) => v < 100).length;
+  const mid = hist.sizes.filter((v) => v >= 100 && v < 1000).length;
+  const large = hist.sizes.filter((v) => v >= 1000).length;
+  const priced = hist.sizes.length || 1;
+  const perDay = days && days > 0 ? hist.count / days : null;
+
+  const tally = Object.entries(hist.byLiquidator).sort((a, b) => b[1] - a[1]);
+  const topShare = tally.length ? (tally[0][1] / hist.count) * 100 : 0;
+
+  console.log(
+    `[清算/実績] ${chain}: ${spanNote}で ${hist.count.toLocaleString()}件${doneNote}` +
+    (perDay != null ? `(1日あたり${perDay.toFixed(1)}件)` : "") + `。新規${added}件。RPC ${requests}回\n` +
+    `  規模: $100未満 ${small}件(${((small / priced) * 100).toFixed(0)}%) / ` +
+    `$100〜1,000 ${mid}件 / $1,000超 ${large}件、中央$${median(hist.sizes).toFixed(2)}` +
+    (hist.unpriced ? `(価格不明${hist.unpriced}件は除く)` : "") + `\n` +
+    `  清算した人: ${tally.length}人、上位1者が${topShare.toFixed(0)}%` +
+    (tally.length ? `(${tally[0][0].slice(0, 10)}… ${tally[0][1]}件)` : "") +
+    `。※金額は**現在の価格**での換算(ステーブルの借金なら正確、変動資産は目安)`
+  );
 }
 
 // ===== ② 健全度を測る =====
@@ -405,6 +763,7 @@ export async function sweepAll() {
     try {
       await refreshRoster(chain);
       await sweepChain(chain);
+      await scanLiquidationHistory(chain);
     } catch (e) {
       stats.errors++; stats.lastError = (e.message || "").slice(0, 80);
     }
@@ -425,7 +784,22 @@ export async function checkWatchAll() {
 export function formatAaveLine() {
   if (verifiedChains.length === 0) return "";
   const watching = [...watchList.values()].reduce((n, m) => n + m.size, 0);
-  return ` 清算[名簿${stats.rosterTotal.toLocaleString()} 見張り${watching} 見つけた${stats.found} 他者${stats.taken} 回復${stats.recovered} RPC${stats.rpcCalls}${stats.errors ? ` 失敗${stats.errors}` : ""}]`;
+
+  // 実績(過去に実際に起きた清算)。**規模の分布がこの第1段の答えそのもの**なので、
+  // 生存ログにも小口の割合まで出す。
+  let histCount = 0, histSmall = 0, histPriced = 0;
+  for (const v of state.values()) {
+    const h = v.hist;
+    if (!h) continue;
+    histCount += h.count;
+    histPriced += h.sizes.length;
+    histSmall += h.sizes.filter((x) => x < 100).length;
+  }
+  const histNote = histCount > 0
+    ? ` 実績${histCount.toLocaleString()}件${histPriced ? `(小口${Math.round((histSmall / histPriced) * 100)}%)` : ""}`
+    : "";
+
+  return ` 清算[名簿${stats.rosterTotal.toLocaleString()} 見張り${watching} 見つけた${stats.found} 他者${stats.taken} 回復${stats.recovered}${histNote} RPC${stats.rpcCalls}${stats.errors ? ` 失敗${stats.errors}` : ""}]`;
 }
 
 export function getAaveStats() {
