@@ -1706,6 +1706,21 @@ async function probeFeesGradually() {
     if (!pool) return;
     try {
       const fee = await probePoolFeeBps({ chain, pairAddress: address, tokenInAddress: pool.token0, reserveIn: pool.raw0, reserveOut: pool.raw1 });
+      // **取引の記録から測れないなら、プールと工場に直接聞く。**
+      //
+      // [なぜ(2026年9月21日、生存ログに出して初めて見えた)]
+      //   手数料実測[判明4(30bps以外3) **取引なしで保留42** 疑わしい1 失敗0]
+      // 42プールが「直近の取引が無い」という理由で測れないまま、
+      // 安全側の既定(45bps)を使い続けていた。
+      // **直近の取引が無くても、工場は手数料を知っている。**
+      // 直読みの仕組みは既に作ってあったのに、K検算で拒否された時しか
+      // 呼んでいなかった。「作ったのに使っていない」の一種。
+      if (fee == null) {
+        const key = poolKeyOf(chain, address);
+        if (!feeFixDone.has(key) && !feeFixQueue.has(key)) {
+          feeFixQueue.set(key, { chain, address });
+        }
+      }
       if (fee != null) {
         if (fee !== 30) setPoolFee(chain, address, fee);
         pool.feeProbed = true;
