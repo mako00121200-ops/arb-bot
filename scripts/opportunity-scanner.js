@@ -36,7 +36,7 @@ import {
   getTokenDecimals, getTokenPriceUsd, getPool, hasUsableState, clearFeeProbed,
   KIND_V2, KIND_V3,
 } from "./pool-registry.js";
-import { quoteFromTable, hasQuoteTable, getTableRange } from "./v3-pools.js";
+import { quoteFromTable, hasQuoteTable, getTableRange, getTableTrustedMax } from "./v3-pools.js";
 // 最低利益は**チェーンごと**(ガス代が25倍違うため)。
 import { screenMinProfitUsd } from "./min-profit.js";
 
@@ -317,16 +317,54 @@ const WHATIF_DROPS = (process.env.WHATIF_WALL_DROPS || "29,50,100")
 //   ・最適額が「使える上限」の何%か(小さいほど浅い)
 //   ・最適額の4倍にすると利益が何%になるか(高いほど余裕がある)
 //   ・上限に張り付いた回数(こちらの都合で切られている証拠)
+//
+// [比率だけでは足りなかった(2026年9月21日)]
+// 「最適は上限の0.03%」は比率しか答えない。上限(cap)そのものが
+//   ・取引上限($500)
+//   ・価格表の最大点($2,000ぶん)
+//   ・検証で付けた信用できる上限(trustedMax)
+// のどれで決まっているのかが分からないため、**上限を上げれば増えるのか、
+// 上げても無駄なのか**を判断できなかった。
+// さらにこの中央値は「粗利がプラスになった全経路」のもので、その大半は
+// 送信まで行かない極薄の経路。**実際に送る経路の取引量**は別に測る。
+// RPCは1回も増えない(findBestAmount がすでに計算した値を数えるだけ)。
 const SIZE_SAMPLES_MAX = 600;
-const sizeCurve = { bestPct: [], at4xPct: [] };
+const sizeCurve = {
+  bestPct: [], at4xPct: [],
+  bestUsd: [], capUsd: [],          // 絶対額
+  sentBestUsd: [], sentBestPct: [], // 送信の下限を通った経路だけ
+  capSource: { tradeCap: 0, table: 0, trusted: 0 },
+};
 
-function noteSizeCurve(best, cap, at4) {
-  if (cap <= 0n || best.amountIn <= 0n || best.profit <= 0n) return;
-  sizeCurve.bestPct.push(Number((best.amountIn * 10000n) / cap) / 100);
-  if (at4) sizeCurve.at4xPct.push(Number((at4.profit * 1000n) / best.profit) / 10);
-  // 増え続けないように、古い方から間引く。
-  for (const arr of [sizeCurve.bestPct, sizeCurve.at4xPct]) {
-    if (arr.length > SIZE_SAMPLES_MAX) arr.splice(0, arr.length - SIZE_SAMPLES_MAX);
+/// 増え続けないように、古い方から間引きながら足す。
+function pushCapped(arr, v) {
+  if (!Number.isFinite(v)) return;
+  arr.push(v);
+  if (arr.length > SIZE_SAMPLES_MAX) arr.splice(0, arr.length - SIZE_SAMPLES_MAX);
+}
+
+function noteSizeCurve({ best, cap, at4, maxAmountIn, firstLeg, bestUsd, capUsd, profitable }) {
+  if (cap == null || cap <= 0n || best.amountIn <= 0n || best.profit <= 0n) return;
+  const pct = Number((best.amountIn * 10000n) / cap) / 100;
+  pushCapped(sizeCurve.bestPct, pct);
+  if (at4) pushCapped(sizeCurve.at4xPct, Number((at4.profit * 1000n) / best.profit) / 10);
+  if (bestUsd != null) pushCapped(sizeCurve.bestUsd, bestUsd);
+  if (capUsd != null) pushCapped(sizeCurve.capUsd, capUsd);
+  // **実際に送る経路だけ**の取引量。全体の中央値が極薄の経路に
+  // 引きずられているだけなのかを、これで見分ける。
+  if (profitable) {
+    pushCapped(sizeCurve.sentBestPct, pct);
+    if (bestUsd != null) pushCapped(sizeCurve.sentBestUsd, bestUsd);
+  }
+  // 上限が何で決まったか。cap が取引上限ぶんに届いていれば取引上限が効いている。
+  if (maxAmountIn != null && cap >= maxAmountIn) {
+    sizeCurve.capSource.tradeCap++;
+  } else if (firstLeg && firstLeg.kind === KIND_V3) {
+    const trusted = getTableTrustedMax(firstLeg.chain, firstLeg.pool, firstLeg.zeroForOne);
+    if (trusted != null && trusted <= cap) sizeCurve.capSource.trusted++;
+    else sizeCurve.capSource.table++;
+  } else {
+    sizeCurve.capSource.table++;
   }
 }
 
@@ -342,6 +380,12 @@ export function getSizeCurveStats() {
     samples: sizeCurve.bestPct.length,
     bestPctMedian: medianOf(sizeCurve.bestPct),
     at4xPctMedian: medianOf(sizeCurve.at4xPct),
+    bestUsdMedian: medianOf(sizeCurve.bestUsd),
+    capUsdMedian: medianOf(sizeCurve.capUsd),
+    sentSamples: sizeCurve.sentBestPct.length,
+    sentBestUsdMedian: medianOf(sizeCurve.sentBestUsd),
+    sentBestPctMedian: medianOf(sizeCurve.sentBestPct),
+    capSource: { ...sizeCurve.capSource },
     hitCap: routeCalcStats.hitCap,
   };
 }
@@ -404,17 +448,17 @@ function findBestAmount(maxAmountIn, legs) {
   // 一番良かった額が上限のすぐ下なら、上限で切られていた可能性がある。
   if (best.amountIn > 0n && best.amountIn * 100n >= cap * 95n) routeCalcStats.hitCap++;
   // **捨てていた値で「もっと大きく入れられるか」を測る。**
-  // 最適額の4倍以上を試した中で、いちばん4倍に近いものと比べる。
+  // 最適額の4倍以上を試した中で、いちばん4倍に近いものを選んでおく。
+  // 記録そのものは finalize 側で行う(チェーン・トークン・純利益が要るため)。
+  let at4 = null;
   if (best.profit > 0n) {
     const target = best.amountIn * 4n;
-    let at4 = null;
     for (const e of evals) {
       if (e.amountIn < target) continue;
       if (at4 == null || e.amountIn < at4.amountIn) at4 = e;
     }
-    noteSizeCurve(best, cap, at4);
   }
-  return { ...best, returnBps: bestReturnBps, whatIf };
+  return { ...best, returnBps: bestReturnBps, whatIf, cap, at4 };
 }
 
 function maxAmountFromUsd(chain, token, capUsd) {
@@ -1094,6 +1138,15 @@ function finalize({ chain, tokenA, legs, maxAmountIn, gasCostUsd, label, kind, p
   const grossProfitUsd = toNumber(best.profit) * priceUsd;
   const netProfitUsd = grossProfitUsd - gasCostUsd;
   const hasV3 = legs.some((l) => l.kind === KIND_V3);
+
+  // **取引量の余裕を測る(計測のみ。判定には一切影響しない)。**
+  // ここまで来れば桁数も価格も揃っているので、比率ではなく金額で残せる。
+  noteSizeCurve({
+    best, cap: best.cap, at4: best.at4, maxAmountIn, firstLeg: legs[0],
+    bestUsd: tradeAmountUsd,
+    capUsd: best.cap != null && best.cap > 0n ? toNumber(best.cap) * priceUsd : null,
+    profitable: netProfitUsd > 0,
+  });
 
   // 段ごとに「いくら入れて、いくら返ると見込んだか」を残す。
   //

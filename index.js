@@ -2319,7 +2319,15 @@ function sizeLine() {
   if (!s.samples) return "";
   const best = s.bestPctMedian != null ? `${s.bestPctMedian.toFixed(2)}%` : "-";
   const at4 = s.at4xPctMedian != null ? `${s.at4xPctMedian.toFixed(0)}%` : "測定なし";
-  return ` 取引量[最適は上限の${best} 4倍で利益${at4} 上限張付${s.hitCap.toLocaleString()} 標本${s.samples}]`;
+  // 比率だけでは「上限$500が効いているのか、価格表の$2,000が効いているのか」
+  // が分からない。金額と出どころ、そして**実際に送る経路だけの取引量**を出す。
+  const usd = s.bestUsdMedian != null ? `$${s.bestUsdMedian.toFixed(2)}` : "-";
+  const capUsd = s.capUsdMedian != null ? `$${s.capUsdMedian.toFixed(0)}` : "-";
+  const c = s.capSource || { tradeCap: 0, table: 0, trusted: 0 };
+  const sent = s.sentSamples > 0
+    ? `送る経路${s.sentBestUsdMedian != null ? `$${s.sentBestUsdMedian.toFixed(2)}` : "-"}(上限の${s.sentBestPctMedian != null ? s.sentBestPctMedian.toFixed(2) : "-"}% 標本${s.sentSamples})`
+    : "送る経路まだ0件";
+  return ` 取引量[最適${usd}=上限の${best} 上限${capUsd} 出どころ 取引上限${c.tradeCap.toLocaleString()}/価格表${c.table.toLocaleString()}/検証${c.trusted.toLocaleString()} 4倍で利益${at4} 上限張付${s.hitCap.toLocaleString()} 標本${s.samples} ${sent}]`;
 }
 
 function shortenLabel(label) {
