@@ -32,6 +32,8 @@ const ALERT_MAX_PER_DAY = parseInt(process.env.ALERT_MAX_PER_DAY || "10", 10);
 const ALERT_ENABLED = process.env.ALERT_ENABLED !== "false";
 
 const lastSentAt = new Map(); // key -> ms
+/// この起動中に一度ログへ出した質問の id(同じ文面を流し続けないため)。
+const loggedQuestionIds = new Set();
 let sentToday = 0;
 let todayStamp = new Date().toISOString().slice(0, 10);
 const stats = { sent: 0, skippedCooldown: 0, skippedCap: 0, errors: 0, lastError: null };
@@ -54,12 +56,13 @@ function rollDayIfNeeded() {
 /// @param title 1行の見出し。例 "ガス残高が足りません"
 /// @param body  詳しい内容。何をすればよいかまで書く
 /// @returns 送ったら true
-export async function alertOwner(key, title, body) {
+export async function alertOwner(key, title, body, { quiet = false } = {}) {
   if (!ALERT_ENABLED) return false;
   rollDayIfNeeded();
 
   // 送れる状態かに関わらず、まずログに残す(設定前でも見落とさないため)。
-  console.warn(`[要判断] ${title} / ${body}`);
+  // quiet は「同じ文面を繰り返し流さない」ための指定(質問の再試行など)。
+  if (!quiet) console.warn(`[要判断] ${title} / ${body}`);
 
   if (!isConfigured()) return false;
 
@@ -174,12 +177,23 @@ export async function sendPendingQuestions() {
   for (const q of list) {
     const id = String(q?.id || "").trim();
     if (!id || sent.has(id)) continue;
+    // **片付いた質問は送らない**(2026年9月21日に実際の不具合で判明)。
+    //
+    // Base の再デプロイの依頼を入れた直後に、オーナーが再デプロイしてくれた。
+    // ところが LINE が未設定で「未送信」のままだったため、**解決済みの依頼が
+    // 10分ごとに再試行され続けた**。このまま LINE を設定すれば、済んだことの
+    // 依頼がいきなり届く。誤報は1通でも通知の信用を落とす。
+    // 質問は経緯を残すために消さないので、片付いた印を付けて飛ばす。
+    if (q?.resolved) continue;
     const title = String(q?.title || "Claudeからの質問").slice(0, 200);
     const body = String(q?.body || "").slice(0, 4000);
 
     // 用件ごとの冷却は使わない(id が違えば別の質問なので)。
     // 送れなかった場合は記録せず、次の機会に再試行する。
-    const ok = await alertOwner(`question:${id}`, `判断をお願いします: ${title}`, body);
+    // ただしログは1回だけにする(10分ごとに同じ文面が流れると、他が読めない)。
+    const quiet = loggedQuestionIds.has(id);
+    loggedQuestionIds.add(id);
+    const ok = await alertOwner(`question:${id}`, `判断をお願いします: ${title}`, body, { quiet });
     if (ok) {
       sent.add(id);
       count++;
