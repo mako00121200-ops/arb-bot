@@ -1977,7 +1977,7 @@ ${whatIfRows(chain)}`;
 <table class="t-num"><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table></div>
 
 <div class="card"><h2>📏 あと何bpsで黒字だったか</h2>
-<div class="note" style="margin-top:0;border-top:none;padding-top:0">件数は<b>別々の経路の本数</b>です(同じ経路を何度評価しても1本)。<br>手数料1%のプールを2段通れば壁は200bpsで、価格がどれだけ動いても黒字になりません。そうした経路を除くため、まず壁の高さで分けてから、届きうる経路だけの惜しさを見ます。<br>壁は実測で Polygon 最小35bps / Optimism 最小6bps です。</div>
+<div class="note" style="margin-top:0;border-top:none;padding-top:0">件数は<b>別々の経路の本数</b>です(同じ経路を何度評価しても1本)。<br>まず壁の高さで分けてから、届きうる経路だけの惜しさを見ます。<br><b>壁が高い=無理、ではありません。</b>浅いプールでは価格差が100〜160bpsに達するため、実際に黒字になった取引の壁は105bps・101bps・75bps・65bps・60bpsと、半分以上が60bpsを超えていました(2026年9月21日の実測)。<br>下の「惜しさ」は壁が低い経路ほど当てになります。壁が高い帯は、価格差が大きく動いた時だけ取れる場所です。</div>
 ${nearMissBlocks}</div>
 
 <div class="footerlink"><a href="/about">→ 仕組みについて</a></div></body></html>`;
