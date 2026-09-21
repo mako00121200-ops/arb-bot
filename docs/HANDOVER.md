@@ -2114,6 +2114,33 @@ Base を稼働に加えた初回の起動でこう出た。
 `ALERT_MAX_PER_DAY` / `ALERT_QUOTA_PERCENT` / `ALERT_MIN_GAS_NATIVE` /
 `ALERT_ALL_DOWN_MS` / `ALERT_CONSECUTIVE_SEND_FAILS`
 
+### Claude からの質問も LINE へ転送する(同日に追加)
+
+**なぜこの形なのか。** Claude の作業環境からは `api.line.me` に届かない。
+Railway のアプリ用ドメイン(`*.up.railway.app`)にも届かないので、HTTPで直接
+渡す経路も無い(プロキシの許可リストに無い。`$HTTPS_PROXY/__agentproxy/status`
+で確認済み)。そこで**リポジトリをメールボックスにする**。
+
+**使い方(Claude 向け)。** `docs/owner-questions.json` の `questions` に足して
+コミットする。そのデプロイでファイルごと bot に届き、bot が LINE へ転送する。
+
+```json
+{ "questions": [
+  { "id": "2026-09-21-01", "title": "元手の投入",
+    "body": "2チェーン間の裁定に $2,000 × 2 を入れますか。ETH の価格リスクを取ることになります。" }
+] }
+```
+
+- **id は二度と重複しない値にする**(日付+連番など)
+- 送信済みの id はボリューム(`owner-questions-sent.json`)に記録し、
+  **再デプロイしても二度と送らない**。無料枠を守り、何より読まれなくなるのを防ぐ
+- 解決した質問は**消さずに残す**。id が同じなら再送されないので、経緯が残る
+- 送れなかった分は10分ごとに再試行する
+- LINE 未設定の間は送らず、ログ(`[要判断]`)にだけ出る
+
+**この経路の代償は「デプロイが1回要る」こと。** 質問はコードの修正と一緒に
+出ることが多いので、実際には余分なデプロイにならないことが多い。
+
 ## 進行中の計画
 1. 済: V3型プールをDEX別に数える調査(scripts/pool-survey.js)。Polygon /
    Base / Optimism で実施し、未監視ファクトリーの活動量と、監視ペアの

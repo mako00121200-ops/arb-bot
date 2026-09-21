@@ -18,6 +18,10 @@
 // [無料枠は月200通]
 // 同じ用件を何度も送らないよう、用件ごとに冷却時間を置き、1日の上限も設ける。
 
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
 const LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push";
 
 /// 同じ用件を送り直すまでの間隔。既定6時間。
@@ -104,4 +108,86 @@ export async function alertOwner(key, title, body) {
 export function getAlertStats() {
   rollDayIfNeeded();
   return { ...stats, configured: isConfigured(), enabled: ALERT_ENABLED, sentToday };
+}
+
+// ===== Claude からの質問を転送する(2026年9月21日) =====
+//
+// [なぜこの形なのか]
+// Claude の作業環境からは api.line.me に届かない(外向き通信が遮断されている)。
+// Railway のアプリ用ドメインにも届かないので、HTTPで直接渡す経路も無い。
+// そこで**リポジトリをメールボックスにする**。Claude が
+// docs/owner-questions.json に書いてコミットすると、そのデプロイでこの bot に
+// ファイルごと届き、ここが LINE へ転送する。
+//
+// 新しい秘密情報も外部サービスも増えない。質問がリポジトリに残るので、
+// 後から経緯を追えるという利点もある。
+//
+// [一度送った質問は二度と送らない]
+// 送信済みの id をボリュームに記録する。再デプロイのたびに送り直すと、
+// 無料枠(月200通)をすぐ使い切り、何より読まれなくなる。
+
+// 起動時の作業ディレクトリに依存しないよう、このファイルの位置から求める。
+const QUESTIONS_FILE = process.env.OWNER_QUESTIONS_FILE
+  || path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "docs", "owner-questions.json");
+/// 送信済みの id の記録先。プール地図と同じ場所(ボリューム)に置く。
+const SENT_FILE = process.env.OWNER_QUESTIONS_SENT_FILE
+  || (process.env.POOL_MAP_FILE
+      ? path.join(path.dirname(process.env.POOL_MAP_FILE), "owner-questions-sent.json")
+      : "/tmp/owner-questions-sent.json");
+
+function loadSentIds() {
+  try {
+    if (!fs.existsSync(SENT_FILE)) return new Set();
+    const data = JSON.parse(fs.readFileSync(SENT_FILE, "utf8"));
+    return new Set(Array.isArray(data.ids) ? data.ids : []);
+  } catch (e) {
+    return new Set();
+  }
+}
+
+function saveSentIds(ids) {
+  try {
+    const tmp = SENT_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify({ ids: [...ids], updatedAt: new Date().toISOString() }));
+    fs.renameSync(tmp, SENT_FILE);
+  } catch (e) {
+    console.warn(`[Claudeからの質問] 送信済みの記録に失敗: ${(e.message || "").slice(0, 80)}`);
+  }
+}
+
+/// docs/owner-questions.json にある未送信の質問を LINE へ転送する。
+/// 起動時と、念のため定期的に呼ぶ。
+export async function sendPendingQuestions() {
+  let parsed;
+  try {
+    if (!fs.existsSync(QUESTIONS_FILE)) return 0;
+    parsed = JSON.parse(fs.readFileSync(QUESTIONS_FILE, "utf8"));
+  } catch (e) {
+    console.warn(`[Claudeからの質問] ファイルを読めません: ${(e.message || "").slice(0, 80)}`);
+    return 0;
+  }
+  const list = Array.isArray(parsed?.questions) ? parsed.questions : [];
+  if (list.length === 0) return 0;
+
+  const sent = loadSentIds();
+  let count = 0;
+  for (const q of list) {
+    const id = String(q?.id || "").trim();
+    if (!id || sent.has(id)) continue;
+    const title = String(q?.title || "Claudeからの質問").slice(0, 200);
+    const body = String(q?.body || "").slice(0, 4000);
+
+    // 用件ごとの冷却は使わない(id が違えば別の質問なので)。
+    // 送れなかった場合は記録せず、次の機会に再試行する。
+    const ok = await alertOwner(`question:${id}`, `判断をお願いします: ${title}`, body);
+    if (ok) {
+      sent.add(id);
+      count++;
+    } else if (!isConfigured()) {
+      // LINE が未設定なら、何度も試しても意味がない。ログには alertOwner が出している。
+      break;
+    }
+  }
+  if (count > 0) saveSentIds(sent);
+  return count;
 }
