@@ -501,8 +501,6 @@ const FLASHBLOCKS_CHAINS = new Set(["optimism", "base"]);
 const FLASHBLOCKS_PROBE_TIMEOUT_MS = 20 * 1000;
 const flashblocksStatus = {}; // chain -> { supported, url, intervalsMs, error }
 
-export function getFlashblocksStatus() { return { ...flashblocksStatus }; }
-
 function probeFlashblocks(chainName, wsUrl) {
   return new Promise((resolve) => {
     let socket;
@@ -599,8 +597,6 @@ export function startOnchainFeeds(onSync, onV3Swap, onV3Liquidity) {
     console.log("[オンチェーン] WebSocket URLが1つも未設定。定期読み直しのみで動作します。");
   }
 }
-
-export function updatePoolSubscriptions() { /* setWatchedAddresses を使う */ }
 
 export function isChainWsEnabled(chainName) {
   return chainEnabled.has(chainName);

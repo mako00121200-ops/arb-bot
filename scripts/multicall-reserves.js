@@ -413,22 +413,3 @@ export async function fetchPoolTokensBatch(chain, addresses) {
   }
   return result;
 }
-
-/// 1つの「実行可能ペア」について、全プールの準備量を一括で読む。
-export async function readVerifiedPairPools(pair) {
-  const batch = await fetchReservesBatch(pair.chain, pair.pools);
-  const tokenX = pair.tokenA.toLowerCase();
-  const out = [];
-  for (const p of pair.pools) {
-    const r = batch.get(p.address.toLowerCase());
-    if (!r) continue;
-    const isToken0X = r.token0.toLowerCase() === tokenX;
-    const rawX = isToken0X ? r.raw0 : r.raw1;
-    const rawY = isToken0X ? r.raw1 : r.raw0;
-    const reserveX = parseFloat(ethers.formatUnits(rawX, pair.decimalsX));
-    const reserveY = parseFloat(ethers.formatUnits(rawY, pair.decimalsY));
-    if (!reserveX || !reserveY) continue;
-    out.push({ dexId: p.dexId, pairAddress: p.address, reserveX, reserveY, rawX, rawY });
-  }
-  return out;
-}

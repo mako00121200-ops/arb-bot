@@ -50,8 +50,6 @@ const CAPTURED = new Set(["success"]);
 const events = [];
 const totals = { seen: 0, captured: 0, capturedUsd: 0, missedUsd: 0 };
 
-export function getBigThresholdUsd() { return BIG_OPP_USD; }
-
 /// その機会が「大物」か。
 export function isBigOpportunity(opp) {
   return Number(opp?.netProfitUsd) >= BIG_OPP_USD;
@@ -117,8 +115,4 @@ export function formatBigSummary() {
 export function formatBigLine() {
   if (totals.seen === 0) return "";
   return ` 大物[検知${totals.seen} 成立${totals.captured} 得た$${totals.capturedUsd.toFixed(3)} 逃した見込み$${totals.missedUsd.toFixed(3)}]`;
-}
-
-export function getBigStats() {
-  return { ...totals, thresholdUsd: BIG_OPP_USD, recent: recent().slice(-20) };
 }

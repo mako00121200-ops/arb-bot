@@ -149,10 +149,6 @@ async function runCheck(opp, detectedBlock, detectedAt) {
   }
 }
 
-export function getCompetitorStats() {
-  return { ...totals, bySendResult: JSON.parse(JSON.stringify(bySendResult)) };
-}
-
 setInterval(() => {
   const t = totals;
   const judged = t.ours + t.other_arbitrage + t.moved_by_trade + t.untouched;

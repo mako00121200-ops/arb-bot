@@ -74,17 +74,6 @@ export function getKnownTokens(chain) {
   return KNOWN_TOKENS[(chain || "").toLowerCase()] || {};
 }
 
-/// 従来の呼び出し名との互換のために残す。
-export function getBorrowableTokens(chain) {
-  return getKnownTokens(chain);
-}
-
-/// 安定通貨かどうか。価格の逆算の起点に使う。
-export function isStableToken(chain, address) {
-  const info = getKnownTokens(chain)[(address || "").toLowerCase()];
-  return !!info?.stable;
-}
-
 // 起点として使えると確認できたトークン(桁数と価格が揃ったもの)。
 // index.js が起動時と実行中に登録する。
 const usableStarts = new Map(); // "chain::token" -> true

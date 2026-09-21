@@ -490,7 +490,6 @@ export function getWhatIfProfit() {
   return out;
 }
 
-export const WHATIF_DROP_LIST = [...WHATIF_DROPS];
 
 function recordNearMiss(chain, key, returnBps, wallBps, label) {
   if (returnBps == null || !Number.isFinite(returnBps)) return;
