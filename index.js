@@ -130,7 +130,23 @@ const FAILURE_WINDOW_MS = parseInt(process.env.FAILURE_WINDOW_MS || String(30 * 
 /// 送信失敗が続いたプールを外す時間。**永久にはしない。**
 const FAILURE_DISABLE_MS = parseInt(process.env.FAILURE_DISABLE_MS || String(60 * 60 * 1000), 10);
 const MAX_SANE_RETURN_RATIO = parseFloat(process.env.MAX_SANE_RETURN_RATIO || "0.20");
-const V3_VERIFY_INTERVAL_MS = parseInt(process.env.V3_VERIFY_INTERVAL_MS || "120000", 10);
+/// V3の価格表を公式Quoterと突き合わせる間隔。
+///
+/// [2分 → 45秒に縮めた(2026年9月21日 21:30 JST、実測で判明)]
+/// base の `uniswap-v3(1.00%)→sync発見` が、**価格表が295bps過大**のまま
+/// 何度も「黒字」と判定され、送信直前に毎回捨てられていた
+/// (記録簿の「取れた可能性」の上位2件、合わせて$28.5 はこれだった)。
+/// 捕まえたのは定期検証ではなく、**実際に取ろうとして失敗した後の答え合わせ**。
+///
+/// 定期検証は72回まわって**1件も上限を付けていない**(`V3表[確認72 上限制限0]`)。
+/// 理由は単純で、**一周するのに時間がかかりすぎている**:
+///   価格表327本 × 両方向 = 654通り。2分に1つなら**一周21.8時間**。
+/// しかも向きを交代で測るようにした分(9月21日)、1プールあたり2枠使うので更に遅い。
+///
+/// 45秒なら一周8.2時間。RPCは 4件/45秒 = 毎分5.3回 = 月23万回 = **枠の1.2%**
+/// (今は毎分2回=0.4%なので +0.8%。月末見込28% → 約29%で収まる)。
+/// 壊れた表を早く見つけるほど、幻の機会と無駄な送信直前の確認が減る。
+const V3_VERIFY_INTERVAL_MS = parseInt(process.env.V3_VERIFY_INTERVAL_MS || "45000", 10);
 const MIN_PRICE_SOURCE_USD = parseFloat(process.env.MIN_PRICE_SOURCE_USD || "5000");
 
 // ===== 価格表の保存と復元(2026年9月19日) =====
