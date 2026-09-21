@@ -166,16 +166,6 @@ export async function readL1FeeFromReceipt(chain, txHash) {
   return 0n;
 }
 
-/// 事前判定に使う L1 データ手数料の状況(ダッシュボード・ログ用)。
-export function getL1FeeStatus(chain) {
-  const key = (chain || "").toLowerCase();
-  const measured = l1FeeMeasured.get(key);
-  if (measured) return { wei: measured.value, source: `実測${measured.samples}件` };
-  const cached = l1FeeTypical.get(key);
-  if (cached) return { wei: cached.value, source: "予備コントラクト" };
-  return null;
-}
-
 /// 実際に払う見込みのガス単価(wei)。上限(maxFeePerGas)ではない。
 /// EIP-1559のチェーンでは baseFeePerGas + maxPriorityFeePerGas を払う。
 async function getGasPriceWei(chain) {

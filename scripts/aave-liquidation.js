@@ -920,7 +920,3 @@ export function formatAaveLine() {
 
   return ` 清算[名簿${stats.rosterTotal.toLocaleString()} 見張り${watching} 見つけた${stats.found} 他者${stats.taken} 回復${stats.recovered}${histNote} RPC${stats.rpcCalls}${stats.errors ? ` 失敗${stats.errors}` : ""}]`;
 }
-
-export function getAaveStats() {
-  return { ...stats, chains: [...verifiedChains], watching: [...watchList.values()].reduce((n, m) => n + m.size, 0) };
-}

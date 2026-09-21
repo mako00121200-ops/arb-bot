@@ -282,24 +282,6 @@ export async function callWithRpc(chain, fn, priority = false) {
   }
 }
 
-export async function fetchOnchainReserves({ chain, pairAddress, tokenXAddress, decimalsX, decimalsY, priority = false }) {
-  if (!ethers.isAddress(pairAddress)) throw new Error(`プールアドレスの形式が不正: ${pairAddress}`);
-  const addr = ethers.getAddress(pairAddress);
-  const contract = (p) => new ethers.Contract(addr, PAIR_ABI, p);
-  const [reserves, token0] = await Promise.all([
-    callWithRpc(chain, (p) => contract(p).getReserves(), priority),
-    callWithRpc(chain, (p) => contract(p).token0(), priority),
-  ]);
-  const isToken0X = token0.toLowerCase() === ethers.getAddress(tokenXAddress).toLowerCase();
-  const rawX = isToken0X ? reserves[0] : reserves[1];
-  const rawY = isToken0X ? reserves[1] : reserves[0];
-  return {
-    reserveX: parseFloat(ethers.formatUnits(rawX, decimalsX)),
-    reserveY: parseFloat(ethers.formatUnits(rawY, decimalsY)),
-    rawX, rawY,
-  };
-}
-
 // ===== 手数料の実測 =====
 
 // イベントの識別子は手で書かず、関数の形から計算する(1文字欠けの再発防止)。
@@ -544,18 +526,6 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 const decimalsCache = new Map();
-export async function fetchTokenDecimals(chain, tokenAddress) {
-  const normalized = ethers.getAddress(tokenAddress);
-  const key = `${chain}:${normalized.toLowerCase()}`;
-  if (decimalsCache.has(key)) return decimalsCache.get(key);
-  const decimals = Number(await callWithRpc(chain, (p) => new ethers.Contract(normalized, ERC20_DECIMALS_ABI, p).decimals()));
-  decimalsCache.set(key, decimals);
-  return decimals;
-}
-
-export function isOnchainReadAvailable(chain) {
-  return getChainConfig(chain) !== null;
-}
 
 /// 全チェーン合計のRPC呼び出し数(プロセス起動からの通算)。
 /// 失敗した呼び出しも枠を消費するため、成否を問わず数える。

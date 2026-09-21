@@ -1,3 +1,7 @@
+> **まず `docs/SYSTEM.md` を読むこと。** あちらが「いま何がどう動いているか」の全体図。
+> このファイルは経緯の**時系列の記録**で、3,900行ある。全部読む必要は無い。
+> 直近の状態と教訓は `SYSTEM.md` の §8・§9 にまとめてある。(2026年9月21日)
+
 # arb-bot 引き継ぎ資料(2026年9月20日時点)
 
 ## 目的と方針(オーナーが決めたこと)
@@ -3795,6 +3799,39 @@ USDC や WETH と組んだ、100分で75〜132回も取引されるプールを�
 > **分けて測ったなら、分けて使うこと。**
 > 「判定後に地図が動いた分」と「地図とチェーンの差」は9月19日に分けて測り始めたのに、
 > **責任の判定では合計しか見ていなかった。**「測っているのに使っていない値」の5件目。
+
+---
+
+## 全体図を書き、呼ばれていないコードを整理した(2026年9月21日)
+
+オーナーの指摘:「ミスが増えてきたので、全体をまとめ、使っていないものを整理し、現状を記録してほしい」。
+
+### 全体図
+
+`docs/SYSTEM.md` を新設。ファイル地図・1本の取引が通る道・起動の順序・周期処理・
+保存しているもの・生存ログの読み方・守りの一覧・進行中と未決・**直す前の確認リスト**。
+**記憶ではなく、その場でコードを読んで書いた**(`main()`、環境変数の一覧、保存先、周期の既定値を実物から)。
+
+### 整理したもの(合計 約460行)
+
+| 種類 | 内容 |
+|---|---|
+| **ファイル削除** | `scripts/verified-pairs.js`(書き込む処理がどこにも無く、読むだけだった)/ `scripts/pool-discovery.js`(その死んだ種からしか呼ばれなかった) |
+| **死んだ経路** | `index.js` の `collectSeedPools` / `buildPoolMapFromFactories` / `knownFactories`(種が常に0件で即座に抜けていた) |
+| **呼ばれていない書き出し** | 19件(`getFlashblocksStatus` `updatePoolSubscriptions` `getAaveStats` `getBigThresholdUsd` `getBigStats` `getBorrowableTokens` `isStableToken` `getCompetitorStats` `getL1FeeStatus` `readVerifiedPairPools` `fetchOnchainReserves` `fetchTokenDecimals` `isOnchainReadAvailable` `readV3State` `priceFromSqrtX96` `buildQuoteTable` `getQuoteTableAge` `WHATIF_DROP_LIST` `V3_POOL_ABI`) |
+
+**残したもの:** `pool-survey.js`(手動ツール)、`mainnet-deploy.js`(配置の入口)、読まれていない `stats` の項目(害が無く、消す作業の方が危険)。
+
+### 整理の途中で自分のミスを2つ防いだ
+
+- 切り出し範囲を「次の `}`」で決めたところ、1行関数(`getBigThresholdUsd`)の次の `}` が
+  **使われている `isBigOpportunity`** のものだった。同じく `getFlashblocksStatus` は
+  63行の `probeFlashblocks` を巻き込むところだった。**波括弧を数える方式に変えて回避。**
+- 取り込み名の検査で「`ExecutionError` が無い」「`chain-config.js` が無い」と出たが、
+  **どちらも検査ツールの誤り**(`class` の書き出しと、ルート直下のファイルを見ていなかった)。
+  **検査ツールの結果も、実物で確かめてから信じる。**
+
+検査:全ファイル `node --check` 通過、取り込み名は全て相手に存在、死んだ書き出しは0件。
 
 ---
 

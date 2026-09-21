@@ -49,7 +49,6 @@ import {
   fetchV3StatesBatch, getMulticallStats, findV3PoolsBatch,
 } from "./scripts/multicall-reserves.js";
 import { estimateGasCostUsd, getGasCostStatus, exportGasPriceRatios, importGasPriceRatios, getGasPriceRatio, weiToUsd } from "./scripts/gas-cost.js";
-import { discoverFactory, discoverPoolsFromFactory } from "./scripts/pool-discovery.js";
 import {
   registerPool, removePool, pruneToCandidates, getSubscribedAddresses,
   updateReservesFromSync, updateV3FromSwap, setPoolFee, markFeeFromChain, getPool, getStats,
@@ -70,7 +69,6 @@ import {
   getKnownTokens, isBorrowable,
   markUsableStart, clearUsableStarts, countUsableStarts,
 } from "./scripts/borrowable-tokens.js";
-import { getVerifiedPairs } from "./scripts/verified-pairs.js";
 import { isKnownIncompatiblePool, recordIncompatiblePool } from "./scripts/incompatible-pools.js";
 import { journal, loadJournal, trimJournalIfNeeded, summarize } from "./scripts/opportunity-journal.js";
 import {
@@ -1379,45 +1377,7 @@ async function refreshV3States() {
 }
 
 // ===== プール地図 =====
-function collectSeedPools() {
-  const seedsByChain = {};
-  for (const pair of getVerifiedPairs()) {
-    if (!CHAIN_CONFIG[pair.chain]) continue;
-    if (!seedsByChain[pair.chain]) seedsByChain[pair.chain] = new Map();
-    for (const pool of pair.pools) {
-      const dexId = (pool.dexId || "unknown").toLowerCase();
-      if (!seedsByChain[pair.chain].has(dexId)) seedsByChain[pair.chain].set(dexId, pool.address);
-    }
-  }
-  return seedsByChain;
-}
 
-const knownFactories = new Set();
-
-async function buildPoolMapFromFactories() {
-  const seedsByChain = collectSeedPools();
-  const totalSeeds = Object.values(seedsByChain).reduce((s, m) => s + m.size, 0);
-  if (totalSeeds === 0) return;
-  console.log(`[プール地図] 種プール${totalSeeds}件からファクトリーを逆算します`);
-  for (const [chain, dexMap] of Object.entries(seedsByChain)) {
-    for (const [dexId, address] of dexMap.entries()) {
-      try {
-        const factory = await discoverFactory(chain, address);
-        if (!factory) continue;
-        const fkey = `${chain}::${factory.toLowerCase()}`;
-        if (knownFactories.has(fkey)) continue;
-        knownFactories.add(fkey);
-        const pools = await discoverPoolsFromFactory(chain, factory, dexId);
-        for (const p of pools) {
-          if (isKnownIncompatiblePool(chain, p.address)) continue;
-          registerPool({ ...p, kind: KIND_V2 });
-        }
-      } catch (e) {
-        console.warn(`[プール発見] ${dexId} on ${chain}: 失敗 ${e.message.slice(0, 70)}`);
-      }
-    }
-  }
-}
 
 async function prepareChain(chain) {
   try {
@@ -1473,7 +1433,10 @@ async function preparePoolMap() {
   }
   if (needBuild) {
     stats.mapSource = saved.count > 0 ? "保存済み+再構築" : "新規構築";
-    await buildPoolMapFromFactories();
+    // [2026年9月21日に整理] ここで「ファクトリーからの全プール取り込み」を呼んでいたが、
+    // 種となる verified-pairs.json を書く処理がどこにも無く、一度も動いていなかった。
+    // プールの発見は pool-scout.js(住所を指定しない getLogs で取引のある
+    // プールを全て見る)が担っているので、この道ごと削除した。
   }
 
   for (const [chain, addresses] of Object.entries(getAllPoolAddressesByChain())) {

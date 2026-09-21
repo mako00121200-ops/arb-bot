@@ -132,14 +132,6 @@ export function activeV3Factories(chain) {
 
 export const V3_FEE_TIERS = [100, 500, 3000, 10000];
 
-export const V3_POOL_ABI = [
-  "function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)",
-  "function liquidity() view returns (uint128)",
-  "function token0() view returns (address)",
-  "function token1() view returns (address)",
-  "function fee() view returns (uint24)",
-];
-
 const V3_FACTORY_ABI = [
   "function getPool(address tokenA, address tokenB, uint24 fee) view returns (address)",
   // Algebra系は手数料が動的なので、手数料帯の引数を取らない。
@@ -196,30 +188,6 @@ export async function findV3Pool(chain, factory, tokenA, tokenB, fee, style = "u
   } catch (e) {
     return null;
   }
-}
-
-/// 1プールの状態を読む(単発用)。複数まとめて読むときは
-/// multicall-reserves.js の fetchV3StatesBatch を使う。
-/// 注意: この関数は slot0() しか見ないため、Algebra形式のプールでは必ず
-/// 失敗する。今は誰も呼んでいない。使う場合は multicall-reserves.js の
-/// fetchV3StatesBatch(globalState に対応済み)を使うこと。
-export async function readV3State(chain, poolAddress, priority = false) {
-  try {
-    const contract = (p) => new ethers.Contract(ethers.getAddress(poolAddress), V3_POOL_ABI, p);
-    const [slot0, liquidity] = await Promise.all([
-      callWithRpc(chain, (p) => contract(p).slot0(), priority),
-      callWithRpc(chain, (p) => contract(p).liquidity(), priority),
-    ]);
-    if (slot0[0] <= 0n) return null;
-    return { sqrtPriceX96: slot0[0], tick: Number(slot0[1]), liquidity };
-  } catch (e) {
-    return null;
-  }
-}
-
-export function priceFromSqrtX96(sqrtPriceX96) {
-  const ratio = Number(sqrtPriceX96) / Number(Q96);
-  return ratio * ratio; // token1 / token0
 }
 
 /// 送信直前の正確な見積もり。Uniswap公式の QuoterV2 に計算させる。
@@ -353,21 +321,8 @@ export async function buildQuoteTablesBatch(chain, jobs) {
   return built;
 }
 
-/// 1プール1方向の価格表を作る(単発用。まとめて作るときは buildQuoteTablesBatch)。
-export async function buildQuoteTable({ chain, pool, zeroForOne, tokenIn, tokenOut, feeTier, amountsIn, fork = false }) {
-  const built = await buildQuoteTablesBatch(chain, [{ pool, zeroForOne, tokenIn, tokenOut, feeTier, amountsIn, fork }]);
-  if (built === 0) return 0;
-  const t = quoteTables.get(tableKey(chain, pool, zeroForOne));
-  return t ? t.points.length : 0;
-}
-
 export function hasQuoteTable(chain, pool, zeroForOne) {
   return quoteTables.has(tableKey(chain, pool, zeroForOne));
-}
-
-export function getQuoteTableAge(chain, pool, zeroForOne) {
-  const t = quoteTables.get(tableKey(chain, pool, zeroForOne));
-  return t ? Date.now() - t.at : null;
 }
 
 export function countQuoteTables() {
