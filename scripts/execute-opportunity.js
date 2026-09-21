@@ -452,6 +452,49 @@ function buildLegArgs(chain, opp, version) {
   });
 }
 
+/// 取り消しの先頭4バイト(セレクタ)から、誰が何を言っているかを当てる表。
+///
+/// [なぜ要るか(2026年9月21日、大物の台帳で判明)]
+/// Base の `uniswap-v3(X%)→aerodrome→sync発見` が3本とも
+/// 「execution reverted (unknown custom error)」で確認に失敗していた。
+/// 見込みは $0.12〜$0.26(今の平均の20〜50倍)。**同じ形の経路が繰り返し落ちている。**
+///
+/// ところが今までのコードは、**読めなかった取り消しの中身を捨てていた**。
+/// 原因を突き止めるのに一番必要な情報(セレクタ)を、自分で消していた。
+/// ethers の「unknown custom error」は「分からない」としか言わない。
+///
+/// セレクタは `ethers.id("K()").slice(0,10)` で計算して確かめた。
+const REVERT_SELECTORS = {
+  "0xebb6e92f": "SimulationResult(uint256,uint256) — うちの確認結果",
+  "0x17080d7e": "QuoteResult(uint256) — うちの見積もり結果",
+  "0x08c379a0": "Error(string) — 理由つきの取り消し",
+  "0x4e487b71": "Panic(uint256) — 算術あふれ等",
+  "0xa932492f": "K() — Solidly系(Aerodrome等)。**受取量が多すぎる**",
+  "0x42301c23": "InsufficientOutputAmount() — 受取量が0または不足",
+  "0x098fb561": "InsufficientInputAmount() — 投入量が届いていない",
+  "0xbb55fd27": "InsufficientLiquidity() — 準備量より多く出そうとした",
+  "0x290fa188": "InvalidTo() — 受取先が不正",
+  "0x438d3ade": "BelowMinimumK() — Solidly系のK下限",
+  "0x5945ea56": "InsufficientAmount()",
+  "0xd226f9d4": "InsufficientLiquidityMinted()",
+  "0x1309a563": "IsPaused() — プールが止まっている",
+  "0x2bc80f3a": "T() — Uniswap V3 の tick 不正",
+  "0xa1bf7886": "LOK() — Uniswap V3 が未初期化/ロック中",
+  "0xfcdf4aa7": "SPL() — Uniswap V3 の価格制限に当たった",
+};
+
+/// 読めなかった取り消しの中身を、人が読める形にする。
+/// **分からない時も、必ずセレクタを残す。** それが次の手掛かりになる。
+function describeRevert(revertData) {
+  if (typeof revertData !== "string" || !revertData.startsWith("0x") || revertData.length < 10) {
+    return null;
+  }
+  const selector = revertData.slice(0, 10).toLowerCase();
+  const known = REVERT_SELECTORS[selector];
+  if (known) return `${selector} = ${known}`;
+  return `${selector}(照合表に無い。データ${revertData.length - 2}文字)`;
+}
+
 /// コントラクトに経路を最後まで回させて、戻ってきた量と返済額を受け取る。
 /// 戻り値: { returned, owed } または { error: 拒否理由 }
 /// 確認の本体。blockTag を指定して1回だけ問い合わせる。
@@ -469,7 +512,14 @@ async function simulateAt(chain, contractAddress, from, data, iface, blockTag) {
         }
       } catch (inner) {}
     }
-    return { error: (e?.shortMessage || e?.reason || e?.message || "").slice(0, 160), raw: e };
+    const described = describeRevert(revertData);
+    const base = (e?.shortMessage || e?.reason || e?.message || "").slice(0, 160);
+    // **読めなかった中身を捨てない。** セレクタが原因究明の唯一の手掛かり。
+    return {
+      error: described ? `${base} / 取り消しの中身: ${described}` : base,
+      revertSelector: described,
+      raw: e,
+    };
   }
 }
 

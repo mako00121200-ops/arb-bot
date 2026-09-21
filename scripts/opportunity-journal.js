@@ -78,12 +78,42 @@ export function trimJournalIfNeeded() {
   } catch (e) {}
 }
 
+/// この利回りを超える判定は「計算が壊れている」とみなす。
+/// index.js の罠判定(MAX_SANE_RETURN_RATIO)と同じ値を使う。
+const SANE_RETURN_RATIO = parseFloat(process.env.MAX_SANE_RETURN_RATIO || "0.20");
+
+/// その記録が「幻」か。**投入額に対して有り得ない利回り**のもの。
+///
+/// [なぜ分けるか(2026年9月21日、オーナーの指摘)]
+/// 記録簿の見出しは「黒字判定の合計 +$32.979」だった。しかし内訳を見ると、
+/// 上位4件が **投入$0.59 → 判定+$18.76 / +$4.29 / +$1.49 / +$1.47**。
+/// 利回り **3,180%**。有り得ない。この4件だけで **$26.02(全体の79%)**。
+///
+/// **見出しの8割が幻だった。** これでは「$33を取り逃している」と読めてしまい、
+/// 実際に直すべきもの($0.84の simulate 失敗など)が埋もれる。
+///
+/// 幻は「取り逃した金額」ではなく、**計算が壊れている経路の一覧**として出す。
+/// そちらの方が直す手掛かりになる。
+function isPhantom(r) {
+  if (r.outcome === "trap" || r.outcome === "tax_token") return true;
+  const trade = Number(r.tradeAmountUsd) || 0;
+  const net = Number(r.netProfitUsd) || 0;
+  if (trade <= 0) return false;
+  return net / trade > SANE_RETURN_RATIO;
+}
+
 /// 直近N時間の集計。ダッシュボード用。
 export function summarize(hours = 24) {
   const since = Date.now() - hours * 3600 * 1000;
   const byOutcome = {};
   const byChain = {};
   let profitableUsd = 0, sentUsd = 0, realizedUsd = 0, count = 0;
+  // **取れた可能性がある額**(幻を除いた取り逃し)と、その原因ごとの内訳。
+  let missedUsd = 0;
+  const missedByOutcome = {};
+  // 計算が壊れている経路(直す手掛かり。金額としては数えない)。
+  let phantomUsd = 0, phantomCount = 0;
+  const topPhantom = [];
   const topMissed = [];
 
   for (const r of recent) {
@@ -99,14 +129,30 @@ export function summarize(hours = 24) {
       if (r.actualNetProfitUsd != null) realizedUsd += r.actualNetProfitUsd;
       else if (r.actualProfitUsd != null) realizedUsd += r.actualProfitUsd - (r.actualGasCostUsd ?? 0);
     }
-    // 「黒字だったのに取れなかった」上位を控える。
-    if (r.netProfitUsd > 0 && r.outcome !== "success") topMissed.push(r);
+    // 「黒字だったのに取れなかった」を、**幻と取れたはずのものに分ける**。
+    if (r.netProfitUsd > 0 && r.outcome !== "success") {
+      if (isPhantom(r)) {
+        phantomCount++;
+        phantomUsd += r.netProfitUsd;
+        topPhantom.push(r);
+      } else {
+        missedUsd += r.netProfitUsd;
+        const e = missedByOutcome[r.outcome] || { count: 0, usd: 0 };
+        e.count++; e.usd += r.netProfitUsd;
+        missedByOutcome[r.outcome] = e;
+        topMissed.push(r);
+      }
+    }
   }
-  topMissed.sort((a, b) => (b.netProfitUsd || 0) - (a.netProfitUsd || 0));
+  const byUsd = (a, b) => (b.netProfitUsd || 0) - (a.netProfitUsd || 0);
+  topMissed.sort(byUsd);
+  topPhantom.sort(byUsd);
 
   return {
     hours, count, byOutcome, byChain,
     profitableUsd, sentUsd, realizedUsd,
+    missedUsd, missedByOutcome, phantomUsd, phantomCount,
     topMissed: topMissed.slice(0, 10),
+    topPhantom: topPhantom.slice(0, 5),
   };
 }
