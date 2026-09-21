@@ -74,7 +74,8 @@ import { isKnownIncompatiblePool, recordIncompatiblePool } from "./scripts/incom
 import { journal, loadJournal, trimJournalIfNeeded, summarize } from "./scripts/opportunity-journal.js";
 import {
   activeV3Factories, isForkFactory, V3_FEE_TIERS, findV3Pool, feeTierToBps,
-  buildQuoteTablesBatch, hasQuoteTable, clearQuoteTable, clearQuoteTableDirection, setTableTrustedMax, countQuoteTables,
+  buildQuoteTablesBatch, hasQuoteTable, clearQuoteTable, clearQuoteTableDirection,
+  setTableTrustedMax, getTableTrustedMax, countQuoteTables,
   verifyQuoteTable, QUOTE_SAMPLES_USD, exportQuoteTables, importQuoteTable,
 } from "./scripts/v3-pools.js";
 import { CHAIN_CONFIG } from "./chain-config.js";
@@ -1059,11 +1060,20 @@ async function verifyV3Calculations() {
   if (cappedAt != null) {
     if (lastOkAmountIn != null) {
       // 信用できるところまでで頭打ちにする。**プールは地図に残る。**
-      setTableTrustedMax(pool.chain, pool.address, true, lastOkAmountIn);
+      //
+      // **定期検証は「下げる」ことしかしない。**
+      // 答え合わせ(実際に取ろうとした経路の、実際の額での誤差)が
+      // すでにもっと厳しい上限を学んでいるなら、そちらを尊重する。
+      // 定期検証は $5/$20/$200/$700 の固定点しか見ないが、
+      // 答え合わせは**本当に使った額**を見ている。情報の濃さが違う。
+      // (全ての額で誤差が収まった時だけ、下の分岐で制限を外す)
+      const learned = getTableTrustedMax(pool.chain, pool.address, true);
+      const next = learned != null && learned < lastOkAmountIn ? learned : lastOkAmountIn;
+      setTableTrustedMax(pool.chain, pool.address, true, next);
       stats.v3VerifyCapped++;
       console.log(
         `[V3検証] ${pool.chain} ${pool.address.slice(0, 10)}…(${(pool.feeBps / 100).toFixed(2)}%): ` +
-        `投入$${cappedAt}で過大のため、**信用できる上限を$${amounts.filter((a) => a < cappedAt).pop()}相当に下げました**` +
+        `投入$${cappedAt}で過大のため、**信用できる上限を${next === lastOkAmountIn ? `$${amounts.filter((a) => a < cappedAt).pop()}相当` : "答え合わせで学んだ値"}に下げました**` +
         `(プールは判定に使い続けます)`
       );
     } else {
