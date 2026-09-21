@@ -300,7 +300,7 @@ async function estimateGasUnits(chain, contract, fromAddress, contractAddress, a
 // (送れなかった番号が残ると、以降の送信が詰まるため)。
 const signers = new Map(); // chain -> { wallet, signer }
 
-function getSigner(chain, privateKey) {
+export function getSigner(chain, privateKey) {
   const key = (chain || "").toLowerCase();
   let entry = signers.get(key);
   if (!entry) {

@@ -10,14 +10,16 @@ import solc from "solc";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-export function compileContract() {
-  const contractPath = path.join(__dirname, "..", "contracts", "DexArbFlashLoan.sol");
+/// name は contracts/ の中のファイル名(拡張子なし)= コントラクト名。
+/// 既定は裁定の DexArbFlashLoan。清算は "AaveLiquidator"。
+export function compileContract(name = "DexArbFlashLoan") {
+  const contractPath = path.join(__dirname, "..", "contracts", `${name}.sol`);
   const source = fs.readFileSync(contractPath, "utf8");
 
   const input = {
     language: "Solidity",
     sources: {
-      "DexArbFlashLoan.sol": { content: source },
+      [`${name}.sol`]: { content: source },
     },
     settings: {
       // [ガス削減版(2026年9月20日)]
@@ -46,6 +48,6 @@ export function compileContract() {
   const warnings = (output.errors || []).filter((e) => e.severity === "warning");
   for (const w of warnings) console.warn("[コンパイル] 警告:", w.formattedMessage);
 
-  const compiled = output.contracts["DexArbFlashLoan.sol"]["DexArbFlashLoan"];
+  const compiled = output.contracts[`${name}.sol`][name];
   return { abi: compiled.abi, bytecode: "0x" + compiled.evm.bytecode.object };
 }

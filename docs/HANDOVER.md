@@ -3845,8 +3845,9 @@ USDC や WETH と組んだ、100分で75〜132回も取引されるプールを�
 | 段 | もの | 状態 |
 |---|---|---|
 | 1 | `scripts/liquidation-monitor.js`(名簿・健全度・価格更新・候補の組) | **入れた。ログで確認中** |
-| 2 | `contracts/AaveLiquidator.sol`(flashLoanSimple → liquidationCall → DEX売却)+ `simulateLiquidation` | 未 |
-| 2 | `RUN_LIQUIDATOR_DEPLOY=avalanche` でデプロイ → `LIQUIDATOR_CONTRACT_ADDRESS_AVALANCHE` | 未 |
+| 2 | `contracts/AaveLiquidator.sol`(flashLoanSimple → liquidationCall → DEX売却)+ `simulateLiquidation` | **書いてコンパイル済み(12,404バイト)** |
+| 2 | `scripts/liquidation-executor.js`(経路探し → eth_call で確認 → 送信) | **入れた** |
+| 2 | `RUN_LIQUIDATOR_DEPLOY=avalanche` でデプロイ → `LIQUIDATOR_CONTRACT_ADDRESS_AVALANCHE` | 次 |
 | 2 | DRY_RUN で `simulateLiquidation` の数字を確認 | 未 |
 | 3 | 本番送信(`LIQUIDATION_DRY_RUN=false`)| **オーナーの了承待ち** |
 
@@ -3875,6 +3876,23 @@ USDC や WETH と組んだ、100分で75〜132回も取引されるプールを�
 - **既存の計測(`aave-liquidation.js`)から avalanche を外した**(同じ読み取りを二重にしない)。
   他4チェーンの計測はそのまま。生存ログの `清算[…]` は4チェーン分、`清算AVAX[…]` が新しい方
 
+### 仕組み(実行。`contracts/AaveLiquidator.sol` + `scripts/liquidation-executor.js`)
+
+- **裁定のコントラクトとは別のコントラクト。** 裁定側(5チェーン)を再デプロイしなくてよい
+- 流れ: `flashLoanSimple` で借金の通貨を借りる → `executeOperation` の中で `liquidationCall`(receiveAToken=false)
+  → 受け取った担保を DEX の段(legs)で借金の通貨に売る → 借りた額+0.05% を返して残りが利益。
+  `minProfit` 未満なら取り消す。受取量は全て**残高の差**で測る(裁定側と同じ作法)
+- `simulateLiquidation` は eth_call で最後まで回し、`SimulationResult(returned, owed)` で返して取り消す。
+  **返済後に残る利益 = returned − owed**。送る前の答えは必ずこれ(見積もりは順位づけにしか使わない)
+- 経路: 裁定の地図は「2つ以上のプールがあるペア」に絞られていて担保→借金のプールが無いことがあるので、
+  V3 のファクトリー(Uniswap / Pharaoh 等、`V3_FACTORIES.avalanche`)と V2 のファクトリー(LFJ V1、
+  `LIQUIDATION_V2_FACTORIES`)にも聞く(結果は6時間覚える)。中継(WAVAX/USDC/USDt/WETH.e/BTC.b)を挟む2段も候補
+- 順位づけ: V3 は裁定コントラクトの `quoteV3`、V2 は準備量の式。滑りが `LIQUIDATION_MAX_SLIPPAGE_BPS` を
+  超える経路は見送り。上位3本を `simulateLiquidation` で確かめ、最良を採る
+- ガスは固定値(`LIQUIDATION_GAS_UNITS`=120万で費用を見積もり、送信の上限は `LIQUIDATION_GAS_LIMIT`=200万)
+- 送信は execute-opportunity.js と同じ流儀: 同じ NonceManager(`getSigner` を公開した)、記録簿
+  (`real-executions.json` に kind=liquidation)、`Liquidated` イベントから確定値、画面の候補の記録に結果
+
 ### 環境変数(すべて `LIQUIDATION_` で始める)
 
 | 名前 | 既定 | 意味 |
@@ -3896,8 +3914,12 @@ USDC や WETH と組んだ、100分で75〜132回も取引されるプールを�
 | `LIQUIDATION_MAX_BREAKDOWN_USERS` | 60 | 内訳を一度に読む人数の上限 |
 | `LIQUIDATION_WSS_URL` | (`AVALANCHE_WSS_URL`) | 清算用の WebSocket。未設定なら裁定と同じ端点へ別接続 |
 | `LIQUIDATION_STATE_FILE` | ボリュームの `liquidation-avalanche.json` | 名簿と遡りの進み具合の保存先 |
-| `RUN_LIQUIDATOR_DEPLOY` | (無し) | `avalanche` でコントラクトをデプロイ(第2段) |
-| `LIQUIDATOR_CONTRACT_ADDRESS_AVALANCHE` | (無し) | デプロイしたコントラクトの住所(第2段) |
+| `LIQUIDATION_GAS_UNITS` / `LIQUIDATION_GAS_LIMIT` | 1200000 / 2000000 | 費用見積もりのガス量 / 送信時の上限 |
+| `LIQUIDATION_MIN_PROFIT_SHARE_BPS` | 5000 | 確認した利益のうち鎖上に要求する割合(値動きの余裕) |
+| `LIQUIDATION_SIMULATE_TOP_N` | 3 | 見積もり上位の何本を eth_call で確かめるか |
+| `LIQUIDATION_V2_FACTORIES` | LFJ V1 | V2 ファクトリー(`住所:名前:手数料bps` をカンマ区切り) |
+| `RUN_LIQUIDATOR_DEPLOY` | (無し) | `avalanche` でコントラクトをデプロイ。完了後 false に戻す |
+| `LIQUIDATOR_CONTRACT_ADDRESS_AVALANCHE` | (無し) | デプロイしたコントラクトの住所。未設定なら候補はログのみ |
 
 ### RPC の枠(上限から計算)
 
@@ -3919,7 +3941,11 @@ USDC や WETH と組んだ、100分で75〜132回も取引されるプールを�
 - `[清算AVAX/価格] WAVAX が更新 → 要注意N人を測り直します` … **③が動いている証拠**
 - `[清算AVAX/候補] … 肩代わり$X(100%) ボーナス5.0% 見込み粗利$Y` … 組めた
 - `[清算AVAX/他者]` / `[清算AVAX/回復]` … 候補がその後どうなったか
-- 生存ログ: `清算AVAX[名簿N(遡りX%) 要注意M 候補C 他者T 回復R 価格更新P(即Q) Pool受信E WS接続 RPCn]`
+- `[清算AVAX/経路] … 候補N本(滑り300bps以内M本): uniswap-v3 滑り12bps / …` … 売る経路
+- `[清算AVAX/確認] … 戻りX 返済Y USDC → 返済後の利益$Z` … **eth_call の答え**
+- `[清算AVAX/判断] … 利益$Z − ガス$G = 純利$N → 送る(DRY_RUN なので送りません)`
+- `[清算AVAX/送信]` / `[清算AVAX/確定]` … 本番のみ
+- 生存ログ: `清算AVAX[名簿N(遡りX% 幅W) 要注意M 候補C 他者T 回復R 価格更新P(即Q) Pool受信E WS接続 確認S RPCn]`
 
 ---
 
