@@ -3443,6 +3443,84 @@ uint256 debtUsed = debtBefore + debtToCover - balanceOf(debt);  // ← 二重に
 
 ---
 
+## 「書いたのに一度も動いていない仕組み」を機械的に洗った(2026年9月21日)
+
+オーナーの指摘で全ファイルを走査した。今日すでに2件この型を見つけている
+(`isKRevert` が一度も true にならなかった / `clearFeeProbed` が常に false を返した)。
+
+### 見つかった最大のもの:**ファクトリーからのプール発見が一度も走っていない**
+
+```js
+async function buildPoolMapFromFactories() {
+  const seedsByChain = collectSeedPools();
+  const totalSeeds = Object.values(seedsByChain).reduce((s, m) => s + m.size, 0);
+  if (totalSeeds === 0) return;          // ← **毎回ここで抜けている**
+  ...
+}
+```
+
+`collectSeedPools()` は `getVerifiedPairs()` を読む。
+そのファイルに書き込む `recordVerifiedPair()` は、**コードのどこからも呼ばれていない**。
+
+```
+recordVerifiedPair の出現: scripts/verified-pairs.js:48 の定義のみ
+```
+
+**つまり `verified-pairs.json` は一度も書かれず、種は常に0件、
+`buildPoolMapFromFactories` は即座に抜ける。**
+その先の `discoverPoolsFromFactory`(ファクトリーの全プールを取り込む処理)は
+**一度も実行されていない**。`scripts/pool-discovery.js` 全体が休眠している。
+
+**これが損かどうかは、まだ断定できない。** プールは他の道
+(イベントからの発見・pool-scout)で1,270本まで増えているので「プールが無い」
+わけではない。ただし**ファクトリー単位でまとめて取り込む道は塞がっている**。
+
+**勝手に有効化しない。** `MAX_POOLS_PER_FACTORY = 3000` なので、
+複数チェーン×複数ファクトリーで**数千〜万のプール**が入りうる。
+一度きりの取り込み費用は安い(束ねて数千回)が、**その後ずっと
+Sync イベントの受信が増える**。受信は既に枠の72%(102万/142万)を占めている。
+**後戻りしにくい構成変更**なので、オーナーの判断を待つ。
+
+### 見つかったもの②:数えているのに一度も出していない値
+
+| | 何が分からなかったか |
+|---|---|
+| `getTrustedMaxCount()` | **今この瞬間、上限がかかっている表が何本か** |
+| `getQuarantineStats()` | 一時除外が効いているか(のべ/今/飛ばした経路) |
+| `getFeeProbeStats()` | 手数料の実測が進んでいるか |
+
+**どれも「効いているのか」を判断するのに要る数字**だった。生存ログに足した。
+
+```
+V3表[確認96 上限制限2(今4本) 取下0 過小3]
+一時除外[のべ3 今1 飛ばした経路120]
+手数料実測[判明7(30bps以外3) 取引なしで保留41 疑わしい1 失敗0]
+```
+
+足す時に**また自分で間違えた**。`getFeeProbeStats()` の項目名を
+`probed / failed / onHold` と書いたが、実物は
+`byAmountOut / byLogs / non30 / noTrades / implausible / errors` だった。
+**実物を読んでから書くべきだった。**
+
+### 見つかったもの③:使われていない書き出し(害は無い)
+
+`getBorrowableTokens` `isStableToken` `decodeV3SwapData` `priceFromSqrtX96`
+`readV3State` `buildQuoteTable` `getQuoteTableAge` `fetchOnchainReserves`
+`fetchTokenDecimals` `isOnchainReadAvailable` `readVerifiedPairPools`
+`getBigStats` `getBigThresholdUsd` `getAaveStats` `getCompetitorStats`
+`getL1FeeStatus` `verified-pairs` の読み書き5関数
+
+いずれも補助の関数で、**動いていないことによる損は無い**。今は消さない
+(消す変更そのものが危険を持ち込むため)。
+
+### 教訓
+
+> **「分岐が一度も通らない」と「値が一度も読まれない」は、別々に洗うこと。**
+> 前者は `isKRevert` で、後者は今回の3つで見つかった。
+> **どちらも「動いているように見えて動いていない」。**
+
+---
+
 ## 進行中の計画
 1. 済: V3型プールをDEX別に数える調査(scripts/pool-survey.js)。Polygon /
    Base / Optimism で実施し、未監視ファクトリーの活動量と、監視ペアの

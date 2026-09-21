@@ -38,7 +38,7 @@ import { runPoolSurvey } from "./scripts/pool-survey.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
 import { scoutAllChains, getScoutChains, SCOUT_INTERVAL_MS } from "./scripts/pool-scout.js";
-import { probePoolFeeBps, isFeeProbeOnHold, getRpcStatus, getRpcCallTotals, callWithRpc, probePendingState, getProviderForChain } from "./scripts/onchain-reserves.js";
+import { probePoolFeeBps, isFeeProbeOnHold, getRpcStatus, getRpcCallTotals, callWithRpc, probePendingState, getProviderForChain , getFeeProbeStats } from "./scripts/onchain-reserves.js";
 import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
 import { alertOwner, getAlertStats, sendPendingQuestions } from "./scripts/owner-alert.js";
 import { verifyAaveChains, getAaveChains, sweepAll as aaveSweepAll, checkWatchAll as aaveCheckWatchAll, formatAaveLine, AAVE_SWEEP_INTERVAL_MS, AAVE_WATCH_INTERVAL_MS } from "./scripts/aave-liquidation.js";
@@ -63,6 +63,7 @@ import {
   scanForChangedPool, scanAllPairs, getRouteCalcStats,
   getNearMissStats, countIfWallDrops, getWallBreakdown, NEAR_MISS_REACHABLE_WALL_BPS,
   getWhatIfProfit, getSpotScreenStats, takeQuoteDemand, getQuoteDemandTotal, getScreenMinProfitUsd,
+  getQuarantineStats,
 } from "./scripts/opportunity-scanner.js";
 import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS, resetNonce, checkContractVersions } from "./scripts/execute-opportunity.js";
 import {
@@ -75,7 +76,7 @@ import { journal, loadJournal, trimJournalIfNeeded, summarize } from "./scripts/
 import {
   activeV3Factories, isForkFactory, V3_FEE_TIERS, findV3Pool, feeTierToBps,
   buildQuoteTablesBatch, hasQuoteTable, clearQuoteTable, clearQuoteTableDirection,
-  setTableTrustedMax, getTableTrustedMax, countQuoteTables,
+  setTableTrustedMax, getTableTrustedMax, getTrustedMaxCount, countQuoteTables,
   verifyQuoteTable, QUOTE_SAMPLES_USD, exportQuoteTables, importQuoteTable,
 } from "./scripts/v3-pools.js";
 import { CHAIN_CONFIG } from "./chain-config.js";
@@ -934,9 +935,38 @@ const VERIFY_AMOUNTS_USD = (process.env.VERIFY_AMOUNTS_USD || "5,20,200,700")
 const verifyErrorByUsd = new Map(); // usd -> { count, sumAbsBps, worstBps, overCount }
 
 /// 生存ログ用。価格表に制限をかけた数と、向きごと取り下げた数。
+///
+/// [2026年9月21日: 今まで見えていなかったものを足した]
+/// オーナーの指摘「書いたのに一度も呼ばれていない仕組みは無いか」で洗ったところ、
+/// **数えているのに一度も画面にもログにも出していない値**が見つかった。
+///   getTrustedMaxCount()  … 今この瞬間、上限がかかっている表の数
+///   getQuarantineStats()  … 一時除外の実績
+///   getFeeProbeStats()    … 手数料の実測の実績
+/// どれも「効いているのか」を判断するのに要る数字だった。
 function v3TableLine() {
-  if (!stats.v3VerifyCapped && !stats.v3VerifyDropped && !stats.v3VerifyUnderCount) return "";
-  return ` V3表[確認${stats.v3VerifyCount} 上限制限${stats.v3VerifyCapped} 取下${stats.v3VerifyDropped} 過小${stats.v3VerifyUnderCount}]`;
+  const capped = getTrustedMaxCount();
+  if (!stats.v3VerifyCapped && !stats.v3VerifyDropped && !stats.v3VerifyUnderCount && !capped) return "";
+  return ` V3表[確認${stats.v3VerifyCount} 上限制限${stats.v3VerifyCapped}(今${capped}本) 取下${stats.v3VerifyDropped} 過小${stats.v3VerifyUnderCount}]`;
+}
+
+/// 一時除外と手数料の実測の実績。どちらも0のうちは出さない。
+function quarantineFeeLine() {
+  let out = "";
+  try {
+    const q = getQuarantineStats();
+    if (q && (q.quarantined || q.active || q.skippedRoutes)) {
+      out += ` 一時除外[のべ${q.quarantined} 今${q.active} 飛ばした経路${(q.skippedRoutes || 0).toLocaleString()}]`;
+    }
+  } catch (e) {}
+  try {
+    // 項目名は実物に合わせる(最初 probed/failed/onHold と書いて存在しなかった)。
+    const fp = getFeeProbeStats();
+    const known = (fp?.byAmountOut ?? 0) + (fp?.byLogs ?? 0);
+    if (known || fp?.noTrades || fp?.implausible || fp?.errors) {
+      out += ` 手数料実測[判明${known}(30bps以外${fp.non30 ?? 0}) 取引なしで保留${fp.noTrades ?? 0} 疑わしい${fp.implausible ?? 0} 失敗${fp.errors ?? 0}]`;
+    }
+  } catch (e) {}
+  return out;
 }
 
 export function getVerifyErrorStats() {
@@ -1965,7 +1995,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${disableLine()}${formatBigLine()}${formatAaveLine()}${alertLine}`);
+  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${formatBigLine()}${formatAaveLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
