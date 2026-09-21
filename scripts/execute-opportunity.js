@@ -94,7 +94,7 @@ const LEARN_CAP_BPS = parseFloat(process.env.LEARN_CAP_BPS || "20");
 /// **負 = 見込みの方が大きい = 表が過大**。これが危ない向き。
 /// その額では信用できないので、**半分まで**上限を下げる。
 /// (定期検証が通れば上限は外れるので、行き過ぎても戻れる)
-function learnTrustedMaxFromDiff(chain, leg, amountIn, offDiffBps) {
+function learnTrustedMaxFromDiff(chain, leg, amountIn, offDiffBps, why = "公式との差") {
   if (leg.kind !== KIND_V3 || offDiffBps == null) return false;
   if (offDiffBps > -LEARN_CAP_BPS) return false;   // 過小・軽微は触らない
   if (!(amountIn > 0n)) return false;
@@ -112,7 +112,7 @@ function learnTrustedMaxFromDiff(chain, leg, amountIn, offDiffBps) {
   const range = getTableRange(chain, leg.pool, zeroForOne);
   console.log(
     `[表の上限/学習] ${chain} ${leg.dexId}:${leg.pool.slice(0, 10)}…: ` +
-    `投入${amountIn} で表が**${Math.abs(offDiffBps).toFixed(1)}bps 過大**(公式との差)。` +
+    `投入${amountIn} で表が**${Math.abs(offDiffBps).toFixed(1)}bps 過大**(${why})。` +
     `信用できる上限を ${next} に下げました` +
     (range ? "" : "(最小点も下回ったため、このプールはこの向きでは判定しません)")
   );
@@ -219,6 +219,19 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
   const parts = [];
   let worst = null;       // 表示用: いちばん差の大きかった段
   let blameWorst = null;  // 責任用: **こちらの模型が間違っていると示せた**段だけ
+  // **模型の誤りの合計**(2026年9月21日、オーナーの指摘で追加)。
+  //
+  // [なぜ合計が要るか]
+  // 記録簿の「送信直前に見送り」の上位に、base の3段V3が
+  // **投入$1600 で 実測 -26.1 / -21.4 / -18.8bps** と並んでいた。
+  // 別々のプールなのに同じ額で同じ幅ずれている = 価格の動きではなく**模型の誤り**。
+  // ところが段ごとに割れば1段あたり6〜9bpsで、段ごとの閾値(20bps)には
+  // **一度も届かない**。だから上限が一度も下がらず、同じ額で落ち続けていた。
+  // **合計して初めて見える誤りがある。**
+  let modelSum = 0;       // 測れた段の模型誤差の合計(bps)
+  let modelKnown = 0;     // 模型誤差を測れた段の数
+  let learnedAny = false; // 段ごとの学習が発動したか
+  const v3Model = [];     // 合計から学ぶ時の対象(V3で公式と比べられた段)
   for (let i = 0; i < legs.length; i++) {
     if (actual[i] == null) { parts.push(`${i + 1}段目 ${legs[i].dexId}:読めず`); continue; }
     const diff = bpsDiff(expected[i].out, actual[i]);
@@ -227,7 +240,8 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
     const offDiff = ownQuoted[i] && official[i] != null ? bpsDiff(expected[i].out, official[i]) : null;
     const offNote = offDiff != null ? `(公式${offDiff >= 0 ? "+" : ""}${offDiff.toFixed(1)}bps)` : "";
     // **測った誤差を、その場で表の上限に反映する。**
-    try { learnTrustedMaxFromDiff(chain, legs[i], expected[i].in, offDiff); } catch (e) {}
+    try { if (learnTrustedMaxFromDiff(chain, legs[i], expected[i].in, offDiff)) learnedAny = true; } catch (e) {}
+    if (offDiff != null && legs[i].kind === KIND_V3) v3Model.push({ i, leg: legs[i], bps: offDiff });
     // V2の段は、差を「判定してから地図が動いた分」と「地図とチェーンの差」に分ける。
     let splitNote = "";
     let gapBps = null;
@@ -254,13 +268,33 @@ async function diagnoseRejectedRoute(chain, contractAddress, opp) {
     if (modelBps != null && (blameWorst == null || modelBps < blameWorst.bps)) {
       blameWorst = { i, bps: modelBps, leg: legs[i] };
     }
+    if (modelBps != null) { modelSum += modelBps; modelKnown++; }
   }
+  // **合計を呼び出し側へ返す。** 記録簿が「模型の誤り」と「価格が動いた」を
+  // 分けて数えられるようにする(今までどちらも「送信直前に見送り」だった)。
+  opp.modelBps = modelKnown > 0 ? modelSum : null;
   if (parts.length === 0) return;
   // 表示は今までどおり「いちばん差の大きかった段」を出す(原因を探す手掛かり)。
   const note = worst && worst.diff <= -DIAGNOSE_MIN_BPS
     ? ` ← ${worst.i + 1}段目 ${worst.leg.dexId}:${worst.leg.pool.slice(0, 10)}… が最大のずれ`
     : "";
-  console.log(`[段ごとの答え合わせ] ${chain} ${opp.label} 投入${opp.amountIn}: ${parts.join(" / ")}${note}`);
+  const sumNote = modelKnown > 0
+    ? ` / **模型の誤りの合計${modelSum >= 0 ? "+" : ""}${modelSum.toFixed(1)}bps**(${modelKnown}段で測定)`
+    : "";
+  console.log(`[段ごとの答え合わせ] ${chain} ${opp.label} 投入${opp.amountIn}: ${parts.join(" / ")}${sumNote}${note}`);
+
+  // **段ごとでは届かない誤りを、合計で捕まえる。**
+  // 段ごとの学習が一度も発動せず、合計では閾値を超えている時だけ、
+  // いちばんずれていたV3の段の上限を下げる(半分にする)。
+  // 誤差の原因が何であれ「その額では表を信用できない」ことは測れているので、
+  // 額を抑えるのが正しい対処。定期検証が通れば上限は戻る。
+  if (!learnedAny && modelKnown > 0 && modelSum <= -LEARN_CAP_BPS && v3Model.length > 0) {
+    const worstV3 = v3Model.reduce((a, b) => (b.bps < a.bps ? b : a));
+    try {
+      learnTrustedMaxFromDiff(chain, worstV3.leg, expected[worstV3.i].in, modelSum,
+        `経路全体の合計。この段は${worstV3.bps.toFixed(1)}bps`);
+    } catch (e) {}
+  }
 
   // **責任を問うのは、模型の誤りが大きいと示せた時だけ。**
   if (blameWorst && blameWorst.bps <= -BLAME_MIN_BPS) {

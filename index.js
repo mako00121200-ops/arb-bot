@@ -422,6 +422,30 @@ function rejectIfTrap(opp) {
 }
 
 // ===== 記録簿 =====
+/// 「模型の誤り」と呼ぶ境目(bps)。表の上限を下げる閾値(LEARN_CAP_BPS)と同じ尺度。
+/// これより大きくずれていれば、価格の動きではなく**こちらの計算が違っていた**と見なす。
+const MODEL_WRONG_BPS = parseFloat(process.env.MODEL_WRONG_BPS || "-20");
+
+/// 送信まで行かなかった機会を、**実測で**分類する。
+///
+/// [なぜ要るか(2026年9月21日、オーナーの指摘)]
+/// 画面の「送信直前に見送り 264件 +$77.89」には、中身の違う3つが混ざっていた。
+///   ・チェーン上で赤字。**こちらの計算が違っていた**(直せる)
+///   ・チェーン上で赤字。**判定から送信までに価格が動いた**(速さの問題。計算は正しい)
+///   ・チェーン上では黒字。**ガス代に届かない**(そもそも失敗ではない)
+/// 全部に「判定と実測のずれ」という同じ直し方が書かれていたので、
+/// **どれから手を付ければよいか分からなかった。**
+/// `sendResult` と `modelBps` は既に測ってあるので、それで分ける。
+function notSentOutcome(opp) {
+  if (opp.sendResult === "below_gas") return "below_gas";
+  if (opp.sendResult !== "rejected") return "not_sent";
+  // チェーン上で赤字だった。段ごとの答え合わせが原因を測れていれば、それで分ける。
+  if (opp.modelBps != null) {
+    return opp.modelBps <= MODEL_WRONG_BPS ? "model_wrong" : "price_moved";
+  }
+  return "not_profitable_onchain";
+}
+
 function record(opp, outcome, extra = {}) {
   journal({
     outcome, chain: opp.chain, kind: opp.kind, label: opp.label, hasV3: !!opp.hasV3,
@@ -436,6 +460,9 @@ function record(opp, outcome, extra = {}) {
     ...(opp.actualNetProfitUsd != null ? { actualNetProfitUsd: opp.actualNetProfitUsd } : {}),
     // 送信直前の確認でどれだけ足りなかったか(赤字だった場合)。
     ...(opp.shortfallBps != null ? { shortfallBps: opp.shortfallBps } : {}),
+    // 段ごとの答え合わせで測った「模型の誤りの合計」(bps)。
+    // これが小さければ、赤字の原因は価格の動き(= 競争に負けた)。
+    ...(opp.modelBps != null ? { modelBps: Number(opp.modelBps.toFixed(1)) } : {}),
     ...(opp.sendResult ? { sendResult: opp.sendResult } : {}),
     ...extra,
   });
@@ -978,11 +1005,19 @@ export function getVerifyErrorStats() {
 
 async function verifyV3Calculations() {
   if (!anyReady()) return;
+  // **向きも交代で確かめる(2026年9月21日)。**
+  //
+  // [なぜ要るか]
+  // 信用できる上限は**向きごと**に付くのに、この検証は zeroForOne=true しか
+  // 測っていなかった。つまり**逆向きに付いた上限は一度も外れない**。
+  // 下げる一方のラチェットになり、使うほど判定できる額が痩せていく
+  // (同じ型の欠陥を9月21日に「順位の数え方」で1件直している)。
+  const zeroForOne = (v3VerifyCursor % 2) === 0;
   const candidates = [];
   for (const chain of chainReady) {
     for (const pool of getPoolsByKind(chain, KIND_V3)) {
       if (disabledPools.has(poolKeyOf(chain, pool.address))) continue;
-      if (!hasQuoteTable(chain, pool.address, true)) continue;
+      if (!hasQuoteTable(chain, pool.address, zeroForOne)) continue;
       // フォークのプールは公式Quoterで引けないため、この検証の対象外にする。
       if (isForkFactory(chain, pool.factory)) continue;
       candidates.push(pool);
@@ -997,7 +1032,11 @@ async function verifyV3Calculations() {
     return t != null && now - t < RECENT_USE_MS;
   });
   const list = used.length > 0 ? used : candidates;
-  const pool = list[v3VerifyCursor % list.length];
+  // **同じ数え札で「プール」と「向き」を選んではいけない。**
+  // どちらも1ずつ進むと噛み合ってしまい、プール数が偶数の時は
+  // 「このプールは必ず順方向、隣は必ず逆方向」と固定される(偶奇の取り違え)。
+  // 札を2で割って進めれば、1つのプールを順・逆の順に続けて測れる。
+  const pool = list[Math.floor(v3VerifyCursor / 2) % list.length];
   v3VerifyCursor++;
 
   // **小さい順に確かめ、「どこまでなら信用できるか」を決める。**
@@ -1024,16 +1063,20 @@ async function verifyV3Calculations() {
   let cappedAt = null;         // 過大が出た投入額($)
   const curve = [];            // 投入額ごとの誤差(大きさとの関係を見るため)
 
+  const tokenIn = zeroForOne ? pool.token0 : pool.token1;
+  const tokenOut = zeroForOne ? pool.token1 : pool.token0;
+  const dirNote = zeroForOne ? "" : "(逆向き)";
+
   for (const usd of amounts) {
     // 表の点そのものではなく、点と点の間の値で確かめる。
-    const amountIn = usdToAmount(pool.chain, pool.token0, usd);
+    const amountIn = usdToAmount(pool.chain, tokenIn, usd);
     if (!amountIn) continue;
 
     let result;
     try {
       result = await verifyQuoteTable({
-        chain: pool.chain, pool: pool.address, zeroForOne: true,
-        tokenIn: pool.token0, tokenOut: pool.token1, feeTier: pool.feeTier, amountIn,
+        chain: pool.chain, pool: pool.address, zeroForOne,
+        tokenIn, tokenOut, feeTier: pool.feeTier, amountIn,
       });
     } catch (e) { continue; }
     // 流動性が足りず公式Quoterが失敗した場合は測れない。その額は飛ばす。
@@ -1061,7 +1104,7 @@ async function verifyV3Calculations() {
     }
     // 閾値は1%(100bps)では粗すぎた。狙う利幅が5〜50bpsなので20bpsで出す。
     if (Math.abs(bps) > 20) {
-      console.log(`[V3検証] ${pool.chain} ${pool.address.slice(0, 10)}…(${(pool.feeBps / 100).toFixed(2)}%) 投入$${usd}: 補間が公式より${bps > 0 ? "過大" : "過小"}${Math.abs(bps).toFixed(1)}bps`);
+      console.log(`[V3検証] ${pool.chain} ${pool.address.slice(0, 10)}…${dirNote}(${(pool.feeBps / 100).toFixed(2)}%) 投入$${usd}: 補間が公式より${bps > 0 ? "過大" : "過小"}${Math.abs(bps).toFixed(1)}bps`);
     }
 
     // **過大だけが危ない。** 過小は見積もりが辛いだけで、損にはならない。
@@ -1075,7 +1118,7 @@ async function verifyV3Calculations() {
 
   // **どの額から壊れるかを1行で残す。** これが「大きい額で失敗する」の証拠になる。
   if (curve.length > 1) {
-    console.log(`[V3検証/大きさ] ${pool.chain} ${pool.address.slice(0, 10)}…(${(pool.feeBps / 100).toFixed(2)}%): ${curve.join(" / ")}${cappedAt != null ? ` → **$${cappedAt}で過大**` : ""}`);
+    console.log(`[V3検証/大きさ] ${pool.chain} ${pool.address.slice(0, 10)}…${dirNote}(${(pool.feeBps / 100).toFixed(2)}%): ${curve.join(" / ")}${cappedAt != null ? ` → **$${cappedAt}で過大**` : ""}`);
   }
 
   if (cappedAt != null) {
@@ -1088,27 +1131,33 @@ async function verifyV3Calculations() {
       // 定期検証は $5/$20/$200/$700 の固定点しか見ないが、
       // 答え合わせは**本当に使った額**を見ている。情報の濃さが違う。
       // (全ての額で誤差が収まった時だけ、下の分岐で制限を外す)
-      const learned = getTableTrustedMax(pool.chain, pool.address, true);
+      const learned = getTableTrustedMax(pool.chain, pool.address, zeroForOne);
       const next = learned != null && learned < lastOkAmountIn ? learned : lastOkAmountIn;
-      setTableTrustedMax(pool.chain, pool.address, true, next);
+      setTableTrustedMax(pool.chain, pool.address, zeroForOne, next);
       stats.v3VerifyCapped++;
       console.log(
-        `[V3検証] ${pool.chain} ${pool.address.slice(0, 10)}…(${(pool.feeBps / 100).toFixed(2)}%): ` +
+        `[V3検証] ${pool.chain} ${pool.address.slice(0, 10)}…${dirNote}(${(pool.feeBps / 100).toFixed(2)}%): ` +
         `投入$${cappedAt}で過大のため、**信用できる上限を${next === lastOkAmountIn ? `$${amounts.filter((a) => a < cappedAt).pop()}相当` : "答え合わせで学んだ値"}に下げました**` +
         `(プールは判定に使い続けます)`
       );
     } else {
       // いちばん小さい額でも過大。この向きは使えないので、**その向きだけ**捨てる。
-      clearQuoteTableDirection(pool.chain, pool.address, true);
+      clearQuoteTableDirection(pool.chain, pool.address, zeroForOne);
       stats.v3VerifyDropped++;
       console.log(
-        `[V3検証] ${pool.chain} ${pool.address.slice(0, 10)}…(${(pool.feeBps / 100).toFixed(2)}%): ` +
+        `[V3検証] ${pool.chain} ${pool.address.slice(0, 10)}…${dirNote}(${(pool.feeBps / 100).toFixed(2)}%): ` +
         `最小の投入$${cappedAt}でも過大のため、この向きの価格表を捨てました(逆向きは残します)`
       );
     }
   } else if (lastOkAmountIn != null) {
     // 全部通った。前に付けた制限があれば外す(流動性が改善した場合に戻せる)。
-    setTableTrustedMax(pool.chain, pool.address, true, null);
+    // **上限を外してよいのは、上限の元になった額を測り直して通った時だけ。**
+    // verifyQuoteTable は上限を無視して測るので、ここまで来たら本当に全部通っている。
+    const had = getTableTrustedMax(pool.chain, pool.address, zeroForOne);
+    setTableTrustedMax(pool.chain, pool.address, zeroForOne, null);
+    if (had != null) {
+      console.log(`[V3検証] ${pool.chain} ${pool.address.slice(0, 10)}…${dirNote}: 全ての額で誤差が収まったので、信用できる上限の制限を**外しました**`);
+    }
   }
 }
 
@@ -1778,7 +1827,7 @@ async function handleOpportunity(opp, meta = {}) {
     } else {
       reasons.notSent++;
       cooldownUntil.set(key, Date.now() + 30 * 1000);
-      record(opp, "not_sent", meta);
+      record(opp, notSentOutcome(opp), meta);
       noteBigOutcome(opp, "not_sent", opp.shortfallBps != null ? `不足${opp.shortfallBps.toFixed(1)}bps` : "");
       // **不足の実測は、V2の手数料の誤差を知っている唯一の情報。** 捨てない。
       try { learnV2FeeFromShortfall(opp); } catch (e) {}
@@ -1793,7 +1842,10 @@ async function handleOpportunity(opp, meta = {}) {
     // 制限時間超過など、送信側の catch を通らない失敗でも手元の nonce を
     // 鎖上の値に合わせ直す。放置すると以降の送信が詰まる。
     try { resetNonce(opp.chain); } catch (inner) {}
-    record(opp, "failed", { ...meta, error: msg, stage });
+    // **「失敗」と「負け」を同じ箱に入れない。**
+    // `wait`(確定待ちで取り消された)は、送った後に他者が先に取った時に起きる。
+    // 直し方が「取り消しの中身から原因を特定する」ではなく「速さ」なので分ける。
+    record(opp, stage === "wait" ? "race_lost" : "failed", { ...meta, error: msg, stage });
   } finally {
     executing.delete(key);
     for (const k of lockKeys) executingPools.delete(k);
@@ -2290,6 +2342,8 @@ function renderPage() {
     success: "成功", not_sent: "送信直前に見送り", failed: "送信失敗",
     below_min: "最低利益未満", trap: "罠の疑い", tax_token: "税トークン",
     unprofitable: "赤字", skipped_cooldown: "冷却中", not_profitable_onchain: "実測で赤字",
+    model_wrong: "こちらの計算が違っていた", price_moved: "先に価格が動いた",
+    below_gas: "ガス代に届かず見送り", race_lost: "送信後に先を越された",
   };
   const outcomeLine = Object.entries(sum.byOutcome)
     .sort((a, b) => b[1] - a[1])
@@ -2299,7 +2353,7 @@ function renderPage() {
   // 黒字と判定したのに取れなかった上位。ここが改善の手がかりになる。
   const missedRows = sum.topMissed.map((m, i) => `<tr><td>${i+1}</td>
     <td style="font-size:9px">${m.kind || ''} ${m.chain || ''}${m.hasV3 ? ' <span style="color:#6fae62">V3</span>' : ''}<br>${shortenLabel(m.label)}</td>
-    <td style="font-size:9px">${OUTCOME_LABEL[m.outcome] || m.outcome}${m.shortfallBps != null ? `<br><span style="color:#888">実測${m.shortfallBps.toFixed(1)}bps</span>` : ''}${m.stage ? `<br><span style="color:#888">${m.stage}</span>` : ''}</td>
+    <td style="font-size:9px">${OUTCOME_LABEL[m.outcome] || m.outcome}${m.shortfallBps != null ? `<br><span style="color:#888">実測${m.shortfallBps.toFixed(1)}bps</span>` : ''}${m.modelBps != null ? `<br><span style="color:#888">模型${m.modelBps >= 0 ? '+' : ''}${m.modelBps.toFixed(1)}bps</span>` : ''}${m.stage ? `<br><span style="color:#888">${m.stage}</span>` : ''}</td>
     <td style="text-align:right">$${(m.tradeAmountUsd ?? 0).toFixed(2)}</td>
     <td style="text-align:right;color:#e8a33d;font-weight:600">+$${(m.netProfitUsd ?? 0).toFixed(4)}</td></tr>`).join('')
     || `<tr><td colspan="5" style="color:#888">取り逃した黒字はありません</td></tr>`;
@@ -2308,6 +2362,10 @@ function renderPage() {
   const CAUSE_FIX = {
     failed: "送信は届いたが失敗。取り消しの中身(セレクタ)から原因を特定する",
     not_sent: "判定と実測のずれ。価格表の精度か、反応の遅れ",
+    model_wrong: "**こちらの計算が違っていた。** 測った誤差の合計で、その額の投入をやめる(自動で上限を下げる)",
+    price_moved: "計算は合っていたが、判定から送信までに他者が取った。**速さの問題**で、計算は直さない",
+    below_gas: "チェーン上では黒字だが、ガス代に届かない。投入額を増やせるかが鍵",
+    race_lost: "送信は正しかったが、確定前に他者が先に取った。失われたのはガス代のみ。**速さの問題**",
     below_min: "ガス代に埋もれている。投入額を増やせるかが鍵",
     skipped_cooldown: "直前の失敗で冷却中。失敗の原因を直せば冷却も減る",
     cooldown: "直前の失敗で冷却中。失敗の原因を直せば冷却も減る",
