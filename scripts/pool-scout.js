@@ -33,6 +33,7 @@ import { registerPool, getPool, getPoolsForPair, KIND_V2, KIND_V3 } from "./pool
 import { getKnownTokens } from "./borrowable-tokens.js";
 import { isForkFactory, isForkQuoterEnabled, V3_FACTORIES, feeTierToBps } from "./v3-pools.js";
 import { isKnownIncompatiblePool } from "./incompatible-pools.js";
+import { getLastRpcUsage } from "./rpc-usage.js";
 
 /// 調べるチェーン。自前の見積もり(ENABLE_FORK_QUOTER)が有効なチェーンでのみ
 /// 意味がある(住所の分からないファクトリーのプールは公式Quoterで引けないため)。
@@ -59,7 +60,34 @@ const SCOUT_MAX_IDENTIFY = parseInt(process.env.SCOUT_MAX_IDENTIFY || "300", 10)
 /// ただしプールを増やすと受信がそのままRPCの消費になるため、
 /// **取引の多い上位だけ**に絞る。件数ではなく順位で切ると、
 /// チェーンの活発さが変わっても増え方が読める。
-const SCOUT_ONE_KNOWN_TOP = parseInt(process.env.SCOUT_ONE_KNOWN_TOP || "8", 10);
+/// 「片方だけ既知」の新しいペアを、取引の多い順に何位まで採るか。
+///
+/// [8 → 50 に広げた(2026年9月21日、オーナーの指示)]
+/// 実測でこうなっていた:
+///   [プール発見] optimism: 3,000ブロックで264プールが稼働。264件を調べ、**0件**を追加。
+///     見送り: 既に地図にある110 / **新しいペア(片方だけ既知)125** / 両方とも未知20 / 流動性が0 9
+///   未採用で取引の多いペア上位: 132回 / 104回 / 90回 / 76回 / 75回(USDC・WETHと組んだペア)
+///
+/// **264本動いているのを見て、0本しか採っていなかった。**
+/// ファクトリーを辿る必要は無かった。`getLogs` は住所を指定せず、
+/// チェーン上の全ての取引を既に見ている。**採用の閾値だけが絞っていた。**
+const SCOUT_ONE_KNOWN_TOP = parseInt(process.env.SCOUT_ONE_KNOWN_TOP || "50", 10);
+
+/// 枠の月末見込がこれを超えたら、**新しいプールの採用を自分で止める**。
+///
+/// [なぜ要るか]
+/// 課金は「購読で届くログ1件ごと」。監視するプールを増やすと受信が増え、
+/// **枠を使い切れば端点に切られて bot ごと止まる**。
+/// 増やす仕組みを入れるなら、**止める仕組みを同時に入れる**
+/// (「再試行する仕組みを作ったら止め方も作る」と同じ)。
+const SCOUT_QUOTA_STOP_PCT = parseFloat(process.env.SCOUT_QUOTA_STOP_PCT || "70");
+
+/// 枠が危なければ true。採用を見送る。
+function quotaTooTight() {
+  const u = getLastRpcUsage();
+  if (!u || !u.reliable) return false;   // まだ測れていないうちは止めない
+  return u.projectedPercent >= SCOUT_QUOTA_STOP_PCT;
+}
 
 // Uniswap V3形式の Swap。Ramses系・Slipstream系のCLプールも同じ形。
 const V3_SWAP_TOPIC = ethers.id("Swap(address,address,int256,int256,uint160,uint128,int24)");
@@ -262,6 +290,13 @@ export async function scoutChain(chain) {
   const skipped = {};
   const candidates = []; // 載せずに保留した「次の候補」
   let added = 0, v2Added = 0, v3Added = 0, addedSwaps = 0;
+
+  // **枠が危なければ、今回は1本も採らない。** 増やす前に止められるようにする。
+  if (quotaTooTight()) {
+    const u = getLastRpcUsage();
+    console.warn(`[プール発見] ${key}: 枠の月末見込が${u.projectedPercent.toFixed(0)}%(上限${SCOUT_QUOTA_STOP_PCT}%)のため、**今回は新しいプールを採りません**`);
+    return { added: 0, scanned, active: counts.size, skipped: { "枠が危ない": ranked.length } };
+  }
 
   for (let rank = 0; rank < ranked.length; rank++) {
     const [address, swaps] = ranked[rank];
