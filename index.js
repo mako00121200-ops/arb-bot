@@ -40,7 +40,7 @@ import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
 import { scoutAllChains, getScoutChains, SCOUT_INTERVAL_MS } from "./scripts/pool-scout.js";
 import { probePoolFeeBps, isFeeProbeOnHold, getRpcStatus, getRpcCallTotals, callWithRpc, probePendingState, getProviderForChain } from "./scripts/onchain-reserves.js";
 import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
-import { alertOwner, getAlertStats } from "./scripts/owner-alert.js";
+import { alertOwner, getAlertStats, sendPendingQuestions } from "./scripts/owner-alert.js";
 import {
   fetchReservesBatch, fetchPoolTokensBatch, fetchTokenDecimalsBatch,
   fetchV3StatesBatch, getMulticallStats, findV3PoolsBatch,
@@ -1612,13 +1612,23 @@ function heartbeat() {
   }
   // オーナーが動かないと解決しないことだけを見張る(通知は LINE)。
   try { checkOwnerAlerts(usageSummary); } catch (e) {}
+  let alertLine = "";
+  try {
+    const a = getAlertStats();
+    // 未設定のうちは黙っている。設定後、送った件数か失敗があれば出す。
+    if (a.configured && (a.sentToday > 0 || a.errors > 0)) {
+      alertLine = ` 通知[本日${a.sentToday}通 失敗${a.errors}${a.lastError ? `:${a.lastError.slice(0, 40)}` : ""}]`;
+    } else if (!a.configured) {
+      alertLine = " 通知[LINE未設定]";
+    }
+  } catch (e) {}
 
   // 価格表は「プール×方向」ごとに要る。分母が無いと揃っているように見えてしまう。
   // V3の段は価格表が無いと使えないので、欠けている分はそのまま経路が組めない。
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}`);
+  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
@@ -2242,6 +2252,10 @@ async function main() {
     saveGasPriceRatios();
   }, SAVE_MAP_INTERVAL_MS);
   setInterval(trimJournalIfNeeded, 30 * 60 * 1000);
+  // Claude が docs/owner-questions.json に置いた質問を LINE へ転送する。
+  // 起動時に1回と、送れなかった分の再試行のため10分ごと。
+  sendPendingQuestions().catch(() => {});
+  setInterval(() => { sendPendingQuestions().catch(() => {}); }, 10 * 60 * 1000);
   // 新しく出来たプールを定期的に拾う。見つかったら、そのチェーンだけ
   // 桁数・状態・購読を作り直す(判定は止めない)。
   if (getScoutChains().length > 0 && SCOUT_INTERVAL_MS > 0) {
