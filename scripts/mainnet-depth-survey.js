@@ -63,7 +63,10 @@ const PAIRS = [
 ];
 
 /// 投入額(USD)。いちばん小さい額を「ほぼ滑らない基準」として使う。
-const SIZES_USD = [100, 1000, 10000, 100000, 1000000];
+// [$1,000,000 では足りなかった(2026年9月22日の初回実測)]
+// USDC→USDT(0.01%)は$1,000,000でも目減りが0.2bpsしかなく、**測る側が先に尽きた**。
+// 天井に当たった値をそのまま「入る額」として読むと過小評価になるので、桁を伸ばす。
+const SIZES_USD = [100, 1000, 10000, 100000, 1000000, 3000000, 10000000];
 
 /// 裁定1件で使うガス量の目安。今の5チェーンでの実測(2段〜3段)に合わせる。
 const GAS_UNITS = parseInt(process.env.MAINNET_SURVEY_GAS_UNITS || "300000", 10);
@@ -82,6 +85,22 @@ const ERC20_ABI = [
   "function decimals() view returns (uint8)",
   "function symbol() view returns (string)",
 ];
+
+/// 歪み(bps)を、**滑りを食いながら**取りに行く時の最適な投入額と粗利。
+///
+/// [初回の実測で私が間違えた所(2026年9月22日)]
+/// まとめの行で「歪みを使い切る額 × 歪み」を粗利として出していた。
+/// しかし**その額まで入れると歪みを滑りで全部食うので、粗利はちょうど0**になる。
+/// 4倍過大な数字を出していた($1,000 と書いたが実際は$250)。
+///
+/// 滑りが投入額にほぼ比例する範囲では、利益 = x × (D − k·x) が
+/// x* =(歪みを使い切る額)/2 で最大になり、その時に残っている幅は D/2。
+///   最適額 = 使い切る額 ÷ 2
+///   粗利   = 最適額 × (D/2) ÷ 10000
+function zeroProfitToBest(zeroProfitUsd, edgeBps) {
+  const bestUsd = (zeroProfitUsd || 0) / 2;
+  return { bestUsd, grossUsd: bestUsd * (edgeBps / 2) / 10000 };
+}
 
 /// 少しずつ並べて実行する(全部同時に投げてRPCを詰まらせない)。
 async function mapLimited(items, limit, fn) {
@@ -162,10 +181,13 @@ async function surveyPool(provider, pair) {
     return { usd: q.usd, outRaw: q.outRaw, slipBps };
   });
 
-  // **狙う歪みを取り切るのに入る額。**
+  // **狙う歪みを「使い切る」額(= 利益がちょうど0になる額)。**
   // 2段の経路なら滑りは2回かかるので、片道で TARGET_EDGE_BPS/2 に達する額を探す。
+  // ここまで入れると歪みを滑りで全部食うので、**儲かる額はこれより小さい**
+  // (下の zeroProfitToBest を参照)。
   const halfEdge = TARGET_EDGE_BPS / 2;
   let sizeAtEdgeUsd = null;
+  let hitCeiling = false;
   for (let i = 0; i < points.length; i++) {
     const s = points[i].slipBps;
     if (s == null) continue;
@@ -177,11 +199,21 @@ async function surveyPool(provider, pair) {
       sizeAtEdgeUsd = prev.usd + (points[i].usd - prev.usd) * ratio;
       break;
     }
-    // 最後まで達しなければ「測った範囲では足りない」= 最大額以上入る。
-    if (i === points.length - 1) sizeAtEdgeUsd = points[i].usd;
+    // 最後まで達しなければ「測った範囲では足りない」= 最大額**以上**入る。
+    // **天井に当たったことを必ず持ち回る。** これを「入る額」として読むと過小評価になる。
+    if (i === points.length - 1) { sizeAtEdgeUsd = points[i].usd; hitCeiling = true; }
+  }
+  // 点と点の間で目減りが跳ね上がっている場合、その間の補間は当てにならない
+  // (流動性がそこで尽きている)。数字だけ見て信じないよう、印を付ける。
+  let cliff = false;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1].slipBps, b = points[i].slipBps;
+    if (a == null || b == null) continue;
+    // 投入額は10倍刻みなので、目減りも概ね10倍まで。それを大きく超えたら崖。
+    if (a > 0.05 && b > a * 30) { cliff = true; break; }
   }
   // 基準の点(=いちばん小さい額)の受取量も返す。価格の算出に使う。
-  return { label, pool, points, sizeAtEdgeUsd, baseUsd: base.usd, baseOutRaw: base.outRaw, tokenOut: pair.tokenOut };
+  return { label, pool, points, sizeAtEdgeUsd, hitCeiling, cliff, baseUsd: base.usd, baseOutRaw: base.outRaw, tokenOut: pair.tokenOut };
 }
 
 /// メインネットの深さを1回だけ測って、ログに出す。**送信は一切しない。**
@@ -217,7 +249,9 @@ export async function runMainnetDepthSurvey() {
       if (!r.points || r.points.length === 0) { console.log(`[メインネット調査] ${r.label}: 見積もれませんでした`); continue; }
       results.push(r);
       const curve = r.points.map((p) => `$${p.usd.toLocaleString()}:${p.slipBps == null ? "-" : `${p.slipBps.toFixed(1)}bps`}`).join(" ");
-      console.log(`[メインネット調査] ${r.label} ${r.pool.slice(0, 10)}… 目減り[${curve}] → ${TARGET_EDGE_BPS}bpsの歪みで入る額 $${Math.round(r.sizeAtEdgeUsd ?? 0).toLocaleString()}`);
+      const { bestUsd, grossUsd } = zeroProfitToBest(r.sizeAtEdgeUsd, TARGET_EDGE_BPS);
+      const note = (r.hitCeiling ? " ※測る側が先に尽きた(これ以上入る)" : "") + (r.cliff ? " ※途中で流動性が尽きており補間は当てにならない" : "");
+      console.log(`[メインネット調査] ${r.label} ${r.pool.slice(0, 10)}… 目減り[${curve}] → ${TARGET_EDGE_BPS}bpsの歪みで最適$${Math.round(bestUsd).toLocaleString()} 粗利$${grossUsd.toFixed(2)}(使い切る額$${Math.round(r.sizeAtEdgeUsd ?? 0).toLocaleString()})${note}`);
     } catch (e) {
       console.warn(`[メインネット調査] ${pair.tokenIn}→${pair.tokenOut}(${pair.fee}) で失敗: ${(e.message || "").slice(0, 100)}`);
     }
@@ -246,14 +280,23 @@ export async function runMainnetDepthSurvey() {
   } catch (e) {}
 
   // **結論。** 今の$1.00と直接比べられる形で出す。
-  const best = results.reduce((a, b) => ((b.sizeAtEdgeUsd ?? 0) > (a.sizeAtEdgeUsd ?? 0) ? b : a));
-  const size = best.sizeAtEdgeUsd ?? 0;
-  const gross = size * (TARGET_EDGE_BPS / 10000);
-  const net = gasUsd != null ? gross - gasUsd : null;
+  // 崖のある(補間が当てにならない)プールは、最良の代表から外す。
+  const sane = results.filter((r) => !r.cliff);
+  const pool = (sane.length ? sane : results).reduce((a, b) => ((b.sizeAtEdgeUsd ?? 0) > (a.sizeAtEdgeUsd ?? 0) ? b : a));
+  const { bestUsd, grossUsd } = zeroProfitToBest(pool.sizeAtEdgeUsd, TARGET_EDGE_BPS);
+  const net = gasUsd != null ? grossUsd - gasUsd : null;
   console.log(
-    `[メインネット調査 まとめ] 最良 ${best.label}: ${TARGET_EDGE_BPS}bpsの歪みで $${Math.round(size).toLocaleString()} 入る`
-    + `(今の5チェーンは$1.00)。粗利$${gross.toFixed(2)}`
+    `[メインネット調査 まとめ] 最良 ${pool.label}: ${TARGET_EDGE_BPS}bpsの歪みで最適$${Math.round(bestUsd).toLocaleString()}`
+    + `(今の5チェーンで実際に送る額は$9.20)。粗利$${grossUsd.toFixed(2)}`
     + (net != null ? ` − ガス$${gasUsd.toFixed(2)} = 純利$${net.toFixed(2)}` : "(ガス代は算出できず)")
+    + (pool.hitCeiling ? " ※測る側が先に尽きているので、これは下限" : "")
   );
+  // **採算の分かれ目。** ガス代$Xを粗利が超えるのに必要な歪みは何bpsか。
+  // 粗利 = (使い切る額/2) × (D/2)/10000 は D の2乗に比例するので、
+  // 基準の D での粗利から逆算できる。**ここが「メインネットで戦えるか」の線。**
+  if (gasUsd != null && grossUsd > 0) {
+    const breakEvenBps = TARGET_EDGE_BPS * Math.sqrt(gasUsd / grossUsd);
+    console.log(`[メインネット調査 採算] ${pool.label}: ガス$${gasUsd.toFixed(2)}を粗利が超えるのに必要な歪みは ${breakEvenBps.toFixed(2)}bps 以上`);
+  }
   return true;
 }
