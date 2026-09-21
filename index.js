@@ -67,7 +67,7 @@ import {
   scanForChangedPool, scanAllPairs, getRouteCalcStats,
   getNearMissStats, countIfWallDrops, getWallBreakdown, NEAR_MISS_REACHABLE_WALL_BPS,
   getWhatIfProfit, getSpotScreenStats, takeQuoteDemand, getQuoteDemandTotal, getScreenMinProfitUsd,
-  getQuarantineStats,
+  getQuarantineStats, getSizeCurveStats,
 } from "./scripts/opportunity-scanner.js";
 import { executeOpportunity, ExecutionError, TAX_TOKEN_FEE_BPS, resetNonce, checkContractVersions } from "./scripts/execute-opportunity.js";
 import {
@@ -130,7 +130,6 @@ const FAILURE_WINDOW_MS = parseInt(process.env.FAILURE_WINDOW_MS || String(30 * 
 /// 送信失敗が続いたプールを外す時間。**永久にはしない。**
 const FAILURE_DISABLE_MS = parseInt(process.env.FAILURE_DISABLE_MS || String(60 * 60 * 1000), 10);
 const MAX_SANE_RETURN_RATIO = parseFloat(process.env.MAX_SANE_RETURN_RATIO || "0.20");
-const BIG_MOVE_PCT = parseFloat(process.env.BIG_MOVE_PCT || "0.5");
 const V3_VERIFY_INTERVAL_MS = parseInt(process.env.V3_VERIFY_INTERVAL_MS || "120000", 10);
 const MIN_PRICE_SOURCE_USD = parseFloat(process.env.MIN_PRICE_SOURCE_USD || "5000");
 
@@ -235,18 +234,14 @@ const failStages = {};
 
 const stats = {
   scans: 0, profitableFound: 0, examined: 0, executed: 0, failed: 0,
-  skippedCooldown: 0, trapsRejected: 0, taxTokensRejected: 0, staleRejected: 0, bigMoves: 0,
-  v3Found: 0, v3Matched: 0, v3Opportunities: 0, v3LiquidityEvents: 0, scoutAdded: 0,
-  quoteTablesBuilt: 0, quoteTablesPending: 0, quoteRebuildsFromPolling: 0, quoteTablesOnDemand: 0,
-  temporarilyDisabled: 0, raceLost: 0, feeFixedOnchain: 0, feeUnreadable: 0, feeLearned: 0,
+  v3Opportunities: 0, quoteTablesPending: 0, quoteRebuildsFromPolling: 0, quoteTablesOnDemand: 0,
+  raceLost: 0, feeFixedOnchain: 0, feeUnreadable: 0, feeLearned: 0,
   v3VerifyCount: 0, v3VerifyWorst: null, v3VerifyRecent: [], v3VerifyDropped: 0,
   v3VerifyCapped: 0, v3VerifyUnderCount: 0,
   disabledFromFile: 0, disabledRuntime: 0,
-  prunedTotal: 0, prunedKept: 0,
-  decimalsKnown: 0, pricedTokens: 0,
-  lastOpportunity: null, recent: [], syncMatched: 0, syncUnknown: 0, disabled: 0,
-  latencies: [], refreshCycles: 0, mapSource: "-", mapSavedAt: null,
-  feeProbed: 0, feeProbePending: 0, lastHeartbeat: null, reservesLoaded: 0, journalLoaded: 0,
+  prunedKept: 0,
+  recent: [], disabled: 0,
+  latencies: [], feeProbed: 0, feeProbePending: 0, lastHeartbeat: null, journalLoaded: 0,
 };
 
 // ふるいの計測の前回値(毎分の通過回数を出すため)。
@@ -302,7 +297,6 @@ function disablePool(chain, address, reason, { fromFile = false, permanent = fal
   if (!fromFile && !permanent) {
     if (temporarilyDisabled.get(key) > Date.now()) return;
     temporarilyDisabled.set(key, Date.now() + FAILURE_DISABLE_MS);
-    stats.temporarilyDisabled++;
     clearPoolState(getPool(chain, address));
     // 理由は**切り詰めすぎない**。70文字で切ると、いちばん知りたい
     // 取り消しのセレクタが消える(実際に消えていた)。
@@ -333,7 +327,6 @@ function noteExecutionFailure(opp, error) {
   cooldownUntil.set(opp.poolAddresses.join("|").toLowerCase(), Date.now() + FAILURE_COOLDOWN_MS);
 
   if (error instanceof ExecutionError && error.taxToken) {
-    stats.taxTokensRejected++;
     const targets = error.taxPools?.length ? error.taxPools : opp.poolAddresses;
     for (const address of targets) {
       disablePool(opp.chain, address, `送金時に税を取るトークン(手数料${TAX_TOKEN_FEE_BPS}bps超)`, { permanent: true });
@@ -341,7 +334,6 @@ function noteExecutionFailure(opp, error) {
     return;
   }
   if (error instanceof ExecutionError && error.staleReserves) {
-    stats.staleRejected++;
     return;
   }
 
@@ -397,7 +389,6 @@ function pruneTaxTokenPools(opp) {
     const pool = getPool(opp.chain, address);
     if (!pool || pool.kind === KIND_V3 || !pool.feeProbed) continue;
     if (pool.feeBps > TAX_TOKEN_FEE_BPS) {
-      stats.taxTokensRejected++;
       disablePool(opp.chain, address, `実測手数料${pool.feeBps}bps(税トークン)`, { permanent: true });
       found = true;
     }
@@ -409,7 +400,6 @@ function rejectIfTrap(opp) {
   if (opp.tradeAmountUsd <= 0) return false;
   const ratio = opp.netProfitUsd / opp.tradeAmountUsd;
   if (ratio <= MAX_SANE_RETURN_RATIO) return false;
-  stats.trapsRejected++;
   const reason = `異常なリターン${(ratio * 100).toFixed(0)}%`;
   if (opp.hasV3) {
     console.log(`[罠の疑い] ${opp.kind} ${opp.chain} ${opp.label}: ${reason}。見送ります`);
@@ -646,7 +636,6 @@ function refreshTokenPrices() {
       }
     }
   }
-  stats.pricedTokens = priced;
   return priced;
 }
 
@@ -887,7 +876,7 @@ async function refreshQuoteTables() {
     }
 
     if (selected.length === 0) return;
-    stats.quoteTablesBuilt += await buildTablesForPools(selected);
+    await buildTablesForPools(selected);
   } finally {
     quoteRefreshRunning = false;
   }
@@ -1440,11 +1429,9 @@ async function prepareChain(chain) {
         }
       } catch (e) {}
     }
-    stats.reservesLoaded += loaded;
 
     const { loaded: v3Loaded, dropped: v3Dropped } = await loadV3StatesForChain(chain);
     const decimalsFound = await loadTokenDecimals(chain);
-    stats.decimalsKnown += decimalsFound;
 
     for (const key of disabledPools) {
       if (!key.startsWith(`${chain}::`)) continue;
@@ -1469,12 +1456,9 @@ async function preparePoolMap() {
   if (saved.count > 0) {
     const ageHours = saved.savedAt ? (Date.now() - new Date(saved.savedAt).getTime()) / 3600000 : 999;
     console.log(`[プール地図] 保存済みを読み込みました: ${saved.count}プール(${ageHours.toFixed(1)}時間前)`);
-    stats.mapSource = "保存済み";
-    stats.mapSavedAt = saved.savedAt;
     if (ageHours > MAP_REBUILD_AFTER_HOURS) needBuild = true;
   }
   if (needBuild) {
-    stats.mapSource = saved.count > 0 ? "保存済み+再構築" : "新規構築";
     // [2026年9月21日に整理] ここで「ファクトリーからの全プール取り込み」を呼んでいたが、
     // 種となる verified-pairs.json を書く処理がどこにも無く、一度も動いていなかった。
     // プールの発見は pool-scout.js(住所を指定しない getLogs で取引のある
@@ -1502,7 +1486,7 @@ async function preparePoolMap() {
   for (const chain of Object.keys(CHAIN_CONFIG)) pickDiscoveryTokens(chain);
   await Promise.all(Object.keys(CHAIN_CONFIG).map(async (chain) => {
     try {
-      stats.v3Found += await discoverV3PoolsForChain(chain);
+      await discoverV3PoolsForChain(chain);
     } catch (e) {
       console.warn(`[探索] ${chain}: 失敗 ${e.message.slice(0, 80)}`);
     }
@@ -1511,15 +1495,13 @@ async function preparePoolMap() {
   // ファクトリーの住所を知らないプールを、取引のイベントから見つけて足す。
   // 絞り込みより先に行う(V3が増えると、組めるV2も増えるため)。
   try {
-    const scouted = await scoutAllChains(Object.keys(CHAIN_CONFIG));
-    stats.scoutAdded = Object.values(scouted).reduce((s, r) => s + (r?.added || 0), 0);
+    await scoutAllChains(Object.keys(CHAIN_CONFIG));
   } catch (e) {
     console.warn(`[プール発見] 失敗 ${(e.message || "").slice(0, 80)}`);
   }
 
   const full = snapshotFullMap();
   const { kept, removed } = pruneToCandidates();
-  stats.prunedTotal = removed;
   stats.prunedKept = kept;
   console.log(`[絞り込み] 全${full}プールのうち、裁定候補${kept}プールを残し${removed}プールを監視対象から外しました`);
 
@@ -1537,7 +1519,6 @@ async function preparePoolMap() {
   console.log(`[V3価格表] 公式Quoterで作成を開始します(V3プール${s.byKind.v3}件 × 2方向、まとめて問い合わせ)`);
 
   savePoolMap();
-  stats.mapSavedAt = new Date().toISOString();
 }
 
 // ===== V2の手数料の実測 =====
@@ -1621,7 +1602,6 @@ async function runOnchainFeeFixes() {
     stats.feeFixedOnchain++;
     console.log(`[手数料/直読み] ${chain} ${address.slice(0, 10)}…: ${before}bps → **${info.feeBps}bps**(${info.source})。K検算で拒否されていた経路が通るようになります`);
     if (info.feeBps > TAX_TOKEN_FEE_BPS) {
-      stats.taxTokensRejected++;
       disablePool(chain, address, `実測手数料${info.feeBps}bps(税トークン)`, { permanent: true });
     }
   }
@@ -1674,7 +1654,6 @@ function learnV2FeeFromShortfall(opp) {
     `(この経路で手数料が未確定のV2はこの1本だけ)`
   );
   if (next > TAX_TOKEN_FEE_BPS) {
-    stats.taxTokensRejected++;
     disablePool(opp.chain, leg.pool, `実測手数料${next}bps(税トークン)`, { permanent: true });
     console.log(`[手数料/不足から学習] ${opp.chain} ${leg.pool.slice(0, 10)}…: ${next}bps は上限${TAX_TOKEN_FEE_BPS}bpsを超えるため、**税トークンとして外します**`);
   }
@@ -1731,7 +1710,6 @@ async function probeFeesGradually() {
         pool.feeProbed = true;
         stats.feeProbed++;
         if (fee > TAX_TOKEN_FEE_BPS) {
-          stats.taxTokensRejected++;
           disablePool(chain, address, `実測手数料${fee}bps(税トークン)`, { permanent: true });
         }
       }
@@ -1781,7 +1759,7 @@ async function handleOpportunity(opp, meta = {}) {
   const key = opp.poolAddresses.join("|").toLowerCase();
   const until = cooldownUntil.get(key);
   if (until && Date.now() < until) {
-    reasons.cooldown++; stats.skippedCooldown++;
+    reasons.cooldown++;
     noteBigOutcome(opp, "cooldown", `あと${Math.ceil((until - Date.now()) / 1000)}秒`);
     return;
   }
@@ -1791,7 +1769,6 @@ async function handleOpportunity(opp, meta = {}) {
 
   stats.profitableFound++;
   if (opp.hasV3) stats.v3Opportunities++;
-  stats.lastOpportunity = new Date().toISOString();
   stats.recent = [{ ...opp, at: new Date().toISOString(), ...meta }, ...stats.recent.filter((r) => r.label !== opp.label)].slice(0, 20);
 
   if (opp.netProfitUsd < MIN_PROFIT_USD) {
@@ -1856,7 +1833,6 @@ async function handleOpportunity(opp, meta = {}) {
 function reactToPoolChange(chain, poolAddress, pool, receivedAt, source) {
   if (!isReady(chain)) return;
   const movePct = pool.lastMovePct || 0;
-  if (movePct >= BIG_MOVE_PCT) stats.bigMoves++;
   try {
     const opp = scanForChangedPool({
       chain, poolAddress, capUsd: getCurrentTradeCapUsd(),
@@ -1872,8 +1848,7 @@ function reactToPoolChange(chain, poolAddress, pool, receivedAt, source) {
 function handleSync(chain, poolAddress, reserve0, reserve1, receivedAt) {
   if (disabledPools.has(poolKeyOf(chain, poolAddress))) return false;
   const pool = updateReservesFromSync(chain, poolAddress, reserve0, reserve1);
-  if (!pool) { stats.syncUnknown++; return false; }
-  stats.syncMatched++;
+  if (!pool) return false;
   reactToPoolChange(chain, poolAddress, pool, receivedAt, "sync");
   return true;
 }
@@ -1882,7 +1857,6 @@ function handleV3Swap(chain, poolAddress, sqrtPriceX96, liquidity, receivedAt) {
   if (disabledPools.has(poolKeyOf(chain, poolAddress))) return false;
   const pool = updateV3FromSwap(chain, poolAddress, sqrtPriceX96, liquidity);
   if (!pool) return false;
-  stats.v3Matched++;
   // 表を作った時からのズレが基準を超えたら作り直す。
   // 1回ぶんの変化ではなく累積で見る(小さな変化が積み重なる場合を拾うため)。
   if ((pool.quoteDriftPct || 0) >= QUOTE_REBUILD_MOVE_PCT) queueQuoteRebuild(chain, poolAddress);
@@ -1895,7 +1869,6 @@ function handleV3Liquidity(chain, poolAddress) {
   if (disabledPools.has(key)) return false;
   const pool = getPool(chain, poolAddress);
   if (!pool || pool.kind !== KIND_V3) return false;
-  stats.v3LiquidityEvents++;
   v3NeedsRefresh.add(key);
   queueQuoteRebuild(chain, poolAddress);
   return true;
@@ -1940,7 +1913,6 @@ async function refreshStaleReserves() {
         if (r) updateReservesFromSync(chain, pool.address, r.raw0, r.raw1);
       }
     }
-    stats.refreshCycles++;
   } catch (e) {
   } finally {
     refreshRunning = false;
@@ -2018,7 +1990,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${alertLine}`);
+  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${sizeLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
@@ -2296,6 +2268,17 @@ a{color:#6fae62}.footerlink{margin-top:18px;font-size:11px}`;
 
 /// 経路の表示を短くする。未知のプールは dexId がアドレスそのものになるため、
 /// そのまま出すと42文字が1列を占めて読みづらい。先頭だけ残す。
+/// 取引量の余裕を1行で出す。**「上限を上げれば大きく取れるのか」への答え。**
+/// 最適額が上限のごく一部で、4倍にすると利益が大きく落ちるなら、
+/// 制限しているのは設定ではなく**プールの深さ**。上限を上げても意味がない。
+function sizeLine() {
+  const s = getSizeCurveStats();
+  if (!s.samples) return "";
+  const best = s.bestPctMedian != null ? `${s.bestPctMedian.toFixed(2)}%` : "-";
+  const at4 = s.at4xPctMedian != null ? `${s.at4xPctMedian.toFixed(0)}%` : "測定なし";
+  return ` 取引量[最適は上限の${best} 4倍で利益${at4} 上限張付${s.hitCap.toLocaleString()} 標本${s.samples}]`;
+}
+
 function shortenLabel(label) {
   return String(label ?? "").replace(/0x[0-9a-fA-F]{40}/g, (m) => `${m.slice(0, 8)}…`);
 }
@@ -2709,7 +2692,6 @@ async function main() {
   setInterval(refreshTokenPrices, PRICE_REFRESH_INTERVAL_MS);
   setInterval(() => {
     savePoolMap();
-    stats.mapSavedAt = new Date().toISOString();
     saveQuoteTables();
     saveGasPriceRatios();
   }, SAVE_MAP_INTERVAL_MS);
@@ -2758,7 +2740,6 @@ async function main() {
         const scouted = await scoutAllChains(Object.keys(CHAIN_CONFIG));
         for (const [chain, r] of Object.entries(scouted)) {
           if (!r || r.added === 0) continue;
-          stats.scoutAdded += r.added;
           await prepareChain(chain);
           refreshTokenPrices();
         }
