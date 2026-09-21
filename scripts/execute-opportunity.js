@@ -27,7 +27,7 @@
 // あったかを確認する(scripts/competitor-check.js)。
 
 import { ethers } from "ethers";
-import { minProfitUsd } from "./min-profit.js";
+import { requiredMinProfitUsd } from "./min-profit.js";
 import { getChainConfig } from "../chain-config.js";
 import { getProviderForChain, callWithRpc, poolHasAmountOut, readBlockTag, isPendingReadChain } from "./onchain-reserves.js";
 import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
@@ -828,7 +828,7 @@ async function executeOpportunityInner(opp) {
   const grossProfitUsd = (Number(profitRaw) / Math.pow(10, decimals)) * priceUsd;
   let gasCostUsd = await estimateGasCostUsd(chain, opp.kind);
   const expectedNetUsd = grossProfitUsd - gasCostUsd;
-  if (expectedNetUsd < minProfitUsd(chain)) {
+  if (expectedNetUsd < requiredMinProfitUsd(chain, gasCostUsd)) {
     markRouteRejected(opp);
     opp.sendResult = "below_gas";
     console.log(`[実行] ${opp.label}: 粗利$${grossProfitUsd.toFixed(4)}(+${profitBps.toFixed(1)}bps)がガス代$${gasCostUsd.toFixed(4)}を引くと下限未満のため見送り`);
@@ -878,7 +878,7 @@ async function executeOpportunityInner(opp) {
   // 吸収していた余裕が無くなり、隙間が表に出た。
   {
     const netAfterMeasured = grossProfitUsd - gasCostUsd;
-    if (netAfterMeasured < minProfitUsd(chain)) {
+    if (netAfterMeasured < requiredMinProfitUsd(chain, gasCostUsd)) {
       markRouteRejected(opp);
       opp.sendResult = "below_gas";
       console.log(`[実行] ${opp.label}: 実測のガス代$${gasCostUsd.toFixed(4)}(典型値の見積もりより高い)を引くと純利$${netAfterMeasured.toFixed(4)}で下限未満のため見送り(粗利$${grossProfitUsd.toFixed(4)})`);
