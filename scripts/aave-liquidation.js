@@ -161,13 +161,20 @@ function loadState() {
     if (!fs.existsSync(STATE_FILE)) return;
     const data = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
     for (const [chain, v] of Object.entries(data.chains || {})) {
+      const hist = normalizeHist(v.hist);
+      // 集計を作り直した時は、読み取りの進み具合も戻す。
+      // **戻さないと、過去を読み直せないまま空の集計だけが残る。**
+      const rebuilt = hist.count === 0 && Number(v.hist?.count) > 0;
+      if (rebuilt) {
+        console.log(`[清算/実績] ${chain}: 数え方を変えたので集計を作り直します(過去を読み直します)`);
+      }
       state.set(chain, {
         users: Array.isArray(v.users) ? v.users : [],
         forwardFrom: Number(v.forwardFrom) || 0,
         backwardTo: Number(v.backwardTo) || 0,
-        histFrom: Number(v.histFrom) || 0,
-        histTo: Number(v.histTo) || 0,
-        hist: normalizeHist(v.hist),
+        histFrom: rebuilt ? 0 : (Number(v.histFrom) || 0),
+        histTo: rebuilt ? 0 : (Number(v.histTo) || 0),
+        hist,
       });
     }
   } catch (e) {
@@ -202,14 +209,22 @@ function stateFor(chain) {
 }
 
 /// 清算の実績をためる入れ物。
+/// 数え方を変えたら上げる。保存済みの集計は作り直す
+/// (1件ずつ数えた古い集計と、1回ずつ数えた新しい集計を混ぜない)。
+const HIST_VERSION = 2;
+
 function emptyHist() {
-  return { count: 0, sumUsd: 0, sizes: [], byLiquidator: {}, oldestBlock: 0, newestBlock: 0, unpriced: 0 };
+  // count は「清算の**回**」、events は生の LiquidationCall の件数。
+  return { v: HIST_VERSION, count: 0, events: 0, sumUsd: 0, sizes: [], byLiquidator: {}, oldestBlock: 0, newestBlock: 0, unpriced: 0 };
 }
 
 function normalizeHist(h) {
-  if (!h || typeof h !== "object") return emptyHist();
+  // 数え方が違う集計は混ぜられないので、作り直す。
+  if (!h || typeof h !== "object" || Number(h.v) !== HIST_VERSION) return emptyHist();
   return {
+    v: HIST_VERSION,
     count: Number(h.count) || 0,
+    events: Number(h.events) || Number(h.count) || 0,
     sumUsd: Number(h.sumUsd) || 0,
     sizes: Array.isArray(h.sizes) ? h.sizes.map(Number).filter((n) => Number.isFinite(n)).slice(-HIST_SIZE_SAMPLES) : [],
     byLiquidator: (h.byLiquidator && typeof h.byLiquidator === "object") ? { ...h.byLiquidator } : {},
@@ -545,28 +560,50 @@ export async function scanLiquidationHistory(chain) {
   if (records.length > 0) {
     const known = await resolveAssets(chain, records.map((r) => r.debtAsset));
     let samples = 0;
+
+    // **「同じ人・同じブロック」を1回としてまとめる。**
+    //
+    // [なぜ必要か(2026年9月21日の実測で判明)]
+    // LiquidationCall は (担保, 借金) の組ごとに出る。大きな清算を1回やると、
+    // 端数の残りでもう1件、塵のような記録が出ることがある。
+    // 生の値を確かめたところ、optimism の 0.0013 USDC も base の 9527 wei も
+    // **読み違いではなく本物**だった。つまり1件ずつ数えると、
+    // 「大きな清算のおまけ」を「小口の機会」として数えてしまう。
+    // **数えるべき単位は『清算1回』であって『イベント1件』ではない。**
+    const episodes = new Map();
     for (const r of records) {
-      hist.count++;
-      hist.byLiquidator[r.liquidator] = (hist.byLiquidator[r.liquidator] || 0) + 1;
+      hist.events++;
       if (!hist.oldestBlock || r.block < hist.oldestBlock) hist.oldestBlock = r.block;
       if (r.block > hist.newestBlock) hist.newestBlock = r.block;
-      const info = known.get(r.debtAsset);
-      if (!info || info.decimals == null || info.priceUsd == null) { hist.unpriced++; continue; }
-      const usd = (Number(r.debtToCover) / 10 ** info.decimals) * info.priceUsd;
-      if (!Number.isFinite(usd)) { hist.unpriced++; continue; }
-      hist.sumUsd += usd;
-      hist.sizes.push(usd);
 
-      // **合計した数字が怪しい時に、何からできているかを見られるようにしておく。**
-      // ごく少額のものを優先して出す(潰れているなら、ここに出る)。
-      if (samples < HIST_SAMPLE_LOGS && (usd < TINY_USD || hist.sizes.length <= HIST_SAMPLE_LOGS)) {
+      const key = `${r.user}:${r.block}`;
+      if (!episodes.has(key)) episodes.set(key, { usd: 0, priced: false, liquidator: r.liquidator, block: r.block });
+      const ep = episodes.get(key);
+
+      const info = known.get(r.debtAsset);
+      if (!info || info.decimals == null || info.priceUsd == null) continue;
+      const usd = (Number(r.debtToCover) / 10 ** info.decimals) * info.priceUsd;
+      if (!Number.isFinite(usd)) continue;
+      ep.usd += usd;
+      ep.priced = true;
+
+      // 合計が怪しい時に、何からできているかを見られるようにしておく。
+      if (samples < HIST_SAMPLE_LOGS && usd < TINY_USD) {
         samples++;
         console.log(
           `[清算/実績/内訳] ${chain} ブロック${r.block.toLocaleString()}: ` +
           `${info.symbol || r.debtAsset.slice(0, 10)}(${info.decimals}桁 単価$${info.priceUsd.toFixed(4)}) ` +
-          `生の量 ${r.debtToCover.toString()} → $${usd < 0.01 ? usd.toFixed(6) : usd.toFixed(2)}`
+          `生の量 ${r.debtToCover.toString()} → $${usd.toFixed(6)}`
         );
       }
+    }
+
+    for (const ep of episodes.values()) {
+      hist.count++;
+      hist.byLiquidator[ep.liquidator] = (hist.byLiquidator[ep.liquidator] || 0) + 1;
+      if (!ep.priced) { hist.unpriced++; continue; }
+      hist.sumUsd += ep.usd;
+      hist.sizes.push(ep.usd);
     }
     if (hist.sizes.length > HIST_SIZE_SAMPLES) hist.sizes = hist.sizes.slice(-HIST_SIZE_SAMPLES);
     // 清算した人の記録も上限を付ける(保存ファイルが際限なく太らないように)。
@@ -609,11 +646,12 @@ async function reportHistory(chain, st, latest, requests, added) {
   const topShare = tally.length ? (tally[0][1] / hist.count) * 100 : 0;
 
   console.log(
-    `[清算/実績] ${chain}: ${spanNote}で ${hist.count.toLocaleString()}件${doneNote}` +
-    (perDay != null ? `(1日あたり${perDay.toFixed(1)}件)` : "") + `。新規${added}件。RPC ${requests}回\n` +
-    `  規模: ごく少額(<$${TINY_USD}) ${tiny}件 / ` +
-    `$${TINY_USD}〜100 ${small}件(${((small / priced) * 100).toFixed(0)}%) / ` +
-    `$100〜1,000 ${mid}件 / $1,000超 ${large}件、中央$${median(hist.sizes).toFixed(2)}` +
+    `[清算/実績] ${chain}: ${spanNote}で ${hist.count.toLocaleString()}**回**${doneNote}` +
+    (hist.events > hist.count ? `(生の記録${hist.events.toLocaleString()}件)` : "") +
+    (perDay != null ? `(1日あたり${perDay.toFixed(1)}回)` : "") + `。新規${added}件。RPC ${requests}回\n` +
+    `  規模(1回あたり): ごく少額(<$${TINY_USD}) ${tiny}回 / ` +
+    `$${TINY_USD}〜100 ${small}回(${((small / priced) * 100).toFixed(0)}%) / ` +
+    `$100〜1,000 ${mid}回 / **$1,000超 ${large}回**、中央$${median(hist.sizes).toFixed(2)}` +
     (hist.unpriced ? `(価格不明${hist.unpriced}件は除く)` : "") + `\n` +
     `  清算した人: ${tally.length}人、上位1者が${topShare.toFixed(0)}%` +
     (tally.length ? `(${tally[0][0].slice(0, 10)}… ${tally[0][1]}件)` : "") +
