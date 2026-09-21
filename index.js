@@ -47,6 +47,8 @@ import { startLiquidationMonitor, setCandidateHandler, formatLiquidationLine, ge
 import { handleLiquidationCandidate, selfCheckLiquidationExecutor } from "./scripts/liquidation-executor.js";
 import { runLiquidatorDeploy } from "./scripts/liquidator-deploy.js";
 import { readPoolFeeOnchain } from "./scripts/pool-fee-onchain.js";
+// 画面とログの時刻は**すべて日本時間**に揃える(保存は UTC のまま)。
+import { TZ_LABEL, formatJst as formatLocalTime, nowJst } from "./scripts/jst.js";
 import {
   fetchReservesBatch, fetchPoolTokensBatch, fetchTokenDecimalsBatch,
   fetchV3StatesBatch, getMulticallStats, findV3PoolsBatch,
@@ -131,18 +133,6 @@ const MAX_SANE_RETURN_RATIO = parseFloat(process.env.MAX_SANE_RETURN_RATIO || "0
 const BIG_MOVE_PCT = parseFloat(process.env.BIG_MOVE_PCT || "0.5");
 const V3_VERIFY_INTERVAL_MS = parseInt(process.env.V3_VERIFY_INTERVAL_MS || "120000", 10);
 const MIN_PRICE_SOURCE_USD = parseFloat(process.env.MIN_PRICE_SOURCE_USD || "5000");
-/// 画面に出す時刻のタイムゾーン。
-///
-/// [なぜ要るか(2026年9月19日)]
-/// 記録簿の時刻を `toLocaleString('ja-JP')` で出していたが、これは
-/// **表示の書式だけ**を日本式にするもので、時刻そのものはコンテナの
-/// タイムゾーン(UTC)のままだった。日本式の書式で9時間ずれた時刻が
-/// 出ていたため、かえって気づきにくい。時刻を読むのはオーナーだけなので
-/// 日本時間に固定する。
-const DISPLAY_TIMEZONE = process.env.DISPLAY_TIMEZONE || "Asia/Tokyo";
-/// 表の日時がどのタイムゾーンかを見出しに出すための表記。
-/// 9時間ずれていても「日本式の書式」では気づけないため、必ず明示する。
-const TZ_LABEL = DISPLAY_TIMEZONE === "Asia/Tokyo" ? "日本時間" : DISPLAY_TIMEZONE;
 
 // ===== 価格表の保存と復元(2026年9月19日) =====
 //
@@ -1976,7 +1966,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${alertLine}`);
+  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy} 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
@@ -2254,25 +2244,6 @@ a{color:#6fae62}.footerlink{margin-top:18px;font-size:11px}`;
 
 /// 経路の表示を短くする。未知のプールは dexId がアドレスそのものになるため、
 /// そのまま出すと42文字が1列を占めて読みづらい。先頭だけ残す。
-/// 記録の時刻を、画面に出す形(日本時間)に整える。
-/// toLocaleString の第1引数は**書式**しか決めない。時刻そのものを日本時間に
-/// するには timeZone を渡す必要がある(渡さないとコンテナのUTCのまま)。
-function formatLocalTime(value) {
-  if (!value) return "-";
-  const d = new Date(value);
-  if (isNaN(d.getTime())) return "-";
-  try {
-    // 桁を揃える(2桁固定)。列が狭いiPhoneでも折り返さないよう年は省く。
-    return d.toLocaleString("ja-JP", {
-      timeZone: DISPLAY_TIMEZONE, hour12: false,
-      month: "2-digit", day: "2-digit",
-      hour: "2-digit", minute: "2-digit", second: "2-digit",
-    });
-  } catch (e) {
-    return d.toISOString().replace("T", " ").slice(0, 19) + " UTC";
-  }
-}
-
 function shortenLabel(label) {
   return String(label ?? "").replace(/0x[0-9a-fA-F]{40}/g, (m) => `${m.slice(0, 8)}…`);
 }
@@ -2447,7 +2418,7 @@ ${whatIfRows(chain)}`;
 
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="refresh" content="20">
 <title>DEXアービトラージ</title><style>${STYLE}</style></head><body>
-<h1>🔍 DEXアービトラージ</h1><div class="sub">フラッシュスワップ方式 / V2 + V3 / ${readyLine}</div>
+<h1>🔍 DEXアービトラージ</h1><div class="sub">フラッシュスワップ方式 / V2 + V3 / ${readyLine}<br>表示はすべて${TZ_LABEL}(いま ${nowJst()})</div>
 
 <div class="card real"><h2>💰 実際の取引結果</h2>
 <div class="stat"><div><div class="v">${real.count}</div><div class="l">実行回数</div></div>
@@ -2534,7 +2505,7 @@ function renderLiquidationCard() {
     ? d.watching.map((w) => `<tr><td>${esc(w.user.slice(0, 10))}…</td><td style="text-align:right;color:${w.hf < 1 ? "#e74c3c" : "#e8a33d"}">${w.hf.toFixed(4)}</td><td style="text-align:right">$${w.debtUsd.toFixed(2)}</td></tr>`).join("")
     : `<tr><td colspan="3" style="color:#888">HF&lt;1.05 の人はいません</td></tr>`;
   const recentRows = d.recent.length
-    ? d.recent.map((r) => `<tr><td>${esc(r.at.slice(5, 16).replace("T", " "))}</td><td>${esc(r.user.slice(0, 10))}…</td><td>${esc(r.pair)}</td><td style="text-align:right">${r.hf.toFixed(4)}</td><td style="text-align:right">$${r.coverUsd.toFixed(2)}</td><td style="text-align:right">$${r.grossUsd.toFixed(2)}</td><td>${esc(r.result)}</td></tr>`).join("")
+    ? d.recent.map((r) => `<tr><td>${esc(formatLocalTime(r.at))}</td><td>${esc(r.user.slice(0, 10))}…</td><td>${esc(r.pair)}</td><td style="text-align:right">${r.hf.toFixed(4)}</td><td style="text-align:right">$${r.coverUsd.toFixed(2)}</td><td style="text-align:right">$${r.grossUsd.toFixed(2)}</td><td>${esc(r.result)}</td></tr>`).join("")
     : `<tr><td colspan="7" style="color:#888">まだ候補はありません</td></tr>`;
   return `<div class="card"><h2>🏦 Aave 清算(Avalanche)${d.dryRun ? ' <span style="color:#e8a33d;font-size:0.8em">DRY_RUN(送信しない)</span>' : ' <span style="color:#e74c3c;font-size:0.8em">本番送信</span>'}</h2>
 <div class="stat"><div><div class="v">${d.roster.toLocaleString()}</div><div class="l">借り手の名簿(遡り${d.backfillPct}%)</div></div>
@@ -2545,7 +2516,7 @@ function renderLiquidationCard() {
 最低利益$${d.minProfitUsd} / 肩代わりの上限$${d.maxDebtUsd} / 全員の測定 ${ago(d.lastSweepAt)} / 最後の価格更新 ${ago(d.lastPriceEventAt)} / RPC${d.rpcCalls.toLocaleString()}回${d.errors ? ` / 失敗${d.errors}(${esc(d.lastError)})` : ""}</div>
 <table class="t-num"><thead><tr><th>要注意の人</th><th style="text-align:right">HF</th><th style="text-align:right">借金</th></tr></thead><tbody>${watchRows}</tbody></table>
 <h2 style="margin-top:14px">候補の記録</h2>
-<table class="t-num"><thead><tr><th>時刻(UTC)</th><th>借り手</th><th>担保→借金</th><th style="text-align:right">HF</th><th style="text-align:right">肩代わり</th><th style="text-align:right">見込み粗利</th><th>結果</th></tr></thead><tbody>${recentRows}</tbody></table></div>`;
+<table class="t-num"><thead><tr><th>時刻(${TZ_LABEL})</th><th>借り手</th><th>担保→借金</th><th style="text-align:right">HF</th><th style="text-align:right">肩代わり</th><th style="text-align:right">見込み粗利</th><th>結果</th></tr></thead><tbody>${recentRows}</tbody></table></div>`;
 }
 
 function renderAbout() {
@@ -2573,7 +2544,7 @@ function startServer() {
       // 生きているかだけを確かめる軽い入口。画面が真っ白な時の切り分けに使う。
       if (req.url === "/ping") {
         res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-        res.end(`ok ${new Date().toISOString()}\n`);
+        res.end(`ok ${nowJst()} (${TZ_LABEL})\n`);
         return;
       }
       const body = req.url === "/about" ? renderAbout() : renderPage();

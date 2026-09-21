@@ -29,6 +29,8 @@ import path from "path";
 import { AaveV3Avalanche } from "@aave-dao/aave-address-book";
 import { callWithRpc } from "./onchain-reserves.js";
 import { MULTICALL3_ADDRESS } from "./multicall-reserves.js";
+// お金に関わる行は、Railway の UTC ではなく**日本時間**で読めるようにする。
+import { nowJst } from "./jst.js";
 
 // ===== 対象(Avalanche のみ)=====
 export const CHAIN = "avalanche";
@@ -491,7 +493,7 @@ function handlePoolLog(log, fromWs) {
     const c = candidates.get(u);
     if (c && !c.doneByUs) {
       stats.takenByOthers++;
-      console.log(`[清算AVAX/他者] ${short(u)} を ${short(liquidator)} が清算しました(うちが候補にしてから${Math.round((Date.now() - c.firstAt) / 1000)}秒)`);
+      console.log(`[清算AVAX/他者 ${nowJst()}] ${short(u)} を ${short(liquidator)} が清算しました(うちが候補にしてから${Math.round((Date.now() - c.firstAt) / 1000)}秒)`);
       candidates.delete(u);
     }
   }
@@ -639,7 +641,7 @@ async function applyHealth(map) {
       const c = candidates.get(u);
       if (!c.doneByUs) {
         stats.recovered++;
-        console.log(`[清算AVAX/回復] ${short(u)}: HF ${hfToNumber(h.hf).toFixed(4)} に戻りました(候補にしてから${Math.round((Date.now() - c.firstAt) / 1000)}秒。借金$${h.debtUsd.toFixed(2)})`);
+        console.log(`[清算AVAX/回復 ${nowJst()}] ${short(u)}: HF ${hfToNumber(h.hf).toFixed(4)} に戻りました(候補にしてから${Math.round((Date.now() - c.firstAt) / 1000)}秒。借金$${h.debtUsd.toFixed(2)})`);
       }
       candidates.delete(u);
     }
@@ -770,7 +772,7 @@ async function handleLiquidatable(u) {
   if (plan.error) {
     if (!c.loggedError) {
       c.loggedError = true;
-      console.log(`[清算AVAX/候補] ${short(u)} HF ${hfToNumber(h.hf).toFixed(4)} 借金$${h.debtUsd.toFixed(2)} 担保$${h.collateralUsd.toFixed(2)} → 組めません: ${plan.error}`);
+      console.log(`[清算AVAX/候補 ${nowJst()}] ${short(u)} HF ${hfToNumber(h.hf).toFixed(4)} 借金$${h.debtUsd.toFixed(2)} 担保$${h.collateralUsd.toFixed(2)} → 組めません: ${plan.error}`);
     }
     return;
   }
@@ -779,7 +781,7 @@ async function handleLiquidatable(u) {
     recentCandidates.unshift({ at: new Date().toISOString(), user: u, hf: plan.hf, debtUsd: h.debtUsd, coverUsd: plan.coverUsd, grossUsd: plan.grossUsd, pair: `${sym(plan.collateralAsset)}→${sym(plan.debtAsset)}`, result: DRY_RUN ? "DRY_RUN" : "" });
     if (recentCandidates.length > 30) recentCandidates.pop();
     console.log(
-      `[清算AVAX/候補] ${short(u)} HF ${plan.hf.toFixed(4)} 借金$${h.debtUsd.toFixed(2)} 担保$${h.collateralUsd.toFixed(2)} ` +
+      `[清算AVAX/候補 ${nowJst()}] ${short(u)} HF ${plan.hf.toFixed(4)} 借金$${h.debtUsd.toFixed(2)} 担保$${h.collateralUsd.toFixed(2)} ` +
       `→ 借金${sym(plan.debtAsset)}$${plan.debtUsd.toFixed(2)} / 担保${sym(plan.collateralAsset)}$${plan.collateralUsd.toFixed(2)} / ` +
       `肩代わり$${plan.coverUsd.toFixed(2)}(${plan.why}) ボーナス${(plan.bonusBps / 100).toFixed(1)}%(うちプロトコル${(plan.protocolFeeBps / 100).toFixed(0)}%) ` +
       `見込み粗利$${plan.grossUsd.toFixed(2)}(担保の売却とガス代は未計算)`
