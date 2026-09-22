@@ -39,7 +39,7 @@ import { runMainnetDepthSurvey } from "./scripts/mainnet-depth-survey.js";
 import { startMainnetEdgeWatch, formatMainnetEdgeLine } from "./scripts/mainnet-edge-watch.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
-import { scoutAllChains, getScoutChains, SCOUT_INTERVAL_MS } from "./scripts/pool-scout.js";
+import { scoutAllChains, scoutReportOnlyChains, getScoutChains, getReportOnlyChains, SCOUT_INTERVAL_MS } from "./scripts/pool-scout.js";
 import { probePoolFeeBps, isFeeProbeOnHold, getRpcStatus, getRpcCallTotals, callWithRpc, probePendingState, getProviderForChain , getFeeProbeStats, ensureAmountOutFlag } from "./scripts/onchain-reserves.js";
 import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
 import { alertOwner, getAlertStats, sendPendingQuestions } from "./scripts/owner-alert.js";
@@ -2851,7 +2851,17 @@ async function main() {
   }
   // 新しく出来たプールを定期的に拾う。見つかったら、そのチェーンだけ
   // 桁数・状態・購読を作り直す(判定は止めない)。
-  if (getScoutChains().length > 0 && SCOUT_INTERVAL_MS > 0) {
+  // 報告だけのチェーンしか設定されていない場合も回す(そうしないと測れない)。
+  if ((getScoutChains().length > 0 || getReportOnlyChains().length > 0) && SCOUT_INTERVAL_MS > 0) {
+    console.log(`[プール発見] ${SCOUT_INTERVAL_MS / 3600000}時間ごと。載せる: ${getScoutChains().join(",") || "なし"} / **報告のみ(1本も載せない)**: ${getReportOnlyChains().join(",") || "なし"}`);
+    // 報告のみのチェーンは、定期実行(初回は6時間後)を待たずに一度だけ測る。
+    // 地図には1本も載せないので、ここで走らせても受信は増えない。
+    if (getReportOnlyChains().length > 0) {
+      setTimeout(() => {
+        scoutReportOnlyChains(Object.keys(CHAIN_CONFIG)).catch((e) =>
+          console.warn(`[プール発見] 起動後の報告に失敗 ${(e.message || "").slice(0, 80)}`));
+      }, 3 * 60 * 1000);
+    }
     setInterval(async () => {
       try {
         const scouted = await scoutAllChains(Object.keys(CHAIN_CONFIG));
