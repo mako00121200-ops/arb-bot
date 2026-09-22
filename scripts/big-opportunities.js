@@ -28,6 +28,7 @@
 const BIG_OPP_USD = parseFloat(process.env.BIG_OPP_USD || "0.10");
 /// まとめを出す間隔と、覚えておく件数の上限。
 import { loadState, saveState } from "./state-file.js";
+import { noteOpportunityTier } from "./opportunity-tiers.js";
 
 const WINDOW_MS = parseInt(process.env.BIG_OPP_WINDOW_MS || String(30 * 60 * 1000), 10);
 const MAX_KEPT = 500;
@@ -116,6 +117,10 @@ export function isBigOpportunity(opp) {
 /// 大物の行く先を1件記録する。大物でなければ何もしない。
 /// @returns 記録したら true
 export function noteBigOutcome(opp, outcome, detail = "") {
+  // **段の集計は「大物」だけでなく全件を数える。**
+  // ここは機会1件につきちょうど1回だけ通る(呼び出しは10箇所、全て return 直前)ので、
+  // 二重に数える心配がない。呼び出し口を新しく作らずに全件を拾えるのが利点。
+  noteOpportunityTier(opp, outcome);
   if (!isBigOpportunity(opp)) return false;
   const netUsd = Number(opp.netProfitUsd) || 0;
   const at = Date.now();

@@ -46,6 +46,7 @@ import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
 import { alertOwner, getAlertStats, sendPendingQuestions } from "./scripts/owner-alert.js";
 import { verifyAaveChains, getAaveChains, sweepAll as aaveSweepAll, checkWatchAll as aaveCheckWatchAll, formatAaveLine, AAVE_SWEEP_INTERVAL_MS, AAVE_WATCH_INTERVAL_MS } from "./scripts/aave-liquidation.js";
 import { noteBigOutcome, formatBigLine, formatBigSummary, flushBigOpportunities } from "./scripts/big-opportunities.js";
+import { formatTierLine, formatTierBreakdown, formatMoveBreakdown, flushTiers } from "./scripts/opportunity-tiers.js";
 import { probeUniswapXOnce, formatUniswapXLine, formatUniswapXReport, getProbeChains, PROBE_INTERVAL_MS } from "./scripts/uniswapx-probe.js";
 import { probeSolanaOnce, formatSolanaLine, getSolanaTokenCount, SOLANA_PROBE_INTERVAL_MS } from "./scripts/solana-probe.js";
 import { startLiquidationMonitor, setCandidateHandler, formatLiquidationLine, getLiquidationDashboard, CHAIN as LIQUIDATION_CHAIN, TAG as LIQUIDATION_TAG } from "./scripts/liquidation-monitor.js";
@@ -1830,6 +1831,15 @@ function poolLockKeys(opp) {
 
 async function handleOpportunity(opp, meta = {}) {
   stats.examined++;
+  // **引き金の大きさを機会に写す。**
+  //
+  // [2026年9月22日] `pool-registry` は前から `lastMovePct`(1回の取引でプールの価格が
+  // 何%動いたか)を計算し、`reactToPoolChange` はそれを meta に入れて渡していた。
+  // **だが誰も読まなかった。** 大口スワップを別に検知する仕組みを作る必要はなく、
+  // **既にある値をここで読むだけ**でよかった(「測っているのに使っていない」7件目)。
+  // これが Backrun の信号そのもの。段の集計(opportunity-tiers)がこれを使う。
+  if (opp.movePct == null && Number.isFinite(Number(meta.movePct))) opp.movePct = Number(meta.movePct);
+  if (opp.source == null && meta.source != null) opp.source = meta.source;
   noteV3PoolsUsed(opp);
   // **捨てる道すべてで大物を数える。** 記録の無い道があると、
   // 「大きな機会が消えた」を後から確かめられない(2026年9月21日に判明)。
@@ -2084,7 +2094,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy}(同時上限${reasons.sendBusyParallel}/同プール${reasons.sendBusyPool}) 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${sizeLine()}${formatSendBalanceLine()}${formatSendSkipLine()}${formatUniswapXLine()}${formatSolanaLine()}${formatMainnetEdgeLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${alertLine}`);
+  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy}(同時上限${reasons.sendBusyParallel}/同プール${reasons.sendBusyPool}) 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${sizeLine()}${formatTierLine()}${formatSendBalanceLine()}${formatSendSkipLine()}${formatUniswapXLine()}${formatSolanaLine()}${formatMainnetEdgeLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
@@ -2164,6 +2174,15 @@ function heartbeat() {
     {
       const bigLine = formatBigSummary();
       if (bigLine) console.log(bigLine);
+    }
+
+    // **利益の段と、引き金の大きさ別の成績。**
+    // 引き金の方が Backrun の答え:「大口スワップの後ほど儲かるのか」。
+    // ここも繰り返しの外で1回だけ。
+    {
+      for (const line of [formatTierBreakdown(), formatMoveBreakdown()]) {
+        if (line) console.log(line);
+      }
     }
 
     // UniswapX の「勝てたか」の詳細。**送信も約定もしていない、読んで計算しただけの数字。**
@@ -2941,7 +2960,8 @@ for (const sig of ["SIGTERM", "SIGINT"]) {
     // **測っているものを全部書き出してから終わる。**
     for (const [name, fn] of [["大物", flushBigOpportunities],
                               ["メインネット歪み", flushMainnetEdge],
-                              ["送信停止", flushSendSkips]]) {
+                              ["送信停止", flushSendSkips],
+                              ["段", flushTiers]]) {
       try { fn(); } catch (e) { console.warn(`[終了] ${name} の書き出しに失敗`); }
     }
     console.log(`[終了] ${sig} を受けました。計測を書き出しました`);
