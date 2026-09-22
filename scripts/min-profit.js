@@ -100,14 +100,54 @@ export function noteSendOutcome(chain, won, usd = 0) {
   save();
 }
 
+/// **優先手数料を積んでよい上限(純利益に対する割合)を、実測から出す。**
+///
+/// [なぜ要るか(2026年9月22日)]
+/// `PRIORITY_FEE_SHARE` は全チェーン一律 0.30 で入れた。だが積んでよい額には
+/// **チェーンごとに天井がある**。入札で取り返せるのは「今負けている分」だけで、
+/// それを超えて払えば、勝率がいくら上がっても差し引きで損をする。
+///
+///   入札で取り返せる最大値 = (1 − 勝率) × (平均利益 + 平均ガス代)   … 勝率が100%になった場合
+///   入札にかかる費用       = 勝率 × share × 平均利益
+///
+/// 等号で解くと **share = (1 − 勝率) × (平均利益 + 平均ガス代) ÷ 平均利益**。
+/// これが損益分岐で、**ここに等しく払うと儲けはゼロ**。だから実際に使うときは
+/// この半分以下に留める。
+///
+/// [この3つの値は、すでにこのファイルが保存している]
+/// wins / losses / gainedUsd / lostGasUsd。**測っているのに使っていなかった。**
+/// 今は数字を出すだけで、入札額はまだ変えていない(オーナーの判断待ち)。
+///
+/// @returns { share, wins, losses, avgGainUsd, avgGasUsd } / 勝ちが無ければ null
+export function breakEvenPriorityShare(chain) {
+  const v = outcomes.get((chain || "").toLowerCase());
+  if (!v || v.wins <= 0 || v.losses <= 0) return null;
+  const avgGainUsd = v.gainedUsd / v.wins;
+  const avgGasUsd = v.lostGasUsd / v.losses;
+  if (!(avgGainUsd > 0)) return null;
+  const winRate = v.wins / (v.wins + v.losses);
+  const share = ((1 - winRate) * (avgGainUsd + avgGasUsd)) / avgGainUsd;
+  return { share, wins: v.wins, losses: v.losses, avgGainUsd, avgGasUsd };
+}
+
 /// 生存ログ用。**チェーンごとの実際の収支。**
 /// 「取った額 − 先越されで失ったガス代」がプラスかどうかが全て。
+///
+/// [得/損を分けて出す理由(2026年9月22日)]
+/// 差額しか出していなかったので、**平均利益も平均ガス代も読み取れなかった**。
+/// この2つが無いと上の `breakEvenPriorityShare` が手計算できず、
+/// 「優先手数料をいくら積むべきか」を推定でしか語れない。
 export function formatSendBalanceLine() {
   if (outcomes.size === 0) return "";
   const parts = [];
   for (const [chain, v] of outcomes) {
     const net = v.gainedUsd - v.lostGasUsd;
-    parts.push(`${chain} 勝${v.wins}/負${v.losses} ${net >= 0 ? "+" : "-"}$${Math.abs(net).toFixed(4)}`);
+    let s = `${chain} 勝${v.wins}/負${v.losses} ${net >= 0 ? "+" : "-"}$${Math.abs(net).toFixed(4)}`;
+    s += `(得$${v.gainedUsd.toFixed(4)}/損$${v.lostGasUsd.toFixed(4)}`;
+    const be = breakEvenPriorityShare(chain);
+    if (be) s += ` 1回 得$${be.avgGainUsd.toFixed(5)}/損$${be.avgGasUsd.toFixed(5)} 入札上限${be.share.toFixed(2)}`;
+    s += ")";
+    parts.push(s);
   }
   return ` 送信の収支[${parts.join(" ")}]`;
 }
