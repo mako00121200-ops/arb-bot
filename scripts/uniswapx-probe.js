@@ -84,6 +84,14 @@ function statFor(chain) {
       // **時刻でふるった分。** tooOld は値動きに汚染されるので捨てた数、
       // noTime は時刻そのものが読めなかった数(= 測れない。0でない間は結論を出さない)。
       tooOld: 0, noTime: 0, ages: [], timeKey: null,
+      /// **経路が無かった通貨の組。** `${tokenIn}|${tokenOut}` -> { n, usd, tokenIn, tokenOut }
+      ///
+      /// [なぜ記録するか(2026年9月22日)]
+      /// base は新しい注文81件のうち**68件(84%)が「経路なし」**で落ちていた。
+      /// 我々のプール地図にその組が無いだけで、**UniswapX で起きていることの
+      /// 16%しか見ていなかった**。だが「経路なし」と数えるだけでは
+      /// **どの組を足せばよいか分からない**。組そのものを控える。
+      missing: {},
       // **約定時刻が無く、注文が作られた時刻しか無いもの。** 齢が測れないので数えない。
       createdOnly: 0,
       // **確認できた勝ちを「齢つき」で持つ。** 値動きの残りかすかどうかを、
@@ -202,7 +210,18 @@ async function probeChain(chain) {
     const mine = bestOutputFor({
       chain, tokenIn: swap.tokenIn, tokenOut: swap.tokenOut, amountIn: swap.amountIn, hubTokens: hubs,
     });
-    if (!mine) { s.noRoute++; continue; }
+    if (!mine) {
+      s.noRoute++;
+      // **足りない組を控える。** 件数と注文額の両方を持つ
+      //(1件$5,000の組と、100件$1の組は、足す価値が違う)。
+      const k = `${swap.tokenIn}|${swap.tokenOut}`;
+      const m = s.missing[k] || { n: 0, usd: 0, tokenIn: swap.tokenIn, tokenOut: swap.tokenOut };
+      m.n++;
+      const inUsd = toUsd(chain, swap.tokenIn, swap.amountIn);
+      if (inUsd != null) m.usd += inUsd;
+      s.missing[k] = m;
+      continue;
+    }
 
     // 差額をUSDにする。出力通貨の桁数と価格が無ければ数えない。
     const diffUsd = toUsd(chain, swap.tokenOut, mine.amountOut - swap.amountOut);
@@ -260,6 +279,8 @@ function restore() {
     const s = statFor(chain);
     for (const k of Object.keys(s)) {
       if (Array.isArray(s[k])) { if (Array.isArray(v[k])) s[k] = v[k].slice(-500); continue; }
+      // **足りない組は数ではなく表。** 上の「数なら数」の枝に落とさない。
+      if (k === "missing") { if (v[k] && typeof v[k] === "object") s[k] = v[k]; continue; }
       if (typeof s[k] === "number" && Number.isFinite(Number(v[k]))) s[k] = Number(v[k]);
       else if (v[k] != null && typeof s[k] !== "number") s[k] = v[k];
     }
@@ -347,3 +368,43 @@ export function getUniswapXStats() {
 }
 
 export function getProbeChains() { return PROBE_CHAINS.filter((c) => CHAIN_IDS[c]); }
+
+/// **地図に足すべき通貨の組**を、価値の高い順に返す。
+///
+/// 並べ方は「注文額の合計」。件数が多くても1件$1なら足す価値は薄く、
+/// 1件$5,000が数回ある組の方が効く(最良の勝ちは $1,901 の注文だった)。
+///
+/// @returns [{ chain, tokenIn, tokenOut, n, usd }]
+export function getMissingPairs(limit = 20) {
+  const out = [];
+  for (const [chain, s] of stats) {
+    for (const m of Object.values(s.missing || {})) {
+      if (!m?.tokenIn || !m?.tokenOut) continue;
+      out.push({ chain, tokenIn: m.tokenIn, tokenOut: m.tokenOut, n: m.n, usd: m.usd });
+    }
+  }
+  out.sort((a, b) => b.usd - a.usd || b.n - a.n);
+  return out.slice(0, limit);
+}
+
+/// 足りない組の要約(生存ログ用)。
+export function formatMissingPairsLine() {
+  const top = getMissingPairs(3);
+  if (top.length === 0) return "";
+  let total = 0, kinds = 0;
+  for (const [, s] of stats) {
+    for (const m of Object.values(s.missing || {})) { total += m.n; kinds++; }
+  }
+  const head = top.map((p) => `${p.chain}:${p.tokenIn.slice(0, 6)}→${p.tokenOut.slice(0, 6)}($${p.usd.toFixed(0)}/${p.n}件)`);
+  return ` 経路なしの組[${kinds}組 計${total}件 上位 ${head.join(" ")}]`;
+}
+
+/// 地図に載った組を控えから消す(同じ組を何度も探しに行かないため)。
+export function forgetMissingPair(chain, tokenIn, tokenOut) {
+  const s = stats.get(chain);
+  if (!s?.missing) return false;
+  const k = `${tokenIn}|${tokenOut}`;
+  if (!s.missing[k]) return false;
+  delete s.missing[k];
+  return true;
+}
