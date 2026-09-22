@@ -27,7 +27,7 @@
 // あったかを確認する(scripts/competitor-check.js)。
 
 import { ethers } from "ethers";
-import { minProfitUsd } from "./min-profit.js";
+import { minProfitUsd, breakEvenPriorityShare } from "./min-profit.js";
 import { getChainConfig } from "../chain-config.js";
 import { getProviderForChain, callWithRpc, poolHasAmountOut, readBlockTag, isPendingReadChain } from "./onchain-reserves.js";
 import { getCurrentTradeCapUsd, recordExecutionSuccess } from "./trade-cap.js";
@@ -571,6 +571,56 @@ const PRIORITY_FEE_CHAINS = new Set(
 /// 積む単価の上限(gwei)。桁を間違えた時の歯止め。
 const PRIORITY_FEE_MAX_GWEI = parseFloat(process.env.PRIORITY_FEE_MAX_GWEI || "50");
 
+// ===== 実測の損益分岐で頭を押さえる(2026年9月22日 12:40 JST)=====
+//
+// [なぜ要るか(実測)]
+// 一律 0.30 で1時間10分回した結果:
+//   負け率      23.5% → 5.3%        (先を越される回数は狙い通り激減した)
+//   1回の収支   $0.00115 → $0.00036 (**利益が69%落ちた**)
+//
+// 入札で取り返せるのは「今負けている分」だけで、それを超えて払うと
+// **勝率が100%になっても差し引きで損**をする。その天井が損益分岐:
+//
+//   損益分岐 share = (1 − 勝率) × (平均利益 + 平均ガス代) ÷ 平均利益
+//
+// 実測(12:29 JST)は **avalanche 0.26 / polygon 0.25** で、**どちらも 0.30 未満**。
+// つまり 0.30 は天井を超えて払っていた。avalanche は全勝ちの86%を稼ぐ主エンジンなので、
+// ここを取りすぎるのがいちばん高くつく。
+//
+// [なぜ「半分」か]
+// 損益分岐ちょうどに払うと、**儲けは定義上ゼロ**になる。取り分を残すため半分にする。
+//
+// [暴れない作り]
+// ・既定(0.30)を**超えることは無い**。下げる方向にしか効かない
+// ・標本が少ないうちは信用しない(勝ち10件・負け3件を下回れば既定のまま)。
+//   base と optimism はまだ1勝もしていないので、ここは既定のまま残る
+// ・勝率が上がると share は下がり、下がると share は戻る。累計の計数なので動きは鈍く、
+//   振動しても常に「損益分岐の半分以下」に留まる
+/// **元に戻すスイッチ。** `PRIORITY_FEE_AUTO_CAP=false` で頭押さえを切り、
+/// 従来どおり全チェーン一律 `PRIORITY_FEE_SHARE` に戻る(再デプロイ不要)。
+const PRIORITY_FEE_AUTO_CAP = (process.env.PRIORITY_FEE_AUTO_CAP || "true").toLowerCase() !== "false";
+/// 損益分岐に対して実際に使う割合。
+const PRIORITY_FEE_SAFETY = parseFloat(process.env.PRIORITY_FEE_SAFETY || "0.5");
+/// この件数に満たないチェーンでは損益分岐を信用せず、既定の share を使う。
+const PRIORITY_FEE_MIN_WINS = parseInt(process.env.PRIORITY_FEE_MIN_WINS || "10", 10);
+// 負けの件数は2件で足りることにする。**間違える向きが安いため。**
+// 平均ガス代を低く見誤れば share は下がり、失うのは「取れたかもしれないレース」だけ
+// (負けても失うのはガス代)。高く見誤っても既定の0.30で頭が止まる。
+// 3件にすると polygon(18勝2負)が長く既定のまま取られ過ぎる。
+const PRIORITY_FEE_MIN_LOSSES = parseInt(process.env.PRIORITY_FEE_MIN_LOSSES || "2", 10);
+
+/// そのチェーンで実際に使う share。実測が足りなければ既定のまま。
+/// **既定より大きくなることは無い。**
+function priorityShareFor(chain) {
+  if (!PRIORITY_FEE_AUTO_CAP) return PRIORITY_FEE_SHARE;
+  const be = breakEvenPriorityShare(chain);
+  if (!be) return PRIORITY_FEE_SHARE;
+  if (be.wins < PRIORITY_FEE_MIN_WINS || be.losses < PRIORITY_FEE_MIN_LOSSES) return PRIORITY_FEE_SHARE;
+  const capped = be.share * PRIORITY_FEE_SAFETY;
+  if (!(capped > 0)) return 0;
+  return capped < PRIORITY_FEE_SHARE ? capped : PRIORITY_FEE_SHARE;
+}
+
 /// その取引で積む優先手数料を決める。
 /// @param availableUsd ガス代を引いた後に残る純利益(USD)
 /// @param gasUnits     見積もったガス量
@@ -593,7 +643,9 @@ async function decidePriorityFee(chain, availableUsd, gasUnits) {
     const oneTokenUsd = await weiToUsd(key, 10n ** 18n);
     if (!(oneTokenUsd > 0)) return null;
 
-    const budgetUsd = availableUsd * PRIORITY_FEE_SHARE;
+    const share = priorityShareFor(key);
+    if (!(share > 0)) return null;
+    const budgetUsd = availableUsd * share;
     const budgetWei = BigInt(Math.floor((budgetUsd / oneTokenUsd) * 1e18));
     if (budgetWei <= 0n) return null;
     let extraPerGas = budgetWei / gasUnits;
@@ -610,7 +662,7 @@ async function decidePriorityFee(chain, availableUsd, gasUnits) {
     const maxFee = fromBase > fromEthers ? fromBase : fromEthers;
     if (maxFee < priority) return null; // 念のため(上限が優先より低いと送れない)
     const bidUsd = (await weiToUsd(key, extraPerGas * gasUnits)) ?? 0;
-    return { maxPriorityFeePerGas: priority, maxFeePerGas: maxFee, bidUsd, extraPerGas };
+    return { maxPriorityFeePerGas: priority, maxFeePerGas: maxFee, bidUsd, extraPerGas, share };
   } catch (e) {
     return null;
   }
@@ -1012,7 +1064,8 @@ async function executeOpportunityInner(opp) {
     if (bid && grossProfitUsd - gasCostUsd - bid.bidUsd >= minProfitUsd()) {
       overrides.maxPriorityFeePerGas = bid.maxPriorityFeePerGas;
       overrides.maxFeePerGas = bid.maxFeePerGas;
-      bidNote = ` 優先+${(Number(bid.extraPerGas) / 1e9).toFixed(3)}gwei($${bid.bidUsd.toFixed(4)})`;
+      // share も出す。**実測の損益分岐で頭を押さえているかを目で確認できるようにする。**
+      bidNote = ` 優先+${(Number(bid.extraPerGas) / 1e9).toFixed(3)}gwei($${bid.bidUsd.toFixed(4)} share${(bid.share ?? 0).toFixed(2)})`;
     } else if (bid) {
       bidNote = " 優先なし(積むと下限割れ)";
     }
