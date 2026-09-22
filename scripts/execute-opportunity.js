@@ -535,6 +535,81 @@ function decideMinProfit(profitRaw, grossProfitUsd, gasCostUsd) {
   return (profitRaw * BigInt(bps)) / 10000n;
 }
 
+// ===== 優先手数料の入札(2026年9月22日、オーナーの承認を得て追加)=====
+//
+// [なぜ要るか]
+// このボットは今まで `maxPriorityFeePerGas` を**一度も指定していなかった**。
+// ethers が RPC に聞いた既定値をそのまま使っていたので、**入札に参加せず
+// 定価で並んでいた**ことになる。
+//
+// Base と Optimism のシーケンサーは**優先手数料の高い順**に並べる(公式文書)。
+// Polygon と Avalanche も単価の高い順。つまり、先を越されて取り消された
+// `wait` の負け(avalanche 24 / base 6 / polygon 2 / arbitrum 1)のうち、
+// いくらかは**こちらが定価で並んでいたせい**である可能性が高い。
+//
+// [arbitrum を外す理由]
+// arbitrum のシーケンサーは**到着順(FCFS)**で、優先手数料では順番が変わらない
+// (順番を買うのは Timeboost という別の競売)。ここで積んでも**捨て金になる**ので外す。
+//
+// [上振れしない作り]
+// 入札の原資は**その取引で残る純利益の一部だけ**。積んだ後にもう一度
+// 「手数料負けしないか」を確かめ、割れるなら積むのをやめる。
+// 赤字の取引はそもそもここまで来ないので、入札で赤字にはならない。
+/// 入札に使う純利益の割合。
+const PRIORITY_FEE_SHARE = parseFloat(process.env.PRIORITY_FEE_SHARE || "0.30");
+/// 優先手数料を積むチェーン。**順番が手数料で決まるチェーンだけ。**
+const PRIORITY_FEE_CHAINS = new Set(
+  (process.env.PRIORITY_FEE_CHAINS || "base,optimism,polygon,avalanche")
+    .split(",").map((c) => c.trim().toLowerCase()).filter(Boolean)
+);
+/// 積む単価の上限(gwei)。桁を間違えた時の歯止め。
+const PRIORITY_FEE_MAX_GWEI = parseFloat(process.env.PRIORITY_FEE_MAX_GWEI || "50");
+
+/// その取引で積む優先手数料を決める。
+/// @param availableUsd ガス代を引いた後に残る純利益(USD)
+/// @param gasUnits     見積もったガス量
+/// 戻り値: { maxPriorityFeePerGas, maxFeePerGas, bidUsd } / 積まないなら null
+async function decidePriorityFee(chain, availableUsd, gasUnits) {
+  const key = (chain || "").toLowerCase();
+  if (!PRIORITY_FEE_CHAINS.has(key)) return null;
+  if (!(availableUsd > 0) || !(gasUnits > 0n)) return null;
+  try {
+    const provider = getProviderForChain(key);
+    if (!provider) return null;
+    const fee = await provider.getFeeData();
+    const basePriority = fee.maxPriorityFeePerGas ?? 0n;
+    // ethers は maxFeePerGas = baseFee×2 + priority で作る。そこから baseFee を戻す。
+    const baseFee = (fee.maxFeePerGas != null && fee.maxFeePerGas > basePriority)
+      ? (fee.maxFeePerGas - basePriority) / 2n
+      : 0n;
+
+    // 1トークンのUSD価格(weiToUsd に 1e18 を渡すとそのまま出る)。
+    const oneTokenUsd = await weiToUsd(key, 10n ** 18n);
+    if (!(oneTokenUsd > 0)) return null;
+
+    const budgetUsd = availableUsd * PRIORITY_FEE_SHARE;
+    const budgetWei = BigInt(Math.floor((budgetUsd / oneTokenUsd) * 1e18));
+    if (budgetWei <= 0n) return null;
+    let extraPerGas = budgetWei / gasUnits;
+    const capWei = BigInt(Math.floor(PRIORITY_FEE_MAX_GWEI * 1e9));
+    if (extraPerGas > capWei) extraPerGas = capWei;
+    if (extraPerGas <= 0n) return null;
+
+    const priority = basePriority + extraPerGas;
+    // 上限は「baseFee×2 + 優先」。ただし baseFee を戻せなかった時に
+    // **基準額を下回って拒否される**ので、ethers が出した上限に積んだ分を
+    // 足した値とを比べて、**大きい方**を使う。
+    const fromBase = baseFee * 2n + priority;
+    const fromEthers = (fee.maxFeePerGas ?? 0n) + extraPerGas;
+    const maxFee = fromBase > fromEthers ? fromBase : fromEthers;
+    if (maxFee < priority) return null; // 念のため(上限が優先より低いと送れない)
+    const bidUsd = (await weiToUsd(key, extraPerGas * gasUnits)) ?? 0;
+    return { maxPriorityFeePerGas: priority, maxFeePerGas: maxFee, bidUsd, extraPerGas };
+  } catch (e) {
+    return null;
+  }
+}
+
 // 旧版の kind。
 const CONTRACT_KIND_V2 = 0;
 const CONTRACT_KIND_V3 = 1;
@@ -921,14 +996,30 @@ async function executeOpportunityInner(opp) {
   // 単価の学習に使うため、この時点の見積もり単価を控えておく。
   const estimatedGasPriceWei = await getEstimatedGasPriceWei(chain);
 
+  // **順番を買う。** 残る純利益の一部だけを優先手数料に積む。
+  // 積んだ後にもう一度「手数料負けしないか」を確かめ、割れるなら積まない。
+  const overrides = { gasLimit: gasWithBuffer };
+  let bidNote = "";
+  {
+    const availableUsd = grossProfitUsd - gasCostUsd;
+    const bid = await decidePriorityFee(chain, availableUsd, gasUnits);
+    if (bid && grossProfitUsd - gasCostUsd - bid.bidUsd >= minProfitUsd()) {
+      overrides.maxPriorityFeePerGas = bid.maxPriorityFeePerGas;
+      overrides.maxFeePerGas = bid.maxFeePerGas;
+      bidNote = ` 優先+${(Number(bid.extraPerGas) / 1e9).toFixed(3)}gwei($${bid.bidUsd.toFixed(4)})`;
+    } else if (bid) {
+      bidNote = " 優先なし(積むと下限割れ)";
+    }
+  }
+
   markRouteConfirmed(opp);
   opp.sendResult = "confirmed";
   const readyMs = Date.now() - startedAt;
-  console.log(`[実行] ${opp.kind} ${chain} ${opp.label}: 送信します(投入$${tradeUsd.toFixed(2)} 粗利$${grossProfitUsd.toFixed(4)}/+${profitBps.toFixed(1)}bps ガス$${gasCostUsd.toFixed(4)} 確認${simMs}ms 準備${readyMs}ms)`);
+  console.log(`[実行] ${opp.kind} ${chain} ${opp.label}: 送信します(投入$${tradeUsd.toFixed(2)} 粗利$${grossProfitUsd.toFixed(4)}/+${profitBps.toFixed(1)}bps ガス$${gasCostUsd.toFixed(4)}${bidNote} 確認${simMs}ms 準備${readyMs}ms)`);
 
   let tx;
   try {
-    tx = await contract.executeRoute(asset, amountIn, legArgs, minProfit, { gasLimit: gasWithBuffer });
+    tx = await contract.executeRoute(asset, amountIn, legArgs, minProfit, overrides);
   } catch (e) {
     const msg = e.message || "";
     // 送れなかった番号が手元に残ると以降の送信が詰まるので、鎖上の値に戻す。
