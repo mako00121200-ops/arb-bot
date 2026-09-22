@@ -38,7 +38,33 @@ export function liquidatorAddressEnvVar(chain) {
   return `LIQUIDATOR_CONTRACT_ADDRESS_${(chain || "").toUpperCase()}`;
 }
 
-export async function runLiquidatorDeploy(chain) {
+/// 複数チェーンをまとめてデプロイする。**再起動の回数を減らすため。**
+/// 1チェーンずつだと、チェーンの数だけ再デプロイが要り、そのたびに
+/// 裁定側の計測(取引量・収支の標本)が消える。
+/// 途中で失敗しても残りは続ける(どれが置けてどれが置けなかったかを全部出す)。
+export async function runLiquidatorDeploy(chains) {
+  const list = String(chains || "").split(",").map((c) => c.trim().toLowerCase()).filter(Boolean);
+  if (list.length === 0) return null;
+  const done = {};
+  for (const c of list) {
+    try {
+      done[c] = await deployOne(c);
+    } catch (e) {
+      done[c] = null;
+      console.error(`[清算デプロイ] ${c} で失敗: ${(e.message || "").slice(0, 160)}`);
+    }
+  }
+  const ok = Object.entries(done).filter(([, v]) => v);
+  if (ok.length > 0) {
+    console.log("[清算デプロイ] まとめ: 下の環境変数を設定し、RUN_LIQUIDATOR_DEPLOY を false に戻してください");
+    for (const [c, addr] of ok) console.log(`  ${liquidatorAddressEnvVar(c)} = ${addr}`);
+  }
+  const failed = Object.entries(done).filter(([, v]) => !v).map(([c]) => c);
+  if (failed.length > 0) console.error(`[清算デプロイ] 置けなかったチェーン: ${failed.join(",")}`);
+  return done;
+}
+
+async function deployOne(chain) {
   const chainKey = (chain || "").toLowerCase();
   const config = getAnyChainConfig(chainKey);
   const pool = AAVE_POOL_BY_CHAIN[chainKey];
