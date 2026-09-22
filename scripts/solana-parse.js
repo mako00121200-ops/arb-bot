@@ -30,6 +30,17 @@ export function readPair(p) {
     baseSymbol: p?.baseToken?.symbol ? String(p.baseToken.symbol) : String(base).slice(0, 6),
     quoteSymbol: p?.quoteToken?.symbol ? String(p.quoteToken.symbol) : String(quote).slice(0, 6),
     priceUsd: price,
+    // **価格差の計算にはこちらを使う**(2026年9月22日の初回計測で判明)。
+    //
+    // [なぜ priceUsd では駄目だったか]
+    // 初回の計測で**対照群の SOL/USDC が 32.1bps** を示した。Solana でいちばん
+    // 流動的なペアに32bpsが残るはずがなく、**測り方が壊れている**証拠だった
+    // (この対照群はまさにそれを捕まえるために入れてあった)。
+    // `priceUsd` は「base の quote建て価格 × quote の USD価格」で**導出**された値で、
+    // プールごとに更新時刻も換算経路も違う。差の中に**古さと換算誤差が混ざる**。
+    // `priceNative`(同じペア内の base/quote 比)なら USD換算が挟まらないので、
+    // 同じ(base, quote)どうしの比較が**そのまま同じ土俵**になる。
+    priceNative: num(p?.priceNative),
     // 流動性と出来高は「不明」を許す。呼ぶ側が足切りに使うので、
     // **不明を0扱いにすると本物を落とす**し、大きい扱いにすると幻を通す。
     liquidityUsd: num(p?.liquidity?.usd),
@@ -64,6 +75,8 @@ export function findSpreads(pairs, { minLiquidityUsd = 5000, minVolumeH24 = 1000
     // 流動性・出来高が**不明なものは使わない**(推測しない)。
     if (p.liquidityUsd == null || p.volumeH24 == null) continue;
     if (p.liquidityUsd < minLiquidityUsd || p.volumeH24 < minVolumeH24) continue;
+    // **priceNative が無いペアは比較に使えない**(USD建てで比べると導出誤差が混ざる)。
+    if (!(p.priceNative > 0)) continue;
     const key = `${p.base}|${p.quote}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(p);
@@ -72,14 +85,15 @@ export function findSpreads(pairs, { minLiquidityUsd = 5000, minVolumeH24 = 1000
   const out = [];
   for (const [key, list] of groups) {
     if (list.length < 2) continue; // 比べる相手が要る
+    // **比較は priceNative(同じペア内の base/quote 比)で行う。** 理由は readPair の注記。
     let low = list[0], high = list[0];
     for (const p of list) {
-      if (p.priceUsd < low.priceUsd) low = p;
-      if (p.priceUsd > high.priceUsd) high = p;
+      if (p.priceNative < low.priceNative) low = p;
+      if (p.priceNative > high.priceNative) high = p;
     }
     if (low.dexId === high.dexId && low.pairAddress === high.pairAddress) continue;
-    if (!(low.priceUsd > 0)) continue;
-    const spreadBps = ((high.priceUsd - low.priceUsd) / low.priceUsd) * 10000;
+    if (!(low.priceNative > 0)) continue;
+    const spreadBps = ((high.priceNative - low.priceNative) / low.priceNative) * 10000;
     if (!(spreadBps > 0)) continue;
     out.push({
       key, baseSymbol: low.baseSymbol, quoteSymbol: low.quoteSymbol,
