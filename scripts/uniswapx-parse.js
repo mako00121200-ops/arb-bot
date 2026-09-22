@@ -18,8 +18,10 @@
 /// startAmount    … ダッチオークションの開始値。約定額の上限であって実額ではないが、
 ///                  他に何も無いよりはまし。**我々に不利な側**(ユーザーへの支払いを
 ///                  多めに見る)なので、勝ちを水増ししない
+export const AMOUNT_KEYS = ["settledAmount", "filledAmount", "amount", "startAmount"];
+
 export function pickAmount(side) {
-  for (const key of ["settledAmount", "filledAmount", "amount", "startAmount"]) {
+  for (const key of AMOUNT_KEYS) {
     const v = side?.[key];
     if (v == null) continue;
     try {
@@ -28,6 +30,36 @@ export function pickAmount(side) {
     } catch (e) { /* 数にならない値は飛ばす */ }
   }
   return null;
+}
+
+/// **pickAmount がどの項目で額を読んだか**を返す。読めなければ null。
+///
+/// [なぜ要るか(2026年9月23日)]
+/// base の Priority 注文は、**優先手数料に比例してユーザーの受取が増える**
+/// (`PriorityOrderReactor.sol` の `outputs.scale(priorityFee)`)。
+/// 注文の `amount` は**最低額**で、実際の受取はそれより多い。
+/// `amount` で比べていると、**競争相手が入札で上乗せした分をまるごと我々の取り分に数える**
+/// = 水増しになる。どの項目で読めているかを数えて、これを確かめる。
+export function amountKeyOf(side) {
+  for (const key of AMOUNT_KEYS) {
+    const v = side?.[key];
+    if (v == null) continue;
+    try {
+      if (BigInt(String(v)) > 0n) return key;
+    } catch (e) { /* 数にならない値は飛ばす */ }
+  }
+  return null;
+}
+
+/// 注文の種類(Priority / Dutch_V3 など)。**名前を決め打ちしない**ので、
+/// 候補の項目を順に見て、どれも無ければ「不明」。
+export const ORDER_TYPE_KEYS = ["orderType", "type"];
+export function orderTypeOf(order) {
+  for (const key of ORDER_TYPE_KEYS) {
+    const v = order?.[key];
+    if (v != null && String(v).trim() !== "") return String(v).slice(0, 24);
+  }
+  return "不明";
 }
 
 /// 注文から「入る通貨と量」「ユーザーへ出す通貨と量」を取り出す。
