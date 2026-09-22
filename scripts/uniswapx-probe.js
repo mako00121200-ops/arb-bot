@@ -36,8 +36,10 @@
 
 import { bestOutputFor } from "./opportunity-scanner.js";
 import { extractSwap } from "./uniswapx-parse.js";
-import { getTokenDecimals, getTokenPriceUsd } from "./pool-registry.js";
+import { getTokenDecimals, getTokenPriceUsd, KIND_V3 } from "./pool-registry.js";
 import { getKnownTokens } from "./borrowable-tokens.js";
+import { quoteV3ByPoolBatch } from "./multicall-reserves.js";
+import { getAnyChainConfig } from "../chain-config.js";
 
 /// UniswapX の公開API。**鍵は要らない**(注文の取得は誰でもできる)。
 const API_BASE = process.env.UNISWAPX_API_BASE || "https://api.uniswap.org/v2";
@@ -64,7 +66,9 @@ const stats = new Map(); // chain -> { seen, quotable, won, lost, marginUsd, bes
 function statFor(chain) {
   if (!stats.has(chain)) {
     stats.set(chain, { seen: 0, quotable: 0, won: 0, lost: 0, marginUsd: 0, bestUsd: 0, best: null,
-      noRoute: 0, noDecimals: 0 });
+      noRoute: 0, noDecimals: 0,
+      // **チェーンに聞いて確かめた分。** 上の won は模型の答えでしかない。
+      hadV2: 0, verifyTried: 0, verifyFailed: 0, verifiedWon: 0, verifiedLost: 0, verifiedUsd: 0 });
   }
   return stats.get(chain);
 }
@@ -90,6 +94,40 @@ async function fetchFilledOrders(chain) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/// **チェーンに聞いて、その経路で本当にいくら返るかを確かめる。**
+///
+/// [なぜ要るか(2026年9月22日、初回計測で判明)]
+/// 初回の結果で `polygon: 注文$20 に対して取り分$6.76`(= 34%)が出た。
+/// **競争市場でこれはあり得ない。** 最良経路が `sync発見`(探索で見つけたV2プール)から
+/// 始まっており、**準備量が古い**か**税トークン**なら我々の計算だけが大きな出力を出す。
+/// 今朝の「判定+$2.65 / 実測−26bps」と同じ型で、模型を信じた結果。
+///
+/// [なぜ V3 だけか]
+/// 自前コントラクトの `quoteV3` は**プール住所を直接渡して実際に試算させる**ので、
+/// チェーン上の真実が返る(裁定側の送信直前の確認と同じ仕組み)。
+/// 一方 V2 は準備量を読み直しても**税トークンを見抜けない**。
+/// **見抜けないものを「確かめた」と呼ばない。** V2を含む経路は検証対象から外し、
+/// 別に数える(hadV2)。
+///
+/// 段は順番に依存する(2段目の入力は1段目の出力)ので、まとめて1回では聞けない。
+/// 2段なら2回。候補は毎回ごく少数なので費用は無視できる。
+///
+/// @returns 最終的な受取量 / 確かめられなければ null
+async function verifyOnChain(chain, legs, amountIn) {
+  const cfg = getAnyChainConfig(chain);
+  const contractAddress = cfg && process.env[cfg.contractAddressEnvVar];
+  if (!contractAddress) return null;
+  let amount = amountIn;
+  for (const leg of legs) {
+    if (leg.kind !== KIND_V3) return null; // V2 を含む経路は「確かめた」と言えない
+    const [out] = await quoteV3ByPoolBatch(
+      chain, contractAddress, [{ pool: leg.pool, tokenIn: leg.tokenIn, amountIn: amount }], false);
+    if (out == null || !(out > 0n)) return null;
+    amount = out;
+  }
+  return amount;
 }
 
 function toUsd(chain, token, raw) {
@@ -130,15 +168,34 @@ async function probeChain(chain) {
     if (diffUsd == null) { s.noDecimals++; continue; }
     s.quotable++;
 
-    if (diffUsd > 0) {
-      s.won++;
-      s.marginUsd += diffUsd;
-      if (diffUsd > s.bestUsd) {
-        s.bestUsd = diffUsd;
-        s.best = { hash, label: mine.label, sizeUsd: toUsd(chain, swap.tokenIn, swap.amountIn) };
+    if (diffUsd <= 0) { s.lost++; continue; }
+
+    // ここまでは**模型の答え**。初回計測で34%という有り得ない値が出たので、
+    // これだけでは「勝てた」と数えない。
+    s.won++;
+    s.marginUsd += diffUsd;
+
+    // **チェーンに聞いて確かめる。** V2 を含む経路は確かめようがないので別に数える。
+    if (mine.legs.some((l) => l.kind !== KIND_V3)) { s.hadV2++; continue; }
+    s.verifyTried++;
+    let trueOut = null;
+    try {
+      trueOut = await verifyOnChain(chain, mine.legs, swap.amountIn);
+    } catch (e) { /* 確かめられなければ数えないだけ */ }
+    if (trueOut == null) { s.verifyFailed++; continue; }
+
+    const trueDiffUsd = toUsd(chain, swap.tokenOut, trueOut - swap.amountOut);
+    if (trueDiffUsd == null) { s.verifyFailed++; continue; }
+    if (trueDiffUsd > 0) {
+      s.verifiedWon++;
+      s.verifiedUsd += trueDiffUsd;
+      if (trueDiffUsd > s.bestUsd) {
+        s.bestUsd = trueDiffUsd;
+        s.best = { hash, label: mine.label, sizeUsd: toUsd(chain, swap.tokenIn, swap.amountIn),
+          modelUsd: diffUsd };
       }
     } else {
-      s.lost++;
+      s.verifiedLost++;
     }
   }
 }
@@ -161,8 +218,15 @@ export function formatUniswapXLine() {
   const parts = [];
   for (const [chain, s] of stats) {
     if (s.seen === 0) continue;
+    // **模型の答えと、チェーンに聞いて確かめた答えを分けて出す。**
+    // 初回計測で模型が34%という有り得ない値を出したので、混ぜて出すと判断を誤る。
     const rate = s.quotable > 0 ? ((s.won / s.quotable) * 100).toFixed(0) : "-";
-    parts.push(`${chain} 見${s.seen}/値付け${s.quotable}(経路なし${s.noRoute})勝${s.won}(${rate}%) 取り分計$${s.marginUsd.toFixed(3)} 最良$${s.bestUsd.toFixed(3)}`);
+    const vTotal = s.verifiedWon + s.verifiedLost;
+    const vRate = vTotal > 0 ? ((s.verifiedWon / vTotal) * 100).toFixed(0) : "-";
+    parts.push(`${chain} 見${s.seen}/値付け${s.quotable}(経路なし${s.noRoute})`
+      + ` 模型勝${s.won}($${s.marginUsd.toFixed(3)})`
+      + ` → **確認済 ${s.verifiedWon}勝/${s.verifiedLost}敗(${vRate}%) $${s.verifiedUsd.toFixed(4)}**`
+      + `(V2で確認不可${s.hadV2} 確認失敗${s.verifyFailed})`);
   }
   return parts.length > 0 ? ` UniswapX計測[${parts.join(" / ")}]` : "";
 }
@@ -172,8 +236,10 @@ export function formatUniswapXReport() {
   const lines = [];
   for (const [chain, s] of stats) {
     if (!s.best) continue;
-    lines.push(`[UniswapX計測] ${chain}: 最良 ${s.best.label} で $${s.bestUsd.toFixed(4)} の取り分`
-      + `(注文$${s.best.sizeUsd != null ? s.best.sizeUsd.toFixed(0) : "?"} / ${s.best.hash.slice(0, 10)}…)`);
+    lines.push(`[UniswapX計測] ${chain}: **チェーンで確認した**最良 ${s.best.label} で $${s.bestUsd.toFixed(4)} の取り分`
+      + `(注文$${s.best.sizeUsd != null ? s.best.sizeUsd.toFixed(0) : "?"}`
+      + `${s.best.modelUsd != null ? ` / 模型は$${s.best.modelUsd.toFixed(4)}と言っていた` : ""}`
+      + ` / ${s.best.hash.slice(0, 10)}…)`);
   }
   return lines;
 }
