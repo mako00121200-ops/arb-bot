@@ -92,6 +92,11 @@ function statFor(chain) {
       /// 16%しか見ていなかった**。だが「経路なし」と数えるだけでは
       /// **どの組を足せばよいか分からない**。組そのものを控える。
       missing: {},
+      /// **別通貨の出力を含む注文**(正しく比べられないので捨てた数)。
+      otherTokenOut: 0,
+      /// **出力が2つ以上あった注文の数**と、見落としていた額の合計。
+      /// これが大きいほど、直す前の数字は水増しされていた。
+      multiOut: 0, ignoredOutUsd: 0,
       // **約定時刻が無く、注文が作られた時刻しか無いもの。** 齢が測れないので数えない。
       createdOnly: 0,
       // **確認できた勝ちを「齢つき」で持つ。** 値動きの残りかすかどうかを、
@@ -205,6 +210,15 @@ async function probeChain(chain) {
 
     const swap = extractSwap(order);
     if (!swap) continue;
+    // **別の通貨での出力があるものは、値段を付けられないので比べない。**
+    // 無理に比べると、その出力を**タダでもらえる前提**になって水増しになる。
+    if (swap.otherTokenOutputs > 0) { s.otherTokenOut++; continue; }
+    if (swap.outputCount > 1) {
+      s.multiOut++;
+      // 直す前はここを見落としていた。どれだけ水増しされていたかを控える。
+      const missed = toUsd(chain, swap.tokenOut, swap.amountOut - swap.mainOnlyOut);
+      if (missed != null) s.ignoredOutUsd += missed;
+    }
 
     // 我々の経路なら、同じ投入額で何が返るか。
     const mine = bestOutputFor({
@@ -267,7 +281,13 @@ async function probeChain(chain) {
 
 /// 保存の形。**中身の意味を変えたら上げる**(古い形を読んで静かに壊れないように)。
 const STATE_NAME = "uniswapx-probe.json";
-const STATE_VERSION = 1;
+/// **2 に上げた(2026年9月22日)。**
+///
+/// 版1までの数字は、**出力が複数ある注文で最大の1つしか見ていなかった**ため、
+/// 手数料の出力を「タダでもらえる」前提で計算されている = **利益が水増しされている**。
+/// 読み戻すと汚染が残るので、**版番号を上げて捨てる**。
+/// (これが版番号を持たせた理由そのもの。9勝$18.5477 は信用しない)
+const STATE_VERSION = 2;
 
 /// 再デプロイで計測が消えないように読み戻す。
 /// (2026年9月22日:1日4回のデプロイで毎回ゼロに戻っていた)
@@ -328,7 +348,10 @@ export function formatUniswapXLine() {
       + `${s.timeKey ? ` key=${s.timeKey}` : ""})/値付け${s.quotable}(経路なし${s.noRoute})`
       + ` 模型勝${s.won}($${s.marginUsd.toFixed(3)})`
       + ` → **確認済 ${s.verifiedWon}勝/${s.verifiedLost}敗(${vRate}%) $${s.verifiedUsd.toFixed(4)}**`
-      + `(V2で確認不可${s.hadV2} 確認失敗${s.verifyFailed})`);
+      + `(V2で確認不可${s.hadV2} 確認失敗${s.verifyFailed})`
+      // **出力が複数ある注文。** 直す前はここを見落として利益を水増ししていた。
+      + (s.multiOut > 0 ? ` **出力複数${s.multiOut}件(見落としていた額 計$${s.ignoredOutUsd.toFixed(4)})**` : "")
+      + (s.otherTokenOut > 0 ? ` 別通貨の出力${s.otherTokenOut}件は除外` : ""));
   }
   return parts.length > 0 ? ` UniswapX計測[${parts.join(" / ")}]` : "";
 }
