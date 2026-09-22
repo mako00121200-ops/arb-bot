@@ -1,10 +1,13 @@
 // scripts/liquidation-monitor.js
 //
-// Avalanche の Aave V3 を見張り、清算できる借り手を見つける(第2段の本体)。
+// **1つのチェーン**の Aave V3 を見張り、清算できる借り手を見つける(第2段の本体)。
+// どのチェーンを見るかは `LIQUIDATION_CHAIN`(既定 avalanche)。下の「対象のチェーン」を読むこと。
 //
 // [役割の分担]
-//   scripts/aave-liquidation.js … 5チェーンの**計測**(読み取りのみ。avalanche はこちらへ移した)
-//   このファイル               … avalanche の**見張りと判断**。送信は LIQUIDATION_DRY_RUN=false の時だけ
+//   scripts/aave-liquidation.js … 5チェーンの**計測**(読み取りのみ。10分ごとの巡回)
+//   このファイル               … **1チェーンだけ**の見張りと判断。価格更新に即反応する。
+//                                 送信は LIQUIDATION_DRY_RUN=false の時だけ
+//   (index.js は、ここで見ているチェーンを計測側の対象から外す)
 //
 // [仕組み]
 //   ① 名簿: 起動時に過去60日の Borrow から借り手を集める(裏で少しずつ遡る)。
@@ -106,8 +109,7 @@ const MAX_SWEEP_CALLS = parseInt(process.env.LIQUIDATION_MAX_SWEEP_CALLS || "80"
 const MAX_ROSTER = parseInt(process.env.LIQUIDATION_MAX_ROSTER || "12000", 10);
 /// 要注意の内訳(担保・借金)を一度に読む人数の上限。
 const MAX_BREAKDOWN_USERS = parseInt(process.env.LIQUIDATION_MAX_BREAKDOWN_USERS || "60", 10);
-/// WebSocket の URL。裁定と同じ端点を既定にする(別接続)。
-/// WebSocket の接続先。`LIQUIDATION_WSS_URL` が無ければ**そのチェーンのもの**を使う。
+/// WebSocket の接続先。裁定とは別の接続。`LIQUIDATION_WSS_URL` が無ければ**そのチェーンのもの**を使う。
 /// (URL 自体は環境変数にしかない。リポジトリには絶対に書かない)
 const WSS_URL = process.env.LIQUIDATION_WSS_URL
   || process.env[`${CHAIN.toUpperCase()}_WSS_URL`] || "";
