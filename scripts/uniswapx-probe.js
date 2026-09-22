@@ -35,7 +35,7 @@
 //   UNISWAPX_PROBE_LIMIT  … 1回に取る注文数(既定20、APIの上限は50)
 
 import { bestOutputFor } from "./opportunity-scanner.js";
-import { extractSwap } from "./uniswapx-parse.js";
+import { extractSwap, readFilledAt, FILLED_AT_KEYS } from "./uniswapx-parse.js";
 import { getTokenDecimals, getTokenPriceUsd, KIND_V3 } from "./pool-registry.js";
 import { getKnownTokens } from "./borrowable-tokens.js";
 import { quoteV3ByPoolBatch } from "./multicall-reserves.js";
@@ -56,6 +56,17 @@ export const PROBE_INTERVAL_MS = parseInt(process.env.UNISWAPX_PROBE_INTERVAL_MS
 const PROBE_LIMIT = Math.min(parseInt(process.env.UNISWAPX_PROBE_LIMIT || "20", 10), 50);
 /// 1回の取得にかける時間の上限。ここで詰まると裁定側の処理が遅れるため。
 const FETCH_TIMEOUT_MS = parseInt(process.env.UNISWAPX_FETCH_TIMEOUT_MS || "8000", 10);
+/// **約定してからこの秒数より古い注文は数えない。**
+///
+/// [なぜ(2026年9月22日の見回り)]
+/// 「過去の約定」と「今の我々の経路」を比べているので、その間の値動きが差に混ざる。
+/// base で **模型$2.397 → チェーンで確認$2.7926** と、模型より確認の方が大きくなった。
+/// 模型は V3 を x·y=k で近似する = **過大に出る側**なので、これは起こらないはず。
+/// 差の出どころが実力ではなく値動きだという証拠。
+///
+/// 短くするほど汚染は減るが、数えられる注文も減る。まず180秒から始めて、
+/// ログに出る `齢中央値` と `古すぎ` の件数を見て詰める。
+const MAX_AGE_SEC = parseInt(process.env.UNISWAPX_MAX_AGE_SEC || "180", 10);
 /// 同じ注文を二度数えないための記憶。
 const seenOrders = new Set();
 const SEEN_LIMIT = 5000;
@@ -68,7 +79,10 @@ function statFor(chain) {
     stats.set(chain, { seen: 0, quotable: 0, won: 0, lost: 0, marginUsd: 0, bestUsd: 0, best: null,
       noRoute: 0, noDecimals: 0,
       // **チェーンに聞いて確かめた分。** 上の won は模型の答えでしかない。
-      hadV2: 0, verifyTried: 0, verifyFailed: 0, verifiedWon: 0, verifiedLost: 0, verifiedUsd: 0 });
+      hadV2: 0, verifyTried: 0, verifyFailed: 0, verifiedWon: 0, verifiedLost: 0, verifiedUsd: 0,
+      // **時刻でふるった分。** tooOld は値動きに汚染されるので捨てた数、
+      // noTime は時刻そのものが読めなかった数(= 測れない。0でない間は結論を出さない)。
+      tooOld: 0, noTime: 0, ages: [], timeKey: null });
   }
   return stats.get(chain);
 }
@@ -154,6 +168,23 @@ async function probeChain(chain) {
     }
     s.seen++;
 
+    // **古い約定は捨てる。** 値動きが差に混ざって、我々の実力ではなくなるため。
+    const filled = readFilledAt(order);
+    if (!filled) {
+      s.noTime++;
+      // 一度だけ、実際のキー名をログに出す。**推測で名前を決めない**ため(§9)。
+      if (s.noTime === 1) {
+        console.warn(`[UniswapX計測] ${chain}: 約定時刻が読めません`
+          + ` 候補[${FILLED_AT_KEYS.join(",")}] 実際のキー[${Object.keys(order || {}).join(",").slice(0, 200)}]`);
+      }
+      continue;
+    }
+    s.timeKey = filled.key;
+    const ageSec = Date.now() / 1000 - filled.sec;
+    if (!(ageSec >= 0) || ageSec > MAX_AGE_SEC) { s.tooOld++; continue; }
+    s.ages.push(ageSec);
+    if (s.ages.length > 200) s.ages.shift();
+
     const swap = extractSwap(order);
     if (!swap) continue;
 
@@ -223,7 +254,11 @@ export function formatUniswapXLine() {
     const rate = s.quotable > 0 ? ((s.won / s.quotable) * 100).toFixed(0) : "-";
     const vTotal = s.verifiedWon + s.verifiedLost;
     const vRate = vTotal > 0 ? ((s.verifiedWon / vTotal) * 100).toFixed(0) : "-";
-    parts.push(`${chain} 見${s.seen}/値付け${s.quotable}(経路なし${s.noRoute})`
+    // **測れているのかどうかを先に出す。** noTime が残っている間は数字を信じない。
+    const med = s.ages.length > 0
+      ? [...s.ages].sort((a, b) => a - b)[Math.floor(s.ages.length / 2)].toFixed(0) : "-";
+    parts.push(`${chain} 見${s.seen}(古すぎ${s.tooOld} 時刻読めず${s.noTime} 齢中央${med}s`
+      + `${s.timeKey ? ` key=${s.timeKey}` : ""})/値付け${s.quotable}(経路なし${s.noRoute})`
       + ` 模型勝${s.won}($${s.marginUsd.toFixed(3)})`
       + ` → **確認済 ${s.verifiedWon}勝/${s.verifiedLost}敗(${vRate}%) $${s.verifiedUsd.toFixed(4)}**`
       + `(V2で確認不可${s.hadV2} 確認失敗${s.verifyFailed})`);

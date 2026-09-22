@@ -55,3 +55,39 @@ export function extractSwap(order) {
   if (tokenIn === main.token) return null;
   return { tokenIn, amountIn: inAmount, tokenOut: main.token, amountOut: main.amount };
 }
+
+/// 約定した時刻を読む。**秒**で返す。読めなければ null。
+///
+/// [なぜ要るか(2026年9月22日の見回りで判明)]
+/// 計測は「**過去に約定した注文**」と「**今の我々の経路**」を比べている。
+/// 約定した時から今までに価格が動いていれば、その差は**単なる値動きであって
+/// 我々の実力ではない**。
+///
+/// 実際にそれが出た。base で **模型$2.397 に対しチェーンで確認したら $2.7926**。
+/// 我々の見積もりより**チェーンの答えの方が大きい**のは、模型が正しければ起こらない
+/// (模型は V3 を x·y=k で近似する = **過大**に出る側)。
+/// つまり差の出どころは経路の優劣ではなく、**その間の値動き**。
+///
+/// [キーを決め打ちしない理由]
+/// この API の応答を手元から見られない(社内プロキシが 403 を返す)。
+/// **実物を読まずに名前を書く**のは §9 で一度やった失敗なので、
+/// 候補を順に見て、**どれが使えたかをログに出す**。どれも無ければ「測れない」と言う。
+/// 単位も秒とミリ秒の両方を受ける(桁で見分ける)。
+export const FILLED_AT_KEYS = ["fillTimestamp", "settledAt", "filledAt", "txTimestamp", "createdAt"];
+
+export function readFilledAt(order) {
+  for (const key of FILLED_AT_KEYS) {
+    const raw = order?.[key];
+    if (raw == null) continue;
+    const n = typeof raw === "number" ? raw : parseFloat(String(raw));
+    if (!Number.isFinite(n) || n <= 0) continue;
+    // 秒なら 1e9〜1e10 の桁、ミリ秒なら 1e12〜1e13 の桁。
+    // **どちらとも言えない値は使わない**(桁を取り違えると「全部古い」か「全部新しい」になる)。
+    let sec = null;
+    if (n >= 1e9 && n < 1e11) sec = n;
+    else if (n >= 1e12 && n < 1e14) sec = n / 1000;
+    if (sec == null) continue;
+    return { sec, key };
+  }
+  return null;
+}
