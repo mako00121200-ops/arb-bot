@@ -27,6 +27,8 @@
 /// $0.10 は**20倍以上**の機会だけを拾うことになる。
 const BIG_OPP_USD = parseFloat(process.env.BIG_OPP_USD || "0.10");
 /// まとめを出す間隔と、覚えておく件数の上限。
+import { loadState, saveState } from "./state-file.js";
+
 const WINDOW_MS = parseInt(process.env.BIG_OPP_WINDOW_MS || String(30 * 60 * 1000), 10);
 const MAX_KEPT = 500;
 
@@ -57,6 +59,54 @@ const MIN_TESTED = parseInt(process.env.BIG_OPP_MIN_TESTED || "10", 10);
 
 const events = [];
 const totals = { seen: 0, captured: 0, capturedUsd: 0, missedUsd: 0 };
+
+/// 保存の形。**中身の意味を変えたら上げる。**
+const STATE_NAME = "big-opportunities.json";
+const STATE_VERSION = 1;
+/// 書きすぎないための間引き。
+const SAVE_MIN_MS = 30 * 1000;
+let lastSavedAt = 0;
+/// 間引きで見送った書き込みを、あとで必ず1回やるための予約。
+/// **これが無いと、間引かれた直後に再デプロイされた分が消える**
+/// (2026年9月22日、単体テストで発見。3件記録して1件しか残らなかった)。
+let pendingSave = null;
+
+/// 再デプロイで台帳が消えないように読み戻す(2026年9月22日、オーナーの提案)。
+/// **30分の窓の外は読み戻さない。** 古い件を今の30分に混ぜると数字が狂う。
+(function restore() {
+  const d = loadState(STATE_NAME, STATE_VERSION);
+  if (!d) return;
+  const since = Date.now() - WINDOW_MS;
+  for (const e of Array.isArray(d.events) ? d.events : []) {
+    if (Number(e?.at) >= since) events.push(e);
+  }
+  for (const k of Object.keys(totals)) {
+    const n = Number(d.totals?.[k]);
+    if (Number.isFinite(n)) totals[k] = n;
+  }
+  if (totals.seen > 0) console.log(`[大物] 前回までの ${totals.seen}件 を読み戻しました(30分の窓に${events.length}件)`);
+})();
+
+function persist() {
+  if (Date.now() - lastSavedAt < SAVE_MIN_MS) {
+    // まだ書かない。**ただし「あとで書く」予約だけは必ず入れる。**
+    if (!pendingSave) {
+      pendingSave = setTimeout(() => { pendingSave = null; persist(); }, SAVE_MIN_MS);
+      if (typeof pendingSave.unref === "function") pendingSave.unref(); // 本体の終了を邪魔しない
+    }
+    return;
+  }
+  if (pendingSave) { clearTimeout(pendingSave); pendingSave = null; }
+  lastSavedAt = Date.now();
+  saveState(STATE_NAME, STATE_VERSION, { events, totals });
+}
+
+/// **今すぐ書く。** 終了の合図を受けた時など、間引きを待てない場面で使う。
+export function flushBigOpportunities() {
+  if (pendingSave) { clearTimeout(pendingSave); pendingSave = null; }
+  lastSavedAt = Date.now();
+  return saveState(STATE_NAME, STATE_VERSION, { events, totals });
+}
 
 /// その機会が「大物」か。
 export function isBigOpportunity(opp) {
@@ -89,6 +139,7 @@ export function noteBigOutcome(opp, outcome, detail = "") {
       `(投入$${(Number(opp.tradeAmountUsd) || 0).toFixed(2)}) → **${why}**${detail ? `(${detail})` : ""}`
     );
   }
+  persist();
   return true;
 }
 

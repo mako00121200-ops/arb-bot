@@ -45,7 +45,7 @@ import { probePoolFeeBps, isFeeProbeOnHold, getRpcStatus, getRpcCallTotals, call
 import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
 import { alertOwner, getAlertStats, sendPendingQuestions } from "./scripts/owner-alert.js";
 import { verifyAaveChains, getAaveChains, sweepAll as aaveSweepAll, checkWatchAll as aaveCheckWatchAll, formatAaveLine, AAVE_SWEEP_INTERVAL_MS, AAVE_WATCH_INTERVAL_MS } from "./scripts/aave-liquidation.js";
-import { noteBigOutcome, formatBigLine, formatBigSummary } from "./scripts/big-opportunities.js";
+import { noteBigOutcome, formatBigLine, formatBigSummary, flushBigOpportunities } from "./scripts/big-opportunities.js";
 import { probeUniswapXOnce, formatUniswapXLine, formatUniswapXReport, getProbeChains, PROBE_INTERVAL_MS } from "./scripts/uniswapx-probe.js";
 import { probeSolanaOnce, formatSolanaLine, getSolanaTokenCount, SOLANA_PROBE_INTERVAL_MS } from "./scripts/solana-probe.js";
 import { startLiquidationMonitor, setCandidateHandler, formatLiquidationLine, getLiquidationDashboard, CHAIN as LIQUIDATION_CHAIN } from "./scripts/liquidation-monitor.js";
@@ -2920,6 +2920,27 @@ async function main() {
 
   restoreGasPriceRatios();
   console.log(`[起動] 準備完了 / 取引上限$${getCurrentTradeCapUsd()} / 最低利益[${describeMinProfit()}]`);
+}
+
+// **終了の合図を受けたら、計測を書き出してから終わる。**
+//
+// [なぜ要るか(2026年9月22日、オーナーの提案)]
+// Railway は再デプロイの前に SIGTERM を送る。今までこれを受けていなかったので、
+// メモリの上にしかない計測が**毎回そのまま消えていた**。1日4回デプロイした結果、
+// UniswapX の計測と大物の台帳が一度も積み上がらなかった。
+//
+// 書き出しは同期(fs.writeFileSync)なので、ここで待つ時間はほぼ無い。
+// 送信中の取引があっても、チェーン上の守り(returned >= owed + minProfit)が
+// 効いているので、途中で落ちても損失にはならない(元々コンテナは強制終了される)。
+let shuttingDown = false;
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => {
+    if (shuttingDown) return;  // 二重に来ても1回だけ
+    shuttingDown = true;
+    try { flushBigOpportunities(); } catch (e) {}
+    console.log(`[終了] ${sig} を受けました。計測を書き出しました`);
+    process.exit(0);
+  });
 }
 
 main().catch((e) => { console.error("致命的エラー:", e); process.exit(1); });
