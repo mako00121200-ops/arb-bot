@@ -35,12 +35,14 @@
 //   UNISWAPX_PROBE_LIMIT  … 1回に取る注文数(既定20、APIの上限は50)
 
 import { bestOutputFor } from "./opportunity-scanner.js";
-import { extractSwap, readFilledAt, FILLED_AT_KEYS, splitByAge } from "./uniswapx-parse.js";
+import { extractSwap, readFilledAt, FILLED_AT_KEYS, splitByAge, resolveOpenOrder } from "./uniswapx-parse.js";
 import { getTokenDecimals, getTokenPriceUsd, KIND_V3 } from "./pool-registry.js";
 import { getKnownTokens, toWrappedToken, isNativeToken } from "./borrowable-tokens.js";
 import { quoteV3ByPoolBatch } from "./multicall-reserves.js";
 import { getAnyChainConfig } from "../chain-config.js";
 import { loadState, saveState } from "./state-file.js";
+import { getProviderForChain } from "./onchain-reserves.js";
+import { estimateGasCostUsd } from "./gas-cost.js";
 
 /// UniswapX の公開API。**鍵は要らない**(注文の取得は誰でもできる)。
 const API_BASE = process.env.UNISWAPX_API_BASE || "https://api.uniswap.org/v2";
@@ -112,22 +114,29 @@ function statFor(chain) {
 
 /// API から約定済みの注文を取る。失敗しても例外は投げない(裁定側を止めない)。
 async function fetchFilledOrders(chain) {
+  return (await fetchOrders(chain, "filled", PROBE_LIMIT)) || [];
+}
+
+/// API から注文を取る。**失敗なら null**(空の配列と区別する。
+/// 募集中の注文では「一覧から消えた = 終わった」と読むので、取れなかった回に
+/// 全部を「終わった」と誤判定しないため)。
+async function fetchOrders(chain, status, limit) {
   const chainId = CHAIN_IDS[chain];
-  if (!chainId) return [];
-  const url = `${API_BASE}/orders?chainId=${chainId}&orderStatus=filled&limit=${PROBE_LIMIT}`;
+  if (!chainId) return null;
+  const url = `${API_BASE}/orders?chainId=${chainId}&orderStatus=${status}&limit=${limit}`;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
   try {
     const res = await fetch(url, { signal: ctrl.signal, headers: { accept: "application/json" } });
     if (!res.ok) {
-      console.warn(`[UniswapX計測] ${chain}: APIが${res.status}を返しました`);
-      return [];
+      console.warn(`[UniswapX計測] ${chain}: APIが${res.status}を返しました(${status})`);
+      return null;
     }
     const body = await res.json();
-    return Array.isArray(body?.orders) ? body.orders : [];
+    return Array.isArray(body?.orders) ? body.orders : null;
   } catch (e) {
-    console.warn(`[UniswapX計測] ${chain}: 取得に失敗 ${(e.message || "").slice(0, 60)}`);
-    return [];
+    console.warn(`[UniswapX計測] ${chain}: 取得に失敗(${status}) ${(e.message || "").slice(0, 60)}`);
+    return null;
   } finally {
     clearTimeout(timer);
   }
@@ -302,6 +311,247 @@ async function probeChain(chain) {
   }
 }
 
+// ===========================================================================
+// **募集中の注文を、今の価格で値付けする。**(2026年9月23日、オーナー了承)
+//
+// [なぜ(約定済みの計測の弱点)]
+// 約定済みの注文と「今の経路」を比べると、約定から今までの値動きが取り分に混ざる。
+// 齢で割って見分ける仕組みも入れたが、若い注文は2時間で1件ほどしか増えず、結論まで
+// 何日もかかる。polygon(約定時刻が無い)と avalanche(全部古すぎる)は測れてすらいない。
+//
+// 募集中の注文なら**今の注文と今の価格**を比べるので、値動きは原理的に混ざらない。
+// 埋める側が見る条件そのもの。**注文は出さない。約定もしない。**
+//
+// [数え方]
+// 同じ注文を、一覧から消えるまで毎回値付けし直す(ダッチオークションは時間とともに
+// 埋める側に有利になるので、最初に見た時だけでは「待てば黒字になった」を取りこぼす)。
+// 一覧から消えた時点で、1件につき1回だけ結末を数える:
+//   勝ち        … 募集中のうちに、**チェーンで確かめて**ガス代の概算を引いても黒字になった
+//   負け        … 値付けはできたが、消えるまで一度も黒字にならなかった(= 他の誰かの方が安く埋めた)
+//   値付けできず … 経路なし・独占中のまま終わった、など(理由ごとに数える)
+// 勝ちについては「黒字を見てから一覧から消えるまで何秒あったか」も控える。
+// これが短いほど、速さの勝負になる。
+//
+// [注意]
+//   ・Priority 型(base)は入札ゼロの時の額で比べるので**取り分の上限**。別に数える
+//   ・Dutch_V3 のガス単価による補正(adjustmentPerGweiBaseFee)は公式SDKの resolve も
+//     入れていないので入れていない
+//   ・ガス代は裁定の2段/3段の概算を流用している(Reactor の分は含まない)。**概算**
+
+export const OPEN_INTERVAL_MS = parseInt(process.env.UNISWAPX_OPEN_INTERVAL_MS || "20000", 10);
+/// 1回に取る募集中の注文の数(APIの上限は50)。
+const OPEN_LIMIT = 50;
+/// 一覧が上限いっぱいで返ってきた時は「消えた = 終わった」と言えないので、
+/// この時間見えなければ終わったとみなす。
+const OPEN_FORGET_MS = 10 * 60 * 1000;
+const OPEN_TRACK_LIMIT = 5000;
+
+/// 募集中の注文ごとの状態。hash -> { chain, firstSeen, lastSeen, priced, reason, win }
+const tracked = new Map();
+/// チェーンごとの集計。
+const openStats = new Map();
+
+function openStatFor(chain) {
+  if (!openStats.has(chain)) {
+    openStats.set(chain, {
+      polls: 0, pollFailed: 0, seen: 0,
+      won: 0, lost: 0,
+      /// 値付けできずに終わった理由ごとの件数
+      unpriced: {},
+      /// 勝ちの取り分(チェーンで確認、ガス代の概算を引く前 / 引いた後)
+      grossUsd: 0, netUsd: 0,
+      /// Priority 型の勝ち(上限)の件数
+      upperWins: 0,
+      /// 勝ちの記録 { usd, net, bps, sizeUsd, heldSec, upper }
+      wins: [],
+      bestNet: 0, best: null,
+    });
+  }
+  return openStats.get(chain);
+}
+
+function median(list) {
+  if (list.length === 0) return null;
+  const a = [...list].sort((x, y) => x - y);
+  return a[Math.floor(a.length / 2)];
+}
+
+/// 一覧から消えた注文の結末を数える。
+function finalizeOpen(hash, t) {
+  tracked.delete(hash);
+  const s = openStatFor(t.chain);
+  if (t.win) {
+    s.won++;
+    s.grossUsd += t.win.usd;
+    if (t.win.net != null) s.netUsd += t.win.net;
+    if (t.win.upper) s.upperWins++;
+    s.wins.push({ ...t.win, heldSec: Math.max(0, (t.lastSeen - t.win.at) / 1000) });
+    if (s.wins.length > 500) s.wins.shift();
+    const net = t.win.net ?? t.win.usd;
+    if (net > s.bestNet) {
+      s.bestNet = net;
+      s.best = { hash, label: t.win.label, usd: t.win.usd, net: t.win.net, sizeUsd: t.win.sizeUsd,
+        bps: t.win.bps, type: t.win.type, upper: t.win.upper };
+    }
+  } else if (t.priced) {
+    s.lost++;
+  } else {
+    const r = t.reason || "不明";
+    s.unpriced[r] = (s.unpriced[r] || 0) + 1;
+  }
+}
+
+/// 1件の募集中の注文を、今の条件で値付けする。結果は t に書き込む。
+async function priceOpenOrder(chain, order, t, nowSec, block, hubs) {
+  const r = resolveOpenOrder(order, { nowSec, block });
+  if (!r.ok) { t.reason = r.reason; return; }
+  t.type = r.type;
+  // 独占期間中は、独占者以外は上乗せを払わないと埋められない(上乗せ率は応答に無い)。
+  // 次の回に期間が明けていれば値付けする。
+  if (r.exclusive) { t.reason = "独占中"; return; }
+  if (r.otherTokenOutputs > 0) { t.reason = "別通貨の出力"; return; }
+  const tokenIn = toWrappedToken(chain, r.tokenIn);
+  const tokenOut = toWrappedToken(chain, r.tokenOut);
+  if (tokenIn == null || tokenOut == null) { t.reason = "読替不可"; return; }
+  if (tokenIn === tokenOut) { t.reason = "ラップのみ"; return; }
+
+  const mine = bestOutputFor({ chain, tokenIn, tokenOut, amountIn: r.amountIn, hubTokens: hubs });
+  if (!mine) {
+    t.reason = "経路なし";
+    // 約定済みの計測と同じ控えに載せ、地図に足す候補にする(1件につき1回だけ)。
+    if (!t.missingNoted) {
+      t.missingNoted = true;
+      const ms = statFor(chain);
+      const k = `${tokenIn}|${tokenOut}`;
+      const m = ms.missing[k] || { n: 0, usd: 0, tokenIn, tokenOut };
+      m.n++;
+      const inUsd = toUsd(chain, tokenIn, r.amountIn);
+      if (inUsd != null) m.usd += inUsd;
+      ms.missing[k] = m;
+    }
+    return;
+  }
+  const diffUsd = toUsd(chain, tokenOut, mine.amountOut - r.amountOut);
+  if (diffUsd == null) { t.reason = "価格不明"; return; }
+  t.priced = true;
+  // 模型(V3 も x·y=k で近似 = 過大に出る側)で赤字なら、チェーンに聞くまでもない。
+  if (diffUsd <= 0) { t.reason = "赤字"; return; }
+  // V2 を含む経路は税トークンを見抜けないので「確かめた」と言えない。勝ちに数えない。
+  if (mine.legs.some((l) => l.kind !== KIND_V3)) { t.reason = "V2で確認不可"; return; }
+  let trueOut = null;
+  try { trueOut = await verifyOnChain(chain, mine.legs, r.amountIn); } catch (e) { /* 数えないだけ */ }
+  if (trueOut == null) { t.reason = "確認失敗"; return; }
+  const usd = toUsd(chain, tokenOut, trueOut - r.amountOut);
+  if (usd == null || usd <= 0) { t.reason = "赤字(確認)"; return; }
+  let gas = null;
+  try { gas = await estimateGasCostUsd(chain, mine.legs.length >= 2 ? "3step" : "2step"); } catch (e) { /* 概算なしで残す */ }
+  const net = gas != null ? usd - gas : null;
+  if (net != null && net <= 0) { t.reason = "ガス負け"; return; }
+  const sizeUsd = toUsd(chain, tokenIn, r.amountIn);
+  t.win = { at: Date.now(), usd, net, sizeUsd, bps: sizeUsd > 0 ? (usd / sizeUsd) * 10000 : null,
+    label: mine.label, type: r.type, upper: r.upperBound };
+}
+
+async function probeOpenChain(chain) {
+  const s = openStatFor(chain);
+  const orders = await fetchOrders(chain, "open", OPEN_LIMIT);
+  if (orders == null) { s.pollFailed++; return; }
+  s.polls++;
+  const now = Date.now();
+  const nowSec = Math.floor(now / 1000);
+  // Dutch_V3 はブロック番号で額が決まる。要る時だけ1回聞く。
+  let block = null;
+  if (orders.some((o) => o?.type === "Dutch_V3")) {
+    try { block = await getProviderForChain(chain).getBlockNumber(); } catch (e) { /* 分からなければ null */ }
+  }
+  const hubs = Object.keys(getKnownTokens(chain));
+  const present = new Set();
+  for (const order of orders) {
+    const hash = order?.orderHash;
+    if (!hash) continue;
+    present.add(hash);
+    let t = tracked.get(hash);
+    if (!t) {
+      if (tracked.size >= OPEN_TRACK_LIMIT) continue;
+      t = { chain, firstSeen: now, lastSeen: now, priced: false, reason: null, win: null };
+      tracked.set(hash, t);
+      s.seen++;
+    }
+    t.lastSeen = now;
+    if (t.win) continue; // 一度勝てた注文は、それ以上値付けしない
+    try {
+      await priceOpenOrder(chain, order, t, nowSec, block, hubs);
+    } catch (e) { t.reason = "失敗"; }
+  }
+  // **一覧から消えた注文の結末を数える。** 一覧が上限いっぱいなら、
+  // 見えていないだけの可能性があるので、しばらく見えない時だけ終わりとみなす。
+  const complete = orders.length < OPEN_LIMIT;
+  for (const [hash, t] of tracked) {
+    if (t.chain !== chain || present.has(hash)) continue;
+    if (complete || now - t.lastSeen > OPEN_FORGET_MS) finalizeOpen(hash, t);
+  }
+}
+
+let openRunning = false;
+let openRuns = 0;
+/// 募集中の注文を全チェーンぶん値付けする。**注文は出さない。**
+export async function probeUniswapXOpenOnce(activeChains) {
+  if (openRunning) return; // 前の回が終わっていなければ飛ばす(重ならないように)
+  openRunning = true;
+  try {
+    for (const chain of PROBE_CHAINS) {
+      if (!activeChains.includes(chain) || !CHAIN_IDS[chain]) continue;
+      try {
+        await probeOpenChain(chain);
+      } catch (e) {
+        console.warn(`[UniswapX募集中] ${chain}: 失敗 ${(e.message || "").slice(0, 60)}`);
+      }
+    }
+    // 保存は約定済みの計測と同じファイル。20秒ごとに書くと多いので、15回に1回。
+    if (++openRuns % 15 === 0) persist();
+  } finally {
+    openRunning = false;
+  }
+}
+
+/// 生存ログ用の1行。
+export function formatUniswapXOpenLine() {
+  const parts = [];
+  for (const [chain, s] of openStats) {
+    if (s.polls === 0 && s.seen === 0) continue;
+    const ended = s.won + s.lost + Object.values(s.unpriced).reduce((a, n) => a + n, 0);
+    const why = Object.entries(s.unpriced).sort((a, b) => b[1] - a[1]).slice(0, 3)
+      .map(([r, n]) => `${r}${n}`).join(" ");
+    const priced = s.won + s.lost;
+    const rate = priced > 0 ? `${((s.won / priced) * 100).toFixed(0)}%` : "-";
+    const bps = median(s.wins.map((w) => w.bps).filter((x) => x != null));
+    const held = median(s.wins.map((w) => w.heldSec));
+    let open = 0;
+    for (const t of tracked.values()) if (t.chain === chain) open++;
+    parts.push(`${chain} 取得${s.polls}回${s.pollFailed ? `(失敗${s.pollFailed})` : ""} 見${s.seen} 募集中${open}`
+      + ` 終了${ended}(**勝${s.won}/負${s.lost} 勝率${rate}**${why ? ` 値付けできず[${why}]` : ""})`
+      + ` 取り分 計$${s.grossUsd.toFixed(4)}(ガス概算後$${s.netUsd.toFixed(4)})`
+      + (bps != null ? ` 中央${bps.toFixed(1)}bps` : "")
+      + (held != null ? ` 黒字の持続 中央${held.toFixed(0)}s` : "")
+      + (s.upperWins > 0 ? ` うち上限扱い${s.upperWins}件` : ""));
+  }
+  return parts.length > 0 ? ` UniswapX募集中[${parts.join(" / ")}]` : "";
+}
+
+/// 詳しい報告(30分ごと)。勝てた最良の1本。
+export function formatUniswapXOpenReport() {
+  const lines = [];
+  for (const [chain, s] of openStats) {
+    if (!s.best) continue;
+    const b = s.best;
+    lines.push(`[UniswapX募集中] ${chain}: 最良 ${b.label} で $${b.usd.toFixed(4)}`
+      + `${b.net != null ? `(ガス概算後$${b.net.toFixed(4)})` : ""}`
+      + `(注文$${b.sizeUsd != null ? b.sizeUsd.toFixed(0) : "?"} ${b.bps != null ? `${b.bps.toFixed(1)}bps ` : ""}${b.type}`
+      + `${b.upper ? " **入札ゼロ時の上限**" : ""} / ${b.hash.slice(0, 10)}…)`);
+  }
+  return lines;
+}
+
 /// 保存の形。**中身の意味を変えたら上げる**(古い形を読んで静かに壊れないように)。
 const STATE_NAME = "uniswapx-probe.json";
 /// **3 に上げた(2026年9月22日、2度目)。**
@@ -336,6 +586,16 @@ function restore() {
   }
   const n = [...stats.values()].reduce((a, v) => a + v.seen, 0);
   if (n > 0) console.log(`[UniswapX計測] 前回までの ${n}件 を読み戻しました(記憶${seenOrders.size}件)`);
+  // 募集中の注文の集計(2026年9月23日に追加。古い保存には無い)。
+  for (const [chain, v] of Object.entries(d.open || {})) {
+    const s = openStatFor(chain);
+    for (const k of Object.keys(s)) {
+      if (Array.isArray(s[k])) { if (Array.isArray(v?.[k])) s[k] = v[k].slice(-500); continue; }
+      if (typeof s[k] === "number") { if (Number.isFinite(Number(v?.[k]))) s[k] = Number(v[k]); continue; }
+      if (k === "unpriced" && v?.[k] && typeof v[k] === "object") { s[k] = v[k]; continue; }
+      if (v?.[k] != null) s[k] = v[k];
+    }
+  }
 }
 restore();
 
@@ -343,6 +603,7 @@ function persist() {
   saveState(STATE_NAME, STATE_VERSION, {
     seen: [...seenOrders],
     stats: Object.fromEntries([...stats].map(([c, v]) => [c, v])),
+    open: Object.fromEntries([...openStats].map(([c, v]) => [c, v])),
   });
 }
 
