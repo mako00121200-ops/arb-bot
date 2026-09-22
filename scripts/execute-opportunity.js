@@ -870,7 +870,49 @@ function clearV3TablesOfRoute(chain, opp) {
 
 /// 送信判定の入口。「誰が取ったか」の確認を予約してから本体を実行し、
 /// 送信直前の結果を opp.sendResult に残す。
+/// **実際に送ってよいチェーン。** 空なら全チェーン(既定=今までどおり)。
+///
+/// [なぜ要るか(2026年9月22日、オーナーの指摘)]
+/// 実測で**一度も勝っていないのに送り続けているチェーン**があった:
+///   base     0勝6負 −$0.0300
+///   arbitrum 0勝1負 −$0.0157
+/// 合計 −$0.0457。同じ期間の粗利が +$0.2827 なので、**稼ぎの16%をここで捨てていた**。
+/// 「まだ標本が少ない」と言って放置したのは私の判断ミス。0勝7負は
+/// 「勝てるかどうか分からない」ではなく、**勝っていないという実測**。
+///
+/// 止めるのは**送信だけ**。監視は続けるので、勝てるようになったかは
+/// `[実行] 送信しない` の行で分かる(そこが黒字続きなら再開を検討する)。
+const SEND_CHAINS = (process.env.SEND_CHAINS || "")
+  .split(",").map((c) => c.trim().toLowerCase()).filter(Boolean);
+
+/// チェーンごとの「送らなかった回数」。判断材料として残す。
+const skippedByChain = new Map();
+
+export function isSendAllowed(chain) {
+  if (SEND_CHAINS.length === 0) return true; // 未設定なら今までどおり全部送る
+  return SEND_CHAINS.includes(String(chain || "").toLowerCase());
+}
+
+export function getSendSkips() { return Object.fromEntries(skippedByChain); }
+
+export function formatSendSkipLine() {
+  if (skippedByChain.size === 0) return "";
+  const parts = [...skippedByChain].map(([c, v]) =>
+    `${c}:${v.n}回(見込み計$${v.usd.toFixed(4)})`);
+  return ` 送信停止[${parts.join(" ")}]`;
+}
+
 export async function executeOpportunity(opp) {
+  // **止めているチェーンなら、ここで終わり。** 送信の手前の唯一の関所。
+  if (!isSendAllowed(opp.chain)) {
+    const v = skippedByChain.get(opp.chain) || { n: 0, usd: 0 };
+    v.n++; v.usd += Number(opp.netProfitUsd) || 0;
+    skippedByChain.set(opp.chain, v);
+    opp.sendResult = "skipped_chain";
+    console.log(`[実行] ${opp.chain} ${opp.label}: **送信しない**(SEND_CHAINS で停止中)`
+      + ` 見込み$${(Number(opp.netProfitUsd) || 0).toFixed(4)}`);
+    return false;
+  }
   scheduleCompetitorCheck(opp);
   try {
     const ok = await executeOpportunityInner(opp);
