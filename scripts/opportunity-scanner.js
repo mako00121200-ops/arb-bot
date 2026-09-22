@@ -1181,6 +1181,64 @@ function labelOf(legs) {
   return legs.map((l) => `${l.dexId}${l.kind === KIND_V3 ? `(${(l.feeBps / 100).toFixed(2)}%)` : ""}`).join("→");
 }
 
+/// **A→B(一方通行)の最良の受取量。** 裁定は「始点に戻る」経路しか組まないが、
+/// UniswapX の注文は A→B なので、こちらが要る。
+///
+/// [なぜここに置くか(2026年9月22日)]
+/// 段の計算(orient / legAmountOut / legIsUsable / 手数料の解決)は全てこのファイルに
+/// あり、価格表の信用できる範囲の扱いもここに集約されている。別ファイルで書き直すと
+/// **同じ物を書く仕組みが2つ**になり、片方だけ直す事故が起きる(§9の型)。
+/// 公開するのはこの1関数だけにして、中身は既存の部品をそのまま使う。
+///
+/// @param hubTokens 2段の中継に試す通貨(手書きの主要通貨を渡す想定)。
+///   総当たりにすると二乗で増えるので、呼ぶ側が絞る。
+/// @returns { amountOut, legs, label } / 経路が無ければ null
+export function bestOutputFor({ chain, tokenIn, tokenOut, amountIn, hubTokens = [], maxPoolsPerPair = 12 }) {
+  if (!(amountIn > 0n)) return null;
+  const from = (tokenIn || "").toLowerCase();
+  const to = (tokenOut || "").toLowerCase();
+  if (!from || !to || from === to) return null;
+
+  let best = null;
+  const consider = (legs) => {
+    let amount = amountIn;
+    for (const leg of legs) {
+      if (!legIsUsable(leg)) return;
+      amount = legAmountOut(leg, amount);
+      if (!(amount > 0n)) return;
+    }
+    if (best == null || amount > best.amountOut) {
+      best = { amountOut: amount, legs, label: labelOf(legs) };
+    }
+  };
+
+  // 1段。
+  for (const p of getPoolsForPair(chain, from, to).slice(0, maxPoolsPerPair)) {
+    const leg = orient(p, from);
+    if (leg.tokenOut === to) consider([leg]);
+  }
+
+  // 2段(中継通貨ごと)。
+  for (const hub of hubTokens) {
+    const mid = (hub || "").toLowerCase();
+    if (!mid || mid === from || mid === to) continue;
+    const firsts = getPoolsForPair(chain, from, mid).slice(0, maxPoolsPerPair);
+    const seconds = getPoolsForPair(chain, mid, to).slice(0, maxPoolsPerPair);
+    if (firsts.length === 0 || seconds.length === 0) continue;
+    for (const p1 of firsts) {
+      const l1 = orient(p1, from);
+      if (l1.tokenOut !== mid) continue;
+      for (const p2 of seconds) {
+        if (p2.address.toLowerCase() === p1.address.toLowerCase()) continue;
+        const l2 = orient(p2, mid);
+        if (l2.tokenOut !== to) continue;
+        consider([l1, l2]);
+      }
+    }
+  }
+  return best;
+}
+
 export function scanTwoStep({ chain, tokenA, tokenB, pools, capUsd, gasCostUsd, isBorrowable }) {
   // 計測だけ先に行う。RPCは使わず、この下の判定には一切影響しない。
   measureSpotScreen(chain, tokenA, tokenB, pools, capUsd, gasCostUsd);
