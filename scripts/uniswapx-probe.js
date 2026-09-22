@@ -35,7 +35,7 @@
 //   UNISWAPX_PROBE_LIMIT  … 1回に取る注文数(既定20、APIの上限は50)
 
 import { bestOutputFor } from "./opportunity-scanner.js";
-import { extractSwap, readFilledAt, FILLED_AT_KEYS, splitByAge } from "./uniswapx-parse.js";
+import { extractSwap, readFilledAt, FILLED_AT_KEYS, splitByAge, amountKeyOf, orderTypeOf } from "./uniswapx-parse.js";
 import { getTokenDecimals, getTokenPriceUsd, KIND_V3 } from "./pool-registry.js";
 import { getKnownTokens, toWrappedToken, isNativeToken } from "./borrowable-tokens.js";
 import { quoteV3ByPoolBatch } from "./multicall-reserves.js";
@@ -103,6 +103,16 @@ function statFor(chain) {
       nativeUnknown: 0,
       // **約定時刻が無く、注文が作られた時刻しか無いもの。** 齢が測れないので数えない。
       createdOnly: 0,
+      /// **注文の種類ごとの件数**(見た全件)と、**確認済みの勝ちの種類ごとの件数と額**。
+      ///
+      /// [なぜ(2026年9月23日)] base には Priority(優先手数料の競売)と V3 Dutch
+      /// (先着)の2つがあり、**同じ「差」でも取れる額の意味が違う**(STRATEGY-RESEARCH §13)。
+      types: {}, winTypes: {},
+      /// **出力の額をどの項目で読んだか**の件数。`amount` は Priority 注文では
+      /// **最低額**で、実際の受取はもっと多い = そこで比べると水増しになる。
+      outKeys: {},
+      /// 種類ごとに一度だけ、実際のキー名をログに出した印(推測で名前を決めないため)。
+      keysLogged: {},
       // **確認できた勝ちを「齢つき」で持つ。** 値動きの残りかすかどうかを、
       // これで判定する(§下の formatUniswapXReport)。
       verifiedWins: [] });
@@ -190,6 +200,16 @@ async function probeChain(chain) {
       for (const k of seenOrders) { seenOrders.delete(k); if (++n >= SEEN_LIMIT / 2) break; }
     }
     s.seen++;
+    const otype = orderTypeOf(order);
+    s.types[otype] = (s.types[otype] || 0) + 1;
+    // 種類ごとに一度だけ、注文と出力の実際のキー名を出す(§9: 実物を読まずに名前を書かない)。
+    if (!s.keysLogged[otype]) {
+      s.keysLogged[otype] = true;
+      const out0 = Array.isArray(order?.outputs) ? order.outputs[0] : null;
+      console.log(`[UniswapX計測] ${chain}: 種類${otype} の実際のキー`
+        + ` 注文[${Object.keys(order || {}).join(",").slice(0, 300)}]`
+        + ` 出力[${Object.keys(out0 || {}).join(",").slice(0, 150)}]`);
+    }
 
     // **古い約定は捨てる。** 値動きが差に混ざって、我々の実力ではなくなるため。
     const filled = readFilledAt(order);
@@ -214,6 +234,9 @@ async function probeChain(chain) {
 
     const swap = extractSwap(order);
     if (!swap) continue;
+    const outKey = amountKeyOf(order.outputs.find((o) => o?.token
+      && String(o.token).toLowerCase() === swap.tokenOut)) || "不明";
+    s.outKeys[outKey] = (s.outKeys[outKey] || 0) + 1;
     // **別の通貨での出力があるものは、値段を付けられないので比べない。**
     // 無理に比べると、その出力を**タダでもらえる前提**になって水増しになる。
     if (swap.otherTokenOutputs > 0) { s.otherTokenOut++; continue; }
@@ -289,7 +312,10 @@ async function probeChain(chain) {
       // **齢と一緒に残す。** 「取り分」が値動きの残りかすなら、
       // 齢が0に近づくほど取り分も0に近づくはず。それを後で見る。
       s.verifiedWins.push({ ageSec, usd: trueDiffUsd,
-        sizeUsd: toUsd(chain, tokenIn, swap.amountIn) });
+        sizeUsd: toUsd(chain, tokenIn, swap.amountIn), type: otype, outKey });
+      const wt = s.winTypes[`${otype}/${outKey}`] || { n: 0, usd: 0 };
+      wt.n++; wt.usd += trueDiffUsd;
+      s.winTypes[`${otype}/${outKey}`] = wt;
       if (s.verifiedWins.length > 500) s.verifiedWins.shift();
       if (trueDiffUsd > s.bestUsd) {
         s.bestUsd = trueDiffUsd;
@@ -330,6 +356,8 @@ function restore() {
       if (Array.isArray(s[k])) { if (Array.isArray(v[k])) s[k] = v[k].slice(-500); continue; }
       // **足りない組は数ではなく表。** 上の「数なら数」の枝に落とさない。
       if (k === "missing") { if (v[k] && typeof v[k] === "object") s[k] = v[k]; continue; }
+      // 「キー名を出した印」はデプロイごとにやり直す(読み戻すと新しいデプロイで一度も出なくなる)。
+      if (k === "keysLogged") continue;
       if (typeof s[k] === "number" && Number.isFinite(Number(v[k]))) s[k] = Number(v[k]);
       else if (v[k] != null && typeof s[k] !== "number") s[k] = v[k];
     }
@@ -359,6 +387,10 @@ export async function probeUniswapXOnce(activeChains) {
   persist(); // **1周ごとに保存。** 次のデプロイで消えないように
 }
 
+function fmtCounts(o) {
+  return Object.entries(o).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k}:${n}`).join(" ");
+}
+
 /// 生存ログ用の1行。まだ1件も見ていなければ空。
 export function formatUniswapXLine() {
   if (stats.size === 0) return "";
@@ -382,7 +414,12 @@ export function formatUniswapXLine() {
       + (s.multiOut > 0 ? ` **出力複数${s.multiOut}件(見落としていた額 計$${s.ignoredOutUsd.toFixed(4)})**` : "")
       + (s.otherTokenOut > 0 ? ` 別通貨の出力${s.otherTokenOut}件は除外` : "")
       + (s.nativeSwapped > 0 ? ` ネイティブ${s.nativeSwapped}件を包んだ版に読替` : "")
-      + (s.nativeUnknown > 0 ? ` 読替不可${s.nativeUnknown}` : ""));
+      + (s.nativeUnknown > 0 ? ` 読替不可${s.nativeUnknown}` : "")
+      // **種類と、額を読んだ項目。** 勝ちが Priority/amount に偏っていたら水増しを疑う。
+      + (Object.keys(s.types).length > 0 ? ` 種類[${fmtCounts(s.types)}]` : "")
+      + (Object.keys(s.outKeys).length > 0 ? ` 額の項目[${fmtCounts(s.outKeys)}]` : "")
+      + (Object.keys(s.winTypes).length > 0
+        ? ` 勝ちの内訳[${Object.entries(s.winTypes).map(([k, v]) => `${k}:${v.n}件$${v.usd.toFixed(2)}`).join(" ")}]` : ""));
   }
   return parts.length > 0 ? ` UniswapX計測[${parts.join(" / ")}]` : "";
 }
