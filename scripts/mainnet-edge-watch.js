@@ -29,6 +29,7 @@
 
 import { ethers } from "ethers";
 import { nowJst } from "./jst.js";
+import { loadState, saveState } from "./state-file.js";
 
 const UNIV3_FACTORY = "0x1F98431c8aD98523631AE4a59f267346ea31F984";
 
@@ -96,10 +97,82 @@ const stats = {
   msAbove: new Array(EDGE_EDGES.length).fill(0),
   bestBps: null, bestLabel: null,
   startedAt: null, watched: 0, dropped: 0, lastEventAt: 0, connects: 0,
+  /// **前回までに見張っていた合計時間(ms)。**
+  ///
+  /// [なぜ startedAt を保存しないか(2026年9月22日)]
+  /// 「毎時N回」は `回数 ÷ (今 − startedAt)` で出している。
+  /// startedAt をそのまま保存すると、**デプロイで止まっていた時間まで分母に入る**。
+  /// 回数は増えないのに分母だけ伸びるので、**数字が静かに嘘になる**
+  /// (312行の注記と同じ失敗。実際に毎時47回が23回に半減して見えたことがある)。
+  /// そこで「見張っていた時間そのもの」を積んで保存する。
+  uptimeMs: 0,
 };
 
 /// ペアごとの「今どの段より上にいるか」。跨いだ瞬間だけを数えるために要る。
+/// **これは保存しない。** 今この瞬間の状態であって、積み上げる数字ではない。
 const pairState = new Map();
+
+/// 保存の形。**中身の意味を変えたら上げる。**
+const STATE_NAME = "mainnet-edge.json";
+const STATE_VERSION = 1;
+const SAVE_MIN_MS = 60 * 1000;
+let lastSavedAt = 0;
+let pendingSave = null;
+
+function stateSnapshot() {
+  return {
+    events: stats.events, episodes: stats.episodes, msAbove: stats.msAbove,
+    bestBps: stats.bestBps, bestLabel: stats.bestLabel,
+    // 今回ぶんを足し込んでから保存する(次の起動がそこから続けられるように)
+    uptimeMs: (stats.uptimeMs || 0) + (stats.startedAt ? Date.now() - stats.startedAt : 0),
+    verify: { ...verify },
+  };
+}
+
+function persist() {
+  if (Date.now() - lastSavedAt < SAVE_MIN_MS) {
+    if (!pendingSave) {
+      pendingSave = setTimeout(() => { pendingSave = null; persist(); }, SAVE_MIN_MS);
+      if (typeof pendingSave.unref === "function") pendingSave.unref();
+    }
+    return;
+  }
+  if (pendingSave) { clearTimeout(pendingSave); pendingSave = null; }
+  lastSavedAt = Date.now();
+  saveState(STATE_NAME, STATE_VERSION, stateSnapshot());
+}
+
+/// **今すぐ書く。** 終了の合図を受けた時に使う。
+export function flushMainnetEdge() {
+  if (!stats.started) return false;
+  if (pendingSave) { clearTimeout(pendingSave); pendingSave = null; }
+  lastSavedAt = Date.now();
+  return saveState(STATE_NAME, STATE_VERSION, stateSnapshot());
+}
+
+/// 前回までの計測を読み戻す(2026年9月22日、オーナーの提案)。
+function restore() {
+  const d = loadState(STATE_NAME, STATE_VERSION);
+  if (!d) return;
+  const num = (v, fb) => (Number.isFinite(Number(v)) ? Number(v) : fb);
+  stats.events = num(d.events, 0);
+  stats.uptimeMs = num(d.uptimeMs, 0);
+  if (Array.isArray(d.episodes) && d.episodes.length === EDGE_EDGES.length) {
+    stats.episodes = d.episodes.map((v) => num(v, 0));
+  }
+  if (Array.isArray(d.msAbove) && d.msAbove.length === EDGE_EDGES.length) {
+    stats.msAbove = d.msAbove.map((v) => num(v, 0));
+  }
+  if (d.bestBps != null) { stats.bestBps = num(d.bestBps, null); stats.bestLabel = d.bestLabel || null; }
+  for (const k of Object.keys(verify)) {
+    if (typeof verify[k] === "number") verify[k] = num(d.verify?.[k], verify[k]);
+    else if (d.verify?.[k] != null) verify[k] = d.verify[k];
+  }
+  if (stats.events > 0 || verify.tried > 0) {
+    console.log(`[メインネット歪み] 前回までの 受信${stats.events.toLocaleString()}件`
+      + ` / 確認${verify.tried}件(見張り${(stats.uptimeMs / 3600000).toFixed(1)}時間)を読み戻しました`);
+  }
+}
 
 function feeToBps(fee) { return fee / 100; }
 
@@ -254,6 +327,7 @@ async function verifyEpisode(buy, sell, label, blockNumber) {
   }
   if (best == null) return;
   verify.tried++;
+  persist();   // 判断材料が増えたので保存(間引きあり)
 
   // ② 同じ額を**今の状態**でも聞く。①との差が「消えるまでの速さ」そのもの。
   let nowNetUsd = null;
@@ -502,6 +576,7 @@ export async function startMainnetEdgeWatch() {
 
   stats.started = true;
   stats.watched = pools.size;
+  restore();              // **前回までの計測を引き継ぐ**(uptimeMs も含む)
   stats.startedAt = Date.now();
   return true;
 }
@@ -523,7 +598,9 @@ function msAboveNow() {
 ///   1時間の期待利益 ≒ 回数 × その歪みでの粗利 × 勝率
 export function formatMainnetEdgeLine() {
   if (!stats.started) return "";
-  const elapsedMs = stats.startedAt ? Date.now() - stats.startedAt : 0;
+  // **前回までの見張り時間 + 今回ぶん。** 止まっていた時間は入れない。
+  const elapsedMs = (stats.uptimeMs || 0)
+    + (stats.startedAt ? Date.now() - stats.startedAt : 0);
   const hours = elapsedMs / 3600000;
   const perHour = (n) => (hours > 0.01 ? Math.round(n / hours) : 0);
   const ms = msAboveNow();

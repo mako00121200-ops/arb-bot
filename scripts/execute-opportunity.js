@@ -27,6 +27,7 @@
 // あったかを確認する(scripts/competitor-check.js)。
 
 import { ethers } from "ethers";
+import { loadState, saveState } from "./state-file.js";
 import { minProfitUsd, breakEvenPriorityShare } from "./min-profit.js";
 import { getChainConfig } from "../chain-config.js";
 import { getProviderForChain, callWithRpc, poolHasAmountOut, readBlockTag, isPendingReadChain } from "./onchain-reserves.js";
@@ -886,7 +887,50 @@ const SEND_CHAINS = (process.env.SEND_CHAINS || "")
   .split(",").map((c) => c.trim().toLowerCase()).filter(Boolean);
 
 /// チェーンごとの「送らなかった回数」。判断材料として残す。
+///
+/// **これは再デプロイをまたいで残す。** 止めた判断が正しかったかは
+/// 「止めた先でいくら見込みが出続けたか」でしか分からず、
+/// 毎回ゼロに戻ると永遠に判断できない(2026年9月22日、オーナーの提案)。
 const skippedByChain = new Map();
+
+const SKIP_STATE_NAME = "send-skips.json";
+const SKIP_STATE_VERSION = 1;
+const SKIP_SAVE_MIN_MS = 60 * 1000;
+let skipLastSavedAt = 0;
+let skipPendingSave = null;
+
+(function restoreSkips() {
+  const d = loadState(SKIP_STATE_NAME, SKIP_STATE_VERSION);
+  if (!d) return;
+  for (const [chain, v] of Object.entries(d)) {
+    const n = Number(v?.n), usd = Number(v?.usd);
+    if (Number.isFinite(n) && Number.isFinite(usd)) skippedByChain.set(chain, { n, usd });
+  }
+  if (skippedByChain.size > 0) {
+    const total = [...skippedByChain.values()].reduce((a, v) => a + v.n, 0);
+    console.log(`[実行] 送信停止の記録 ${total}件 を読み戻しました`);
+  }
+})();
+
+function persistSkips() {
+  if (Date.now() - skipLastSavedAt < SKIP_SAVE_MIN_MS) {
+    if (!skipPendingSave) {
+      skipPendingSave = setTimeout(() => { skipPendingSave = null; persistSkips(); }, SKIP_SAVE_MIN_MS);
+      if (typeof skipPendingSave.unref === "function") skipPendingSave.unref();
+    }
+    return;
+  }
+  if (skipPendingSave) { clearTimeout(skipPendingSave); skipPendingSave = null; }
+  skipLastSavedAt = Date.now();
+  saveState(SKIP_STATE_NAME, SKIP_STATE_VERSION, Object.fromEntries(skippedByChain));
+}
+
+/// **今すぐ書く。** 終了の合図を受けた時に使う。
+export function flushSendSkips() {
+  if (skipPendingSave) { clearTimeout(skipPendingSave); skipPendingSave = null; }
+  skipLastSavedAt = Date.now();
+  return saveState(SKIP_STATE_NAME, SKIP_STATE_VERSION, Object.fromEntries(skippedByChain));
+}
 
 export function isSendAllowed(chain) {
   if (SEND_CHAINS.length === 0) return true; // 未設定なら今までどおり全部送る
@@ -908,6 +952,7 @@ export async function executeOpportunity(opp) {
     const v = skippedByChain.get(opp.chain) || { n: 0, usd: 0 };
     v.n++; v.usd += Number(opp.netProfitUsd) || 0;
     skippedByChain.set(opp.chain, v);
+    persistSkips();
     opp.sendResult = "skipped_chain";
     console.log(`[実行] ${opp.chain} ${opp.label}: **送信しない**(SEND_CHAINS で停止中)`
       + ` 見込み$${(Number(opp.netProfitUsd) || 0).toFixed(4)}`);

@@ -37,7 +37,7 @@ import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
 import { runPoolSurvey } from "./scripts/pool-survey.js";
 import { runMainnetDepthSurvey } from "./scripts/mainnet-depth-survey.js";
 import { runWickBacktestAll, wickBacktestSymbols } from "./scripts/wick-backtest.js";
-import { startMainnetEdgeWatch, formatMainnetEdgeLine } from "./scripts/mainnet-edge-watch.js";
+import { startMainnetEdgeWatch, formatMainnetEdgeLine, flushMainnetEdge } from "./scripts/mainnet-edge-watch.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
 import { scoutAllChains, getScoutChains, getReportOnlyChains, SCOUT_INTERVAL_MS, SCOUT_EVICT_IDLE_MS } from "./scripts/pool-scout.js";
@@ -75,7 +75,7 @@ import {
   getWhatIfProfit, getSpotScreenStats, takeQuoteDemand, getQuoteDemandTotal,
   getQuarantineStats, getSizeCurveStats,
 } from "./scripts/opportunity-scanner.js";
-import { executeOpportunity, formatSendSkipLine, ExecutionError, TAX_TOKEN_FEE_BPS, resetNonce, checkContractVersions } from "./scripts/execute-opportunity.js";
+import { executeOpportunity, formatSendSkipLine, flushSendSkips, ExecutionError, TAX_TOKEN_FEE_BPS, resetNonce, checkContractVersions } from "./scripts/execute-opportunity.js";
 import {
   getKnownTokens, isBorrowable,
   markUsableStart, clearUsableStarts, countUsableStarts,
@@ -2937,7 +2937,12 @@ for (const sig of ["SIGTERM", "SIGINT"]) {
   process.on(sig, () => {
     if (shuttingDown) return;  // 二重に来ても1回だけ
     shuttingDown = true;
-    try { flushBigOpportunities(); } catch (e) {}
+    // **測っているものを全部書き出してから終わる。**
+    for (const [name, fn] of [["大物", flushBigOpportunities],
+                              ["メインネット歪み", flushMainnetEdge],
+                              ["送信停止", flushSendSkips]]) {
+      try { fn(); } catch (e) { console.warn(`[終了] ${name} の書き出しに失敗`); }
+    }
     console.log(`[終了] ${sig} を受けました。計測を書き出しました`);
     process.exit(0);
   });
