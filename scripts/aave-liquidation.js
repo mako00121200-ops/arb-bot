@@ -25,6 +25,8 @@ import { ethers } from "ethers";
 import fs from "fs";
 import path from "path";
 import { callWithRpc, getProviderForChain } from "./onchain-reserves.js";
+// 「どの借金をどの担保で取るか」を決める部分。チェーンを引数に取る共通の道具。
+import { buildPlan, formatPlan } from "./liquidation-plan.js";
 
 /// Aave V3 Pool の住所。公開情報だが、**起動時に実測で確かめてから使う**
 /// (getUserAccountData が返らないチェーンは自動で外す)。
@@ -205,7 +207,14 @@ const seenLiquidatable = new Map();
 const stats = {
   rosterTotal: 0, sweeps: 0, watchChecks: 0, found: 0, taken: 0, recovered: 0,
   rpcCalls: 0, errors: 0, lastError: null, disabledChains: [], shrinks: 0,
+  // 計画まで立てられた件数と、その粗利の合計(2026年9月22日に追加)。
+  planned: 0, planFailed: 0, plannedUsd: 0, bestPlanUsd: 0, bestPlanWhere: null,
 };
+
+/// 計画ができた時に呼ぶ処理。**index.js から差し込む。**
+/// ここが null の間は、計画をログに出すだけで何もしない。
+let onPlan = null;
+export function setPlanHandler(fn) { onPlan = fn; }
 
 function loadState() {
   try {
@@ -771,6 +780,33 @@ function reportLiquidatable(chain, user, info) {
       `→ 肩代わり$${coverUsd.toFixed(2)}(${closeFactor * 100}%まで) ` +
       `ボーナス${ASSUMED_BONUS_BPS / 100}%で粗利**$${grossUsd.toFixed(2)}**(担保の売却手数料とガス代は未計算)`
     );
+
+    // **ここまでは概算。** どの借金をどの担保で取るかを実際に決める。
+    // 読み取りのみ。送信は onPlan を差し込むまで一切しない。
+    planFor(chain, user, info).catch(() => { stats.planFailed++; });
+  }
+}
+
+/// 清算できる人ひとりぶんの計画を立ててログに出す。
+/// **この関数は送信しない。** onPlan が差さっていればそこへ渡すだけ。
+async function planFor(chain, user, info) {
+  const plan = await buildPlan(chain, chainOf(chain), poolFor(chain), user, info.hf);
+  if (!plan || plan.error) {
+    stats.planFailed++;
+    console.log(`[清算/計画] ${chain} ${user.slice(0, 10)}…: ${formatPlan(plan)}`);
+    return;
+  }
+  stats.planned++;
+  stats.plannedUsd += plan.grossUsd;
+  if (plan.grossUsd > stats.bestPlanUsd) {
+    stats.bestPlanUsd = plan.grossUsd;
+    stats.bestPlanWhere = `${chain} ${plan.debtSymbol}←${plan.collateralSymbol}`;
+  }
+  console.log(`[清算/計画] ${chain} ${user.slice(0, 10)}…: ${formatPlan(plan)}`);
+  if (onPlan) {
+    try { await onPlan(plan); } catch (e) {
+      console.warn(`[清算/計画] ${chain}: 実行側で失敗 ${(e.message || "").slice(0, 80)}`);
+    }
   }
 }
 
@@ -918,5 +954,11 @@ export function formatAaveLine() {
     ? ` 実績${histCount.toLocaleString()}件${histPriced ? `(小口${Math.round((histSmall / histPriced) * 100)}% 極小${Math.round((histTiny / histPriced) * 100)}%)` : ""}`
     : "";
 
-  return ` 清算[名簿${stats.rosterTotal.toLocaleString()} 見張り${watching} 見つけた${stats.found} 他者${stats.taken} 回復${stats.recovered}${histNote} RPC${stats.rpcCalls}${stats.errors ? ` 失敗${stats.errors}` : ""}]`;
+  // 計画まで立てられたか。**「見つけた」と「取れる形になった」は別物**なので分ける。
+  const planNote = (stats.planned || stats.planFailed)
+    ? ` 計画${stats.planned}(失敗${stats.planFailed} 粗利計$${stats.plannedUsd.toFixed(2)}`
+      + (stats.bestPlanUsd > 0 ? ` 最良$${stats.bestPlanUsd.toFixed(2)}(${stats.bestPlanWhere})` : "") + ")"
+    : "";
+
+  return ` 清算[名簿${stats.rosterTotal.toLocaleString()} 見張り${watching} 見つけた${stats.found} 他者${stats.taken} 回復${stats.recovered}${planNote}${histNote} RPC${stats.rpcCalls}${stats.errors ? ` 失敗${stats.errors}` : ""}]`;
 }
