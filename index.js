@@ -48,7 +48,7 @@ import { verifyAaveChains, getAaveChains, sweepAll as aaveSweepAll, checkWatchAl
 import { noteBigOutcome, formatBigLine, formatBigSummary, flushBigOpportunities } from "./scripts/big-opportunities.js";
 import { probeUniswapXOnce, formatUniswapXLine, formatUniswapXReport, getProbeChains, PROBE_INTERVAL_MS } from "./scripts/uniswapx-probe.js";
 import { probeSolanaOnce, formatSolanaLine, getSolanaTokenCount, SOLANA_PROBE_INTERVAL_MS } from "./scripts/solana-probe.js";
-import { startLiquidationMonitor, setCandidateHandler, formatLiquidationLine, getLiquidationDashboard, CHAIN as LIQUIDATION_CHAIN } from "./scripts/liquidation-monitor.js";
+import { startLiquidationMonitor, setCandidateHandler, formatLiquidationLine, getLiquidationDashboard, CHAIN as LIQUIDATION_CHAIN, TAG as LIQUIDATION_TAG } from "./scripts/liquidation-monitor.js";
 import { handleLiquidationCandidate, selfCheckLiquidationExecutor } from "./scripts/liquidation-executor.js";
 import { runLiquidatorDeploy } from "./scripts/liquidator-deploy.js";
 import { readPoolFeeOnchain } from "./scripts/pool-fee-onchain.js";
@@ -2831,7 +2831,8 @@ async function main() {
   sendPendingQuestions().catch(() => {});
   setInterval(() => { sendPendingQuestions().catch(() => {}); }, 10 * 60 * 1000);
 
-  // Avalanche の Aave V3 清算(第2段の本体。既定は LIQUIDATION_DRY_RUN=true で送らない)。
+  // Aave V3 清算の速い見張り(第2段の本体。既定は LIQUIDATION_DRY_RUN=true で送らない)。
+  // 見る先は LIQUIDATION_CHAIN(既定 avalanche)。**1チェーンだけ**。
   // 失敗しても裁定は止めない。
   let liquidationStarted = false;
   try {
@@ -2843,7 +2844,7 @@ async function main() {
       setTimeout(() => { selfCheckLiquidationExecutor().catch(() => {}); }, 90 * 1000);
     }
   } catch (e) {
-    console.warn(`[清算AVAX] 始められませんでした: ${(e.message || "").slice(0, 100)}`);
+    console.warn(`[${LIQUIDATION_TAG}] 始められませんでした: ${(e.message || "").slice(0, 100)}`);
   }
 
   // Aave V3 の清算の機会を**測るだけ**(第1段。送信は一切しない)。
