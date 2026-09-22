@@ -221,7 +221,7 @@ async function refreshGasCosts() {
 //   前者が多ければ**上限を上げれば取れる**(その分ガスの同時持ち出しは増える)
 //   後者が多ければ**上限を上げても無駄**。同じプールを2本同時に通せば
 //   先に着いた方が価格を動かし、後の方は巻き戻ってガス代だけ失う
-const reasons = { disabled: 0, taxToken: 0, cooldown: 0, trap: 0, belowMin: 0, executing: 0, sendBusy: 0, sendBusyParallel: 0, sendBusyPool: 0, notSent: 0, failed: 0, success: 0 };
+const reasons = { disabled: 0, taxToken: 0, cooldown: 0, trap: 0, notProfitable: 0, belowMin: 0, executing: 0, sendBusy: 0, sendBusyParallel: 0, sendBusyPool: 0, notSent: 0, failed: 0, success: 0 };
 
 // ===== 最低利益未満で見送った機会の内訳(2026年9月20日) =====
 //
@@ -1839,9 +1839,13 @@ const inFlightByChain = new Map();  // chain -> 送信中の本数
 /// (送信中のものが数件あるので、小さいずれは正常)
 function reasonsResidual() {
   const counted = reasons.disabled + reasons.taxToken + reasons.cooldown + reasons.trap
-    + reasons.belowMin + reasons.executing + reasons.sendBusy
+    + reasons.notProfitable + reasons.belowMin + reasons.executing + reasons.sendBusy
     + reasons.success + reasons.notSent + reasons.failed;
-  const diff = stats.examined - counted;
+  // **いま送信中のものは、まだどの箱にも入っていない。** これは正常なので差し引く。
+  // 引かないと「送信が混んでいる時ほど穴が空いて見える」ことになる。
+  let inFlight = 0;
+  for (const n of inFlightByChain.values()) inFlight += n;
+  const diff = stats.examined - counted - inFlight;
   return diff === 0 ? "" : ` 残${diff}`;
 }
 
@@ -1876,7 +1880,11 @@ async function handleOpportunity(opp, meta = {}) {
   if (cool) cooldownUntil.delete(key);
 
   if (rejectIfTrap(opp)) { reasons.trap++; record(opp, "trap"); noteBigOutcome(opp, "trap"); return; }
-  if (!opp.profitable) return;
+  // **黒字にならなかった。** ここは今まで無言で帰っていた
+  // (2026年9月23日、`残N` の見張りを入れて発覚。精査の3割がここだった)。
+  // 粗利は出たが、手数料とガス代を入れたら黒字にならなかった機会。
+  // **いちばん件数の多い出口**なので、数えないと内訳が意味を成さない。
+  if (!opp.profitable) { reasons.notProfitable++; return; }
 
   stats.profitableFound++;
   if (opp.hasV3) stats.v3Opportunities++;
@@ -2114,7 +2122,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 税${reasons.taxToken} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 同経路${reasons.executing} 送信中${reasons.sendBusy}(同時上限${reasons.sendBusyParallel}/同プール${reasons.sendBusyPool}) 見送${reasons.notSent} 失敗${reasons.failed}${reasonsResidual()}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${sizeLine()}${formatTierLine()}${formatSendBalanceLine()}${formatSendSkipLine()}${formatUniswapXLine()}${formatMissingPairsLine()}${formatPairFillLine()}${formatSolanaLine()}${formatMainnetEdgeLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${alertLine}`);
+  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 税${reasons.taxToken} 冷却${reasons.cooldown} 罠${reasons.trap} 非黒字${reasons.notProfitable} 下限${reasons.belowMin} 同経路${reasons.executing} 送信中${reasons.sendBusy}(同時上限${reasons.sendBusyParallel}/同プール${reasons.sendBusyPool}) 見送${reasons.notSent} 失敗${reasons.failed}${reasonsResidual()}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${sizeLine()}${formatTierLine()}${formatSendBalanceLine()}${formatSendSkipLine()}${formatUniswapXLine()}${formatMissingPairsLine()}${formatPairFillLine()}${formatSolanaLine()}${formatMainnetEdgeLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
