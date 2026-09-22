@@ -565,3 +565,27 @@ API の実物を手元から読めない(プロキシが403)ので、計測に�
 **読み方:** 勝ちが `Priority/amount` に集中していたら、その額は水増しを疑う。
 決済額を持つキー(`settledAmounts` のようなもの)が注文の側に見えたら、それを読むよう直す。
 既存の15勝には種類が付いていない(付け始めはこのデプロイから)。
+
+### 追記(2026年9月23日 07:23 JST の見回り)— **#146 の計測が穴を見つけた**
+
+#146 で出したキー名(実物):
+```
+注文[… fillBlock, txHash, startingBaseFee, fillTimestamp, settledAmounts, type, cosignature, cosignerData, input, outputs …]
+出力[recipient, minAmount, startAmount, curve, token, adjustmentPerGweiBaseFee]
+```
+- **種類は全部 `Dutch_V3`**(base 80件 / arbitrum 27件)。**Priority は1件も来ていない**
+  → §13 の「base は Priority なら値付けの勝負」は、**今の API の標本には当てはまらない**
+  (API が Priority 注文を返していないのか、base で使われていないのかは未確認)
+- **額は全部 `startAmount`(競売の開始額)で読んでいた。** 実際の受取は注文の外側の
+  **`settledAmounts`**(uniswapx-service の `SettledAmount` 型 = `{tokenOut, amountOut, tokenIn, amountIn}` の配列)にある
+- V3 Dutch は**cosigner が開始額を上書きできる**(`cosignerData`)ので、
+  `startAmount` と実額の差は**どちら向きにもずれうる**。累計 base 23勝 $49.90 / arbitrum 17勝 $48.70 は
+  **この誤差込み**で、信用できない
+
+**直し(PR、未マージ・オーナー判断待ち):**
+- `readSettled` を足し、`settledAmounts` があれば**実額で比べる**(出力は通貨一致分を合算、
+  入力は全要素で同じ値の時だけ使う。形が違えば使わない)
+- 生存ログに `開始額−実額 中央Nbps(M件)`(直す前の誤差の大きさ)と、`settledAmounts` の実物を一度だけ出す
+- **保存の版を 3→4 に上げ、これまでの勝ちと齢の判定を捨てる**(誤差の向きが分からないため)
+
+**base の齢の判定(若7件 14.7bps / 古16件 15.2bps)も、この誤差の上に乗っていた。** 実額で測り直す。
