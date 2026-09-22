@@ -98,3 +98,50 @@ export function countUsableStarts(chain = null) {
   for (const key of usableStarts.keys()) if (key.startsWith(`${chain}::`)) n++;
   return n;
 }
+
+/// チェーンごとの「包んだ基軸通貨」の記号。**住所は上の表から引く**(二重に書かない)。
+const WRAPPED_NATIVE_SYMBOL = {
+  base: "WETH", optimism: "WETH", arbitrum: "WETH",
+  polygon: "WMATIC", avalanche: "WAVAX", ethereum: "WETH",
+};
+
+/// **ネイティブ通貨を表す住所。**
+///
+/// [なぜ要るか(2026年9月22日、UniswapX の計測で判明)]
+/// UniswapX は出力に**ネイティブ ETH** を指定できる。その時トークンの住所は
+/// **ゼロ住所**になる。我々の地図には WETH しか無いので、
+/// `USDC → ETH`(base でいちばん多い取引)を**1件も見られていなかった**。
+/// 経路なしで落ちた組の筆頭が **$25,266ぶん(6件)** の `USDC → 0x0000…` だった。
+///
+/// `0xEeee…` を使う実装もあるので両方見る。
+const NATIVE_SENTINELS = new Set([
+  "0x0000000000000000000000000000000000000000",
+  "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+]);
+
+/// そのチェーンの「包んだ基軸通貨」の住所。分からなければ null。
+export function getWrappedNative(chain) {
+  const sym = WRAPPED_NATIVE_SYMBOL[(chain || "").toLowerCase()];
+  if (!sym) return null;
+  for (const [address, meta] of Object.entries(getKnownTokens(chain))) {
+    if (meta?.symbol === sym) return address.toLowerCase();
+  }
+  return null;
+}
+
+/// ネイティブ通貨の住所か。
+export function isNativeToken(address) {
+  return NATIVE_SENTINELS.has(String(address || "").toLowerCase());
+}
+
+/// **ネイティブ通貨の住所を、そのチェーンの包んだ版に読み替える。**
+/// それ以外はそのまま返す(小文字にするだけ)。
+///
+/// 読み替えられない時(知らないチェーン等)は **null を返す**。
+/// 元の住所をそのまま返すと、**存在しないプールを探し続ける**ことになる。
+export function toWrappedToken(chain, address) {
+  const a = String(address || "").toLowerCase();
+  if (!a) return null;
+  if (!isNativeToken(a)) return a;
+  return getWrappedNative(chain);
+}
