@@ -47,6 +47,14 @@ const OUTCOME_LABEL = {
 /// これ以外は「逃した」として数える。
 const CAPTURED = new Set(["success"]);
 
+/// **チェーンに実際に聞いたところまで行った結末。**
+/// ここまで来たものだけが「本物だったかどうか」を知っている。
+/// 手前で捨てた(冷却・同プール・同経路など)ものは、**本物だったかどうか誰も知らない**。
+const TESTED = new Set(["success", "not_sent", "failed"]);
+/// 本物率を言うのに最低限要る件数。これ未満では率を出さない
+/// (標本19件で決着と書いた失敗の再発防止)。
+const MIN_TESTED = parseInt(process.env.BIG_OPP_MIN_TESTED || "10", 10);
+
 const events = [];
 const totals = { seen: 0, captured: 0, capturedUsd: 0, missedUsd: 0 };
 
@@ -108,11 +116,48 @@ export function formatBigSummary() {
 
   return `[大物] 30分: $${BIG_OPP_USD.toFixed(2)}以上を ${list.length}件検知 → ` +
     `**成立${captured.length}件(実際に$${gotUsd.toFixed(4)})** / ` +
-    `逃した${list.length - captured.length}件(見込み$${lostUsd.toFixed(4)})[${why}]`;
+    `逃した${list.length - captured.length}件(見込み$${lostUsd.toFixed(4)})[${why}]` +
+    formatRealRate(list);
 }
 
 /// 生存ログに入れる短い1行。まだ1件も見ていなければ空。
 export function formatBigLine() {
   if (totals.seen === 0) return "";
   return ` 大物[検知${totals.seen} 成立${totals.captured} 得た$${totals.capturedUsd.toFixed(3)} 逃した見込み$${totals.missedUsd.toFixed(3)}]`;
+}
+
+/// **「見込み$XX」のうち、本当に取れたはずの分はいくらか。**
+///
+/// [なぜ要るか(2026年9月22日の見回りで判明)]
+/// `逃した見込み$68.24` が出た。だが `見込み` は機会を見つけた時点の計算で、
+/// **V3の段も x·y=k で近似している**(§8-1)。過大に出る側の数字。
+///
+/// 本物かどうかを知っているのは、**チェーンに実際に聞いたところまで行った件**だけ:
+///   成立           … 本物だった
+///   送信直前で見送り … 実測ガスを入れたら下限を割った = **その分は無かった**
+///   送信して失敗   … simulate が拒否した = **その分は無かった**
+/// 手前で捨てた件(冷却・同プール・同経路)は、**本物だったか誰も知らない**。
+///
+/// そこで「試した件の本物率」を出し、見込みにそれを掛けて**正直な期待値**を添える。
+/// 実際、最初に出た1件は `送信して失敗(simulate)` で、見込み$1.48 は幻だった。
+///
+/// @returns 付け足す文字列(件数が足りなければ「まだ言えない」)
+export function formatRealRate(list) {
+  const tested = list.filter((e) => TESTED.has(e.outcome));
+  const real = tested.filter((e) => CAPTURED.has(e.outcome));
+  const missedUsd = list.filter((e) => !CAPTURED.has(e.outcome) && e.outcome !== "sent")
+    .reduce((s, e) => s + e.netUsd, 0);
+  if (tested.length < MIN_TESTED) {
+    return ` / **本物率はまだ言えない**(チェーンに聞けたのは${tested.length}件、${MIN_TESTED}件必要)`;
+  }
+  const rate = real.length / tested.length;
+  return ` / **試した${tested.length}件のうち本物は${real.length}件(${(rate * 100).toFixed(0)}%)**`
+    + ` → 見込み$${missedUsd.toFixed(2)}の期待値は**$${(missedUsd * rate).toFixed(4)}**`;
+}
+
+/// 試した件だけの内訳(判断用)。読む側が居なければ消してよい。
+export function getBigTestedStats() {
+  const list = recent();
+  const tested = list.filter((e) => TESTED.has(e.outcome));
+  return { tested: tested.length, real: tested.filter((e) => CAPTURED.has(e.outcome)).length };
 }
