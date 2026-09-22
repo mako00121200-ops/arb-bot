@@ -63,7 +63,12 @@ const MIN_CHUNK_BLOCKS = 100;
 /// 1回の調査で使うRPCの上限。
 const SCOUT_MAX_REQUESTS = parseInt(process.env.SCOUT_MAX_REQUESTS || "40", 10);
 /// 1回の調査で新しく地図に載せるプールの上限(受信の増えすぎを防ぐ)。
-const SCOUT_MAX_NEW_POOLS = parseInt(process.env.SCOUT_MAX_NEW_POOLS || "150", 10);
+///
+/// [150 → 20 に下げた(2026年9月22日)]
+/// 150 は6時間周期を前提にした値。周期を1.5時間に縮めると1日16回走るので、
+/// 同じ150のままだと最悪1日2,400件が積み上がる。取引の多い順に採るので
+/// 20件でも上位は毎回入る。載せ切れなかった分は次の周期に回るだけで失われない。
+const SCOUT_MAX_NEW_POOLS = parseInt(process.env.SCOUT_MAX_NEW_POOLS || "20", 10);
 /// 正体を調べるプールの上限(Swapの多い順)。
 const SCOUT_MAX_IDENTIFY = parseInt(process.env.SCOUT_MAX_IDENTIFY || "300", 10);
 /// 「片方だけ既知」の新しいペアを取り込む上限(取引の多い順の順位)。
@@ -368,6 +373,8 @@ export async function scoutChain(chain, { reportOnly = false } = {}) {
       token0: entry.token0, token1: entry.token1,
       feeTier: isV3 ? entry.fee : null,
       feeBps,
+      // 探索由来の印。静かになったら自動で外してよいのはこの印のあるものだけ。
+      source: "scout",
       // V2 の準備量と V3 の状態は、この後の prepareChain がまとめて読む。
       updatedAt: 0,
     });
@@ -488,3 +495,6 @@ export async function scoutReportOnlyChains(activeChains, exclude = []) {
 export function getScoutChains() { return [...SCOUT_CHAINS]; }
 export function getReportOnlyChains() { return [...REPORT_ONLY_CHAINS]; }
 export const SCOUT_INTERVAL_MS = parseFloat(process.env.SCOUT_INTERVAL_HOURS || "6") * 60 * 60 * 1000;
+/// 探索由来のプールを「静か」とみなして外すまでの時間。
+/// 探索の遡り窓(3,000ブロック≒100分)より十分長く取り、一時的な凪で外さない。
+export const SCOUT_EVICT_IDLE_MS = parseFloat(process.env.SCOUT_EVICT_IDLE_HOURS || "24") * 60 * 60 * 1000;

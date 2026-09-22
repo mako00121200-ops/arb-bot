@@ -30,6 +30,7 @@
 // 識別子を計算で求めるために読み込む(このファイルで使うのはこれだけ)。
 import { ethers } from "ethers";
 import { callWithRpc, isPendingReadChain } from "./scripts/onchain-reserves.js";
+import { notePoolEvent } from "./scripts/pool-registry.js";
 
 // 識別子は手で書かない。過去に1文字欠けたまま気づかず、最初期から一度も
 // 受信できていなかった。署名の文字列だけを書き、ハッシュは計算させる。
@@ -62,6 +63,8 @@ const DATA_TIMEOUT_MS = 120 * 1000;
 const PING_INTERVAL_MS = 20 * 1000;
 const PING_REQUEST_ID = 999;
 const SUBSCRIBE_REQUEST_ID_BASE = 100;
+/// 古い購読の解除に使う id。返事は読まないので範囲は要らないが、他と被らない値にする。
+const UNSUBSCRIBE_REQUEST_ID = 3;
 // 確定前(Flashblocks)のイベントを**押し出しで**受け取る購読の id の範囲。
 // 確定後の "logs" の購読と区別するため、別の範囲にする。
 //
@@ -124,6 +127,7 @@ const chainSubscribeErrors = {};
 const chainReconnects = {};
 const chainAddresses = {};      // チェーン→購読するアドレスの配列
 const chainSubCounts = {};      // チェーン→購読した回数
+const chainSubIds = {};         // チェーン→確定後(logs)の購読ID。購読し直す時に解除するため
 let globalOnSync = null;
 let globalOnV3Swap = null;
 let globalOnV3Liquidity = null;
@@ -206,6 +210,8 @@ function dispatchLog(chainName, log, receivedAt, source) {
   const topic = (log.topics && log.topics[0]) || "";
   const address = (log.address || "").toLowerCase();
   if (!address) return;
+  // そのプールに「イベントが届いた」ことだけ先に刻む(静かなプールを外す判定に使う)。
+  notePoolEvent(chainName, address, receivedAt);
   if (source === "pending") pendingStatsFor(chainName).events++;
 
   if (topic === SYNC_TOPIC) {
@@ -298,6 +304,26 @@ function sendSubscription(chainName) {
     console.log(`[オンチェーン] ${chainName}: 監視対象が0件のため購読しません`);
     return;
   }
+  // **古い購読を先に解除する。**
+  //
+  // [なぜ要るか(2026年9月22日に判明)]
+  // 監視対象が変わるたび(探索でプールを足した時)にここで購読し直すが、
+  // 前の購読は生きたままだった。確定後の購読IDを保存しておらず、解除もしていない。
+  // 同じイベントが購読の数だけ重複して届き、処理は rememberLog で弾けるが
+  // **課金は届いた件数ぶん**かかる。探索の周期を縮めるほど雪だるまになる。
+  // 確定前(pending)の購読は元から解除していた(probe の finish と同じ形)。
+  const old = chainSubIds[chainName];
+  if (old && old.size > 0) {
+    let released = 0;
+    for (const subId of old) {
+      try {
+        socket.send(JSON.stringify({ jsonrpc: "2.0", id: UNSUBSCRIBE_REQUEST_ID, method: "eth_unsubscribe", params: [subId] }));
+        released++;
+      } catch (e) { break; }
+    }
+    if (released > 0) console.log(`[オンチェーン] ${chainName}: 古い購読${released}件を解除してから購読し直します`);
+  }
+  chainSubIds[chainName] = new Set();
   let sent = 0;
   for (let i = 0; i < addresses.length; i += ADDRESSES_PER_SUBSCRIPTION) {
     const chunk = addresses.slice(i, i + ADDRESSES_PER_SUBSCRIPTION);
@@ -370,6 +396,8 @@ function connectChain(chainName, wsUrl) {
     socket.addEventListener("open", () => {
       chainConnectedAt[chainName] = Date.now();
       chainLastDataAt[chainName] = Date.now();
+      // 新しいソケットなので前の購読IDは無効。解除を送っても意味が無いので空にする。
+      chainSubIds[chainName] = new Set();
       sendSubscription(chainName);
       if (chainPingTimers[chainName]) clearInterval(chainPingTimers[chainName]);
       chainPingTimers[chainName] = setInterval(() => sendPing(chainName), PING_INTERVAL_MS);
@@ -407,9 +435,16 @@ function connectChain(chainName, wsUrl) {
             }
             return;
           }
-          if (msg.id >= SUBSCRIBE_REQUEST_ID_BASE && msg.id < PING_REQUEST_ID && msg.error) {
-            chainSubscribeErrors[chainName] = JSON.stringify(msg.error).slice(0, 120);
-            console.warn(`[オンチェーン] ${chainName}: 購読が拒否されました: ${chainSubscribeErrors[chainName]}`);
+          if (msg.id >= SUBSCRIBE_REQUEST_ID_BASE && msg.id < PING_REQUEST_ID) {
+            if (msg.error) {
+              chainSubscribeErrors[chainName] = JSON.stringify(msg.error).slice(0, 120);
+              console.warn(`[オンチェーン] ${chainName}: 購読が拒否されました: ${chainSubscribeErrors[chainName]}`);
+            } else if (typeof msg.result === "string" && msg.result.length >= 18) {
+              // 確定後の購読ID。次に購読し直す時に解除する(重複配信=二重課金を防ぐ)。
+              // 長さで見分けるのは確定前の購読と同じ理由(短い値はブロック番号など)。
+              if (!chainSubIds[chainName]) chainSubIds[chainName] = new Set();
+              chainSubIds[chainName].add(msg.result);
+            }
           }
           return;
         }
