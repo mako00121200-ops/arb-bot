@@ -62,6 +62,33 @@ export function orderTypeOf(order) {
   return "不明";
 }
 
+/// **実際に決済された額**を `settledAmounts` から読む。読めなければ null。
+///
+/// - 出力:通貨が一致する要素の `amountOut` を**全部足す**(手数料の出力も届ける義務がある)
+/// - 入力:要素ごとに同じ `amountIn` が繰り返されている前提なので、**全部同じ時だけ**使う。
+///   違っていたら形が想定と違うので使わない(推測で足さない)
+export function readSettled(order, tokenIn, tokenOut) {
+  const arr = Array.isArray(order?.settledAmounts) ? order.settledAmounts : null;
+  if (!arr || arr.length === 0) return null;
+  let out = 0n, outSeen = false;
+  const ins = new Set();
+  for (const e of arr) {
+    try {
+      if (e?.tokenOut && String(e.tokenOut).toLowerCase() === tokenOut && e.amountOut != null) {
+        out += BigInt(String(e.amountOut)); outSeen = true;
+      }
+      if (e?.tokenIn && String(e.tokenIn).toLowerCase() === tokenIn && e.amountIn != null) {
+        ins.add(BigInt(String(e.amountIn)).toString());
+      }
+    } catch (err) { return null; }   // 数にならない値があれば形が違う。丸ごと使わない
+  }
+  const amountIn = ins.size === 1 ? BigInt([...ins][0]) : null;
+  return {
+    amountOut: outSeen && out > 0n ? out : null,
+    amountIn: amountIn != null && amountIn > 0n ? amountIn : null,
+  };
+}
+
 /// 注文から「入る通貨と量」「ユーザーへ出す通貨と量」を取り出す。
 /// 取れなければ null を返し、呼ぶ側は**数えない**。
 ///
@@ -106,10 +133,27 @@ export function extractSwap(order) {
   // 同じ通貨どうしは扱わない(ラップの出入りなど。裁定の対象ではない)。
   if (tokenIn === main.token) return null;
 
+  // **実際に決済された額があれば、そちらで比べる。**
+  //
+  // [なぜ(2026年9月23日の見回りで判明)]
+  // API の出力には `startAmount`(競売の開始額)と `minAmount` しか無く、pickAmount は
+  // `startAmount` を拾っていた(base 71件中71件)。実際の受取は注文の外側の
+  // `settledAmounts`(配列。1件 = {tokenOut, amountOut, tokenIn, amountIn}、
+  // uniswapx-service の SettledAmount 型)にある。V3 Dutch では値が下がるうえ、
+  // **cosigner が開始額を上書きできる**ので、`startAmount` との差は
+  // 我々の実力より大きくも小さくもなりうる。**実額で比べるのが正しい。**
+  const settled = readSettled(order, tokenIn, main.token);
+  const amountOut = settled?.amountOut ?? owedOut;
+  const amountIn = settled?.amountIn ?? inAmount;
+
   return {
-    tokenIn, amountIn: inAmount, tokenOut: main.token,
-    // **比べる相手はこれ。** 全部の出力の合計。
-    amountOut: owedOut,
+    tokenIn, amountIn, tokenOut: main.token,
+    // **比べる相手はこれ。** 実額があれば実額、無ければ全部の出力の合計(開始額)。
+    amountOut,
+    // どちらで比べたか。"settled" / "startAmount" 等(pickAmount が拾った項目)
+    amountSource: settled?.amountOut != null ? "settledAmounts" : "order",
+    // 参考:開始額の合計(実額との差を測るため)
+    orderOut: owedOut,
     // 参考:いちばん大きい1つだけの額(水増しがどれだけあったかを測るため)
     mainOnlyOut: main.amount,
     outputCount: outputs.length,

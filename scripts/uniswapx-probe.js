@@ -113,6 +113,9 @@ function statFor(chain) {
       outKeys: {},
       /// 種類ごとに一度だけ、実際のキー名をログに出した印(推測で名前を決めないため)。
       keysLogged: {},
+      /// **開始額が実額より何bps大きかったか**(実額が読めた注文ごと)。直す前の誤差の大きさ。
+      startVsSettledBps: [],
+      settledShapeLogged: false,
       // **確認できた勝ちを「齢つき」で持つ。** 値動きの残りかすかどうかを、
       // これで判定する(§下の formatUniswapXReport)。
       verifiedWins: [] });
@@ -234,8 +237,20 @@ async function probeChain(chain) {
 
     const swap = extractSwap(order);
     if (!swap) continue;
-    const outKey = amountKeyOf(order.outputs.find((o) => o?.token
-      && String(o.token).toLowerCase() === swap.tokenOut)) || "不明";
+    // 額をどこから読んだか。実額(settledAmounts)が読めればそれ、無ければ出力の項目名。
+    const outKey = swap.amountSource === "settledAmounts" ? "settledAmounts"
+      : (amountKeyOf(order.outputs.find((o) => o?.token
+        && String(o.token).toLowerCase() === swap.tokenOut)) || "不明");
+    // **開始額と実額の差。** 直す前はこの差を「我々の取り分」に混ぜていた。
+    // 正なら開始額の方が大きい(=直す前は取り分を小さく見ていた)、負なら逆。
+    if (outKey === "settledAmounts" && swap.amountOut > 0n) {
+      const bps = Number((swap.orderOut - swap.amountOut) * 100000n / swap.amountOut) / 10;
+      if (Number.isFinite(bps)) { s.startVsSettledBps.push(bps); if (s.startVsSettledBps.length > 200) s.startVsSettledBps.shift(); }
+    }
+    if (!s.settledShapeLogged && Array.isArray(order.settledAmounts)) {
+      s.settledShapeLogged = true;
+      console.log(`[UniswapX計測] ${chain}: settledAmounts の実物 ${JSON.stringify(order.settledAmounts).slice(0, 300)}`);
+    }
     s.outKeys[outKey] = (s.outKeys[outKey] || 0) + 1;
     // **別の通貨での出力があるものは、値段を付けられないので比べない。**
     // 無理に比べると、その出力を**タダでもらえる前提**になって水増しになる。
@@ -243,7 +258,7 @@ async function probeChain(chain) {
     if (swap.outputCount > 1) {
       s.multiOut++;
       // 直す前はここを見落としていた。どれだけ水増しされていたかを控える。
-      const missed = toUsd(chain, toWrappedToken(chain, swap.tokenOut) || swap.tokenOut, swap.amountOut - swap.mainOnlyOut);
+      const missed = toUsd(chain, toWrappedToken(chain, swap.tokenOut) || swap.tokenOut, swap.orderOut - swap.mainOnlyOut);
       if (missed != null) s.ignoredOutUsd += missed;
     }
 
@@ -330,6 +345,15 @@ async function probeChain(chain) {
 
 /// 保存の形。**中身の意味を変えたら上げる**(古い形を読んで静かに壊れないように)。
 const STATE_NAME = "uniswapx-probe.json";
+/// **4 に上げた(2026年9月23日、3度目)。**
+///
+/// 版3までの勝ちは、ユーザーの受取を**実額(settledAmounts)ではなく競売の開始額
+/// (outputs[].startAmount)**で比べていた(base 71件中71件)。V3 Dutch では cosigner が
+/// 開始額を上書きでき、約定までに値も下がるので、**差の向きが分からない**。
+/// 読み戻さずに捨て、実額で測り直す(齢の判定もやり直し)。
+///
+/// --- 版3にした理由(下は当時の記録) ---
+///
 /// **3 に上げた(2026年9月22日、2度目)。**
 ///
 /// 版2の `missing`(経路なしの組の控え)には、**ゼロ住所のままの組**が入っている。
@@ -342,7 +366,7 @@ const STATE_NAME = "uniswapx-probe.json";
 /// 手数料の出力を「タダでもらえる」前提で計算されている = **利益が水増しされている**。
 /// 読み戻すと汚染が残るので、**版番号を上げて捨てる**。
 /// (これが版番号を持たせた理由そのもの。9勝$18.5477 は信用しない)
-const STATE_VERSION = 3;
+const STATE_VERSION = 4;
 
 /// 再デプロイで計測が消えないように読み戻す。
 /// (2026年9月22日:1日4回のデプロイで毎回ゼロに戻っていた)
@@ -357,7 +381,7 @@ function restore() {
       // **足りない組は数ではなく表。** 上の「数なら数」の枝に落とさない。
       if (k === "missing") { if (v[k] && typeof v[k] === "object") s[k] = v[k]; continue; }
       // 「キー名を出した印」はデプロイごとにやり直す(読み戻すと新しいデプロイで一度も出なくなる)。
-      if (k === "keysLogged") continue;
+      if (k === "keysLogged" || k === "settledShapeLogged") continue;
       if (typeof s[k] === "number" && Number.isFinite(Number(v[k]))) s[k] = Number(v[k]);
       else if (v[k] != null && typeof s[k] !== "number") s[k] = v[k];
     }
@@ -418,6 +442,8 @@ export function formatUniswapXLine() {
       // **種類と、額を読んだ項目。** 勝ちが Priority/amount に偏っていたら水増しを疑う。
       + (Object.keys(s.types).length > 0 ? ` 種類[${fmtCounts(s.types)}]` : "")
       + (Object.keys(s.outKeys).length > 0 ? ` 額の項目[${fmtCounts(s.outKeys)}]` : "")
+      + (s.startVsSettledBps.length > 0
+        ? ` 開始額−実額 中央${[...s.startVsSettledBps].sort((a, b) => a - b)[Math.floor(s.startVsSettledBps.length / 2)].toFixed(1)}bps(${s.startVsSettledBps.length}件)` : "")
       + (Object.keys(s.winTypes).length > 0
         ? ` 勝ちの内訳[${Object.entries(s.winTypes).map(([k, v]) => `${k}:${v.n}件$${v.usd.toFixed(2)}`).join(" ")}]` : ""));
   }
