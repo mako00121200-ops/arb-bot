@@ -34,6 +34,7 @@ import { getKnownTokens } from "./borrowable-tokens.js";
 import { isForkFactory, isForkQuoterEnabled, V3_FACTORIES, feeTierToBps } from "./v3-pools.js";
 import { isKnownIncompatiblePool } from "./incompatible-pools.js";
 import { getLastRpcUsage } from "./rpc-usage.js";
+import { getSyncStats } from "../dex-onchain-realtime.js";
 
 /// 調べるチェーン。自前の見積もり(ENABLE_FORK_QUOTER)が有効なチェーンでのみ
 /// 意味がある(住所の分からないファクトリーのプールは公式Quoterで引けないため)。
@@ -416,6 +417,19 @@ export async function scoutChain(chain, { reportOnly = false } = {}) {
     const u = getLastRpcUsage();
     // 受信が枠に占める割合。呼び出し(eth_call 等)はプールを増やしても増えない。
     const eventShare = (u && u.total > 0) ? u.events / u.total : null;
+    // **このチェーンが全受信に占める割合。**
+    //
+    // [最初の版の誤り(2026年9月22日 14:40 JST、初回の出力で判明)]
+    // 候補の比率は「このチェーンの既存監視」との比なのに、それに**全体**の受信占有率を
+    // そのまま掛けていた。avalanche の受信は全体の約9%しか無いので、avalanche の
+    // 費用を**約10倍**、base を約2.5倍、過大に出していた。比率は必ず
+    // 「同じ母集団」どうしで掛ける。ここでは 全体の受信 × このチェーンの占有 × 候補の比。
+    // 起動直後は受信の計数がほぼ0で占有率が当てにならないため、一定数に満たなければ
+    // 月末見込への換算は出さない(比率だけ出す)。
+    const sync = getSyncStats();
+    const totalReceived = Object.values(sync).reduce((s, v) => s + (v?.received || 0), 0);
+    const chainShare = totalReceived > 0 ? (sync[key]?.received || 0) / totalReceived : null;
+    const shareReliable = totalReceived >= 1000 && chainShare != null;
     const marks = [...new Set([5, 10, 20, 50, candidates.length])]
       .filter((n) => n > 0 && n <= candidates.length).sort((a, b) => a - b);
     const parts = [];
@@ -424,12 +438,14 @@ export async function scoutChain(chain, { reportOnly = false } = {}) {
       if (!(mappedSwaps > 0)) { parts.push(`上位${n}件:${sum}回(既存の回数が0で比較不能)`); continue; }
       const ratio = sum / mappedSwaps;
       let s = `上位${n}件:受信+${(ratio * 100).toFixed(0)}%`;
-      if (eventShare != null && u.reliable) {
-        s += `→月末見込${u.projectedPercent.toFixed(0)}%が${(u.projectedPercent * (1 + ratio * eventShare)).toFixed(0)}%に`;
+      if (eventShare != null && u.reliable && shareReliable) {
+        const after = u.projectedPercent * (1 + ratio * eventShare * chainShare);
+        s += `→月末見込${u.projectedPercent.toFixed(0)}%が${after.toFixed(1)}%に`;
       }
       parts.push(s);
     }
-    console.log(`[発見の候補] ${key}: 載せた場合の費用(既存監視${mappedSwaps.toLocaleString()}回/${scanned.toLocaleString()}ブロックとの比): ${parts.join(" / ")}`);
+    const shareNote = shareReliable ? `、このチェーンは全受信の${(chainShare * 100).toFixed(0)}%` : "、受信の占有率は計測中";
+    console.log(`[発見の候補] ${key}: 載せた場合の費用(既存監視${mappedSwaps.toLocaleString()}回/${scanned.toLocaleString()}ブロックとの比${shareNote}): ${parts.join(" / ")}`);
   }
   return { added, scanned, active: counts.size, skipped, wouldAdd, reportOnly };
 }
