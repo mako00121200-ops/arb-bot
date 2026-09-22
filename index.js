@@ -47,7 +47,8 @@ import { alertOwner, getAlertStats, sendPendingQuestions } from "./scripts/owner
 import { verifyAaveChains, getAaveChains, sweepAll as aaveSweepAll, checkWatchAll as aaveCheckWatchAll, formatAaveLine, AAVE_SWEEP_INTERVAL_MS, AAVE_WATCH_INTERVAL_MS } from "./scripts/aave-liquidation.js";
 import { noteBigOutcome, formatBigLine, formatBigSummary, flushBigOpportunities } from "./scripts/big-opportunities.js";
 import { formatTierLine, formatTierBreakdown, formatMoveBreakdown, flushTiers } from "./scripts/opportunity-tiers.js";
-import { probeUniswapXOnce, formatUniswapXLine, formatUniswapXReport, getProbeChains, PROBE_INTERVAL_MS } from "./scripts/uniswapx-probe.js";
+import { probeUniswapXOnce, formatUniswapXLine, formatUniswapXReport, getProbeChains, PROBE_INTERVAL_MS, formatMissingPairsLine } from "./scripts/uniswapx-probe.js";
+import { fillMissingPairsOnce, formatPairFillLine, flushPairFiller } from "./scripts/pair-filler.js";
 import { probeSolanaOnce, formatSolanaLine, getSolanaTokenCount, SOLANA_PROBE_INTERVAL_MS } from "./scripts/solana-probe.js";
 import { startLiquidationMonitor, setCandidateHandler, formatLiquidationLine, getLiquidationDashboard, CHAIN as LIQUIDATION_CHAIN, TAG as LIQUIDATION_TAG } from "./scripts/liquidation-monitor.js";
 import { handleLiquidationCandidate, selfCheckLiquidationExecutor } from "./scripts/liquidation-executor.js";
@@ -2094,7 +2095,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy}(同時上限${reasons.sendBusyParallel}/同プール${reasons.sendBusyPool}) 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${sizeLine()}${formatTierLine()}${formatSendBalanceLine()}${formatSendSkipLine()}${formatUniswapXLine()}${formatSolanaLine()}${formatMainnetEdgeLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${alertLine}`);
+  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy}(同時上限${reasons.sendBusyParallel}/同プール${reasons.sendBusyPool}) 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${sizeLine()}${formatTierLine()}${formatSendBalanceLine()}${formatSendSkipLine()}${formatUniswapXLine()}${formatMissingPairsLine()}${formatPairFillLine()}${formatSolanaLine()}${formatMainnetEdgeLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
@@ -2898,6 +2899,20 @@ async function main() {
       const runProbe = () => probeUniswapXOnce(Object.keys(CHAIN_CONFIG))
         .catch((e) => console.warn(`[UniswapX計測] 失敗 ${(e.message || "").slice(0, 80)}`));
       setTimeout(() => { runProbe(); setInterval(runProbe, PROBE_INTERVAL_MS); }, 5 * 60 * 1000);
+
+      // **「経路が無い」と落ちた組を、ファクトリーに聞いて地図に足す。**
+      //
+      // [2026年9月22日] base は新しい注文81件のうち **68件(84%)が「経路なし」**
+      // だった。地図にその組が無いだけで、UniswapX で起きていることの16%しか
+      // 見ていなかった。総当たりの発見(pool-scout)と違い、
+      // **足りないと分かっている組だけ**を聞くので安い。
+      //
+      // 計測が組を溜めてから動かしたいので、計測開始の10分後から。
+      // 枠が苦しい時は動かさない(発見と同じ歯止め)。
+      // 枠の歯止めは pair-filler の中に置いてある(発見と同じ判定)。
+      const runFill = () => fillMissingPairsOnce(Object.keys(CHAIN_CONFIG))
+        .catch((e) => console.warn(`[組を足す] 失敗 ${(e.message || "").slice(0, 80)}`));
+      setTimeout(() => { runFill(); setInterval(runFill, 10 * 60 * 1000); }, 15 * 60 * 1000);
     }
 
     // **Solana の計測。** 「放置されているのに取引されているコイン」があるかを測る。
@@ -2961,7 +2976,8 @@ for (const sig of ["SIGTERM", "SIGINT"]) {
     for (const [name, fn] of [["大物", flushBigOpportunities],
                               ["メインネット歪み", flushMainnetEdge],
                               ["送信停止", flushSendSkips],
-                              ["段", flushTiers]]) {
+                              ["段", flushTiers],
+                              ["組を足す", flushPairFiller]]) {
       try { fn(); } catch (e) { console.warn(`[終了] ${name} の書き出しに失敗`); }
     }
     console.log(`[終了] ${sig} を受けました。計測を書き出しました`);
