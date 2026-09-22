@@ -37,7 +37,7 @@
 import { bestOutputFor } from "./opportunity-scanner.js";
 import { extractSwap, readFilledAt, FILLED_AT_KEYS, splitByAge } from "./uniswapx-parse.js";
 import { getTokenDecimals, getTokenPriceUsd, KIND_V3 } from "./pool-registry.js";
-import { getKnownTokens } from "./borrowable-tokens.js";
+import { getKnownTokens, toWrappedToken, isNativeToken } from "./borrowable-tokens.js";
 import { quoteV3ByPoolBatch } from "./multicall-reserves.js";
 import { getAnyChainConfig } from "../chain-config.js";
 import { loadState, saveState } from "./state-file.js";
@@ -97,6 +97,10 @@ function statFor(chain) {
       /// **出力が2つ以上あった注文の数**と、見落としていた額の合計。
       /// これが大きいほど、直す前の数字は水増しされていた。
       multiOut: 0, ignoredOutUsd: 0,
+      /// **ネイティブ通貨(ゼロ住所)を含んでいた注文。** 包んだ版に読み替えて扱う。
+      nativeSwapped: 0,
+      /// 読み替えられなかった(包んだ版が分からない)数。
+      nativeUnknown: 0,
       // **約定時刻が無く、注文が作られた時刻しか無いもの。** 齢が測れないので数えない。
       createdOnly: 0,
       // **確認できた勝ちを「齢つき」で持つ。** 値動きの残りかすかどうかを、
@@ -216,29 +220,48 @@ async function probeChain(chain) {
     if (swap.outputCount > 1) {
       s.multiOut++;
       // 直す前はここを見落としていた。どれだけ水増しされていたかを控える。
-      const missed = toUsd(chain, swap.tokenOut, swap.amountOut - swap.mainOnlyOut);
+      const missed = toUsd(chain, toWrappedToken(chain, swap.tokenOut) || swap.tokenOut, swap.amountOut - swap.mainOnlyOut);
       if (missed != null) s.ignoredOutUsd += missed;
     }
 
+    // **ネイティブ通貨(ゼロ住所)は、包んだ版に読み替える。**
+    //
+    // [2026年9月22日] UniswapX は出力にネイティブ ETH を指定できる。その時の住所は
+    // ゼロ住所で、我々の地図には WETH しか無い。読み替えないと
+    // **`USDC → ETH`(base でいちばん多い取引)を1件も見られない**。
+    // 経路なしの筆頭が $25,266ぶん(6件)の `USDC → 0x0000…` だった。
+    //
+    // 桁は同じ(ETH も WETH も18桁)なので、金額はそのまま比べられる。
+    // **ただし実際に約定させる時は WETH を ETH に戻す手間がかかる**(ガスが少し増える)。
+    const hadNative = isNativeToken(swap.tokenIn) || isNativeToken(swap.tokenOut);
+    const tokenIn = toWrappedToken(chain, swap.tokenIn);
+    const tokenOut = toWrappedToken(chain, swap.tokenOut);
+    if (tokenIn == null || tokenOut == null) { s.nativeUnknown++; continue; }
+    // 読み替えた結果、同じ通貨どうしになったら扱わない(ETH↔WETH のラップ)。
+    if (tokenIn === tokenOut) continue;
+    if (hadNative) s.nativeSwapped++;
+
     // 我々の経路なら、同じ投入額で何が返るか。
     const mine = bestOutputFor({
-      chain, tokenIn: swap.tokenIn, tokenOut: swap.tokenOut, amountIn: swap.amountIn, hubTokens: hubs,
+      chain, tokenIn, tokenOut, amountIn: swap.amountIn, hubTokens: hubs,
     });
     if (!mine) {
       s.noRoute++;
       // **足りない組を控える。** 件数と注文額の両方を持つ
       //(1件$5,000の組と、100件$1の組は、足す価値が違う)。
-      const k = `${swap.tokenIn}|${swap.tokenOut}`;
-      const m = s.missing[k] || { n: 0, usd: 0, tokenIn: swap.tokenIn, tokenOut: swap.tokenOut };
+      // **控えるのは読み替え後の住所。** ゼロ住所のまま控えると、
+      // ファクトリーに「存在しないプール」を聞きに行き続けることになる。
+      const k = `${tokenIn}|${tokenOut}`;
+      const m = s.missing[k] || { n: 0, usd: 0, tokenIn, tokenOut };
       m.n++;
-      const inUsd = toUsd(chain, swap.tokenIn, swap.amountIn);
+      const inUsd = toUsd(chain, tokenIn, swap.amountIn);
       if (inUsd != null) m.usd += inUsd;
       s.missing[k] = m;
       continue;
     }
 
     // 差額をUSDにする。出力通貨の桁数と価格が無ければ数えない。
-    const diffUsd = toUsd(chain, swap.tokenOut, mine.amountOut - swap.amountOut);
+    const diffUsd = toUsd(chain, tokenOut, mine.amountOut - swap.amountOut);
     if (diffUsd == null) { s.noDecimals++; continue; }
     s.quotable++;
 
@@ -258,7 +281,7 @@ async function probeChain(chain) {
     } catch (e) { /* 確かめられなければ数えないだけ */ }
     if (trueOut == null) { s.verifyFailed++; continue; }
 
-    const trueDiffUsd = toUsd(chain, swap.tokenOut, trueOut - swap.amountOut);
+    const trueDiffUsd = toUsd(chain, tokenOut, trueOut - swap.amountOut);
     if (trueDiffUsd == null) { s.verifyFailed++; continue; }
     if (trueDiffUsd > 0) {
       s.verifiedWon++;
@@ -266,11 +289,11 @@ async function probeChain(chain) {
       // **齢と一緒に残す。** 「取り分」が値動きの残りかすなら、
       // 齢が0に近づくほど取り分も0に近づくはず。それを後で見る。
       s.verifiedWins.push({ ageSec, usd: trueDiffUsd,
-        sizeUsd: toUsd(chain, swap.tokenIn, swap.amountIn) });
+        sizeUsd: toUsd(chain, tokenIn, swap.amountIn) });
       if (s.verifiedWins.length > 500) s.verifiedWins.shift();
       if (trueDiffUsd > s.bestUsd) {
         s.bestUsd = trueDiffUsd;
-        s.best = { hash, label: mine.label, sizeUsd: toUsd(chain, swap.tokenIn, swap.amountIn),
+        s.best = { hash, label: mine.label, sizeUsd: toUsd(chain, tokenIn, swap.amountIn),
           modelUsd: diffUsd };
       }
     } else {
@@ -281,13 +304,19 @@ async function probeChain(chain) {
 
 /// 保存の形。**中身の意味を変えたら上げる**(古い形を読んで静かに壊れないように)。
 const STATE_NAME = "uniswapx-probe.json";
-/// **2 に上げた(2026年9月22日)。**
+/// **3 に上げた(2026年9月22日、2度目)。**
+///
+/// 版2の `missing`(経路なしの組の控え)には、**ゼロ住所のままの組**が入っている。
+/// 読み替えを入れた今、それは**永久に解決しない幽霊の組**として残り続け、
+/// 「経路なしの上位」を占めてしまう。読み戻さずに捨てる。
+///
+/// --- 版2にした理由(下は当時の記録) ---
 ///
 /// 版1までの数字は、**出力が複数ある注文で最大の1つしか見ていなかった**ため、
 /// 手数料の出力を「タダでもらえる」前提で計算されている = **利益が水増しされている**。
 /// 読み戻すと汚染が残るので、**版番号を上げて捨てる**。
 /// (これが版番号を持たせた理由そのもの。9勝$18.5477 は信用しない)
-const STATE_VERSION = 2;
+const STATE_VERSION = 3;
 
 /// 再デプロイで計測が消えないように読み戻す。
 /// (2026年9月22日:1日4回のデプロイで毎回ゼロに戻っていた)
@@ -351,7 +380,9 @@ export function formatUniswapXLine() {
       + `(V2で確認不可${s.hadV2} 確認失敗${s.verifyFailed})`
       // **出力が複数ある注文。** 直す前はここを見落として利益を水増ししていた。
       + (s.multiOut > 0 ? ` **出力複数${s.multiOut}件(見落としていた額 計$${s.ignoredOutUsd.toFixed(4)})**` : "")
-      + (s.otherTokenOut > 0 ? ` 別通貨の出力${s.otherTokenOut}件は除外` : ""));
+      + (s.otherTokenOut > 0 ? ` 別通貨の出力${s.otherTokenOut}件は除外` : "")
+      + (s.nativeSwapped > 0 ? ` ネイティブ${s.nativeSwapped}件を包んだ版に読替` : "")
+      + (s.nativeUnknown > 0 ? ` 読替不可${s.nativeUnknown}` : ""));
   }
   return parts.length > 0 ? ` UniswapX計測[${parts.join(" / ")}]` : "";
 }
