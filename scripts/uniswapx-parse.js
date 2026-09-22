@@ -40,6 +40,7 @@ export function extractSwap(order) {
   const outputs = Array.isArray(order?.outputs) ? order.outputs : [];
   if (!input?.token || outputs.length === 0) return null;
 
+  // **いちばん大きい出力を「ユーザーの取り分」とする。**
   let main = null;
   for (const o of outputs) {
     if (!o?.token) continue;
@@ -50,11 +51,41 @@ export function extractSwap(order) {
   const inAmount = pickAmount(input);
   if (main == null || inAmount == null || !(inAmount > 0n) || !(main.amount > 0n)) return null;
 
+  // **払う義務があるのは「いちばん大きい1つ」ではなく、出力の全部。**
+  //
+  // [なぜ直したか(2026年9月22日、オーナーの指摘で発覚)]
+  // UniswapX の注文は「ユーザーへの出力」に加えて**手数料の出力**を持つことがある。
+  // 約定させる側はその**全部**を届ける義務がある。
+  // 最大の1つだけを見ていると、残りを**タダでもらえる前提**になり、
+  // その分そのまま**我々の取り分が水増しされる**。
+  // $1,900 の注文で 0.25% の手数料出力を見落とせば $4.75 — 記録した最良の利益
+  // $3.40 より大きい。**これだけで幻を作れる。**
+  let owedOut = 0n;
+  let otherTokens = 0;
+  for (const o of outputs) {
+    if (!o?.token) continue;
+    const amt = pickAmount(o);
+    if (amt == null) continue;
+    if (String(o.token).toLowerCase() === main.token) owedOut += amt;
+    else otherTokens++;   // **別の通貨での出力は値段を付けられない**(下で捨てる)
+  }
+
   const tokenIn = String(input.token).toLowerCase();
   // 同じ通貨どうしは扱わない(ラップの出入りなど。裁定の対象ではない)。
   if (tokenIn === main.token) return null;
-  return { tokenIn, amountIn: inAmount, tokenOut: main.token, amountOut: main.amount };
+
+  return {
+    tokenIn, amountIn: inAmount, tokenOut: main.token,
+    // **比べる相手はこれ。** 全部の出力の合計。
+    amountOut: owedOut,
+    // 参考:いちばん大きい1つだけの額(水増しがどれだけあったかを測るため)
+    mainOnlyOut: main.amount,
+    outputCount: outputs.length,
+    // **別通貨の出力があるものは、正しく比べられない。** 呼ぶ側が捨てる。
+    otherTokenOutputs: otherTokens,
+  };
 }
+
 
 /// 約定した時刻を読む。**秒**で返す。読めなければ null。
 ///
