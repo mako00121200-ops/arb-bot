@@ -36,6 +36,7 @@ import { startOnchainFeeds, getSyncStats, isChainWsEnabled, isChainHealthy, setW
 import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
 import { runPoolSurvey } from "./scripts/pool-survey.js";
 import { runMainnetDepthSurvey } from "./scripts/mainnet-depth-survey.js";
+import { runWickBacktestAll, wickBacktestSymbols } from "./scripts/wick-backtest.js";
 import { startMainnetEdgeWatch, formatMainnetEdgeLine } from "./scripts/mainnet-edge-watch.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
@@ -2770,6 +2771,13 @@ async function main() {
   const mainnetSurvey = process.env.RUN_MAINNET_SURVEY;
   if (mainnetSurvey && mainnetSurvey !== "false") {
     try { await runMainnetDepthSurvey(); } catch (e) { console.error("[メインネット調査] 失敗:", e.message); }
+  }
+
+  // **「ロスカットの急落を買って戻ったら売る」を過去データで検証する**(オーナーの案)。
+  // Binance の無料の公開ダンプ(1分足)を読んで計算するだけ。**取引も送金もしない。**
+  // 裁定botには一切触れない。終わったら RUN_WICK_BACKTEST を空に戻すこと。
+  if (wickBacktestSymbols().length > 0) {
+    try { await runWickBacktestAll(); } catch (e) { console.error("[ヒゲ検証] 失敗:", e.message); }
   }
 
   // メインネットの**歪みの頻度**を数えるだけの見張り(送信しない・判定もしない)。
