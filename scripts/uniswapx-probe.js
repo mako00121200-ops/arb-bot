@@ -40,6 +40,7 @@ import { getTokenDecimals, getTokenPriceUsd, KIND_V3 } from "./pool-registry.js"
 import { getKnownTokens } from "./borrowable-tokens.js";
 import { quoteV3ByPoolBatch } from "./multicall-reserves.js";
 import { getAnyChainConfig } from "../chain-config.js";
+import { loadState, saveState } from "./state-file.js";
 
 /// UniswapX の公開API。**鍵は要らない**(注文の取得は誰でもできる)。
 const API_BASE = process.env.UNISWAPX_API_BASE || "https://api.uniswap.org/v2";
@@ -245,6 +246,36 @@ async function probeChain(chain) {
   }
 }
 
+/// 保存の形。**中身の意味を変えたら上げる**(古い形を読んで静かに壊れないように)。
+const STATE_NAME = "uniswapx-probe.json";
+const STATE_VERSION = 1;
+
+/// 再デプロイで計測が消えないように読み戻す。
+/// (2026年9月22日:1日4回のデプロイで毎回ゼロに戻っていた)
+function restore() {
+  const d = loadState(STATE_NAME, STATE_VERSION);
+  if (!d) return;
+  for (const h of d.seen || []) seenOrders.add(h);
+  for (const [chain, v] of Object.entries(d.stats || {})) {
+    const s = statFor(chain);
+    for (const k of Object.keys(s)) {
+      if (Array.isArray(s[k])) { if (Array.isArray(v[k])) s[k] = v[k].slice(-500); continue; }
+      if (typeof s[k] === "number" && Number.isFinite(Number(v[k]))) s[k] = Number(v[k]);
+      else if (v[k] != null && typeof s[k] !== "number") s[k] = v[k];
+    }
+  }
+  const n = [...stats.values()].reduce((a, v) => a + v.seen, 0);
+  if (n > 0) console.log(`[UniswapX計測] 前回までの ${n}件 を読み戻しました(記憶${seenOrders.size}件)`);
+}
+restore();
+
+function persist() {
+  saveState(STATE_NAME, STATE_VERSION, {
+    seen: [...seenOrders],
+    stats: Object.fromEntries([...stats].map(([c, v]) => [c, v])),
+  });
+}
+
 /// 全チェーンを測る。**注文は取るが、約定は一切しない。**
 export async function probeUniswapXOnce(activeChains) {
   for (const chain of PROBE_CHAINS) {
@@ -255,6 +286,7 @@ export async function probeUniswapXOnce(activeChains) {
       console.warn(`[UniswapX計測] ${chain}: 失敗 ${(e.message || "").slice(0, 60)}`);
     }
   }
+  persist(); // **1周ごとに保存。** 次のデプロイで消えないように
 }
 
 /// 生存ログ用の1行。まだ1件も見ていなければ空。
