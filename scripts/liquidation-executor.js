@@ -10,7 +10,7 @@
 // 裁定のプール地図は「同じペアに2つ以上のプールがあるペア」に絞られているので、
 // 担保→借金のプールが地図に無いことがある。そこで V3 のファクトリー(Uniswap / Pharaoh 等)と
 // V2 のファクトリー(LFJ V1)に「このペアのプールはあるか」を聞き、結果を覚えておく。
-// 中継(WAVAX / USDC / USDt / WETH.e / BTC.b)を挟む2段の経路も候補にする。
+// 中継(そのチェーンの基軸とステーブル。HUB_SYMBOLS 参照)を挟む2段の経路も候補にする。
 //
 // [順位づけと確認]
 // 候補の経路は、まず見積もり(V3 は裁定コントラクトの quoteV3、V2 は準備量の式)で並べ、
@@ -18,7 +18,6 @@
 // 見積もりは順位を決めるためだけに使う。
 
 import { ethers } from "ethers";
-import { AaveV3Avalanche } from "@aave-dao/aave-address-book";
 import { getChainConfig } from "../chain-config.js";
 import { callWithRpc, poolHasAmountOut } from "./onchain-reserves.js";
 import { getSigner, resetNonce } from "./execute-opportunity.js";
@@ -28,7 +27,7 @@ import { V3_FACTORIES } from "./v3-pools.js";
 import { gasUnitsToUsd, weiToUsd, getEstimatedGasPriceWei, recordActualGasPrice } from "./gas-cost.js";
 import { recordRealExecution } from "./real-execution-log.js";
 import { alertOwner } from "./owner-alert.js";
-import { CHAIN, DRY_RUN, MIN_PROFIT_USD, MAX_SLIPPAGE_BPS, getReserveInfo, noteSimulation } from "./liquidation-monitor.js";
+import { CHAIN, TAG, BOOK, DRY_RUN, MIN_PROFIT_USD, MAX_SLIPPAGE_BPS, getReserveInfo, noteSimulation } from "./liquidation-monitor.js";
 import { liquidatorAddressEnvVar } from "./liquidator-deploy.js";
 // お金に関わる行は、Railway の UTC ではなく**日本時間**で読めるようにする。
 import { nowJst } from "./jst.js";
@@ -47,16 +46,37 @@ const MIN_PROFIT_SHARE_BPS = BigInt(process.env.LIQUIDATION_MIN_PROFIT_SHARE_BPS
 const SIMULATE_TOP_N = parseInt(process.env.LIQUIDATION_SIMULATE_TOP_N || "3", 10);
 /// V3 のファクトリーに聞く手数料帯。
 const FEE_TIERS = [100, 500, 3000, 10000];
-/// V2 のファクトリー(住所:名前:手数料bps)。既定は LFJ(Trader Joe)V1。応答しなければ無視される。
-const V2_FACTORIES = (process.env.LIQUIDATION_V2_FACTORIES || "0x9Ad6C38BE94206cA50bb0d90783181662f0Cfa10:lfj-v1:30")
+/// V2 のファクトリー(住所:名前:手数料bps)。応答しなければ無視される。
+///
+/// **既定の LFJ(Trader Joe)V1 は avalanche の住所**なので、他のチェーンでは付けない。
+/// 他チェーンの住所をここに書くと、**存在しない契約に毎回問い合わせて枠を捨てる**。
+/// 必要なら `LIQUIDATION_V2_FACTORIES` で明示する。
+const V2_FACTORY_DEFAULTS = {
+  avalanche: "0x9Ad6C38BE94206cA50bb0d90783181662f0Cfa10:lfj-v1:30",
+};
+const V2_FACTORIES = (process.env.LIQUIDATION_V2_FACTORIES || V2_FACTORY_DEFAULTS[CHAIN] || "")
   .split(",").map((v) => v.trim()).filter(Boolean).map((v) => {
     const [address, dexId, fee] = v.split(":");
     if (!/^0x[0-9a-fA-F]{40}$/.test(address || "")) return null;
     return { address, dexId: dexId || "v2", feeBps: parseInt(fee || "30", 10) };
   }).filter(Boolean);
-/// 中継に使う通貨(address-book から)。
-const HUBS = ["WAVAX", "USDC", "USDt", "WETHe", "BTCb"]
-  .map((k) => AaveV3Avalanche.ASSETS[k]?.UNDERLYING).filter(Boolean).map((a) => a.toLowerCase());
+/// 中継に使う通貨(**住所は address-book から**。記号だけをここに書く)。
+///
+/// 記号はチェーンごとに違う(avalanche は WETHe / USDt、base は WETH / USDbC)。
+/// **無い記号は静かに落ちる**ので、address-book に実在する綴りを使うこと
+/// (2026年9月22日に各チェーンの一覧を実際に出して確かめた)。
+const HUB_SYMBOLS = {
+  avalanche: ["WAVAX", "USDC", "USDt", "WETHe", "BTCb"],
+  base:      ["WETH", "USDC", "cbBTC", "wstETH", "USDbC"],
+  optimism:  ["WETH", "USDC", "USDT", "WBTC", "USDCn"],
+  arbitrum:  ["WETH", "USDC", "USDT", "WBTC", "USDCn"],
+  polygon:   ["WPOL", "USDC", "USDT0", "WETH", "WBTC", "USDCn"],
+};
+const HUBS = (HUB_SYMBOLS[CHAIN] || [])
+  .map((k) => BOOK?.ASSETS?.[k]?.UNDERLYING).filter(Boolean).map((a) => a.toLowerCase());
+if (BOOK && HUBS.length === 0) {
+  console.warn(`[${TAG}] 中継通貨が1つも見つかりません(記号の綴り違い?)。経路探しが弱くなります`);
+}
 /// プールの探索結果を覚えておく時間。
 const POOL_CACHE_MS = 6 * 60 * 60 * 1000;
 
@@ -238,7 +258,7 @@ async function ensureOwner(address) {
   const raw = await callWithRpc(CHAIN, (p) => p.call({ to: address, data: LIQUIDATOR_IFACE.encodeFunctionData("owner", []) }), true);
   stats.ownerAddress = LIQUIDATOR_IFACE.decodeFunctionResult("owner", raw)[0];
   stats.ownerChecked = true;
-  console.log(`[清算AVAX/契約] ${address} の所有者 ${stats.ownerAddress}`);
+  console.log(`[${TAG}/契約] ${address} の所有者 ${stats.ownerAddress}`);
   return stats.ownerAddress;
 }
 
@@ -270,7 +290,7 @@ export async function handleLiquidationCandidate(plan) {
   if (!address) {
     if (!stats.noContract) {
       stats.noContract = true;
-      console.log(`[清算AVAX/契約] ${liquidatorAddressEnvVar(CHAIN)} が未設定です。候補はログに出すだけで、確認も送信もしません`);
+      console.log(`[${TAG}/契約] ${liquidatorAddressEnvVar(CHAIN)} が未設定です。候補はログに出すだけで、確認も送信もしません`);
     }
     return { summary: "契約なし" };
   }
@@ -286,12 +306,12 @@ export async function handleLiquidationCandidate(plan) {
   const routes = await buildRoutes(plan.collateralAsset, plan.debtAsset, seized);
   stats.routesFound += routes.length;
   if (routes.length === 0) {
-    console.log(`[清算AVAX/経路] ${short(plan.user)}: ${sym(plan.collateralAsset)}→${sym(plan.debtAsset)} を売る経路が見つかりません`);
+    console.log(`[${TAG}/経路] ${short(plan.user)}: ${sym(plan.collateralAsset)}→${sym(plan.debtAsset)} を売る経路が見つかりません`);
     return { summary: "経路なし" };
   }
   const withSlip = routes.map((r) => ({ ...r, slippageBps: seizedInDebt > 0n ? Number(((seizedInDebt - r.estimatedOut) * 10000n) / seizedInDebt) : null }));
   const okRoutes = withSlip.filter((r) => r.slippageBps == null || r.slippageBps <= MAX_SLIPPAGE_BPS);
-  console.log(`[清算AVAX/経路] ${short(plan.user)}: ${sym(plan.collateralAsset)}→${sym(plan.debtAsset)} 候補${routes.length}本(滑り${MAX_SLIPPAGE_BPS}bps以内${okRoutes.length}本): ` +
+  console.log(`[${TAG}/経路] ${short(plan.user)}: ${sym(plan.collateralAsset)}→${sym(plan.debtAsset)} 候補${routes.length}本(滑り${MAX_SLIPPAGE_BPS}bps以内${okRoutes.length}本): ` +
     withSlip.slice(0, 5).map((r) => `${r.label} 滑り${r.slippageBps == null ? "?" : r.slippageBps.toFixed(0)}bps`).join(" / "));
   if (okRoutes.length === 0) return { summary: "滑り超過" };
 
@@ -303,10 +323,10 @@ export async function handleLiquidationCandidate(plan) {
   let best = null;
   for (const r of okRoutes.slice(0, SIMULATE_TOP_N)) {
     const sim = await simulate(address, from, liq, r.legs);
-    if (sim.error) { console.log(`[清算AVAX/確認 ${nowJst()}] ${short(plan.user)} ${r.label}: 取り消し(${sim.error})`); continue; }
+    if (sim.error) { console.log(`[${TAG}/確認 ${nowJst()}] ${short(plan.user)} ${r.label}: 取り消し(${sim.error})`); continue; }
     const profitRaw = sim.returned - sim.owed;
     const profitUsd = (Number(profitRaw) / Math.pow(10, rd.decimals)) * (Number(rd.price) / 1e8);
-    console.log(`[清算AVAX/確認 ${nowJst()}] ${short(plan.user)} ${r.label}: 戻り${ethers.formatUnits(sim.returned, rd.decimals)} 返済${ethers.formatUnits(sim.owed, rd.decimals)} ${sym(plan.debtAsset)} → 返済後の利益$${profitUsd.toFixed(4)}`);
+    console.log(`[${TAG}/確認 ${nowJst()}] ${short(plan.user)} ${r.label}: 戻り${ethers.formatUnits(sim.returned, rd.decimals)} 返済${ethers.formatUnits(sim.owed, rd.decimals)} ${sym(plan.debtAsset)} → 返済後の利益$${profitUsd.toFixed(4)}`);
     if (!best || profitRaw > best.profitRaw) best = { route: r, sim, profitRaw, profitUsd };
   }
   if (!best) return { summary: "確認で全て取り消し" };
@@ -314,7 +334,7 @@ export async function handleLiquidationCandidate(plan) {
   const gasUsd = (await gasUnitsToUsd(CHAIN, GAS_UNITS)) ?? 0.03;
   const netUsd = best.profitUsd - gasUsd;
   const verdict = netUsd >= MIN_PROFIT_USD ? "送る" : `下限$${MIN_PROFIT_USD}未満`;
-  console.log(`[清算AVAX/判断 ${nowJst()}] ${short(plan.user)} ${best.route.label}: 利益$${best.profitUsd.toFixed(4)} − ガス$${gasUsd.toFixed(4)} = 純利$${netUsd.toFixed(4)} → ${verdict}${DRY_RUN ? "(DRY_RUN なので送りません)" : ""}`);
+  console.log(`[${TAG}/判断 ${nowJst()}] ${short(plan.user)} ${best.route.label}: 利益$${best.profitUsd.toFixed(4)} − ガス$${gasUsd.toFixed(4)} = 純利$${netUsd.toFixed(4)} → ${verdict}${DRY_RUN ? "(DRY_RUN なので送りません)" : ""}`);
   if (netUsd < MIN_PROFIT_USD) return { summary: `純利$${netUsd.toFixed(2)} 下限未満` };
   if (DRY_RUN) return { summary: `DRY_RUN 純利$${netUsd.toFixed(2)}` };
 
@@ -335,23 +355,23 @@ export async function handleLiquidationCandidate(plan) {
   const legs = best.route.legs.map(({ pool, tokenOut, flags, feeBps }) => ({ pool, tokenOut, flags, feeBps }));
   const startedAt = Date.now();
   stats.sends++;
-  console.log(`[清算AVAX/送信 ${nowJst()}] ${short(plan.user)} ${best.route.label}: 肩代わり$${plan.coverUsd.toFixed(2)} 最低利益${ethers.formatUnits(minProfit, rd.decimals)} ${sym(plan.debtAsset)} 送信します`);
+  console.log(`[${TAG}/送信 ${nowJst()}] ${short(plan.user)} ${best.route.label}: 肩代わり$${plan.coverUsd.toFixed(2)} 最低利益${ethers.formatUnits(minProfit, rd.decimals)} ${sym(plan.debtAsset)} 送信します`);
   let tx;
   try {
     tx = await contract.liquidate({ ...liq, minProfit }, legs, { gasLimit: GAS_LIMIT });
   } catch (e) {
     resetNonce(CHAIN);
     const msg = describeAaveRevert(e);
-    console.warn(`[清算AVAX/送信] 送れませんでした: ${msg}`);
+    console.warn(`[${TAG}/送信] 送れませんでした: ${msg}`);
     return { summary: `送信失敗: ${msg.slice(0, 40)}`, sent: false };
   }
-  console.log(`[清算AVAX/送信] ${tx.hash}`);
+  console.log(`[${TAG}/送信] ${tx.hash}`);
   let receipt;
   try {
     receipt = await tx.wait();
   } catch (e) {
     resetNonce(CHAIN);
-    console.warn(`[清算AVAX/送信] 確定待ちで失敗(取り消された可能性): ${(e.message || "").slice(0, 120)}`);
+    console.warn(`[${TAG}/送信] 確定待ちで失敗(取り消された可能性): ${(e.message || "").slice(0, 120)}`);
     return { summary: "確定で取り消し", sent: true, ok: false };
   }
   let profitTokens = null, seizedTokens = null, coveredTokens = null;
@@ -371,7 +391,7 @@ export async function handleLiquidationCandidate(plan) {
   try { actualGasCostUsd = await weiToUsd(CHAIN, receipt.gasUsed * receipt.gasPrice); } catch (e) {}
   const actualNetProfitUsd = actualProfitUsd != null && actualGasCostUsd != null ? actualProfitUsd - actualGasCostUsd : null;
   try { recordActualGasPrice(CHAIN, estimatedGasPriceWei, receipt.gasPrice); } catch (e) {}
-  console.log(`[清算AVAX/確定 ${nowJst()}] ブロック${receipt.blockNumber} ガス${receipt.gasUsed} 肩代わり${coveredTokens ?? "?"} ${sym(plan.debtAsset)} 受取${seizedTokens ?? "?"} ${sym(plan.collateralAsset)} 粗利+$${(actualProfitUsd ?? 0).toFixed(4)} − ガス$${(actualGasCostUsd ?? 0).toFixed(4)} = 純利益+$${(actualNetProfitUsd ?? 0).toFixed(4)}(${Date.now() - startedAt}ms)`);
+  console.log(`[${TAG}/確定 ${nowJst()}] ブロック${receipt.blockNumber} ガス${receipt.gasUsed} 肩代わり${coveredTokens ?? "?"} ${sym(plan.debtAsset)} 受取${seizedTokens ?? "?"} ${sym(plan.collateralAsset)} 粗利+$${(actualProfitUsd ?? 0).toFixed(4)} − ガス$${(actualGasCostUsd ?? 0).toFixed(4)} = 純利益+$${(actualNetProfitUsd ?? 0).toFixed(4)}(${Date.now() - startedAt}ms)`);
   recordRealExecution({
     timestamp: new Date().toISOString(),
     pairLabel: `liquidation ${CHAIN} ${sym(plan.collateralAsset)}→${sym(plan.debtAsset)} ${short(plan.user)}`,
@@ -388,12 +408,12 @@ export async function handleLiquidationCandidate(plan) {
 }
 
 /// 起動時の自己点検(読み取りのみ)。候補が出るまで実行の道筋が一度も通らないので、
-/// コントラクトの住所・所有者・Pool と、典型的な組(WAVAX→USDC)の経路探しをここで確かめる。
+/// コントラクトの住所・所有者・Pool と、典型的な組(基軸→USDC)の経路探しをここで確かめる。
 /// 失敗しても起動は止めない。
 export async function selfCheckLiquidationExecutor() {
   const address = contractAddress();
   if (!address) {
-    console.log(`[清算AVAX/契約] ${liquidatorAddressEnvVar(CHAIN)} が未設定です。候補はログに出すだけで、確認も送信もしません`);
+    console.log(`[${TAG}/契約] ${liquidatorAddressEnvVar(CHAIN)} が未設定です。候補はログに出すだけで、確認も送信もしません`);
     stats.noContract = true;
     return;
   }
@@ -403,22 +423,26 @@ export async function selfCheckLiquidationExecutor() {
     const pool = LIQUIDATOR_IFACE.decodeFunctionResult("POOL", raw)[0];
     const wallet = process.env.MAINNET_BOT_PRIVATE_KEY ? new ethers.Wallet(process.env.MAINNET_BOT_PRIVATE_KEY).address : null;
     const ownerOk = wallet ? owner.toLowerCase() === wallet.toLowerCase() : null;
-    console.log(`[清算AVAX/契約] Pool ${pool} / 所有者は bot のウォレット${ownerOk === null ? "(鍵が無いので未確認)" : ownerOk ? "と一致" : "と**不一致**(送信は全て拒否されます)"}`);
+    console.log(`[${TAG}/契約] Pool ${pool} / 所有者は bot のウォレット${ownerOk === null ? "(鍵が無いので未確認)" : ownerOk ? "と一致" : "と**不一致**(送信は全て拒否されます)"}`);
   } catch (e) {
-    console.warn(`[清算AVAX/契約] ${address} を読めません: ${(e.message || "").slice(0, 100)}`);
+    console.warn(`[${TAG}/契約] ${address} を読めません: ${(e.message || "").slice(0, 100)}`);
     return;
   }
-  // 典型的な組で経路探しを通す。清算する額の想定は $500 ぶんの WAVAX。
+  // 典型的な組で経路探しを通す。清算する額の想定は $500 ぶんの基軸通貨。
   try {
-    const wavax = AaveV3Avalanche.ASSETS.WAVAX.UNDERLYING, usdc = AaveV3Avalanche.ASSETS.USDC.UNDERLYING;
-    const rc = getReserveInfo(wavax);
-    if (!rc || rc.price === 0n) { console.log("[清算AVAX/自己点検] WAVAX の価格がまだ無いので経路の点検は省きます"); return; }
+    // そのチェーンの「包んだ基軸」と USDC で点検する(記号はチェーンごとに違う)。
+    const nativeSym = (HUB_SYMBOLS[CHAIN] || [])[0];
+    const native = BOOK?.ASSETS?.[nativeSym]?.UNDERLYING;
+    const usdc = BOOK?.ASSETS?.USDC?.UNDERLYING;
+    if (!native || !usdc) { console.log(`[${TAG}/自己点検] ${nativeSym || "?"}/USDC が住所帳に無いので省きます`); return; }
+    const rc = getReserveInfo(native);
+    if (!rc || rc.price === 0n) { console.log(`[${TAG}/自己点検] ${nativeSym} の価格がまだ無いので経路の点検は省きます`); return; }
     const seized = (500n * 10n ** 8n * 10n ** BigInt(rc.decimals)) / rc.price;
-    const routes = await buildRoutes(wavax, usdc, seized);
+    const routes = await buildRoutes(native, usdc, seized);
     const line = routes.slice(0, 4).map((r) => `${r.label} → ${ethers.formatUnits(r.estimatedOut, 6)} USDC`).join(" / ");
-    console.log(`[清算AVAX/自己点検] WAVAX $500ぶん → USDC の経路 ${routes.length}本${routes.length ? `: ${line}` : "(**見つからず**。ファクトリーの住所か地図を確かめること)"}`);
+    console.log(`[${TAG}/自己点検] ${nativeSym} $500ぶん → USDC の経路 ${routes.length}本${routes.length ? `: ${line}` : "(**見つからず**。ファクトリーの住所か地図を確かめること)"}`);
   } catch (e) {
-    console.warn(`[清算AVAX/自己点検] 経路探しに失敗: ${(e.message || "").slice(0, 120)}`);
+    console.warn(`[${TAG}/自己点検] 経路探しに失敗: ${(e.message || "").slice(0, 120)}`);
   }
 }
 

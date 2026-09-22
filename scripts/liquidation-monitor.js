@@ -1,10 +1,13 @@
 // scripts/liquidation-monitor.js
 //
-// Avalanche の Aave V3 を見張り、清算できる借り手を見つける(第2段の本体)。
+// **1つのチェーン**の Aave V3 を見張り、清算できる借り手を見つける(第2段の本体)。
+// どのチェーンを見るかは `LIQUIDATION_CHAIN`(既定 avalanche)。下の「対象のチェーン」を読むこと。
 //
 // [役割の分担]
-//   scripts/aave-liquidation.js … 5チェーンの**計測**(読み取りのみ。avalanche はこちらへ移した)
-//   このファイル               … avalanche の**見張りと判断**。送信は LIQUIDATION_DRY_RUN=false の時だけ
+//   scripts/aave-liquidation.js … 5チェーンの**計測**(読み取りのみ。10分ごとの巡回)
+//   このファイル               … **1チェーンだけ**の見張りと判断。価格更新に即反応する。
+//                                 送信は LIQUIDATION_DRY_RUN=false の時だけ
+//   (index.js は、ここで見ているチェーンを計測側の対象から外す)
 //
 // [仕組み]
 //   ① 名簿: 起動時に過去60日の Borrow から借り手を集める(裏で少しずつ遡る)。
@@ -26,18 +29,48 @@
 import { ethers } from "ethers";
 import fs from "fs";
 import path from "path";
-import { AaveV3Avalanche } from "@aave-dao/aave-address-book";
+import {
+  AaveV3Avalanche, AaveV3Base, AaveV3Optimism, AaveV3Arbitrum, AaveV3Polygon,
+} from "@aave-dao/aave-address-book";
 import { callWithRpc } from "./onchain-reserves.js";
 import { MULTICALL3_ADDRESS } from "./multicall-reserves.js";
 // お金に関わる行は、Railway の UTC ではなく**日本時間**で読めるようにする。
 import { nowJst } from "./jst.js";
 
-// ===== 対象(Avalanche のみ)=====
-export const CHAIN = "avalanche";
-/// Pool の住所は address-book から取る(思い込みで書かない)。起動時に応答を確かめる。
-const POOL_ADDRESS = AaveV3Avalanche.POOL;
-const ORACLE_ADDRESS = AaveV3Avalanche.ORACLE;
-const DATA_PROVIDER_ADDRESS = AaveV3Avalanche.AAVE_PROTOCOL_DATA_PROVIDER;
+// ===== 対象のチェーン =====
+//
+// [なぜ切り替えにしたか(2026年9月22日、オーナーの指示)]
+// この見張り役の値打ちは「**Chainlink の価格更新を受けて即座に測り直す**」こと。
+// 10分巡回では、価格が閾値を割った瞬間に起きる清算に間に合わない。
+// ところがこの速い見張りは avalanche にしか無く、**avalanche には獲物がいない**
+// (丸一日 `候補0`)。95日の実測では $1,000超の清算は
+//   base 101回(1.06回/日、清算者66人・首位20%)/ arbitrum 12回 / polygon 39回 / optimism 12回
+// **機械は avalanche にあり、獲物は base にいた。** そこで向き先を選べるようにした。
+//
+// **同時に2チェーンは見られない。** このファイルは名簿・要注意・統計を
+// モジュール直下に1組だけ持つ作りなので、作り替えずに動かすには「切り替え」しかない。
+export const CHAIN = (process.env.LIQUIDATION_CHAIN || "avalanche").trim().toLowerCase();
+
+/// チェーンごとの住所帳。**思い込みで住所を書かない**(全て address-book から取る)。
+const BOOKS = {
+  avalanche: AaveV3Avalanche, base: AaveV3Base,
+  optimism: AaveV3Optimism, arbitrum: AaveV3Arbitrum, polygon: AaveV3Polygon,
+};
+/// 知らないチェーン名を渡された時に**黙って avalanche を見に行かない**。
+/// (向き先を間違えたまま「候補0」と報告するのが、いちばん質の悪い壊れ方)
+export const BOOK = BOOKS[CHAIN] || null;
+if (!BOOK) {
+  console.error(`[清算] LIQUIDATION_CHAIN="${CHAIN}" は知らないチェーンです`
+    + `(使えるのは ${Object.keys(BOOKS).join(" / ")})。清算の見張りは動きません`);
+}
+
+/// 生存ログとログの見出し。**チェーン名を必ず入れる。**
+/// base を見ているのに「清算AVAX」と出ていたら、後で自分の数字を読み違える。
+export const TAG = `清算${CHAIN === "avalanche" ? "AVAX" : CHAIN.toUpperCase()}`;
+
+const POOL_ADDRESS = BOOK ? BOOK.POOL : "";
+const ORACLE_ADDRESS = BOOK ? BOOK.ORACLE : "";
+const DATA_PROVIDER_ADDRESS = BOOK ? BOOK.AAVE_PROTOCOL_DATA_PROVIDER : "";
 
 // ===== 設定(環境変数。一覧は docs/HANDOVER.md)=====
 const ENABLED = process.env.LIQUIDATION_ENABLED !== "false";
@@ -76,8 +109,10 @@ const MAX_SWEEP_CALLS = parseInt(process.env.LIQUIDATION_MAX_SWEEP_CALLS || "80"
 const MAX_ROSTER = parseInt(process.env.LIQUIDATION_MAX_ROSTER || "12000", 10);
 /// 要注意の内訳(担保・借金)を一度に読む人数の上限。
 const MAX_BREAKDOWN_USERS = parseInt(process.env.LIQUIDATION_MAX_BREAKDOWN_USERS || "60", 10);
-/// WebSocket の URL。裁定と同じ端点を既定にする(別接続)。
-const WSS_URL = process.env.LIQUIDATION_WSS_URL || process.env.AVALANCHE_WSS_URL || "";
+/// WebSocket の接続先。裁定とは別の接続。`LIQUIDATION_WSS_URL` が無ければ**そのチェーンのもの**を使う。
+/// (URL 自体は環境変数にしかない。リポジトリには絶対に書かない)
+const WSS_URL = process.env.LIQUIDATION_WSS_URL
+  || process.env[`${CHAIN.toUpperCase()}_WSS_URL`] || "";
 
 // ===== Aave の定数(v3.3 の LiquidationLogic より)=====
 const LIQUIDATABLE_HF = 10n ** 18n;
@@ -130,14 +165,14 @@ const POOL_TOPICS = [TOPIC_BORROW, TOPIC_SUPPLY, TOPIC_REPAY, TOPIC_WITHDRAW, TO
 const TOPIC_BORROW_CONFIRMED = "0xb3d084820fb1a9decffb176436bd02558d15fac9b0ddfed8c465bc7359d7dce0";
 const TOPIC_LIQUIDATION_CONFIRMED = "0xe413a321e8681d831f4dbccbca790d2952b56f977908e45be37335533e005286";
 if (TOPIC_BORROW !== TOPIC_BORROW_CONFIRMED || TOPIC_LIQUIDATION !== TOPIC_LIQUIDATION_CONFIRMED) {
-  console.error("[清算AVAX] 致命的: イベント識別子が確認済みの値と一致しません");
+  console.error(`[${TAG}] 致命的: イベント識別子が確認済みの値と一致しません`);
 }
 
 // ===== 保存 =====
 const STATE_FILE = process.env.LIQUIDATION_STATE_FILE
   || (process.env.POOL_MAP_FILE
-      ? path.join(path.dirname(process.env.POOL_MAP_FILE), "liquidation-avalanche.json")
-      : "/tmp/liquidation-avalanche.json");
+      ? path.join(path.dirname(process.env.POOL_MAP_FILE), `liquidation-${CHAIN}.json`)
+      : `/tmp/liquidation-${CHAIN}.json`);
 const STATE_VERSION = 1;
 
 /// 名簿: 住所(小文字) -> { seenBlock: 最後に見たブロック }
@@ -155,9 +190,9 @@ function loadState() {
     for (const [u, v] of Object.entries(raw.roster || {})) roster.set(u, { seenBlock: v.seenBlock || 0 });
     Object.assign(backfill, raw.backfill || {});
     liveBlock = raw.liveBlock || 0;
-    console.log(`[清算AVAX] 保存から復元: 名簿${roster.size}人 遡り${backfill.done ? "完了" : `途中(${backfill.cursor})`} 追いつき${liveBlock}`);
+    console.log(`[${TAG}] 保存から復元: 名簿${roster.size}人 遡り${backfill.done ? "完了" : `途中(${backfill.cursor})`} 追いつき${liveBlock}`);
   } catch (e) {
-    console.warn(`[清算AVAX] 保存の読み込みに失敗: ${(e.message || "").slice(0, 80)}`);
+    console.warn(`[${TAG}] 保存の読み込みに失敗: ${(e.message || "").slice(0, 80)}`);
   }
 }
 
@@ -167,7 +202,7 @@ function saveState() {
     for (const [u, v] of roster) out.roster[u] = v;
     fs.writeFileSync(STATE_FILE, JSON.stringify(out));
   } catch (e) {
-    console.warn(`[清算AVAX] 保存に失敗: ${(e.message || "").slice(0, 80)}`);
+    console.warn(`[${TAG}] 保存に失敗: ${(e.message || "").slice(0, 80)}`);
   }
 }
 
@@ -301,7 +336,7 @@ async function loadReserves() {
   }
   await refreshPrices(reserveList);
   const line = reserveList.map((a) => { const r = reserves.get(a); return `${r.symbol}(ボーナス${(r.bonusBps / 100).toFixed(1)}% $${baseToUsd(r.price).toFixed(2)})`; }).join(" ");
-  console.log(`[清算AVAX/資産] ${reserveList.length}種: ${line}`);
+  console.log(`[${TAG}/資産] ${reserveList.length}種: ${line}`);
 }
 
 /// Aave 自身のオラクルから価格を読み直す(清算の判定に使われているのと同じ価格)。
@@ -373,7 +408,7 @@ async function resolveFeeds() {
   stats.feedsResolved = sources.filter((s) => (first.get(s) || []).length > 0).length;
   stats.feedsUnresolved = sources.length - stats.feedsResolved;
   const unresolved = sources.filter((s) => (first.get(s) || []).length === 0).map((s) => `${assetsOf(s).map(sym).join("/")}=${short(s)}`);
-  console.log(`[清算AVAX/価格] 出どころ${sources.length}件 → 購読する住所${feedToAssets.size}件(本体まで辿れた${stats.feedsResolved}件${unresolved.length ? ` / 辿れず(出どころのまま購読): ${unresolved.join(" ")}` : ""})`);
+  console.log(`[${TAG}/価格] 出どころ${sources.length}件 → 購読する住所${feedToAssets.size}件(本体まで辿れた${stats.feedsResolved}件${unresolved.length ? ` / 辿れず(出どころのまま購読): ${unresolved.join(" ")}` : ""})`);
 }
 
 // ===== 名簿 =====
@@ -419,7 +454,7 @@ async function initBackfill() {
   backfill.cursor = latest;
   backfill.latestAtStart = latest;
   backfill.done = false;
-  console.log(`[清算AVAX/名簿] ${ROSTER_DAYS}日ぶんの Borrow を遡ります: ${backfill.targetFrom}〜${latest}(約${perDay.toLocaleString()}ブロック/日)`);
+  console.log(`[${TAG}/名簿] ${ROSTER_DAYS}日ぶんの Borrow を遡ります: ${backfill.targetFrom}〜${latest}(約${perDay.toLocaleString()}ブロック/日)`);
 }
 
 /// 裏で少しずつ遡る(新しい方から)。1回に BACKFILL_CHUNKS_PER_TICK 回まで。
@@ -443,7 +478,7 @@ async function backfillTick() {
     }
     if (added > 0) trimRoster();
     if (backfill.done) {
-      console.log(`[清算AVAX/名簿] 遡りが完了しました: 名簿${roster.size}人`);
+      console.log(`[${TAG}/名簿] 遡りが完了しました: 名簿${roster.size}人`);
       saveState();
     }
   } finally {
@@ -500,7 +535,7 @@ function handlePoolLog(log, fromWs) {
     const c = candidates.get(u);
     if (c && !c.doneByUs) {
       stats.takenByOthers++;
-      console.log(`[清算AVAX/他者 ${nowJst()}] ${short(u)} を ${short(liquidator)} が清算しました(うちが候補にしてから${Math.round((Date.now() - c.firstAt) / 1000)}秒)`);
+      console.log(`[${TAG}/他者 ${nowJst()}] ${short(u)} を ${short(liquidator)} が清算しました(うちが候補にしてから${Math.round((Date.now() - c.firstAt) / 1000)}秒)`);
       candidates.delete(u);
     }
   }
@@ -522,7 +557,7 @@ function handlePriceLog(log) {
     if (hit) { recheckQueue.add(u); n++; }
   }
   stats.priceRechecks += n;
-  if (n > 0) console.log(`[清算AVAX/価格] ${touched.map(sym).join("/")} が更新 → 要注意${n}人を測り直します`);
+  if (n > 0) console.log(`[${TAG}/価格] ${touched.map(sym).join("/")} が更新 → 要注意${n}人を測り直します`);
   if (n > 0) processRecheckQueue().catch(() => {});
 }
 
@@ -537,7 +572,7 @@ const WS_PING_ID = 9199;
 
 function connectWs() {
   if (!WSS_URL) {
-    console.log("[清算AVAX] AVALANCHE_WSS_URL が未設定のため、イベントは5分ごとの getLogs だけで追います");
+    console.log(`[${TAG}] ${CHAIN.toUpperCase()}_WSS_URL が未設定のため、イベントは5分ごとの getLogs だけで追います`);
     return;
   }
   try {
@@ -570,9 +605,9 @@ function connectWs() {
       const msg = JSON.parse(event.data);
       if (msg.id !== undefined) {
         if ((msg.id === WS_SUB_POOL_ID || msg.id === WS_SUB_FEEDS_ID) && msg.error) {
-          console.warn(`[清算AVAX] 購読が拒否されました(${msg.id === WS_SUB_POOL_ID ? "Pool" : "価格"}): ${JSON.stringify(msg.error).slice(0, 120)}`);
+          console.warn(`[${TAG}] 購読が拒否されました(${msg.id === WS_SUB_POOL_ID ? "Pool" : "価格"}): ${JSON.stringify(msg.error).slice(0, 120)}`);
         } else if (msg.id === WS_SUB_POOL_ID || msg.id === WS_SUB_FEEDS_ID) {
-          console.log(`[清算AVAX] ${msg.id === WS_SUB_POOL_ID ? "Pool のイベント" : `価格フィード${feedToAssets.size}件`}の購読を始めました`);
+          console.log(`[${TAG}] ${msg.id === WS_SUB_POOL_ID ? "Pool のイベント" : `価格フィード${feedToAssets.size}件`}の購読を始めました`);
           wsBackoffMs = 1000;
         }
         return;
@@ -594,7 +629,7 @@ function scheduleWsReconnect(why) {
   stats.wsReconnects++;
   const wait = wsBackoffMs;
   wsBackoffMs = Math.min(60 * 1000, wsBackoffMs * 2);
-  console.log(`[清算AVAX] WebSocket ${why}。${Math.round(wait / 1000)}秒後に繋ぎ直します`);
+  console.log(`[${TAG}] WebSocket ${why}。${Math.round(wait / 1000)}秒後に繋ぎ直します`);
   setTimeout(connectWs, wait);
 }
 
@@ -648,13 +683,13 @@ async function applyHealth(map) {
       const c = candidates.get(u);
       if (!c.doneByUs) {
         stats.recovered++;
-        console.log(`[清算AVAX/回復 ${nowJst()}] ${short(u)}: HF ${hfToNumber(h.hf).toFixed(4)} に戻りました(候補にしてから${Math.round((Date.now() - c.firstAt) / 1000)}秒。借金$${h.debtUsd.toFixed(2)})`);
+        console.log(`[${TAG}/回復 ${nowJst()}] ${short(u)}: HF ${hfToNumber(h.hf).toFixed(4)} に戻りました(候補にしてから${Math.round((Date.now() - c.firstAt) / 1000)}秒。借金$${h.debtUsd.toFixed(2)})`);
       }
       candidates.delete(u);
     }
   }
   if (newlyWatched.length > 0) {
-    console.log(`[清算AVAX/要注意] ${newlyWatched.length}人が HF<${ethers.formatUnits(WATCH_HF, 18)} に入りました(要注意 計${watch.size}人)`);
+    console.log(`[${TAG}/要注意] ${newlyWatched.length}人が HF<${ethers.formatUnits(WATCH_HF, 18)} に入りました(要注意 計${watch.size}人)`);
     await loadBreakdown(newlyWatched.slice(0, MAX_BREAKDOWN_USERS));
   }
   for (const u of liquidatable) {
@@ -779,7 +814,7 @@ async function handleLiquidatable(u) {
   if (plan.error) {
     if (!c.loggedError) {
       c.loggedError = true;
-      console.log(`[清算AVAX/候補 ${nowJst()}] ${short(u)} HF ${hfToNumber(h.hf).toFixed(4)} 借金$${h.debtUsd.toFixed(2)} 担保$${h.collateralUsd.toFixed(2)} → 組めません: ${plan.error}`);
+      console.log(`[${TAG}/候補 ${nowJst()}] ${short(u)} HF ${hfToNumber(h.hf).toFixed(4)} 借金$${h.debtUsd.toFixed(2)} 担保$${h.collateralUsd.toFixed(2)} → 組めません: ${plan.error}`);
     }
     return;
   }
@@ -788,7 +823,7 @@ async function handleLiquidatable(u) {
     recentCandidates.unshift({ at: new Date().toISOString(), user: u, hf: plan.hf, debtUsd: h.debtUsd, coverUsd: plan.coverUsd, grossUsd: plan.grossUsd, pair: `${sym(plan.collateralAsset)}→${sym(plan.debtAsset)}`, result: DRY_RUN ? "DRY_RUN" : "" });
     if (recentCandidates.length > 30) recentCandidates.pop();
     console.log(
-      `[清算AVAX/候補 ${nowJst()}] ${short(u)} HF ${plan.hf.toFixed(4)} 借金$${h.debtUsd.toFixed(2)} 担保$${h.collateralUsd.toFixed(2)} ` +
+      `[${TAG}/候補 ${nowJst()}] ${short(u)} HF ${plan.hf.toFixed(4)} 借金$${h.debtUsd.toFixed(2)} 担保$${h.collateralUsd.toFixed(2)} ` +
       `→ 借金${sym(plan.debtAsset)}$${plan.debtUsd.toFixed(2)} / 担保${sym(plan.collateralAsset)}$${plan.collateralUsd.toFixed(2)} / ` +
       `肩代わり$${plan.coverUsd.toFixed(2)}(${plan.why}) ボーナス${(plan.bonusBps / 100).toFixed(1)}%(うちプロトコル${(plan.protocolFeeBps / 100).toFixed(0)}%) ` +
       `見込み粗利$${plan.grossUsd.toFixed(2)}(担保の売却とガス代は未計算)`
@@ -808,7 +843,7 @@ async function handleLiquidatable(u) {
       if (rec && result?.summary) rec.result = result.summary;
     } catch (e) {
       c.lastResult = { error: (e.message || "").slice(0, 120) };
-      console.warn(`[清算AVAX/候補] ${short(u)}: 処理に失敗: ${(e.message || "").slice(0, 120)}`);
+      console.warn(`[${TAG}/候補] ${short(u)}: 処理に失敗: ${(e.message || "").slice(0, 120)}`);
     }
   }
 }
@@ -879,21 +914,23 @@ async function processRecheckQueue() {
 
 /// index.js から呼ぶ。失敗しても例外を外に出さない(裁定を止めない)。
 export async function startLiquidationMonitor(activeChains) {
-  if (!ENABLED) { console.log("[清算AVAX] LIQUIDATION_ENABLED=false のため動かしません"); return false; }
-  if (!activeChains.includes(CHAIN)) { console.log(`[清算AVAX] ${CHAIN} が稼働チェーンに無いため動かしません`); return false; }
+  if (!ENABLED) { console.log(`[${TAG}] LIQUIDATION_ENABLED=false のため動かしません`); return false; }
+  if (!activeChains.includes(CHAIN)) { console.log(`[${TAG}] ${CHAIN} が稼働チェーンに無いため動かしません`); return false; }
   stats.enabled = true;
   try {
     await verifyPool();
     stats.verified = true;
-    console.log(`[清算AVAX] Aave V3 Pool ${POOL_ADDRESS} に応答を確認しました(DRY_RUN=${DRY_RUN} 最低利益$${MIN_PROFIT_USD} 上限$${MAX_DEBT_USD})`);
+    console.log(`[${TAG}] **${CHAIN}** の Aave V3 Pool ${POOL_ADDRESS} に応答を確認しました`
+      + `(DRY_RUN=${DRY_RUN} 最低利益$${MIN_PROFIT_USD} 上限$${MAX_DEBT_USD}`
+      + ` WS=${WSS_URL ? "あり" : "**なし**(5分ごとの getLogs だけ)"})`);
   } catch (e) {
-    console.warn(`[清算AVAX] Pool ${POOL_ADDRESS} が応答しません(${(e.message || "").slice(0, 80)})。見張りません`);
+    console.warn(`[${TAG}] Pool ${POOL_ADDRESS} が応答しません(${(e.message || "").slice(0, 80)})。見張りません`);
     return false;
   }
   loadState();
-  try { await loadReserves(); } catch (e) { console.warn(`[清算AVAX] 資産の情報を読めませんでした: ${(e.message || "").slice(0, 100)}`); }
-  try { await resolveFeeds(); } catch (e) { console.warn(`[清算AVAX] 価格フィードを辿れませんでした: ${(e.message || "").slice(0, 100)}`); }
-  try { await initBackfill(); } catch (e) { console.warn(`[清算AVAX] 名簿の遡りを始められませんでした: ${(e.message || "").slice(0, 100)}`); }
+  try { await loadReserves(); } catch (e) { console.warn(`[${TAG}] 資産の情報を読めませんでした: ${(e.message || "").slice(0, 100)}`); }
+  try { await resolveFeeds(); } catch (e) { console.warn(`[${TAG}] 価格フィードを辿れませんでした: ${(e.message || "").slice(0, 100)}`); }
+  try { await initBackfill(); } catch (e) { console.warn(`[${TAG}] 名簿の遡りを始められませんでした: ${(e.message || "").slice(0, 100)}`); }
   connectWs();
   setInterval(() => { backfillTick().catch((e) => { stats.errors++; stats.lastError = `遡り: ${(e.message || "").slice(0, 60)}`; }); }, BACKFILL_INTERVAL_MS);
   setInterval(() => { sweep().catch(() => {}); }, SWEEP_INTERVAL_MS);
@@ -901,7 +938,7 @@ export async function startLiquidationMonitor(activeChains) {
   // 最初の全員測定は、名簿が少し貯まってから。
   setTimeout(() => { sweep().catch(() => {}); }, 45 * 1000);
   setInterval(saveState, 10 * 60 * 1000);
-  console.log(`[清算AVAX] 見張りを始めます(全員${SWEEP_INTERVAL_MS / 60000}分ごと、要注意${WATCH_INTERVAL_MS / 1000}秒ごと、名簿は${ROSTER_DAYS}日ぶん)`);
+  console.log(`[${TAG}] 見張りを始めます(全員${SWEEP_INTERVAL_MS / 60000}分ごと、要注意${WATCH_INTERVAL_MS / 1000}秒ごと、名簿は${ROSTER_DAYS}日ぶん)`);
   return true;
 }
 
@@ -910,9 +947,9 @@ export async function startLiquidationMonitor(activeChains) {
 /// 生存ログ用の1項目。
 export function formatLiquidationLine() {
   if (!stats.enabled) return "";
-  if (!stats.verified) return " 清算AVAX[応答なし]";
+  if (!stats.verified) return ` ${TAG}[応答なし]`;
   const ws = WSS_URL ? (stats.wsConnected ? "接続" : "切断") : "WSなし";
-  return ` 清算AVAX[名簿${roster.size.toLocaleString()}(遡り${backfillProgressPct()}%${backfill.done ? "" : ` 幅${chunkBlocks.toLocaleString()}`}) 要注意${watch.size} 候補${stats.found} 他者${stats.takenByOthers} 回復${stats.recovered} 価格更新${stats.priceEvents}(即${stats.priceRechecks}) Pool受信${stats.poolEvents} WS${ws}${stats.simulated ? ` 確認${stats.simulated}` : ""}${stats.sent ? ` 送信${stats.sent}/${stats.sentOk}` : ""} RPC${stats.rpcCalls}${stats.errors ? ` 失敗${stats.errors}` : ""}]`;
+  return ` ${TAG}[名簿${roster.size.toLocaleString()}(遡り${backfillProgressPct()}%${backfill.done ? "" : ` 幅${chunkBlocks.toLocaleString()}`}) 要注意${watch.size} 候補${stats.found} 他者${stats.takenByOthers} 回復${stats.recovered} 価格更新${stats.priceEvents}(即${stats.priceRechecks}) Pool受信${stats.poolEvents} WS${ws}${stats.simulated ? ` 確認${stats.simulated}` : ""}${stats.sent ? ` 送信${stats.sent}/${stats.sentOk}` : ""} RPC${stats.rpcCalls}${stats.errors ? ` 失敗${stats.errors}` : ""}]`;
 }
 
 /// 画面用。
