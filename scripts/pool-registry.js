@@ -45,6 +45,10 @@ export function registerPool({
   // 保存済みの地図から戻した準備量は古い。0を渡すと「読み直しが必要」と
   // 判定されるので、復元時だけ明示的に0を渡す。
   updatedAt = Date.now(),
+  // 出どころ。"curated" = 手書きの名簿・ファクトリー由来、"scout" = 取引イベントからの自動発見。
+  // **自動で外してよいのは "scout" だけ**(下の evictQuietScoutPools)。
+  // 手書き由来には「動きが遅いが相手側として価値がある」プールが含まれる(HANDOVER)。
+  source = "curated",
 }) {
   const key = poolKey(chain, address);
   const existing = pools.get(key);
@@ -59,6 +63,12 @@ export function registerPool({
     feeProbed: kind === KIND_V3 ? true : (existing?.feeProbed || feeProbed),
     updatedAt,
     lastMovePct: existing?.lastMovePct ?? 0,
+    // 一度付いた出どころは、再登録(探索の再発見など)で上書きしない。
+    source: existing?.source ?? source,
+    // **イベントが最後に届いた時刻。** updatedAt は60秒の定期読み直しでも進むので、
+    // 「静かかどうか」の判定には使えない。こちらは WebSocket の受信でしか進まない。
+    // 登録時を起点にするので、起動直後・登録直後は猶予が付く。
+    lastEventAt: existing?.lastEventAt ?? Date.now(),
   });
   if (!existing) {
     const pk = pairKey(chain, token0, token1);
@@ -87,6 +97,45 @@ export function removePool(chain, address) {
     if (byToken.get(tk)?.size === 0) byToken.delete(tk);
   }
   return true;
+}
+
+/// イベントが届いたことを刻む(dex-onchain-realtime の受信経路から呼ばれる)。
+export function notePoolEvent(chain, address, at = Date.now()) {
+  const pool = pools.get(poolKey(chain, address));
+  if (pool) pool.lastEventAt = at;
+}
+
+/// **探索が自動で載せたプールのうち、しばらくイベントの無いものを地図から外す。**
+///
+/// [なぜ要るか(2026年9月22日)]
+/// 探索の周期を6時間→1.5時間に縮めると、載せる側だけが速くなる。
+/// 減らす規則が無ければ監視プールと受信(=RPCの費用)は増える一方になる。
+/// 「増やす仕組みを入れるなら止める仕組みを同時に入れる」。
+///
+/// [なぜ探索由来だけか]
+/// 手書き由来には「動きが遅いが価格が取り残されやすく、相手側として価値がある」
+/// プールがある(HANDOVER の Avalanche 0x3e603C14…、Swap 8回で13プール)。
+/// 静かというだけで外すと、まさにその機会を捨てる。**手書き由来は絶対に外さない。**
+///
+/// [なぜ購読解除ではなく地図から外すか]
+/// 地図に残して購読だけ止めると、古い価格のまま経路計算に混ざり
+/// **幻の機会を作る**(今日 base/optimism で見た「判定+$2.65 / 実測−26bps」の型)。
+/// 外しても、また動き出せば探索が次の周期で拾い直す(探索は稼働中の全プールを見る)。
+///
+/// @param keep  外してはいけないキー("chain::address")。送信中の経路が使っているプール。
+/// @returns 外したプールの一覧
+export function evictQuietScoutPools(chain, maxIdleMs, keep = new Set()) {
+  const cutoff = Date.now() - maxIdleMs;
+  const evicted = [];
+  for (const p of [...pools.values()]) {
+    if (p.chain !== chain || p.source !== "scout") continue;
+    if ((p.lastEventAt ?? 0) >= cutoff) continue;
+    if (keep.has(poolKey(chain, p.address))) continue;
+    evicted.push({ address: p.address, dexId: p.dexId, token0: p.token0, token1: p.token1,
+      idleMs: Date.now() - (p.lastEventAt ?? 0) });
+    removePool(chain, p.address);
+  }
+  return evicted;
 }
 
 /// V3を含む経路の材料になるプールだけを残し、それ以外を地図から外す。
@@ -492,6 +541,9 @@ export function snapshotFullMap() {
       chain: p.chain, address: p.address, dexId: p.dexId, factory: p.factory,
       token0: p.token0, token1: p.token1, feeBps: p.feeBps, feeProbed: !!p.feeProbed,
       kind: p.kind, feeTier: p.feeTier,
+      // 出どころも残す。これが無いと再起動後に探索由来が全部「手書き」扱いになり、
+      // 二度と自動で外せなくなる。
+      source: p.source,
       // 準備量も残す。次の起動で「どのトークンが厚いか」を測るのに使う。
       // これが無いと、地図を読み直した直後は全プールの準備量が0になり、
       // 深さで探索対象を選べない(2026年9月18日に実測で判明)。
@@ -523,7 +575,7 @@ export function savePoolMap() {
     entries.push({
       chain: p.chain, address: p.address, dexId: p.dexId, factory: p.factory,
       token0: p.token0, token1: p.token1, feeBps: p.feeBps, feeProbed: !!p.feeProbed,
-      kind: p.kind, feeTier: p.feeTier,
+      kind: p.kind, feeTier: p.feeTier, source: p.source,
     });
   }
   try {

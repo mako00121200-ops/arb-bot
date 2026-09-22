@@ -39,7 +39,7 @@ import { runMainnetDepthSurvey } from "./scripts/mainnet-depth-survey.js";
 import { startMainnetEdgeWatch, formatMainnetEdgeLine } from "./scripts/mainnet-edge-watch.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
 import { getCurrentTradeCapUsd, getSuccessCount } from "./scripts/trade-cap.js";
-import { scoutAllChains, scoutReportOnlyChains, getScoutChains, getReportOnlyChains, SCOUT_INTERVAL_MS } from "./scripts/pool-scout.js";
+import { scoutAllChains, getScoutChains, getReportOnlyChains, SCOUT_INTERVAL_MS, SCOUT_EVICT_IDLE_MS } from "./scripts/pool-scout.js";
 import { probePoolFeeBps, isFeeProbeOnHold, getRpcStatus, getRpcCallTotals, callWithRpc, probePendingState, getProviderForChain , getFeeProbeStats, ensureAmountOutFlag } from "./scripts/onchain-reserves.js";
 import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
 import { alertOwner, getAlertStats, sendPendingQuestions } from "./scripts/owner-alert.js";
@@ -58,7 +58,7 @@ import {
 } from "./scripts/multicall-reserves.js";
 import { estimateGasCostUsd, getGasCostStatus, exportGasPriceRatios, importGasPriceRatios, getGasPriceRatio, weiToUsd } from "./scripts/gas-cost.js";
 import {
-  registerPool, removePool, pruneToCandidates, getSubscribedAddresses,
+  registerPool, removePool, pruneToCandidates, getSubscribedAddresses, evictQuietScoutPools,
   updateReservesFromSync, updateV3FromSwap, setPoolFee, markFeeFromChain, getPool, getStats,
   setTokenDecimals, getTokenDecimals, setTokenPriceUsd, getTokenPriceUsd,
   getAllPoolAddressesByChain, getPoolsForToken, getStalePools, getPoolsByKind,
@@ -2854,19 +2854,24 @@ async function main() {
   // 報告だけのチェーンしか設定されていない場合も回す(そうしないと測れない)。
   if ((getScoutChains().length > 0 || getReportOnlyChains().length > 0) && SCOUT_INTERVAL_MS > 0) {
     console.log(`[プール発見] ${SCOUT_INTERVAL_MS / 3600000}時間ごと。載せる: ${getScoutChains().join(",") || "なし"} / **報告のみ(1本も載せない)**: ${getReportOnlyChains().join(",") || "なし"}`);
-    // 報告のみのチェーンは、定期実行(初回は6時間後)を待たずに一度だけ測る。
-    // 地図には1本も載せないので、ここで走らせても受信は増えない。
-    if (getReportOnlyChains().length > 0) {
-      setTimeout(() => {
-        scoutReportOnlyChains(Object.keys(CHAIN_CONFIG)).catch((e) =>
-          console.warn(`[プール発見] 起動後の報告に失敗 ${(e.message || "").slice(0, 80)}`));
-      }, 3 * 60 * 1000);
-    }
+    // (報告のみのチェーンの初回は preparePoolMap の起動時探索が兼ねる。
+    //  3分後にもう一度走らせていたが、同じ結果を2回出していたので外した。)
     setInterval(async () => {
       try {
         const scouted = await scoutAllChains(Object.keys(CHAIN_CONFIG));
         for (const [chain, r] of Object.entries(scouted)) {
-          if (!r || r.added === 0) continue;
+          if (!r || r.reportOnly) continue;
+          // **足す前に減らす。** 探索が自動で載せたプールのうち、しばらくイベントの無い
+          // ものを外す。手書き由来は対象外。送信中の経路が使っているプールも外さない。
+          const inUse = new Set([...executingPools].filter((k) => k.startsWith(`${chain}::`)));
+          const evicted = evictQuietScoutPools(chain, SCOUT_EVICT_IDLE_MS, inUse);
+          if (evicted.length > 0) {
+            const sample = evicted.slice(0, 5).map((e) =>
+              `${e.dexId}:${e.address.slice(0, 8)}…(${Math.round(e.idleMs / 3600000)}時間無音)`).join(" ");
+            console.log(`[プール発見] ${chain}: 静かな探索プール${evicted.length}件を外した(${SCOUT_EVICT_IDLE_MS / 3600000}時間イベントなし): ${sample}`);
+          }
+          if (r.added === 0 && evicted.length === 0) continue;
+          // 監視対象が変わったので、状態を読み直して購読をやり直す(古い購読は解除される)。
           await prepareChain(chain);
           refreshTokenPrices();
         }
