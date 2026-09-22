@@ -73,6 +73,21 @@ const MULTICALL3_ABI = [
 /// 市場の鍵 -> { oracle, dataProvider, list: [asset], reserves: Map(asset -> info), pricedAt }
 const markets = new Map();
 
+/// **読み込み中の約束を覚えておく(2026年9月22日 09:11 JST の実測で必要と分かった)。**
+///
+/// [何が起きたか]
+/// 清算できる人を15人まとめて見つけた時、15本の計画づくりが**同時に**走り、
+/// 全部が「まだ資産を読んでいない」と判断して**それぞれ別の表を作った**。
+/// 最後に書いた表だけが markets に残り、価格はそこに入る。ところが
+/// 各計画は自分が作った**古い表**を握っているので、価格が 0 のまま。
+/// 結果、15人中11人が「計画できず(価格が無い)」になった。
+/// ログに「資産15種を読みました」が4回出ていたのがその証拠。
+///
+/// 同じ市場への2本目以降は、1本目の約束をそのまま待たせる。
+/// RPCも1回分で済む。
+const loadingMarket = new Map();
+const loadingPrices = new Map();
+
 /// **価格はすぐ古くなる。** これより古ければ読み直す。
 const PRICE_MAX_AGE_MS = parseInt(process.env.LIQUIDATION_PRICE_MAX_AGE_MS || "30000", 10);
 
@@ -105,7 +120,15 @@ async function resolveAddresses(chain, rpcChain, pool) {
 export async function ensureReserves(chain, rpcChain, pool) {
   const existing = markets.get(chain);
   if (existing && existing.reserves.size > 0) return existing;
+  // **同時に呼ばれても読み込みは1回だけ。** 二重に読むと表が分かれて価格が迷子になる。
+  const inFlight = loadingMarket.get(chain);
+  if (inFlight) return inFlight;
+  const promise = loadReservesOnce(chain, rpcChain, pool).finally(() => loadingMarket.delete(chain));
+  loadingMarket.set(chain, promise);
+  return promise;
+}
 
+async function loadReservesOnce(chain, rpcChain, pool) {
   const { oracle, dataProvider } = await resolveAddresses(chain, rpcChain, pool);
   if (!oracle || !dataProvider) {
     console.warn(`[清算/計画] ${chain}: オラクルかデータプロバイダを辿れません。計画は立てられません`);
@@ -158,6 +181,15 @@ export async function refreshPrices(chain, force = false) {
   const m = markets.get(chain);
   if (!m || m.list.length === 0) return false;
   if (!force && Date.now() - m.pricedAt < PRICE_MAX_AGE_MS) return true;
+  // **こちらも同時に呼ばれる。** 15人ぶん同時に価格を読むとRPCを15回使う。
+  const inFlight = loadingPrices.get(chain);
+  if (inFlight) return inFlight;
+  const promise = fetchPrices(m, chain).finally(() => loadingPrices.delete(chain));
+  loadingPrices.set(chain, promise);
+  return promise;
+}
+
+async function fetchPrices(m, chain) {
   try {
     const raw = await callWithRpc(m.rpcChain, (p) => p.call({
       to: m.oracle,
