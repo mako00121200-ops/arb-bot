@@ -1826,6 +1826,25 @@ const MAX_PARALLEL_SENDS_PER_CHAIN = parseInt(process.env.MAX_PARALLEL_SENDS_PER
 const executingPools = new Set();   // "chain::pool" 送信中の経路が使っているプール
 const inFlightByChain = new Map();  // chain -> 送信中の本数
 
+/// **内訳の合計と「精査」のずれ。** 合っていれば何も出さない。
+///
+/// [なぜ要るか(2026年9月23日)]
+/// `無効562` を追った時、**精査が+110件増えているのに内訳の全項目が止まっていた**。
+/// 調べると `税トークン` `同じ経路を送信中` `送信して失敗` の3つを
+/// **加算しているのに生存ログに出していなかった**(「測っているのに使っていない」8件目)。
+/// 出していない箱があると、**機会がどこへ消えたかを追えない**。
+///
+/// 3つを出すようにした上で、**合計が合っているかもここで見張る**。
+/// 今後また箱を足して出し忘れたら、ここに `残N` として現れる。
+/// (送信中のものが数件あるので、小さいずれは正常)
+function reasonsResidual() {
+  const counted = reasons.disabled + reasons.taxToken + reasons.cooldown + reasons.trap
+    + reasons.belowMin + reasons.executing + reasons.sendBusy
+    + reasons.success + reasons.notSent + reasons.failed;
+  const diff = stats.examined - counted;
+  return diff === 0 ? "" : ` 残${diff}`;
+}
+
 function poolLockKeys(opp) {
   return opp.poolAddresses.map((a) => `${opp.chain}::${a.toLowerCase()}`);
 }
@@ -2095,7 +2114,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 送信中${reasons.sendBusy}(同時上限${reasons.sendBusyParallel}/同プール${reasons.sendBusyPool}) 見送${reasons.notSent}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${sizeLine()}${formatTierLine()}${formatSendBalanceLine()}${formatSendSkipLine()}${formatUniswapXLine()}${formatMissingPairsLine()}${formatPairFillLine()}${formatSolanaLine()}${formatMainnetEdgeLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${alertLine}`);
+  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 税${reasons.taxToken} 冷却${reasons.cooldown} 罠${reasons.trap} 下限${reasons.belowMin} 同経路${reasons.executing} 送信中${reasons.sendBusy}(同時上限${reasons.sendBusyParallel}/同プール${reasons.sendBusyPool}) 見送${reasons.notSent} 失敗${reasons.failed}${reasonsResidual()}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${sizeLine()}${formatTierLine()}${formatSendBalanceLine()}${formatSendSkipLine()}${formatUniswapXLine()}${formatMissingPairsLine()}${formatPairFillLine()}${formatSolanaLine()}${formatMainnetEdgeLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
