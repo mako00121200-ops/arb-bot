@@ -50,10 +50,16 @@ export function wickBacktestSymbols() {
   return (process.env.RUN_WICK_BACKTEST || "").split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
 }
 
-/// 1日ぶんの1分足を取る。**futures(um)の公開ダンプ**を使う。
-/// 無ければ null(その日は飛ばす)。**推測で埋めない。**
-async function fetchDay(symbol, dateStr) {
-  const url = `${BASE}/data/futures/um/daily/klines/${symbol}/${INTERVAL}/${symbol}-${INTERVAL}-${dateStr}.zip`;
+/// 1ヶ月ぶんの1分足を取る。**futures(um)の公開ダンプ**を使う。
+/// 無ければ null(その月は飛ばす)。**推測で埋めない。**
+///
+/// [なぜ日次ではなく月次か(2026年9月22日)]
+/// 最初は日次で書いたが、初回結果で **180日では急落が2〜10件しか無い**と分かった。
+/// この戦略を殺すのは稀な外生ショックなので、**2025年10月10日($190億)を含む
+/// 長い期間**が要る。だが1500日を日次で取ると1銘柄1,500回になり現実的でない。
+/// 月次なら同じ期間が**約50回**で済む。
+async function fetchMonth(symbol, monthStr) {
+  const url = `${BASE}/data/futures/um/monthly/klines/${symbol}/${INTERVAL}/${symbol}-${INTERVAL}-${monthStr}.zip`;
   try {
     const res = await fetch(url);
     if (!res.ok) return null;
@@ -156,14 +162,30 @@ export async function runWickBacktest(symbol) {
   const hold = parseInt(process.env.WICK_HOLD || "3", 10);
   const feeBps = parseFloat(process.env.WICK_FEE_BPS || "10");
 
-  console.log(`[ヒゲ検証] ${symbol}: ${days}日ぶんの${INTERVAL}足を取ります(${window}本で-${dropPct}%以上 → ${hold}本後に決済、手数料${feeBps}bps)。**取引はしません**`);
+  // **観測期間に「最悪の日」が入っているかを先に言う。**
+  // 入っていなければ、どんな良い数字が出ても意味が無い。
+  const oldest = new Date(Date.now() - days * 86400000);
+  const CRASH_DAYS = [
+    { d: "2025-10-10", what: "$190億のカスケード(記録的)" },
+    { d: "2024-08-05", what: "円キャリー巻き戻し" },
+    { d: "2022-11-08", what: "FTX破綻" },
+  ];
+  const covered = CRASH_DAYS.filter((c) => new Date(c.d + "T00:00:00Z") >= oldest);
+  console.log(`[ヒゲ検証] ${symbol}: ${days}日ぶん(${ymd(oldest)}以降)の${INTERVAL}足を取ります`
+    + `(${window}本で-${dropPct}%以上 → ${hold}本後に決済、手数料${feeBps}bps)。**取引はしません**`);
+  console.log(`[ヒゲ検証] ${symbol}: 期間に含まれる既知の大暴落 → `
+    + (covered.length > 0 ? covered.map((c) => `${c.d}(${c.what})`).join(" / ")
+      : `**なし。この期間の良い数字は「事故が無かっただけ」かもしれない**`));
 
   const bars = [];
   let got = 0, missed = 0;
-  // 前日まで(当日ぶんはまだ置かれていないことがある)。
-  for (let k = days; k >= 1; k--) {
-    const d = new Date(Date.now() - k * 86400000);
-    const csv = await fetchDay(symbol, ymd(d));
+  // 月単位で遡る。当月は途中までしか置かれていないので前月まで。
+  const months = Math.ceil(days / 30);
+  const now = new Date();
+  for (let k = months; k >= 1; k--) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - k, 1));
+    const monthStr = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+    const csv = await fetchMonth(symbol, monthStr);
     if (!csv) { missed++; continue; }
     const part = parseCloses(csv);
     if (part.length === 0) { missed++; continue; }
@@ -171,7 +193,7 @@ export async function runWickBacktest(symbol) {
     got++;
   }
   if (bars.length === 0) {
-    console.warn(`[ヒゲ検証] ${symbol}: データを1日ぶんも取れませんでした(取得失敗${missed}日)`);
+    console.warn(`[ヒゲ検証] ${symbol}: データを1ヶ月ぶんも取れませんでした(取得失敗${missed}ヶ月)`);
     return null;
   }
   bars.sort((a, b) => a.t - b.t);
@@ -183,16 +205,30 @@ export async function runWickBacktest(symbol) {
   }
 
   const pct = (b) => `${(b / 100).toFixed(2)}%`;
-  console.log(`[ヒゲ検証] ${symbol}: ${got}日(欠${missed})/${bars.length.toLocaleString()}本 → 急落**${r.count}件**`);
+  console.log(`[ヒゲ検証] ${symbol}: ${got}ヶ月(欠${missed})/${bars.length.toLocaleString()}本 → 急落**${r.count}件**`);
   console.log(`[ヒゲ検証] ${symbol}: 勝率${(r.winRate * 100).toFixed(1)}% 平均${r.meanBps.toFixed(1)}bps 中央${r.medianBps.toFixed(1)}bps **合計${r.totalBps.toFixed(0)}bps(${pct(r.totalBps)})**`);
   console.log(`[ヒゲ検証] ${symbol}: **左の尾** 下位5%=${r.p05Bps.toFixed(1)}bps(${pct(r.p05Bps)}) 下位1%=${r.p01Bps.toFixed(1)}bps(${pct(r.p01Bps)}) **最悪=${r.worstBps.toFixed(1)}bps(${pct(r.worstBps)})** / 最良=${r.bestBps.toFixed(1)}bps`);
 
   // **1回の最悪が、それまでの合計を飲み込むか。** これがこの戦略の核心の問い。
+  //
+  // [標本が少なければ、答えないのが正しい(2026年9月22日、初回結果で自分が誤った)]
+  // 最初の版は無条件に「1回の事故では飲まれない」と書いた。だが BTC は急落2件、
+  // ETH は10件しか無く、**10件で最悪値を語るのは §9「標本19件で結論」と同じ過ち**。
+  // この戦略を殺すのは「1万回に1回」の外生ショックで、10件の観測はそれについて
+  // **何も語らない**。人数が足りない時は「分からない」と言う。
+  const MIN_EVENTS = parseInt(process.env.WICK_MIN_EVENTS || "30", 10);
+  if (r.count < MIN_EVENTS) {
+    console.log(`[ヒゲ検証] ${symbol}: 判定 → **標本${r.count}件では答えを出せない**(最低${MIN_EVENTS}件)。`
+      + `この戦略を殺すのは稀な外生ショックで、${r.count}件の観測はそれについて何も語らない。`
+      + `条件を緩める(WICK_DROP_PCT を下げる)か、期間を延ばす(WICK_BACKTEST_DAYS)。`);
+    return r;
+  }
   const eaten = Math.abs(r.worstBps) >= r.totalBps;
   console.log(`[ヒゲ検証] ${symbol}: 判定 → 合計${r.totalBps.toFixed(0)}bps に対し最悪の1回が${r.worstBps.toFixed(0)}bps。`
     + (eaten
       ? `**1回の事故で全部飲まれる。この条件では成立しない。**`
-      : `1回の事故では飲まれない(ただし事故が重なる可能性は別に考える)。`));
+      : `観測された範囲では1回の事故で飲まれない。**ただし観測期間に最悪の日が入っていなければ無意味**`
+        + `(2025年10月10-11日の$190億のカスケードを含むか、日数から確かめること)。`));
   return r;
 }
 
