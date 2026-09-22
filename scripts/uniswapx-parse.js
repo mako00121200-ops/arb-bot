@@ -73,7 +73,13 @@ export function extractSwap(order) {
 /// **実物を読まずに名前を書く**のは §9 で一度やった失敗なので、
 /// 候補を順に見て、**どれが使えたかをログに出す**。どれも無ければ「測れない」と言う。
 /// 単位も秒とミリ秒の両方を受ける(桁で見分ける)。
-export const FILLED_AT_KEYS = ["fillTimestamp", "settledAt", "filledAt", "txTimestamp", "createdAt"];
+/// **約定そのものの時刻。** これがあれば齢は正しく測れる。
+export const FILL_TIME_KEYS = ["fillTimestamp", "settledAt", "filledAt", "txTimestamp"];
+/// 注文が**作られた**時刻。約定はこれより後なので、齢の上限にしかならない。
+/// (2026年9月22日: polygon はこれしか返さず、20件中20件が「古すぎ」になっていた。
+///  だが本当は古いのではなく**約定時刻が分からない**だけ。**違うものを同じ箱に入れない**)
+export const CREATED_AT_KEYS = ["createdAt"];
+export const FILLED_AT_KEYS = [...FILL_TIME_KEYS, ...CREATED_AT_KEYS];
 
 export function readFilledAt(order) {
   for (const key of FILLED_AT_KEYS) {
@@ -87,7 +93,31 @@ export function readFilledAt(order) {
     if (n >= 1e9 && n < 1e11) sec = n;
     else if (n >= 1e12 && n < 1e14) sec = n / 1000;
     if (sec == null) continue;
-    return { sec, key };
+    return { sec, key, isFillTime: FILL_TIME_KEYS.includes(key) };
   }
   return null;
+}
+
+/// 勝ちを「齢」で二つに割って、取り分の大きさを比べる。
+///
+/// [これで何が分かるか(2026年9月22日)]
+/// 齢の上限を180秒にしたあとも、base で **$1,903 の注文に $9.23(48bps)** が残った。
+/// これが本物の実力なのか、**まだ残っている値動き**なのかを見分けたい。
+///
+///   値動きの残りかすなら … 齢が短いほど取り分は小さくなる(若い側 ≪ 古い側)
+///   本物の実力なら       … 齢に関係なく同じくらい出る(若い側 ≈ 古い側)
+///
+/// **どちらとも言えない件数では判定しない。** 呼ぶ側が enough を見て決める。
+export function splitByAge(wins, cutSec = 60, minEach = 5) {
+  const side = (list) => {
+    let usd = 0, size = 0, n = 0;
+    for (const w of list) {
+      if (!(w?.sizeUsd > 0) || !(w?.usd > 0)) continue; // 大きさが分からないものは bps にできない
+      usd += w.usd; size += w.sizeUsd; n++;
+    }
+    return { n, usd, sizeUsd: size, bps: size > 0 ? (usd / size) * 10000 : null };
+  };
+  const young = side(wins.filter((w) => w?.ageSec != null && w.ageSec < cutSec));
+  const old = side(wins.filter((w) => w?.ageSec != null && w.ageSec >= cutSec));
+  return { cutSec, young, old, enough: young.n >= minEach && old.n >= minEach };
 }

@@ -35,7 +35,7 @@
 //   UNISWAPX_PROBE_LIMIT  … 1回に取る注文数(既定20、APIの上限は50)
 
 import { bestOutputFor } from "./opportunity-scanner.js";
-import { extractSwap, readFilledAt, FILLED_AT_KEYS } from "./uniswapx-parse.js";
+import { extractSwap, readFilledAt, FILLED_AT_KEYS, splitByAge } from "./uniswapx-parse.js";
 import { getTokenDecimals, getTokenPriceUsd, KIND_V3 } from "./pool-registry.js";
 import { getKnownTokens } from "./borrowable-tokens.js";
 import { quoteV3ByPoolBatch } from "./multicall-reserves.js";
@@ -82,7 +82,12 @@ function statFor(chain) {
       hadV2: 0, verifyTried: 0, verifyFailed: 0, verifiedWon: 0, verifiedLost: 0, verifiedUsd: 0,
       // **時刻でふるった分。** tooOld は値動きに汚染されるので捨てた数、
       // noTime は時刻そのものが読めなかった数(= 測れない。0でない間は結論を出さない)。
-      tooOld: 0, noTime: 0, ages: [], timeKey: null });
+      tooOld: 0, noTime: 0, ages: [], timeKey: null,
+      // **約定時刻が無く、注文が作られた時刻しか無いもの。** 齢が測れないので数えない。
+      createdOnly: 0,
+      // **確認できた勝ちを「齢つき」で持つ。** 値動きの残りかすかどうかを、
+      // これで判定する(§下の formatUniswapXReport)。
+      verifiedWins: [] });
   }
   return stats.get(chain);
 }
@@ -180,6 +185,10 @@ async function probeChain(chain) {
       continue;
     }
     s.timeKey = filled.key;
+    // **注文が作られた時刻しか無いものは、齢が測れない。**
+    // 約定はそれより後なので「古すぎ」と同じ箱に入れると、本当は新しいものまで捨てたことになる。
+    // 分けて数え、判断からは外す(polygon が該当。2026年9月22日)。
+    if (!filled.isFillTime) { s.createdOnly++; continue; }
     const ageSec = Date.now() / 1000 - filled.sec;
     if (!(ageSec >= 0) || ageSec > MAX_AGE_SEC) { s.tooOld++; continue; }
     s.ages.push(ageSec);
@@ -220,6 +229,11 @@ async function probeChain(chain) {
     if (trueDiffUsd > 0) {
       s.verifiedWon++;
       s.verifiedUsd += trueDiffUsd;
+      // **齢と一緒に残す。** 「取り分」が値動きの残りかすなら、
+      // 齢が0に近づくほど取り分も0に近づくはず。それを後で見る。
+      s.verifiedWins.push({ ageSec, usd: trueDiffUsd,
+        sizeUsd: toUsd(chain, swap.tokenIn, swap.amountIn) });
+      if (s.verifiedWins.length > 500) s.verifiedWins.shift();
       if (trueDiffUsd > s.bestUsd) {
         s.bestUsd = trueDiffUsd;
         s.best = { hash, label: mine.label, sizeUsd: toUsd(chain, swap.tokenIn, swap.amountIn),
@@ -257,7 +271,7 @@ export function formatUniswapXLine() {
     // **測れているのかどうかを先に出す。** noTime が残っている間は数字を信じない。
     const med = s.ages.length > 0
       ? [...s.ages].sort((a, b) => a - b)[Math.floor(s.ages.length / 2)].toFixed(0) : "-";
-    parts.push(`${chain} 見${s.seen}(古すぎ${s.tooOld} 時刻読めず${s.noTime} 齢中央${med}s`
+    parts.push(`${chain} 見${s.seen}(古すぎ${s.tooOld} 約定時刻なし${s.createdOnly} 時刻読めず${s.noTime} 齢中央${med}s`
       + `${s.timeKey ? ` key=${s.timeKey}` : ""})/値付け${s.quotable}(経路なし${s.noRoute})`
       + ` 模型勝${s.won}($${s.marginUsd.toFixed(3)})`
       + ` → **確認済 ${s.verifiedWon}勝/${s.verifiedLost}敗(${vRate}%) $${s.verifiedUsd.toFixed(4)}**`
@@ -275,6 +289,21 @@ export function formatUniswapXReport() {
       + `(注文$${s.best.sizeUsd != null ? s.best.sizeUsd.toFixed(0) : "?"}`
       + `${s.best.modelUsd != null ? ` / 模型は$${s.best.modelUsd.toFixed(4)}と言っていた` : ""}`
       + ` / ${s.best.hash.slice(0, 10)}…)`);
+
+    // **その取り分が値動きの残りかすでないかを、齢で割って見る。**
+    const sp = splitByAge(s.verifiedWins);
+    if (sp.enough) {
+      const y = sp.young.bps.toFixed(1), o = sp.old.bps.toFixed(1);
+      // 若い側が古い側の半分未満なら、**残っているのは値動き**と読む。
+      const verdict = sp.young.bps < sp.old.bps * 0.5
+        ? "**まだ値動きが混ざっている**(齢の上限をさらに下げる)"
+        : "齢で変わらない = **値動きでは説明できない**";
+      lines.push(`[UniswapX計測] ${chain}: 齢${sp.cutSec}秒未満 ${sp.young.n}件 ${y}bps`
+        + ` / ${sp.cutSec}秒以上 ${sp.old.n}件 ${o}bps → ${verdict}`);
+    } else {
+      lines.push(`[UniswapX計測] ${chain}: 齢で割るには足りない`
+        + `(若${sp.young.n}件/古${sp.old.n}件、各5件必要)。**まだ結論を出さない**`);
+    }
   }
   return lines;
 }
