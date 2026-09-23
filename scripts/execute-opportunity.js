@@ -1032,7 +1032,41 @@ export function flushSendSkips() {
   return saveState(SKIP_STATE_NAME, SKIP_STATE_VERSION, Object.fromEntries(skippedByChain));
 }
 
+/// **連敗したら、そのチェーンの送信を自動で止める**(2026年9月23日、optimism の送信再開の準備)。
+///
+/// 今までは負けが続いても送り続けた(base は 0勝6負 で −$0.03 を出すまで人が止めるのを待った)。
+/// 再開したチェーンで N 回続けて負けるか、このデプロイ以降の損が上限を超えたら、送信だけ止める。
+/// 止めた後も**影の確認は続く**ので、本物が出続けるかは見える。再デプロイで解ける(メモリのみ)。
+///
+/// 既定は送信を再開したばかりのチェーンだけが対象(avalanche は負け率2〜3割が平常なので含めない)。
+const AUTO_STOP_CHAINS = new Set((process.env.SEND_AUTO_STOP_CHAINS ?? "optimism,base,arbitrum")
+  .split(",").map((c) => c.trim().toLowerCase()).filter(Boolean));
+const AUTO_STOP_LOSSES = parseInt(process.env.SEND_AUTO_STOP_LOSSES || "5", 10);
+const AUTO_STOP_USD = parseFloat(process.env.SEND_AUTO_STOP_USD || "0.10");
+const chainRun = new Map(); // chain -> { streak, netUsd, wins, losses }
+const autoStopped = new Map(); // chain -> 理由
+
+export function noteChainSendResult(chain, won, usd = 0) {
+  const key = String(chain || "").toLowerCase();
+  if (!AUTO_STOP_CHAINS.has(key)) return;
+  const r = chainRun.get(key) || { streak: 0, netUsd: 0, wins: 0, losses: 0 };
+  const amount = Math.abs(Number(usd) || 0);
+  if (won) { r.streak = 0; r.netUsd += amount; r.wins++; }
+  else { r.streak++; r.netUsd -= amount; r.losses++; }
+  chainRun.set(key, r);
+  if (autoStopped.has(key)) return;
+  let why = null;
+  if (r.streak >= AUTO_STOP_LOSSES) why = `${r.streak}連敗`;
+  else if (r.netUsd <= -AUTO_STOP_USD) why = `損が$${(-r.netUsd).toFixed(4)}に達した(上限$${AUTO_STOP_USD})`;
+  if (why) {
+    autoStopped.set(key, why);
+    console.warn(`[送信の自動停止] **${key} の送信を止めました**: ${why}(このデプロイで ${r.wins}勝${r.losses}負 ${r.netUsd >= 0 ? "+" : ""}$${r.netUsd.toFixed(4)})。`
+      + `影の確認は続けます。再開は再デプロイで`);
+  }
+}
+
 export function isSendAllowed(chain) {
+  if (autoStopped.has(String(chain || "").toLowerCase())) return false;
   if (SEND_CHAINS.length === 0) return true; // 未設定なら今までどおり全部送る
   return SEND_CHAINS.includes(String(chain || "").toLowerCase());
 }
@@ -1040,14 +1074,15 @@ export function isSendAllowed(chain) {
 export function getSendSkips() { return Object.fromEntries(skippedByChain); }
 
 export function formatSendSkipLine() {
-  if (skippedByChain.size === 0) return "";
+  if (skippedByChain.size === 0 && autoStopped.size === 0) return "";
   const parts = [...skippedByChain].map(([c, v]) =>
     `${c}:${v.n}回(見込み計$${v.usd.toFixed(4)})`
     // **チェーンに聞いた結果。** 本物が出続けるなら、送信の再開を検討する材料になる。
     + (v.tried > 0
       ? `[確認${v.tried} 本物${v.real}($${v.realUsd.toFixed(4)}) ガス負け${v.gasLoss} 赤字${v.loss} 拒否${v.rejected}${v.errors ? ` 失敗${v.errors}` : ""}]`
       : ""));
-  return ` 送信停止[${parts.join(" ")}]`;
+  const auto = [...autoStopped].map(([c, why]) => `${c}:${why}`);
+  return ` 送信停止[${parts.join(" ")}]${auto.length ? ` **自動停止[${auto.join(" ")}]**` : ""}`;
 }
 
 export async function executeOpportunity(opp) {
