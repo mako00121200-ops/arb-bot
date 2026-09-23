@@ -56,8 +56,14 @@ const MIN_DEBT_USD = parseFloat(process.env.MORPHO_LIQ_MIN_DEBT_USD || "10");
 const BACKFILL_REQUESTS_PER_TICK = parseInt(process.env.MORPHO_LIQ_BACKFILL_PER_TICK || "30", 10);
 /// eth_call で確かめる経路の本数。
 const SIMULATE_TOP_N = 3;
-/// 同じ借り手を確かめ直すまでの時間。
-const RESIM_MS = 60 * 1000;
+/// 同じ借り手を確かめ直すまでの時間。清算されずに残る人(放置)を毎分確かめてログを埋めないため長めに。
+const RESIM_MS = 10 * 60 * 1000;
+/// 清算できるのに、これだけ誰にも清算されない人は「放置」として別に数える。
+/// [なぜ(2026年9月23日 17:54 JST の初回の実測)]
+/// wbCOIN/USDC で使用率102.6%の人が約20人、誰にも清算されずに残っていた。売れない担保・止まった
+/// オラクル・送金停止などで「清算できても誰も取らない」ものは、競争の場ではない。
+/// これを「清算可」に混ぜると、機会を水増しして読んでしまう。
+const STALE_MS = 10 * 60 * 1000;
 /// ガス量の見込み(清算 + 1〜2段のスワップ)。
 const GAS_UNITS = BigInt(process.env.MORPHO_LIQ_GAS_UNITS || "700000");
 
@@ -400,7 +406,9 @@ async function noteLiquidation(log) {
     S.stats.leadBlocks.push(gap);
     if (S.stats.leadBlocks.length > 500) S.stats.leadBlocks.shift();
     S.stats.seenBonusUsd += bonusUsd ?? 0;
-    const verdict = gap >= 2 ? "**出していれば先に取れた**" : gap === 1 ? "同着の勝負" : "同じブロック内で負け(Flashblock 単位の速さ勝負)";
+    const staleFor = Date.now() - seen.at;
+    const verdict = staleFor > STALE_MS ? `放置されていた(${(staleFor / 60000).toFixed(0)}分)後に清算。競争は薄い`
+      : gap >= 2 ? "**出していれば先に取れた**" : gap === 1 ? "同着の勝負" : "同じブロック内で負け(Flashblock 単位の速さ勝負)";
     console.log(`${head}: 先に見つけていた(状態ブロック${seen.block} → 差${gap}ブロック、`
       + `ブロック時刻まで${leadMs != null ? (leadMs / 1000).toFixed(1) + "秒" : "?"}) → ${verdict}。`
       + `確認の利益${seen.simUsd != null ? "$" + seen.simUsd.toFixed(2) : seen.simRaw ?? "未確認"}。清算者 ${short(ev.args.caller)}`);
@@ -485,7 +493,7 @@ async function handleResults({ results, stateBlock, at }) {
     if (r.h.ratio >= WATCH_RATIO) S.watch.set(key, r.h.ratio); else S.watch.delete(key);
     if (!r.h.liquidatable) continue;
     if (!S.seen.has(key)) {
-      S.seen.set(key, { block: stateBlock, at, repaidUsd: null, simUsd: null, simRaw: null });
+      S.seen.set(key, { block: stateBlock, at, repaidUsd: null, simUsd: null, simRaw: null, pair: `${r.m.coll?.symbol}/${r.m.loan?.symbol}` });
       S.stats.liquidatable++; // 同じ人を読み直すたびに数えない(1秒ごとに読むので、数えると何十倍にもなる)
     }
     found.push(r);
@@ -634,7 +642,12 @@ export function formatMorphoLine() {
   const done = span > 0 && S.backTo != null ? Math.round((((S.forwardFrom ?? start) - S.backTo) / span) * 100) : 0;
   const err = Object.entries(st.simErr).map(([k, v]) => `${k}:${v}`).join(" ");
   const wm = median(st.watchMs);
-  return ` Morpho[名簿${S.roster.size} 遡り${done}% 危ない${S.watch.size}(読み${wm != null ? wm + "ms" : "-"}) 清算可${st.liquidatable}(塵${st.dust})`
+  const now = Date.now();
+  const stale = [...S.seen.values()].filter((v) => now - v.at > STALE_MS);
+  const staleMarkets = new Map();
+  for (const v of stale) if (v.pair) staleMarkets.set(v.pair, (staleMarkets.get(v.pair) || 0) + 1);
+  const staleLine = stale.length ? ` 放置${stale.length}(10分以上。${[...staleMarkets].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, v]) => `${k}:${v}`).join(" ")})` : "";
+  return ` Morpho[名簿${S.roster.size} 遡り${done}% 危ない${S.watch.size}(読み${wm != null ? wm + "ms" : "-"}) 清算可${st.liquidatable}(塵${st.dust})${staleLine}`
     + ` 確認${st.simOk}/${st.simulated} 黒字${st.simBest} 経路なし${st.noRoute}${err ? ` 取消[${err}]` : ""}`
     + ` 実清算${st.liqEvents}=先に発見${st.liqSeenFirst}[2ブロック以上${st.gapMore} 1ブロック${st.gapOne} 同ブロック内${st.gapSame}]`
     + `/見逃し${st.liqMissed}[名簿なし${st.missNoRoster} 遡り中${st.missBackfill} 使用率低${st.missFar} 間に合わず${st.missSlow}]`
