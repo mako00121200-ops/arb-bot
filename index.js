@@ -37,7 +37,6 @@ import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
 import { runPoolSurvey } from "./scripts/pool-survey.js";
 import { runMainnetDepthSurvey } from "./scripts/mainnet-depth-survey.js";
 import { runMorphoSurvey, morphoSurveyChains } from "./scripts/morpho-liquidation-survey.js";
-import { runRealTotalsRebuild, rebuildChains } from "./scripts/real-totals-rebuild.js";
 import { runWickBacktestAll, wickBacktestSymbols } from "./scripts/wick-backtest.js";
 import { startMainnetEdgeWatch, formatMainnetEdgeLine, flushMainnetEdge } from "./scripts/mainnet-edge-watch.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
@@ -2059,32 +2058,73 @@ async function refreshStaleReserves() {
 }
 
 // ===== コントラクトに溜まった利益 =====
-const BALANCE_ABI = ["function balancesOf(address[] tokens) view returns (uint256[])"];
+//
+// [画面の「累積利益」はこれ(2026年9月23日、オーナーの指示)]
+// 裁定の利益はコントラクトに貯まり、**一度も引き出していない**。だから今コントラクトにある残高が、
+// そのまま「これまでに貯めた利益」になる。記録を足し上げる方式は、記録を500件で捨てていたため
+// 総額が勝手に変わった。残高はチェーンが持つ実物なので、記録の欠けに左右されない。
+// ガス代はウォレットから払っているので、この残高には**含まれない**(ガス代は別に表示)。
+//
+// 旧コントラクト(再デプロイ前の版)にも利益が残っているので、一緒に数える。
+// 住所は docs/HANDOVER.md の記録(完全な住所が残っているものだけ)。
+const OLD_CONTRACTS = {
+  polygon: ["0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1"],
+  avalanche: ["0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1"],
+  optimism: ["0xD2D45cC99AAe1AF7302b067d116fEEA8d7ceAca1"],
+  base: ["0x68bCbb3f8ec1E783E176Ca76b0ecDc758fdf9B6F"],
+};
+const ERC20_BALANCE_IFACE = new ethers.Interface(["function balanceOf(address) view returns (uint256)"]);
+const MC3_ABI = ["function aggregate3((address target,bool allowFailure,bytes callData)[] calls) view returns ((bool success,bytes returnData)[])"];
+const MC3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11";
 let contractBalances = {};
+let contractBalancesAt = null;
 async function refreshContractBalances() {
   if (!anyReady()) return;
   const out = {};
   for (const [chain, config] of Object.entries(CHAIN_CONFIG)) {
-    const address = process.env[config.contractAddressEnvVar];
-    if (!address) continue;
+    const current = process.env[config.contractAddressEnvVar];
+    const addresses = [...new Set([current, ...(OLD_CONTRACTS[chain] || [])].filter(Boolean).map((a) => a.toLowerCase()))];
+    if (addresses.length === 0) continue;
     const tokens = Object.entries(getKnownTokens(chain));
     if (tokens.length === 0) continue;
     try {
-      const amounts = await callWithRpc(chain, (p) =>
-        new ethers.Contract(address, BALANCE_ABI, p).balancesOf(tokens.map(([a]) => a)));
-      const held = [];
-      for (let i = 0; i < tokens.length; i++) {
-        const [, info] = tokens[i];
-        if (amounts[i] > 0n) {
-          const amount = Number(amounts[i]) / Math.pow(10, info.decimals);
-          const usd = amount * (getTokenPriceUsd(chain, tokens[i][0]) ?? 0);
-          held.push({ symbol: info.symbol, amount, usd });
-        }
+      // 版に関係なく読めるよう、各通貨の balanceOf を束ねて読む
+      const calls = [];
+      for (const addr of addresses) for (const [t] of tokens) {
+        calls.push({ target: t, allowFailure: true, callData: ERC20_BALANCE_IFACE.encodeFunctionData("balanceOf", [addr]) });
       }
+      const results = [];
+      for (let i = 0; i < calls.length; i += 400) {
+        const part = calls.slice(i, i + 400);
+        results.push(...await callWithRpc(chain, (p) => new ethers.Contract(MC3_ADDRESS, MC3_ABI, p).aggregate3(part)));
+      }
+      const bySymbol = new Map();
+      results.forEach((r, i) => {
+        if (!r?.success || r.returnData === "0x") return;
+        const amountRaw = BigInt(ERC20_BALANCE_IFACE.decodeFunctionResult("balanceOf", r.returnData)[0]);
+        if (amountRaw === 0n) return;
+        const [tokenAddr, info] = tokens[i % tokens.length];
+        const amount = Number(amountRaw) / Math.pow(10, info.decimals);
+        const price = getTokenPriceUsd(chain, tokenAddr);
+        const e = bySymbol.get(info.symbol) || { symbol: info.symbol, amount: 0, usd: 0, unpriced: false };
+        e.amount += amount;
+        if (price == null) e.unpriced = true; else e.usd += amount * price;
+        bySymbol.set(info.symbol, e);
+      });
+      const held = [...bySymbol.values()].sort((x, y) => y.usd - x.usd);
       if (held.length > 0) out[chain] = held;
-    } catch (e) {}
+    } catch (e) {
+      // 読めなかったチェーンは前回の値を残す(黙って0にしない)
+      if (contractBalances[chain]) out[chain] = contractBalances[chain];
+    }
   }
   contractBalances = out;
+  contractBalancesAt = Date.now();
+}
+
+/// コントラクトに貯まった利益の合計(ドル)。
+function heldProfitUsd() {
+  return Object.values(contractBalances).flat().reduce((a, h) => a + (h.usd || 0), 0);
 }
 
 // ===== 生存確認 =====
@@ -2488,7 +2528,7 @@ function renderPage() {
     </tr>`).join('') || `<tr><td colspan="2" style="color:#888">まだ検証していません</td></tr>`;
 
   const balanceLine = Object.entries(contractBalances).map(([c, held]) =>
-    `${c}: ${held.map((h) => `${h.symbol} ${h.amount.toFixed(4)}($${h.usd.toFixed(2)})`).join(" / ")}`).join('<br>') || '残高なし';
+    `${c}: ${held.map((h) => `${h.symbol} ${h.amount.toFixed(4)}(${h.unpriced ? "価格不明" : `$${h.usd.toFixed(2)}`})`).join(" / ")}`).join('<br>') || '残高なし';
 
   const syncLine = Object.entries(syncStats).map(([c, v]) =>
     `${c}: ${v.watched.toLocaleString()}プールを${v.subscriptions}回で購読 / 受信 V2 ${v.v2.toLocaleString()}・V3 ${v.v3.toLocaleString()}・流動性 ${v.liquidity.toLocaleString()} ${v.healthy ? '<span style="color:#2ecc71">正常</span>' : `<span style="color:#e74c3c">不達</span>`}`
@@ -2504,11 +2544,13 @@ function renderPage() {
 
 <div class="card real"><h2>💰 実際の取引結果</h2>
 <div class="stat"><div><div class="v">${real.count}</div><div class="l">実行回数</div></div>
-<div><div class="v" style="color:#2ecc71">+$${real.totalProfitUsd.toFixed(4)}</div><div class="l">累積利益(ガス控除後)</div></div>
+<div><div class="v" style="color:#2ecc71">$${heldProfitUsd().toFixed(4)}</div><div class="l">累積利益(コントラクトに貯まった額)</div></div>
 <div><div class="v">$${getCurrentTradeCapUsd()}</div><div class="l">取引上限</div></div>
 <div><div class="v" style="color:${isLive?'#2ecc71':'#888'}">${isLive?'稼働中':'停止中'}</div><div class="l">自動売買</div></div></div>
 <table class="t-real"><thead><tr><th>日時(${TZ_LABEL})</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table>
-<div class="note">経路の最初のプール自身から先に受け取るため、借入手数料はかかりません。<br>累計の内訳: 粗利+$${real.totalGrossProfitUsd.toFixed(4)} − ガス代$${real.totalGasCostUsd.toFixed(4)}${real.totalsSource === "chain" ? `(${formatLocalTime(real.rebuiltAt)}にチェーン上の記録から作り直し、以後は足し上げ。価格はその時点の値)` : ""}<br>コントラクトに溜まっている利益: ${balanceLine}</div></div>
+<div class="note">累積利益は、コントラクトに貯まっている利益の<b>実際の残高</b>です(一度も引き出していないので、これが貯めてきた利益の全部。旧コントラクトの分も含む。今の価格で換算、${contractBalancesAt ? formatLocalTime(contractBalancesAt) : "まだ読んでいない"}時点)。<br>
+内訳: ${balanceLine}<br>
+ガス代はウォレットから払っているので、この額には含まれていません。</div></div></div>
 
 <div class="card"><h2>📐 V3の価格表(公式Quoter)</h2>
 <div class="stat"><div><div class="v" style="color:#6fae62">${countQuoteTables().toLocaleString()}</div><div class="l">作成済みの表</div></div>
@@ -2707,11 +2749,6 @@ async function main() {
     runMorphoSurvey().catch((e) => console.error("[Morpho調査] 失敗:", e.message));
   }
 
-  // 画面の「累積利益」をチェーン上の記録から作り直す(読み取りのみ・1回だけ・裏で)。
-  // 記録を500件で捨てていたため、累計が変わっていた(2026年9月23日)。終わったら空に戻すこと。
-  if (rebuildChains().length > 0) {
-    runRealTotalsRebuild().catch((e) => console.error("[累計の作り直し] 失敗:", e.message));
-  }
 
   // **「ロスカットの急落を買って戻ったら売る」を過去データで検証する**(オーナーの案)。
   // Binance の無料の公開ダンプ(1分足)を読んで計算するだけ。**取引も送金もしない。**
