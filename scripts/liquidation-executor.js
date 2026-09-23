@@ -204,7 +204,7 @@ function legOf(pool, tokenIn, tokenOut) {
 
 /// 担保 → 借金の通貨の経路を集め、見積もりで並べる。
 /// 戻り値: [{ legs, label, estimatedOut }](受取量の多い順)
-async function buildRoutes(collateral, debt, seized) {
+export async function buildRoutes(collateral, debt, seized) {
   const routes = [];
   const c = collateral.toLowerCase(), d = debt.toLowerCase();
   // 1段目の相手: 借金の通貨そのもの + 中継。
