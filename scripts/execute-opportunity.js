@@ -893,6 +893,78 @@ const SEND_CHAINS = (process.env.SEND_CHAINS || "")
 /// 毎回ゼロに戻ると永遠に判断できない(2026年9月22日、オーナーの提案)。
 const skippedByChain = new Map();
 
+/// **送らなかった機会が「本物だったか」を、チェーンに聞いて数える(影の確認)。**
+///
+/// [なぜ要るか(2026年9月23日、オーナーの承認)]
+/// 送信停止中の見込みは base 216回 $8.88 / optimism 239回 $4.78 まで積み上がったが、
+/// これは**模型の値だけ**。大物の実測では模型の見込みは「試した10件中 本物0件」だった。
+/// チェーンに聞かない限り、**送信を再開すべきかが永久に分からない**。
+///
+/// 本番と同じ `simulateRoute`(eth_call)を当てるだけで、**送信しない・ガスを払わない**。
+/// 経路の除外・価格表の破棄など、**本番の状態を変えることは一切しない**。
+///
+///   本物   … チェーン上で黒字、かつガス代を引いても下限以上 = 送っていれば取れた見込み
+///   ガス負け … チェーン上で黒字だがガス代を引くと下限未満
+///   赤字   … チェーン上の計算で赤字(模型の幻)
+///   拒否   … 確認そのものが revert(K検算・税・状態の変化など)
+///
+/// ただし「本物」でも**競争に勝てたかは別**(先越されは送らないと分からない)。上限の目安。
+const SHADOW_KEYS = ["tried", "real", "realUsd", "gasLoss", "loss", "rejected", "errors"];
+function newSkipEntry() {
+  return { n: 0, usd: 0, tried: 0, real: 0, realUsd: 0, gasLoss: 0, loss: 0, rejected: 0, errors: 0 };
+}
+/// RPC の枠を守るため、チェーンごとにこの間隔より詰めて聞かない。
+const SHADOW_MIN_INTERVAL_MS = parseInt(process.env.SEND_SHADOW_MIN_INTERVAL_MS || "15000", 10);
+const SHADOW_ENABLED = process.env.SEND_SHADOW !== "false";
+const shadowLastAt = new Map();
+const shadowInFlight = new Set();
+
+async function shadowCheck(opp) {
+  const chain = opp.chain;
+  const entry = skippedByChain.get(chain);
+  if (!entry) return;
+  const chainConfig = getChainConfig(chain);
+  const contractAddress = chainConfig && process.env[chainConfig.contractAddressEnvVar];
+  const privateKey = process.env.MAINNET_BOT_PRIVATE_KEY;
+  // simulateRoute は onlyOwner なので、所有者の住所で聞く(署名も送信もしない)。
+  if (!contractAddress || !privateKey) return;
+  const decimals = getTokenDecimals(chain, opp.tokenA);
+  const priceUsd = getTokenPriceUsd(chain, opp.tokenA);
+  if (decimals == null || !priceUsd) return;
+
+  // 投入額は本番と同じ扱い(上限で頭を押さえる)。
+  const capUsd = getCurrentTradeCapUsd();
+  let amountIn = opp.amountIn;
+  if (opp.tradeAmountUsd > capUsd) {
+    amountIn = (amountIn * BigInt(Math.round((capUsd / opp.tradeAmountUsd) * 10000))) / 10000n;
+  }
+  if (!(amountIn > 0n)) return;
+
+  entry.tried++;
+  try {
+    const { wallet } = getSigner(chain, privateKey);
+    const version = await detectContractVersion(chain, contractAddress);
+    const legArgs = buildLegArgs(chain, opp, version.version);
+    const sim = await simulate(chain, contractAddress, wallet.address,
+      ethers.getAddress(opp.tokenA), amountIn, legArgs, version.iface);
+    if (sim.error) { entry.rejected++; return; }
+    const profitRaw = sim.returned - sim.owed;
+    if (profitRaw <= 0n) { entry.loss++; return; }
+    const grossUsd = (Number(profitRaw) / Math.pow(10, decimals)) * priceUsd;
+    const gasUsd = await estimateGasCostUsd(chain, opp.kind);
+    const netUsd = grossUsd - gasUsd;
+    if (netUsd < minProfitUsd()) { entry.gasLoss++; return; }
+    entry.real++;
+    entry.realUsd += netUsd;
+    console.log(`[影の確認] ${chain} ${opp.label}: **本物** 純利$${netUsd.toFixed(4)}`
+      + `(模型の見込み$${(Number(opp.netProfitUsd) || 0).toFixed(4)} / ガス$${gasUsd.toFixed(4)})。送信停止中なので送らない`);
+  } catch (e) {
+    entry.errors++;
+  } finally {
+    persistSkips();
+  }
+}
+
 const SKIP_STATE_NAME = "send-skips.json";
 const SKIP_STATE_VERSION = 1;
 const SKIP_SAVE_MIN_MS = 60 * 1000;
@@ -904,7 +976,12 @@ let skipPendingSave = null;
   if (!d) return;
   for (const [chain, v] of Object.entries(d)) {
     const n = Number(v?.n), usd = Number(v?.usd);
-    if (Number.isFinite(n) && Number.isFinite(usd)) skippedByChain.set(chain, { n, usd });
+    if (!Number.isFinite(n) || !Number.isFinite(usd)) continue;
+    const e = newSkipEntry();
+    e.n = n; e.usd = usd;
+    // 影の確認の集計(2026年9月23日に追加)。無い古い記録は0から。
+    for (const k of SHADOW_KEYS) if (Number.isFinite(Number(v?.[k]))) e[k] = Number(v[k]);
+    skippedByChain.set(chain, e);
   }
   if (skippedByChain.size > 0) {
     const total = [...skippedByChain.values()].reduce((a, v) => a + v.n, 0);
@@ -942,17 +1019,28 @@ export function getSendSkips() { return Object.fromEntries(skippedByChain); }
 export function formatSendSkipLine() {
   if (skippedByChain.size === 0) return "";
   const parts = [...skippedByChain].map(([c, v]) =>
-    `${c}:${v.n}回(見込み計$${v.usd.toFixed(4)})`);
+    `${c}:${v.n}回(見込み計$${v.usd.toFixed(4)})`
+    // **チェーンに聞いた結果。** 本物が出続けるなら、送信の再開を検討する材料になる。
+    + (v.tried > 0
+      ? `[確認${v.tried} 本物${v.real}($${v.realUsd.toFixed(4)}) ガス負け${v.gasLoss} 赤字${v.loss} 拒否${v.rejected}${v.errors ? ` 失敗${v.errors}` : ""}]`
+      : ""));
   return ` 送信停止[${parts.join(" ")}]`;
 }
 
 export async function executeOpportunity(opp) {
   // **止めているチェーンなら、ここで終わり。** 送信の手前の唯一の関所。
   if (!isSendAllowed(opp.chain)) {
-    const v = skippedByChain.get(opp.chain) || { n: 0, usd: 0 };
+    const v = skippedByChain.get(opp.chain) || newSkipEntry();
     v.n++; v.usd += Number(opp.netProfitUsd) || 0;
     skippedByChain.set(opp.chain, v);
     persistSkips();
+    // **送らずに、チェーンに聞くだけ。** 待たない(判定の流れを止めない)。
+    const last = shadowLastAt.get(opp.chain) || 0;
+    if (SHADOW_ENABLED && !shadowInFlight.has(opp.chain) && Date.now() - last >= SHADOW_MIN_INTERVAL_MS) {
+      shadowLastAt.set(opp.chain, Date.now());
+      shadowInFlight.add(opp.chain);
+      shadowCheck(opp).catch(() => {}).finally(() => shadowInFlight.delete(opp.chain));
+    }
     opp.sendResult = "skipped_chain";
     console.log(`[実行] ${opp.chain} ${opp.label}: **送信しない**(SEND_CHAINS で停止中)`
       + ` 見込み$${(Number(opp.netProfitUsd) || 0).toFixed(4)}`);
