@@ -24,6 +24,7 @@
 
 import { ethers } from "ethers";
 import { callWithRpc } from "./onchain-reserves.js";
+import { getAnyChainConfig } from "../chain-config.js";
 import { weiToUsd } from "./gas-cost.js";
 import { loadRealExecutions, loadRealTotals, sumOfLog, adoptRebuiltTotals } from "./real-execution-log.js";
 
@@ -54,26 +55,41 @@ export function rebuildChains() {
   return raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 }
 
-async function fromBlockForDays(chain, latest, days) {
+/// 読み取りの経路。既定は bot の RPC(callWithRpc)。古い履歴を持たない RPC(polygon で
+/// 「410 Gone」)の時は、チェーン設定にある**公開 RPC を順に**使う(住所はログに出さない)。
+function viaBot(chain) {
+  return { name: "bot の RPC", send: (m, params) => callWithRpc(chain, (p) => p.send(m, params)) };
+}
+function viaPublic(chain) {
+  const urls = (getAnyChainConfig(chain)?.rpcUrls || []).slice(1); // 先頭は bot の RPC(環境変数)
+  const cfg = getAnyChainConfig(chain);
+  return urls.map((url, i) => {
+    const provider = new ethers.JsonRpcProvider(url, cfg.chainId, { staticNetwork: true });
+    return { name: `公開RPC${i + 1}`, send: (m, params) => provider.send(m, params) };
+  });
+}
+
+async function fromBlockForDays(via, latest, days) {
   const probe = Math.max(0, latest - 200_000);
+  const hex = (n) => "0x" + n.toString(16);
   const [a, b] = await Promise.all([
-    callWithRpc(chain, (p) => p.getBlock(latest)),
-    callWithRpc(chain, (p) => p.getBlock(probe)),
+    via.send("eth_getBlockByNumber", [hex(latest), false]),
+    via.send("eth_getBlockByNumber", [hex(probe), false]),
   ]);
-  const spb = a && b && latest > probe ? (Number(a.timestamp) - Number(b.timestamp)) / (latest - probe) : 2;
+  const spb = a && b && latest > probe ? (Number(BigInt(a.timestamp)) - Number(BigInt(b.timestamp))) / (latest - probe) : 2;
   return Math.max(0, latest - Math.floor((days * 86400) / Math.max(spb, 0.05)));
 }
 
-async function readRouteLogs(chain, from, to) {
+async function readRouteLogs(via, from, to) {
   const out = [];
   let chunk = 50_000, cursor = from, requests = 0, ceiling = Infinity;
   while (cursor <= to && requests < MAX_REQUESTS_PER_CHAIN) {
     const end = Math.min(to, cursor + chunk - 1);
     requests++;
     try {
-      const logs = await callWithRpc(chain, (p) => p.send("eth_getLogs", [{
+      const logs = await via.send("eth_getLogs", [{
         topics: [EVENT_TOPICS], fromBlock: "0x" + cursor.toString(16), toBlock: "0x" + end.toString(16),
-      }]));
+      }]);
       out.push(...(logs || []));
       cursor = end + 1;
       chunk = Math.min(Math.floor(chunk * 1.5), ceiling, 2_000_000);
@@ -115,9 +131,25 @@ async function tokenInfo(chain, token) {
 }
 
 async function rebuildChain(chain, wallet, days) {
-  const latest = await callWithRpc(chain, (p) => p.getBlockNumber());
-  const from = await fromBlockForDays(chain, latest, days);
-  const r = await readRouteLogs(chain, from, latest);
+  // bot の RPC で読み切れなければ、公開 RPC を順に試す
+  let last = null;
+  for (const via of [viaBot(chain), ...viaPublic(chain)]) {
+    try {
+      const res = await rebuildChainVia(chain, wallet, days, via);
+      if (res.complete) return res;
+      last = res;
+      console.log(`[累計の作り直し] ${chain}: ${via.name}では読み切れず(${res.error || "上限"})。次の経路を試します`);
+    } catch (e) {
+      console.log(`[累計の作り直し] ${chain}: ${via.name}で失敗(${(e.message || "").slice(0, 60)})。次の経路を試します`);
+    }
+  }
+  return last ?? { chain, failed: true };
+}
+
+async function rebuildChainVia(chain, wallet, days, via) {
+  const latest = Number(BigInt(await via.send("eth_blockNumber", [])));
+  const from = await fromBlockForDays(via, latest, days);
+  const r = await readRouteLogs(via, from, latest);
   const byTx = new Map();
   for (const log of r.logs) if (!byTx.has(log.transactionHash)) byTx.set(log.transactionHash, log);
   let count = 0, grossUsd = 0, gasUsd = 0, unpriced = 0, foreign = 0;
@@ -127,7 +159,7 @@ async function rebuildChain(chain, wallet, days) {
   let first = null;
   for (const [hash, log] of byTx) {
     let rc;
-    try { rc = await callWithRpc(chain, (p) => p.send("eth_getTransactionReceipt", [hash])); } catch (e) { continue; }
+    try { rc = await via.send("eth_getTransactionReceipt", [hash]); } catch (e) { continue; }
     if (!rc || (rc.from || "").toLowerCase() !== wallet.toLowerCase()) { foreign++; continue; }
     const asset = ethers.getAddress("0x" + log.topics[1].slice(26));
     const profitRaw = BigInt("0x" + log.data.slice(2 + 64, 2 + 128));
@@ -148,7 +180,7 @@ async function rebuildChain(chain, wallet, days) {
     if (first == null || bn < first) first = bn;
     await sleep(40);
   }
-  return { chain, count, grossUsd, gasUsd, netUsd: grossUsd - gasUsd, unpriced, foreign, contracts: contracts.size, complete: r.complete, requests: r.requests, error: r.error, from, latest, first, txs, byEvent };
+  return { chain, via: via.name, count, grossUsd, gasUsd, netUsd: grossUsd - gasUsd, unpriced, foreign, contracts: contracts.size, complete: r.complete, requests: r.requests, error: r.error, from, latest, first, txs, byEvent };
 }
 
 export async function runRealTotalsRebuild() {
@@ -167,7 +199,8 @@ export async function runRealTotalsRebuild() {
     try {
       const r = await rebuildChain(c, wallet, days);
       results.push(r);
-      console.log(`[累計の作り直し] ${c}: 成立${r.count}件(コントラクト${r.contracts}個) 粗利$${r.grossUsd.toFixed(4)} − ガス$${r.gasUsd.toFixed(4)} = 純利$${r.netUsd.toFixed(4)}`
+      if (r.failed) { console.error(`[累計の作り直し] ${c}: どの経路でも読めませんでした`); continue; }
+      console.log(`[累計の作り直し] ${c}(${r.via}): 成立${r.count}件(コントラクト${r.contracts}個) 粗利$${r.grossUsd.toFixed(4)} − ガス$${r.gasUsd.toFixed(4)} = 純利$${r.netUsd.toFixed(4)}`
         + ` 種類[${Object.entries(r.byEvent).map(([k, v]) => `${k}:${v}`).join(" ")}]`
         + `${r.unpriced ? ` 価格不明${r.unpriced}件` : ""}${r.foreign ? ` 他人の取引${r.foreign}件(除外)` : ""} 最初のブロック${r.first ?? "-"}`
         + ` ${r.complete ? "読み切り" : `**途中まで**(${r.error || "上限"})`} RPC${r.requests}`);
