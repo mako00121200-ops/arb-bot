@@ -369,6 +369,26 @@ export function resetNonce(chain) {
 const FEE_CAP_BASE_MULTIPLIER = BigInt(parseInt(process.env.FEE_CAP_BASE_MULTIPLIER || "4", 10));
 
 /// 送信に使う手数料(入札しない時)。基準に余裕を持たせた上限を付ける。
+/// 直近のブロックで**実際に払われた優先手数料**(中央値)。混んでいる時の下限に使う。
+///
+/// [なぜ(2026年9月23日 21:18 JST の実測)]
+/// 詰まり解消の上書き(優先0.1gwei)は4〜6秒で確定したのに、裁定の取引(優先150wei = RPC の提案値)は
+/// 20秒の制限時間内に入らず、avalanche の送信が成功0件のまま続いた。混雑時はブロックが高い入札から
+/// 埋まるので、提案値のままでは入らない。直近の実績に合わせれば、空いている時は小さいままで済む。
+const priorityFloorCache = new Map(); // chain -> { at, wei }
+async function recentPriorityFloor(chain) {
+  const c = priorityFloorCache.get(chain);
+  if (c && Date.now() - c.at < 3000) return c.wei;
+  let wei = 0n;
+  try {
+    const h = await getProviderForChain(chain).send("eth_feeHistory", ["0x5", "latest", [50]]);
+    const rewards = (h?.reward || []).map((r) => BigInt(r?.[0] ?? "0x0")).filter((v) => v > 0n).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    if (rewards.length > 0) wei = rewards[Math.floor(rewards.length / 2)];
+  } catch (e) {}
+  priorityFloorCache.set(chain, { at: Date.now(), wei });
+  return wei;
+}
+
 const feeDataCache = new Map(); // chain -> { at, fee } 送信の速さを落とさないよう2秒だけ使い回す
 async function defaultFeeOverrides(chain) {
   try {
@@ -376,10 +396,13 @@ async function defaultFeeOverrides(chain) {
     const fee = c && Date.now() - c.at < 2000 ? c.fee : await getProviderForChain(chain).getFeeData();
     if (!c || c.fee !== fee) feeDataCache.set(chain, { at: Date.now(), fee });
     if (fee.maxFeePerGas == null || fee.maxPriorityFeePerGas == null) return {};
-    const priority = fee.maxPriorityFeePerGas;
-    const baseFee = fee.maxFeePerGas > priority ? (fee.maxFeePerGas - priority) / 2n : 0n;
+    const suggested = fee.maxPriorityFeePerGas;
+    const baseFee = fee.maxFeePerGas > suggested ? (fee.maxFeePerGas - suggested) / 2n : 0n;
+    const floor = await recentPriorityFloor(chain);
+    const priority = floor > suggested ? floor : suggested;
     const maxFee = baseFee * FEE_CAP_BASE_MULTIPLIER + priority;
-    return { maxPriorityFeePerGas: priority, maxFeePerGas: maxFee > fee.maxFeePerGas ? maxFee : fee.maxFeePerGas };
+    // extraPerGas は判定用(送信には渡さない)。提案値より上げた分 = ガス代の見積もりに入っていない分
+    return { maxPriorityFeePerGas: priority, maxFeePerGas: maxFee > fee.maxFeePerGas ? maxFee : fee.maxFeePerGas, extraPerGas: priority - suggested };
   } catch (e) {
     return {};
   }
@@ -717,11 +740,14 @@ async function decidePriorityFee(chain, availableUsd, gasUnits) {
     const provider = getProviderForChain(key);
     if (!provider) return null;
     const fee = await provider.getFeeData();
-    const basePriority = fee.maxPriorityFeePerGas ?? 0n;
+    const suggestedPriority = fee.maxPriorityFeePerGas ?? 0n;
     // ethers は maxFeePerGas = baseFee×2 + priority で作る。そこから baseFee を戻す。
-    const baseFee = (fee.maxFeePerGas != null && fee.maxFeePerGas > basePriority)
-      ? (fee.maxFeePerGas - basePriority) / 2n
+    const baseFee = (fee.maxFeePerGas != null && fee.maxFeePerGas > suggestedPriority)
+      ? (fee.maxFeePerGas - suggestedPriority) / 2n
       : 0n;
+    // 入札の土台は「提案値」と「直近のブロックで実際に払われた中央値」の大きい方
+    const recentFloor = await recentPriorityFloor(key);
+    const basePriority = recentFloor > suggestedPriority ? recentFloor : suggestedPriority;
 
     // 1トークンのUSD価格(weiToUsd に 1e18 を渡すとそのまま出る)。
     const oneTokenUsd = await weiToUsd(key, 10n ** 18n);
@@ -1372,11 +1398,25 @@ async function executeOpportunityInner(opp) {
 
   // **順番を買う。** 残る純利益の一部だけを優先手数料に積む。
   // 積んだ後にもう一度「手数料負けしないか」を確かめ、割れるなら積まない。
-  const overrides = { gasLimit: gasWithBuffer, ...(await defaultFeeOverrides(chain)) };
+  const { extraPerGas: floorExtraPerGas = 0n, ...feeOverrides } = await defaultFeeOverrides(chain);
+  const overrides = { gasLimit: gasWithBuffer, ...feeOverrides };
   let bidNote = "";
+  // 混雑で優先手数料を上げた分は、ガス代の見積もりに入っていない。上げた後も黒字かを確かめる。
+  if (floorExtraPerGas > 0n) {
+    const floorUsd = (await weiToUsd(chain, floorExtraPerGas * gasUnits)) ?? 0;
+    if (grossProfitUsd - gasCostUsd - floorUsd < minProfitUsd()) {
+      markRouteRejected(opp);
+      opp.sendResult = "below_gas";
+      console.log(`[実行] ${opp.label}: 混雑で優先手数料を上げると+$${floorUsd.toFixed(4)}、純利が下限未満のため見送り(粗利$${grossProfitUsd.toFixed(4)} ガス$${gasCostUsd.toFixed(4)})`);
+      return false;
+    }
+    gasCostUsd += floorUsd;
+    bidNote = ` 混雑加算+$${floorUsd.toFixed(4)}`;
+  }
   {
     const availableUsd = grossProfitUsd - gasCostUsd;
     const bid = await decidePriorityFee(chain, availableUsd, gasUnits);
+    // (入札は「直近の実績」を土台に積むので、上の混雑加算と二重にはならない)
     if (bid && grossProfitUsd - gasCostUsd - bid.bidUsd >= minProfitUsd()) {
       overrides.maxPriorityFeePerGas = bid.maxPriorityFeePerGas;
       overrides.maxFeePerGas = bid.maxFeePerGas;
