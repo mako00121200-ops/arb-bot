@@ -693,3 +693,26 @@ base の大きさ別: $1万以上 163件/$74.9万、$1千〜1万 298件/$9.8万(
 危ない人(使用率95%以上)は **1秒ごと・確定前(pending)の状態**を、状態番号・市場・価格・持分を**1回の束**で読む。
 base は Flashblocks で 200ms ごとに作りかけのブロックが見えるので、確定(2秒)を待たない。
 次の段階の候補: オラクル(Chainlink)の更新取引を確定前のイベントで拾い、その市場だけ即座に計算し直す。
+
+
+## 16. 案1・案2 の「送らない計測」(2026年9月24日、**オーナーの指示: 1と2を進める**)
+
+UniswapX は見送り(計測も `UNISWAPX_PROBE_INTERVAL_MS=0` で停止)。代わりに次の2つを**読むだけ**で測る。
+
+| | 案1 Compound III の割引担保 | 案2 Spark PSM ↔ DEX |
+|---|---|---|
+| ファイル | `scripts/compound-buy-monitor.js` | `scripts/spark-psm-monitor.js` |
+| チェーン | base / arbitrum / optimism / polygon(USDC 市場) | base / arbitrum / optimism |
+| 住所の出典 | compound-finance/comet `deployments/<chain>/usdc/roots.json` | sparkdotfi/spark-address-registry `src/<Chain>.sol` |
+| 起動時の確認 | `baseToken()` が手書きのステーブルか | PSM の `usdc()/usds()/susds()` が表と一致するか |
+| 読む間隔 | 5分 | 2分 |
+| 生存ログ | `Compound[…売出N/M回(準備金/目標) 在庫$ 最良… 黒字N回]` | `Spark[… 今Xbps/最良Ybps 黒字N回 在庫不足 DEX経路なし]` |
+| 機会の行 | `[Compound計測/機会]` | `[Spark計測/機会]` |
+
+DEX 側は模型を使わず、`scripts/onchain-quote.js` で**ファクトリーに組のプールを聞き、自前コントラクトの quoteV3 で
+チェーンに直接試算させる**(UniswapX の見直しで、模型は大口で薄い V2 を選ぶと分かったため)。base は Aerodrome Slipstream も含む。
+
+純利 = 差額 − ガス代(Compound 45万・Spark 35万ガスの見込み)。Compound は借りる費用 5bps も引く(Spark は引いていない)。
+**送信する部分はまだ無い。** 本番化にはコントラクトの追加が要る(オーナーに相談)。
+
+**読み方:** `黒字N回` が1日を通して0なら、その案は見送り。出ていれば `機会` の行の額・頻度・DEX の経路を見て相談に進む。

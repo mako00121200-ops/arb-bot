@@ -1,0 +1,91 @@
+// scripts/onchain-quote.js
+//
+// **価格表や地図に頼らず、チェーンに直接「いくらで売れるか」を聞く。**
+//
+// [なぜ(2026年9月24日)]
+// UniswapX の比べ方を見直した時、我々の模型の経路(価格表のある V3 だけを使う)は、
+// $1,000 を超える額では深い V3 プールを候補から落とし、薄い V2 を選んでいたことが分かった。
+// Compound の割引担保・Spark の交換所との比較は「数千ドルを DEX で売ったらいくらか」が肝なので、
+// 模型ではなく**チェーンの答え**で測る。
+//
+// やること:
+//   1. その組の V3 プールを、そのチェーンの V3 ファクトリー全部に聞いて見つける(6時間覚える)
+//   2. 見つけたプール全部に、自前コントラクトの quoteV3 で実際の受取量を試算させる(1段)
+//   3. 中継通貨(手書きの主要通貨)を挟んだ2段も試す
+//
+// 送信は一切しない。読むだけ。
+import { ethers } from "ethers";
+import { getAnyChainConfig } from "../chain-config.js";
+import { V3_FACTORIES } from "./v3-pools.js";
+import { findV3PoolsBatch, quoteV3ByPoolBatch } from "./multicall-reserves.js";
+// base の Aerodrome Slipstream(清算の売却経路と同じ工場。住所の出典はそちらのコメント)
+import { EXTRA_V3_FACTORIES, SLIPSTREAM_TICK_SPACINGS } from "./liquidation-executor.js";
+
+const FEE_TIERS = [100, 500, 3000, 10000];
+const POOL_CACHE_MS = 6 * 60 * 60 * 1000;
+const poolCache = new Map(); // `${chain}|${t0}|${t1}` -> { at, pools: [{ address, dexId }] }
+
+/// その組の V3 プールをファクトリーに聞く(地図に無くても見つかる)。
+export async function findV3Pools(chain, tokenA, tokenB) {
+  const [t0, t1] = [tokenA.toLowerCase(), tokenB.toLowerCase()].sort();
+  const k = `${chain}|${t0}|${t1}`;
+  const c = poolCache.get(k);
+  if (c && Date.now() - c.at < POOL_CACHE_MS) return c.pools;
+  const pools = [];
+  for (const f of [...(V3_FACTORIES[chain] || []), ...(EXTRA_V3_FACTORIES[chain] || [])]) {
+    const reqs = f.style === "algebra"
+      ? [{ tokenA: t0, tokenB: t1 }]
+      : f.style === "slipstream" ? SLIPSTREAM_TICK_SPACINGS.map((tickSpacing) => ({ tokenA: t0, tokenB: t1, tickSpacing }))
+        : FEE_TIERS.map((feeTier) => ({ tokenA: t0, tokenB: t1, feeTier }));
+    if (reqs.length === 0) continue;
+    let addrs = [];
+    try { addrs = await findV3PoolsBatch(chain, f.address, f.style, reqs); } catch (e) { continue; }
+    addrs.forEach((a, i) => {
+      if (!a || a === ethers.ZeroAddress) return;
+      const fee = reqs[i].feeTier != null ? `(${(reqs[i].feeTier / 10000).toFixed(2)}%)`
+        : reqs[i].tickSpacing != null ? `(ts${reqs[i].tickSpacing})` : "";
+      pools.push({ address: a.toLowerCase(), dexId: `${f.dexId}${fee}` });
+    });
+  }
+  poolCache.set(k, { at: Date.now(), pools });
+  return pools;
+}
+
+function quoterAddress(chain) {
+  const cfg = getAnyChainConfig(chain);
+  return cfg ? process.env[cfg.contractAddressEnvVar] || null : null;
+}
+
+/// tokenIn を amountIn だけ売った時の最良の受取量(1段と、中継通貨を挟んだ2段)。
+/// @returns { out, label } / 売れる経路が無ければ null
+export async function bestSellQuote(chain, tokenIn, tokenOut, amountIn, hubs = [], blockTag = null) {
+  const quoter = quoterAddress(chain);
+  if (!quoter || !(amountIn > 0n)) return null;
+  const from = tokenIn.toLowerCase(), to = tokenOut.toLowerCase();
+  let best = null;
+  const direct = await findV3Pools(chain, from, to);
+  if (direct.length > 0) {
+    const outs = await quoteV3ByPoolBatch(chain, quoter,
+      direct.map((p) => ({ pool: p.address, tokenIn: from, amountIn })), false, blockTag);
+    outs.forEach((o, i) => { if (o != null && (!best || o > best.out)) best = { out: o, label: direct[i].dexId }; });
+  }
+  for (const hub of hubs) {
+    const mid = String(hub).toLowerCase();
+    if (mid === from || mid === to) continue;
+    const firsts = await findV3Pools(chain, from, mid);
+    if (firsts.length === 0) continue;
+    const seconds = await findV3Pools(chain, mid, to);
+    if (seconds.length === 0) continue;
+    const o1 = await quoteV3ByPoolBatch(chain, quoter,
+      firsts.map((p) => ({ pool: p.address, tokenIn: from, amountIn })), false, blockTag);
+    let m = null, mLabel = "";
+    o1.forEach((o, i) => { if (o != null && (m == null || o > m)) { m = o; mLabel = firsts[i].dexId; } });
+    if (m == null) continue;
+    const o2 = await quoteV3ByPoolBatch(chain, quoter,
+      seconds.map((p) => ({ pool: p.address, tokenIn: mid, amountIn: m })), false, blockTag);
+    o2.forEach((o, i) => {
+      if (o != null && (!best || o > best.out)) best = { out: o, label: `${mLabel}→${seconds[i].dexId}` };
+    });
+  }
+  return best;
+}
