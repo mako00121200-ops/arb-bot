@@ -228,3 +228,98 @@ export function splitByAge(wins, cutSec = 60, minEach = 5) {
   const old = side(wins.filter((w) => w?.ageSec != null && w.ageSec >= cutSec));
   return { cutSec, young, old, enough: young.n >= minEach && old.n >= minEach };
 }
+
+// ===== V3 Dutch の「値の下がり方」を再現する(2026年9月23日、オーナーの指示) =====
+//
+// [なぜ要るか]
+// 「どれだけ速ければ勝てるか」「ガス代込みでいくら残るか」を**測って**答えるため。
+// 実際の約定額(settledAmounts)は1点しか教えてくれない。曲線を再現すれば
+// 「その注文が各ブロックでいくら要求していたか」が分かり、
+// **我々が黒字になる最初のブロック**と、勝者が埋めたブロックを比べられる。
+//
+// [一次情報]
+// UniswapX の `NonlinearDutchDecayLib.sol`:
+//   ・decayStartBlock 以前(または曲線が空)… startAmount(下限 minAmount)
+//   ・経過ブロック = block − decayStartBlock
+//   ・曲線の点は (relativeBlocks[i], relativeAmounts[i])。最初の点の前は (0, 0) から補間
+//   ・点と点の間は**直線補間**、最後の点より後は最後の値のまま
+//   ・出力 = startAmount − 補間した差分(下限 minAmount)
+// 開始額は cosigner の `outputOverrides[i]` が 0 でなければそれで上書き(uniswapx-sdk の V3DutchOrder)。
+// relativeBlocks は SDK では数の配列、コントラクトでは 16bit ずつ詰めた数。**両方受ける。**
+
+/// relativeBlocks を数の配列にする。配列ならそのまま、数(文字列)なら 16bit ずつほどく。
+export function unpackRelativeBlocks(raw, n) {
+  if (Array.isArray(raw)) return raw.map((v) => Number(v));
+  if (raw == null) return null;
+  let x;
+  try { x = BigInt(String(raw)); } catch (e) { return null; }
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(Number((x >> BigInt(16 * i)) & 0xffffn));
+  return out;
+}
+
+/// 1つの出力が、あるブロックで要求する額。オンチェーンの decay と同じ手順。
+export function decayedAmount({ start, min, relBlocks, relAmounts, decayStartBlock, block }) {
+  const lo = min != null ? min : 0n;
+  const bound = (v) => (v < lo ? lo : v);
+  if (!relAmounts || relAmounts.length === 0 || decayStartBlock >= block) return bound(start);
+  const elapsed = block - decayStartBlock;
+  let b0 = 0, a0 = 0n, b1, a1;
+  const n = relAmounts.length;
+  if (elapsed <= relBlocks[0]) {
+    b1 = relBlocks[0]; a1 = relAmounts[0];
+  } else if (elapsed >= relBlocks[n - 1]) {
+    b0 = b1 = relBlocks[n - 1]; a0 = a1 = relAmounts[n - 1];
+  } else {
+    let i = 1;
+    while (i < n && relBlocks[i] < elapsed) i++;
+    b0 = relBlocks[i - 1]; a0 = relAmounts[i - 1];
+    b1 = relBlocks[i]; a1 = relAmounts[i];
+  }
+  let delta;
+  if (b1 === b0) delta = a1;
+  else delta = a0 + ((a1 - a0) * BigInt(elapsed - b0)) / BigInt(b1 - b0);
+  return bound(start - delta);
+}
+
+/// 注文から「tokenOut で、各ブロックに合計いくら要求されるか」を返す関数を作る。
+/// 読めなければ null(**推測で埋めない**)。
+export function readV3Requirement(order, tokenOut) {
+  const cd = order?.cosignerData;
+  const decayStartBlock = Number(cd?.decayStartBlock);
+  if (!Number.isFinite(decayStartBlock) || decayStartBlock <= 0) return null;
+  const outs = Array.isArray(order?.outputs) ? order.outputs : [];
+  const overrides = Array.isArray(cd?.outputOverrides) ? cd.outputOverrides : [];
+  const parts = [];
+  try {
+    outs.forEach((o, idx) => {
+      if (!o?.token || String(o.token).toLowerCase() !== tokenOut) return;
+      const ov = overrides[idx] != null ? BigInt(String(overrides[idx])) : 0n;
+      const start = ov > 0n ? ov : BigInt(String(o.startAmount));
+      const min = o.minAmount != null ? BigInt(String(o.minAmount)) : 0n;
+      const relAmounts = Array.isArray(o.curve?.relativeAmounts)
+        ? o.curve.relativeAmounts.map((v) => BigInt(String(v))) : [];
+      const relBlocks = relAmounts.length > 0
+        ? unpackRelativeBlocks(o.curve?.relativeBlocks, relAmounts.length) : [];
+      if (relAmounts.length > 0 && (!relBlocks || relBlocks.length < relAmounts.length)) throw new Error("curve");
+      parts.push({ start, min, relBlocks, relAmounts });
+    });
+  } catch (e) { return null; }
+  if (parts.length === 0) return null;
+  const lastRel = Math.max(0, ...parts.map((p) => (p.relBlocks.length ? p.relBlocks[p.relBlocks.length - 1] : 0)));
+  return {
+    decayStartBlock,
+    endBlock: decayStartBlock + lastRel,
+    at: (block) => parts.reduce((sum, p) => sum + decayedAmount({ ...p, decayStartBlock, block }), 0n),
+  };
+}
+
+/// **我々が黒字になる最初のブロック**を探す。
+/// ours … 我々の経路が出せる額 / need(b) … そのブロックで要求される額 / cost … ガス代(tokenOut 建て)
+/// 見つからなければ null(曲線の終わりまで待っても黒字にならない)。
+export function firstProfitableBlock(req, ours, cost, offset = 0n) {
+  for (let b = req.decayStartBlock; b <= req.endBlock + 1; b++) {
+    if (ours >= req.at(b) + offset + cost) return b;
+  }
+  return null;
+}
