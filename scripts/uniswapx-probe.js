@@ -43,7 +43,7 @@ import { weiToUsd } from "./gas-cost.js";
 import { callWithRpc } from "./onchain-reserves.js";
 import { getTokenDecimals, getTokenPriceUsd, KIND_V3 } from "./pool-registry.js";
 import { getKnownTokens, toWrappedToken, isNativeToken } from "./borrowable-tokens.js";
-import { quoteV3ByPoolBatch } from "./multicall-reserves.js";
+import { quoteV3ByPoolBatch, fetchReservesBatch } from "./multicall-reserves.js";
 import { getAnyChainConfig } from "../chain-config.js";
 import { loadState, saveState, stateFilePath } from "./state-file.js";
 
@@ -200,6 +200,37 @@ async function verifyOnChain(chain, legs, amountIn, blockTag = null) {
   return amount;
 }
 
+/// **経路を、指定したブロックの状態で見積もる。V2 の段も扱う**(2026年9月23日)。
+///
+/// V3 の段は自前コントラクトの quoteV3(チェーンが計算する)、V2 の段はその時点の準備量と
+/// 手数料で x·y=k を計算する。V2 は**税トークンを見抜けない**ので、結果に hasV2 を付けて
+/// 判断材料の中でも**分けて数える**(V2 を含むものだけが良く見えるなら、それは疑う)。
+async function quoteRouteAt(chain, legs, amountIn, blockTag) {
+  const cfg = getAnyChainConfig(chain);
+  const contractAddress = cfg && process.env[cfg.contractAddressEnvVar];
+  if (!contractAddress) return null;
+  let amount = amountIn;
+  let hasV2 = false;
+  for (const leg of legs) {
+    if (leg.kind === KIND_V3) {
+      const [out] = await quoteV3ByPoolBatch(
+        chain, contractAddress, [{ pool: leg.pool, tokenIn: leg.tokenIn, amountIn: amount }], false, blockTag);
+      if (out == null || !(out > 0n)) return null;
+      amount = out;
+      continue;
+    }
+    hasV2 = true;
+    const st = (await fetchReservesBatch(chain, [{ address: leg.pool }], false, blockTag)).get(leg.pool.toLowerCase());
+    if (!st || !(st.raw0 > 0n) || !(st.raw1 > 0n) || leg.feeBps == null) return null;
+    const in0 = String(st.token0).toLowerCase() === String(leg.tokenIn).toLowerCase();
+    const rIn = in0 ? st.raw0 : st.raw1, rOut = in0 ? st.raw1 : st.raw0;
+    const withFee = amount * (10000n - BigInt(leg.feeBps));
+    amount = (withFee * rOut) / (rIn * 10000n + withFee);
+    if (!(amount > 0n)) return null;
+  }
+  return { out: amount, hasV2 };
+}
+
 /// UniswapX の反応器が約定ごとに出すイベント(`ReactorEvents.sol`):
 /// `Fill(bytes32 indexed orderHash, address indexed filler, address indexed swapper, uint256 nonce)`
 const FILL_TOPIC = ethers.id("Fill(bytes32,address,address,uint256)");
@@ -232,10 +263,14 @@ async function readWinnerCost(chain, txHash, orderHash) {
 ///   leadBlocks  … 曲線を再現し、ガス代込みで我々が黒字になる最初のブロックが、
 ///                 勝者のブロックより**何ブロック前か**(+なら勝てた / −なら届かない / null は曲線の最後まで赤字)
 ///
-/// V3 だけの経路に限る(過去の状態で**チェーンに**見積もらせられるのは V3 だけ)。
+/// V2 を含む経路も測る(その時点の準備量で計算)。ただし税トークンを見抜けないので hasV2 で分けて数える。
+///
+/// **独占期間**(2026年9月23日に追加):V3 Dutch では cosigner が `exclusiveFiller` を指定すると、
+/// `decayStartBlock` までは**その者しか**埋められない(他者は `exclusivityOverrideBps` 分を上乗せしない限り不可)。
+/// 初回の2件で勝者が「値下がり開始の2ブロック前」に埋めていたため、**速さの問題か、
+/// quoter(見積もりの審査が要る役)になる問題か**を、これで決着させる。
 async function measureDecision(chain, s, order, swap, mine, tokenOut, sizeUsd) {
   const skip = s.decisionSkip;
-  if (mine.legs.some((l) => l.kind !== KIND_V3)) { skip.notV3++; return; }
   const fillBlock = Number(order.fillBlock);
   if (!Number.isFinite(fillBlock) || fillBlock <= 0) { skip.noFillBlock++; return; }
   // 曲線は**注文の元の住所**で探す(ネイティブ ETH はゼロ住所のまま)。価格の換算だけ包んだ版で行う。
@@ -250,9 +285,10 @@ async function measureDecision(chain, s, order, swap, mine, tokenOut, sizeUsd) {
   }
 
   // 約定の直前(前のブロックの終わり)の状態で、我々の経路を見積もる。
-  let oursAtFill = null;
-  try { oursAtFill = await verifyOnChain(chain, mine.legs, swap.amountIn, fillBlock - 1); } catch (e) {}
-  if (oursAtFill == null) { skip.noHistory++; return; }
+  let quoted = null;
+  try { quoted = await quoteRouteAt(chain, mine.legs, swap.amountIn, fillBlock - 1); } catch (e) {}
+  if (quoted == null) { skip.noHistory++; return; }
+  const oursAtFill = quoted.out;
 
   let cost = null;
   try { cost = order.txHash ? await readWinnerCost(chain, order.txHash, order.orderHash) : null; } catch (e) {}
@@ -272,6 +308,11 @@ async function measureDecision(chain, s, order, swap, mine, tokenOut, sizeUsd) {
   const gapBps = Number((oursAtFill - settled) * 100000n / settled) / 10;
   const be = firstProfitableBlock(req, oursAtFill, costTok, offset);
   const leadBlocks = be == null ? null : fillBlock - be;
+  // 独占の有無と、勝者が独占者本人か。ゼロ住所は「独占なし」。
+  const cd = order.cosignerData || {};
+  const ex = cd.exclusiveFiller ? String(cd.exclusiveFiller).toLowerCase() : null;
+  const exclusiveFiller = ex && !/^0x0{40}$/.test(ex) ? ex : null;
+  const exclOverrideBps = Number.isFinite(Number(cd.exclusivityOverrideBps)) ? Number(cd.exclusivityOverrideBps) : null;
 
   const row = {
     at: new Date().toISOString(), chain, order: order.orderHash, tx: order.txHash,
@@ -280,6 +321,11 @@ async function measureDecision(chain, s, order, swap, mine, tokenOut, sizeUsd) {
     gapBps, gasUsd: Number(gasUsd.toFixed(5)), nFills: cost.nFills, gasUsed: cost.gasUsed, filler: cost.filler,
     sameBlockNetUsd: Number(sameBlockNetUsd.toFixed(5)), leadBlocks,
     offsetBps: Number((offset * 100000n / settled)) / 10,
+    hasV2: quoted.hasV2,
+    exclusiveFiller, exclOverrideBps,
+    // 独占期間中(値下がり開始前)に埋められたか / 埋めたのが独占者本人か
+    inExclusive: exclusiveFiller != null && fillBlock < req.decayStartBlock,
+    byExclusive: exclusiveFiller != null && cost.filler === exclusiveFiller,
   };
   s.decisions.push(row);
   if (s.decisions.length > 300) s.decisions.shift();
@@ -556,7 +602,7 @@ function fmtGap(arr) {
 export function formatDecisionLine(chain, s) {
   const d = s.decisions || [];
   const sk = s.decisionSkip || {};
-  const skipNote = `測れず[V2経路${sk.notV3 || 0} 曲線${sk.noCurve || 0} 過去の状態${sk.noHistory || 0} レシート${sk.noReceipt || 0} 価格${sk.noPrice || 0}]`;
+  const skipNote = `測れず[曲線${sk.noCurve || 0} 過去の状態${sk.noHistory || 0} レシート${sk.noReceipt || 0} 価格${sk.noPrice || 0}]`;
   if (d.length === 0) return `${chain} 判断材料0件 ${skipNote}`;
   const med = (arr) => { const a = arr.filter((v) => v != null && Number.isFinite(v)).sort((x, y) => x - y); return a.length ? a[Math.floor(a.length / 2)] : null; };
   const q = (arr, p) => { const a = arr.filter((v) => v != null && Number.isFinite(v)).sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(a.length * p))] : null; };
@@ -575,11 +621,18 @@ export function formatDecisionLine(chain, s) {
   for (const r of d) if (r.filler) byFiller[r.filler] = (byFiller[r.filler] || 0) + 1;
   const top = Object.entries(byFiller).sort((a, b) => b[1] - a[1]).slice(0, 3)
     .map(([a, n]) => `${a.slice(0, 8)}…${Math.round((n / d.length) * 100)}%`).join(" ");
-  return `${chain} 判断材料${d.length}件`
+  const exN = d.filter((r) => r.exclusiveFiller).length;
+  const exIn = d.filter((r) => r.inExclusive).length;
+  const exBy = d.filter((r) => r.byExclusive).length;
+  const ovr = med(d.filter((r) => r.exclusiveFiller).map((r) => r.exclOverrideBps));
+  const v2n = d.filter((r) => r.hasV2).length;
+  const v2win = d.filter((r) => r.hasV2 && r.sameBlockNetUsd > 0).length;
+  return `${chain} 判断材料${d.length}件(V2含む${v2n}件)`
+    + ` **独占[あり${exN}件 独占期間中に約定${exIn}件 独占者本人が埋めた${exBy}件${ovr != null ? ` 横取りの上乗せ中央${ovr}bps` : ""}]**`
     + ` 勝者の速さ[開始から中央${dMed}ブロック${toMs(dMed)} 速い1割${d10}ブロック${toMs(d10)}${msPerBlock != null ? ` 1ブロック${Math.round(msPerBlock)}ms(実測)` : ""}]`
     + ` 勝者のガス[中央$${med(d.map((r) => r.gasUsd))?.toFixed(4)} 1取引で平均${(d.reduce((a, r) => a + r.nFills, 0) / d.length).toFixed(1)}件]`
     + ` 約定直前の我々−実額[中央${med(d.map((r) => r.gapBps))?.toFixed(1)}bps 上位1割${q(d.map((r) => r.gapBps), 0.9)?.toFixed(1)}bps]`
-    + ` **同じブロックで出せたら黒字${sameWin}件(${Math.round((sameWin / d.length) * 100)}%) 計$${winUsd.toFixed(2)}**`
+    + ` **同じブロックで出せたら黒字${sameWin}件(${Math.round((sameWin / d.length) * 100)}%、うちV2含む${v2win}件) 計$${winUsd.toFixed(2)}**`
     + ` 曲線上で勝てた${couldWin}件 黒字化に要る差[中央${med(leads) ?? "-"}ブロック 最後まで赤字${never}件]`
     + (top ? ` 勝者[${top}]` : "")
     + ` ${skipNote}`;

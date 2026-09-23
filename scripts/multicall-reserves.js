@@ -76,16 +76,16 @@ async function multicall(chain, calls, priority = false, blockTag = null) {
 }
 
 /// 失敗したら半分に割って再試行する。1件まで割っても失敗した分は null。
-async function multicallSplitting(chain, calls, priority = false, minChunk = 4) {
+async function multicallSplitting(chain, calls, priority = false, minChunk = 4, blockTag = null) {
   try {
-    return await multicall(chain, calls, priority);
+    return await multicall(chain, calls, priority, blockTag);
   } catch (e) {
     if (calls.length <= minChunk) return calls.map(() => null);
     multicallStats.splits++;
     const half = Math.ceil(calls.length / 2);
     const [a, b] = await Promise.all([
-      multicallSplitting(chain, calls.slice(0, half), priority, minChunk),
-      multicallSplitting(chain, calls.slice(half), priority, minChunk),
+      multicallSplitting(chain, calls.slice(0, half), priority, minChunk, blockTag),
+      multicallSplitting(chain, calls.slice(half), priority, minChunk, blockTag),
     ]);
     return [...a, ...b];
   }
@@ -93,7 +93,8 @@ async function multicallSplitting(chain, calls, priority = false, minChunk = 4) 
 
 /// 複数プールの準備量とtoken0を一括で読む。
 /// 戻り値: Map<小文字アドレス, { raw0, raw1, token0 } | null(読めない)>
-export async function fetchReservesBatch(chain, pools, priority = false) {
+/// blockTag … 過去のブロック番号を渡すと**その時点の準備量**を読む(省略時は今までどおり)。
+export async function fetchReservesBatch(chain, pools, priority = false, blockTag = null) {
   const result = new Map();
   for (let i = 0; i < pools.length; i += MAX_POOLS_PER_CALL) {
     const chunk = pools.slice(i, i + MAX_POOLS_PER_CALL);
@@ -103,7 +104,7 @@ export async function fetchReservesBatch(chain, pools, priority = false) {
       calls.push({ target, allowFailure: true, callData: PAIR_IFACE.encodeFunctionData("getReserves") });
       calls.push({ target, allowFailure: true, callData: PAIR_IFACE.encodeFunctionData("token0") });
     }
-    const returned = await multicallSplitting(chain, calls, priority);
+    const returned = await multicallSplitting(chain, calls, priority, 4, blockTag);
     for (let j = 0; j < chunk.length; j++) {
       const key = chunk[j].address.toLowerCase();
       const r1 = returned[j * 2], r2 = returned[j * 2 + 1];
