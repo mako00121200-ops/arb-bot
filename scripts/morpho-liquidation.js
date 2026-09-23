@@ -504,7 +504,11 @@ async function handleResults({ results, stateBlock, at }) {
     const repaidUsd = loanUsd != null ? (Number(r.h.borrowed) / 10 ** r.m.loan.decimals) * loanUsd : null;
     const seen = S.seen.get(key);
     if (seen) seen.repaidUsd = repaidUsd;
-    if (repaidUsd != null && repaidUsd < MIN_DEBT_USD) { S.stats.dust++; continue; }
+    if (repaidUsd != null && repaidUsd < MIN_DEBT_USD) {
+      // 塵も「人」で数える(毎秒読み直すたびに数えると、19:21 JST に 11,378 と膨らんでいた)
+      if (seen && !seen.dust) { seen.dust = true; S.stats.dust++; }
+      continue;
+    }
     const last = S.lastSim.get(key) || 0;
     if (Date.now() - last < RESIM_MS) continue;
     S.lastSim.set(key, Date.now());

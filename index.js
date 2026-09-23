@@ -37,6 +37,7 @@ import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
 import { runPoolSurvey } from "./scripts/pool-survey.js";
 import { runMainnetDepthSurvey } from "./scripts/mainnet-depth-survey.js";
 import { runMorphoSurvey, morphoSurveyChains } from "./scripts/morpho-liquidation-survey.js";
+import { runRealTotalsRebuild, rebuildChains } from "./scripts/real-totals-rebuild.js";
 import { runWickBacktestAll, wickBacktestSymbols } from "./scripts/wick-backtest.js";
 import { startMainnetEdgeWatch, formatMainnetEdgeLine, flushMainnetEdge } from "./scripts/mainnet-edge-watch.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
@@ -2650,7 +2651,7 @@ ${whatIfRows(chain)}`;
 <div><div class="v">$${getCurrentTradeCapUsd()}</div><div class="l">取引上限</div></div>
 <div><div class="v" style="color:${isLive?'#2ecc71':'#888'}">${isLive?'稼働中':'停止中'}</div><div class="l">自動売買</div></div></div>
 <table class="t-real"><thead><tr><th>日時(${TZ_LABEL})</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table>
-<div class="note">経路の最初のプール自身から先に受け取るため、借入手数料はかかりません。<br>累計の内訳: 粗利+$${real.totalGrossProfitUsd.toFixed(4)} − ガス代$${real.totalGasCostUsd.toFixed(4)}<br>コントラクトに溜まっている利益: ${balanceLine}</div></div>
+<div class="note">経路の最初のプール自身から先に受け取るため、借入手数料はかかりません。<br>累計の内訳: 粗利+$${real.totalGrossProfitUsd.toFixed(4)} − ガス代$${real.totalGasCostUsd.toFixed(4)}${real.totalsSource === "chain" ? `(${formatLocalTime(real.rebuiltAt)}にチェーン上の記録から作り直し、以後は足し上げ。価格はその時点の値)` : ""}<br>コントラクトに溜まっている利益: ${balanceLine}</div></div>
 
 <div class="card"><h2>📐 V3の価格表(公式Quoter)</h2>
 <div class="stat"><div><div class="v" style="color:#6fae62">${countQuoteTables().toLocaleString()}</div><div class="l">作成済みの表</div></div>
@@ -2862,6 +2863,12 @@ async function main() {
   // 終わったら RUN_MORPHO_SURVEY を空に戻すこと。
   if (morphoSurveyChains().length > 0) {
     runMorphoSurvey().catch((e) => console.error("[Morpho調査] 失敗:", e.message));
+  }
+
+  // 画面の「累積利益」をチェーン上の記録から作り直す(読み取りのみ・1回だけ・裏で)。
+  // 記録を500件で捨てていたため、累計が変わっていた(2026年9月23日)。終わったら空に戻すこと。
+  if (rebuildChains().length > 0) {
+    runRealTotalsRebuild().catch((e) => console.error("[累計の作り直し] 失敗:", e.message));
   }
 
   // **「ロスカットの急落を買って戻ったら売る」を過去データで検証する**(オーナーの案)。
