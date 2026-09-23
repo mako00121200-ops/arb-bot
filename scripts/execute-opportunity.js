@@ -414,12 +414,11 @@ export async function unstickNonce(chain) {
       provider.getTransactionCount(wallet.address, "pending"),
       provider.getFeeData(),
     ]);
-    if (pending <= mined) {
-      // 詰まりは既に解けている(手元の番号だけずれていた)
-      resetNonce(key);
-      console.log(`[詰まり解消] ${key}: 未確定の取引はありません(確定${mined} / 未確定込み${pending})。手元の番号を合わせ直しました`);
-      return;
-    }
+    // 「未確定の取引は無い」と返っても上書きする。
+    // [なぜ(2026年9月23日 21:09 JST の実測)] avalanche の公開 RPC は裏に複数のノードがあり、
+    // 数を聞いたノードは「確定521 / 未確定込み521」(=詰まり無し)と答えたが、送信を受けたノードは
+    // nonce 521(0x209)の古い取引を抱えていて「replacement fee too low」で断り続けた。
+    // 断られたこと自体が「どこかに同じ番号の取引がある」証拠なので、数の答えより断られた事実を信じる。
     const basePriority = fee.maxPriorityFeePerGas ?? 0n;
     const baseFee = fee.maxFeePerGas != null && fee.maxFeePerGas > basePriority ? (fee.maxFeePerGas - basePriority) / 2n : 0n;
     const floor = 100_000_000n; // 0.1 gwei
@@ -431,7 +430,7 @@ export async function unstickNonce(chain) {
     const maxFee = baseFee * FEE_CAP_BASE_MULTIPLIER + priority;
     st.nonce = mined;
     st.priority = priority;
-    console.warn(`[詰まり解消] ${key}: nonce ${mined} が未確定で詰まっています(未確定込み${pending})。自分宛て0円で上書きします(優先${(Number(priority) / 1e9).toFixed(3)}gwei 上限${(Number(maxFee) / 1e9).toFixed(3)}gwei)`);
+    console.warn(`[詰まり解消] ${key}: nonce ${mined} が同じ番号の古い取引に阻まれています(RPC の答え: 確定${mined} / 未確定込み${pending})。自分宛て0円で上書きします(優先${(Number(priority) / 1e9).toFixed(3)}gwei 上限${(Number(maxFee) / 1e9).toFixed(3)}gwei)`);
     const tx = await wallet.sendTransaction({ to: wallet.address, value: 0n, nonce: mined, gasLimit: 21000n, maxPriorityFeePerGas: priority, maxFeePerGas: maxFee });
     console.warn(`[詰まり解消] ${key}: 上書きを送信 ${tx.hash}`);
     const rc = await tx.wait(1, 60_000).catch(() => null);
