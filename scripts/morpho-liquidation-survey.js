@@ -307,7 +307,8 @@ function report(chain, rows, meta) {
   console.log(`${P} 清算があった日 約${counts.length}日、1日の件数 中央値${median(counts) ?? 0}・最大${counts.length ? Math.max(...counts) : 0}(急落の日に集中するか)`);
 
   // 大きい清算の実際のガス代(勝者が払った額)
-  const sampled = rows.filter((r) => r.gasUsd != null);
+  // 大きい順に並べる(rows は時刻順なので、そのままだと「上位5」が小口になる)
+  const sampled = rows.filter((r) => r.gasUsd != null).sort((a, b) => (b.repaidUsd ?? 0) - (a.repaidUsd ?? 0));
   if (sampled.length > 0) {
     const gas = sampled.map((r) => r.gasUsd);
     const net = sampled.filter((r) => r.bonusUsd != null).map((r) => r.bonusUsd - r.gasUsd);
