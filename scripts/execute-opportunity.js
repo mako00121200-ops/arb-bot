@@ -359,6 +359,90 @@ export function resetNonce(chain) {
   if (entry) { try { entry.signer.reset(); } catch (e) {} }
 }
 
+/// 手数料の上限に取る「基準手数料の何倍」。払うのは(基準+優先)だけなので、上限を上げても
+/// 支払いは増えない。上げるのは**基準手数料が急に上がった時に詰まらない**ため。
+///
+/// [なぜ(2026年9月23日 21:03 JST、avalanche で実測)]
+/// 機会が一気に増えた(黒字263件/数分)瞬間に、nonce 0x209 の取引が上限0.295gwei のまま
+/// 未確定で詰まった。ethers の既定は「基準×2 + 優先」で、基準がそれ以上に跳ねると入らない。
+/// 以後の送信はすべて同じ番号で「replacement fee too low」になり、**avalanche の送信が全部止まった**。
+const FEE_CAP_BASE_MULTIPLIER = BigInt(parseInt(process.env.FEE_CAP_BASE_MULTIPLIER || "4", 10));
+
+/// 送信に使う手数料(入札しない時)。基準に余裕を持たせた上限を付ける。
+const feeDataCache = new Map(); // chain -> { at, fee } 送信の速さを落とさないよう2秒だけ使い回す
+async function defaultFeeOverrides(chain) {
+  try {
+    const c = feeDataCache.get(chain);
+    const fee = c && Date.now() - c.at < 2000 ? c.fee : await getProviderForChain(chain).getFeeData();
+    if (!c || c.fee !== fee) feeDataCache.set(chain, { at: Date.now(), fee });
+    if (fee.maxFeePerGas == null || fee.maxPriorityFeePerGas == null) return {};
+    const priority = fee.maxPriorityFeePerGas;
+    const baseFee = fee.maxFeePerGas > priority ? (fee.maxFeePerGas - priority) / 2n : 0n;
+    const maxFee = baseFee * FEE_CAP_BASE_MULTIPLIER + priority;
+    return { maxPriorityFeePerGas: priority, maxFeePerGas: maxFee > fee.maxFeePerGas ? maxFee : fee.maxFeePerGas };
+  } catch (e) {
+    return {};
+  }
+}
+
+// ===== 詰まった nonce の解消 =====
+/// 同じ番号の取引が未確定のまま残っていると、以後の送信は全部「replacement fee too low」で断られる。
+/// その番号に**自分宛ての0円送金**を、手数料を上げて上書きし、詰まりを抜く(avalanche で1回 約$0.001)。
+/// 断られるたびに優先手数料を倍にしていく(置き換えは前の取引より十分高くないと受け付けられない)。
+const unstickState = new Map(); // chain -> { at, nonce, priority }
+const UNSTICK_MIN_INTERVAL_MS = 15000;
+const UNSTICK_MAX_PRIORITY_GWEI = parseFloat(process.env.UNSTICK_MAX_PRIORITY_GWEI || "50");
+
+export function isStuckNonceError(message) {
+  const m = String(message || "").toLowerCase();
+  return m.includes("replacement fee too low") || m.includes("replacement transaction underpriced");
+}
+
+export async function unstickNonce(chain) {
+  const key = (chain || "").toLowerCase();
+  const entry = signers.get(key);
+  if (!entry) return;
+  const prev = unstickState.get(key);
+  if (prev && Date.now() - prev.at < UNSTICK_MIN_INTERVAL_MS) return;
+  const st = { at: Date.now(), nonce: null, priority: 0n };
+  unstickState.set(key, st);
+  try {
+    const provider = getProviderForChain(key);
+    const wallet = entry.wallet;
+    const [mined, pending, fee] = await Promise.all([
+      provider.getTransactionCount(wallet.address, "latest"),
+      provider.getTransactionCount(wallet.address, "pending"),
+      provider.getFeeData(),
+    ]);
+    if (pending <= mined) {
+      // 詰まりは既に解けている(手元の番号だけずれていた)
+      resetNonce(key);
+      console.log(`[詰まり解消] ${key}: 未確定の取引はありません(確定${mined} / 未確定込み${pending})。手元の番号を合わせ直しました`);
+      return;
+    }
+    const basePriority = fee.maxPriorityFeePerGas ?? 0n;
+    const baseFee = fee.maxFeePerGas != null && fee.maxFeePerGas > basePriority ? (fee.maxFeePerGas - basePriority) / 2n : 0n;
+    const floor = 100_000_000n; // 0.1 gwei
+    let priority = basePriority * 3n > floor ? basePriority * 3n : floor;
+    // 同じ番号で前回も上書きを試していたら、その倍から始める
+    if (prev && prev.nonce === mined && prev.priority > 0n) priority = prev.priority * 2n > priority ? prev.priority * 2n : priority;
+    const cap = BigInt(Math.floor(UNSTICK_MAX_PRIORITY_GWEI * 1e9));
+    if (priority > cap) priority = cap;
+    const maxFee = baseFee * FEE_CAP_BASE_MULTIPLIER + priority;
+    st.nonce = mined;
+    st.priority = priority;
+    console.warn(`[詰まり解消] ${key}: nonce ${mined} が未確定で詰まっています(未確定込み${pending})。自分宛て0円で上書きします(優先${(Number(priority) / 1e9).toFixed(3)}gwei 上限${(Number(maxFee) / 1e9).toFixed(3)}gwei)`);
+    const tx = await wallet.sendTransaction({ to: wallet.address, value: 0n, nonce: mined, gasLimit: 21000n, maxPriorityFeePerGas: priority, maxFeePerGas: maxFee });
+    console.warn(`[詰まり解消] ${key}: 上書きを送信 ${tx.hash}`);
+    const rc = await tx.wait(1, 60_000).catch(() => null);
+    resetNonce(key);
+    console.warn(`[詰まり解消] ${key}: ${rc ? `確定(ブロック${rc.blockNumber})。送信を再開できます` : "60秒以内に確定せず。次に断られた時にもう一段上げて試します"}`);
+  } catch (e) {
+    resetNonce(key);
+    console.warn(`[詰まり解消] ${key}: 失敗 ${(e.message || "").slice(0, 120)}`);
+  }
+}
+
 // ===== コントラクトの ABI(新旧2種、2026年9月20日) =====
 //
 // ガス削減版で Leg の形が (pool, tokenIn, tokenOut, kind, feeBps) から
@@ -655,10 +739,10 @@ async function decidePriorityFee(chain, availableUsd, gasUnits) {
     if (extraPerGas <= 0n) return null;
 
     const priority = basePriority + extraPerGas;
-    // 上限は「baseFee×2 + 優先」。ただし baseFee を戻せなかった時に
+    // 上限は「baseFee×FEE_CAP_BASE_MULTIPLIER + 優先」。ただし baseFee を戻せなかった時に
     // **基準額を下回って拒否される**ので、ethers が出した上限に積んだ分を
     // 足した値とを比べて、**大きい方**を使う。
-    const fromBase = baseFee * 2n + priority;
+    const fromBase = baseFee * FEE_CAP_BASE_MULTIPLIER + priority;
     const fromEthers = (fee.maxFeePerGas ?? 0n) + extraPerGas;
     const maxFee = fromBase > fromEthers ? fromBase : fromEthers;
     if (maxFee < priority) return null; // 念のため(上限が優先より低いと送れない)
@@ -1289,7 +1373,7 @@ async function executeOpportunityInner(opp) {
 
   // **順番を買う。** 残る純利益の一部だけを優先手数料に積む。
   // 積んだ後にもう一度「手数料負けしないか」を確かめ、割れるなら積まない。
-  const overrides = { gasLimit: gasWithBuffer };
+  const overrides = { gasLimit: gasWithBuffer, ...(await defaultFeeOverrides(chain)) };
   let bidNote = "";
   {
     const availableUsd = grossProfitUsd - gasCostUsd;
@@ -1316,6 +1400,8 @@ async function executeOpportunityInner(opp) {
     const msg = e.message || "";
     // 送れなかった番号が手元に残ると以降の送信が詰まるので、鎖上の値に戻す。
     resetNonce(chain);
+    // 同じ番号の未確定の取引に阻まれている → 上書きして詰まりを抜く(裏で。この送信は失敗扱い)
+    if (isStuckNonceError(msg)) unstickNonce(chain).catch(() => {});
     throw new ExecutionError(msg.slice(0, 160), { reverted: msg.includes("execution reverted"), stage: "send" });
   }
 
