@@ -1,6 +1,6 @@
 // scripts/morpho-liquidation.js
 //
-// Morpho Blue の清算の**見張り(第1段: 送信しない)**。
+// Morpho Blue の清算の見張りと送信(MORPHO_LIQ_DRY_RUN=false の時だけ送る)。
 //
 // [なぜ(2026年9月23日、オーナーの了承「進めてください」)]
 // 過去90日の実測(scripts/morpho-liquidation-survey.js)で、base の Morpho は
@@ -12,11 +12,11 @@
 //   1. 借り手の名簿を作る(Borrow イベントを遡って読み、借金が0になった人は外す)
 //   2. 名簿の全員の健全度を定期的に読み、危ない人は短い間隔で読み直す
 //   3. 清算できる人を見つけたら、売る経路を探し、コントラクトの simulateLiquidation(eth_call)で
-//      返済後の利益を確かめる(**送らない**)
+//      返済後の利益を確かめる。DRY_RUN でなく、純利が下限以上なら送る(sendLiquidation)
 //   4. 実際に起きた清算(Liquidate イベント)と突き合わせて、**我々が先に見つけていたか・何ブロック
 //      先行していたか**を数える。これが「送れば勝てたか」の答えになる
 //
-// 送信は**まだ作っていない**。この段の数字を見てからオーナーに相談する。
+// 送信は 2026年9月23日にオーナーの指示で追加(「そろそろ自動売買に移行」)。
 //
 // [健全度の式(morpho-blue src/Morpho.sol の _isHealthy と同じ)]
 //   borrowed = borrowShares を資産に直した量(切り上げ)
@@ -33,6 +33,11 @@ import { gasUnitsToUsd } from "./gas-cost.js";
 import { stateFilePath } from "./state-file.js";
 import { nowJst } from "./jst.js";
 import { buildRoutes as buildAaveRoutes } from "./liquidation-executor.js";
+import { getSigner, resetNonce, defaultFeeOverrides } from "./execute-opportunity.js";
+import { weiToUsd } from "./gas-cost.js";
+import { recordRealExecution } from "./real-execution-log.js";
+import { alertOwner } from "./owner-alert.js";
+import { getChainConfig } from "../chain-config.js";
 // 経路探し(liquidation-executor.js)は LIQUIDATION_CHAIN のチェーン用に作られている。
 import { CHAIN as EXECUTOR_CHAIN } from "./liquidation-monitor.js";
 
@@ -58,6 +63,22 @@ const BACKFILL_REQUESTS_PER_TICK = parseInt(process.env.MORPHO_LIQ_BACKFILL_PER_
 const SIMULATE_TOP_N = 3;
 /// 同じ借り手を確かめ直すまでの時間。清算されずに残る人(放置)を毎分確かめてログを埋めないため長めに。
 const RESIM_MS = 10 * 60 * 1000;
+
+/// **送信するか。** 既定は送らない(DRY_RUN)。`MORPHO_LIQ_DRY_RUN=false` の時だけ送る。
+/// [送る判断(2026年9月23日、オーナーの指示「そろそろ自動売買に移行」)]
+/// 元手は要らない(担保を先に受け取り、売って返す)。利益が minProfit に届かなければコントラクトが
+/// 取り消すので、失うのは取り消し時のガス代だけ(base で1回 数セント)。
+export const MORPHO_DRY_RUN = process.env.MORPHO_LIQ_DRY_RUN !== "false";
+/// 送る下限の純利(ガス代を引いた後)。
+const MIN_NET_USD = parseFloat(process.env.MORPHO_LIQ_MIN_NET_USD || "0.05");
+/// 優先手数料に回す利益の割合。base は優先手数料の高い順に並ぶので、清算の取り合いはここで決まる。
+/// **先を越されて取り消しになっても、入札した手数料は払う**(base は取り消しも取り込まれる)。
+/// 勝率が分からないうちは小さく始める(0.10 なら勝率1割強で損益ゼロ)。勝ち負けの実績を見て上げる。
+const BID_SHARE = parseFloat(process.env.MORPHO_LIQ_BID_SHARE || "0.10");
+/// 送信のガスの上限(シミュレーションの実測より十分大きく)
+const SEND_GAS_LIMIT = BigInt(process.env.MORPHO_LIQ_GAS_LIMIT || "2000000");
+/// 取り消し時に失うガス代の何割までなら最低利益を下げてよいか(Aave 清算と同じ考え方)
+const REVERT_GAS_SHARE = parseFloat(process.env.REVERT_GAS_SHARE || "0.10");
 /// 清算できるのに、これだけ誰にも清算されない人は「放置」として別に数える。
 /// [なぜ(2026年9月23日 17:54 JST の初回の実測)]
 /// wbCOIN/USDC で使用率102.6%の人が約20人、誰にも清算されずに残っていた。売れない担保・止まった
@@ -100,6 +121,8 @@ const LIQ_TUPLE = "(address borrower, uint256 seizedAssets, uint256 repaidShares
 const LEG_TUPLE = "(address pool, address tokenOut, uint8 flags, uint16 feeBps)[]";
 const LIQUIDATOR_IFACE = new ethers.Interface([
   `function simulateLiquidation(${MP_TUPLE} mp, ${LIQ_TUPLE} liq, ${LEG_TUPLE} legs)`,
+  `function liquidate(${MP_TUPLE} mp, ${LIQ_TUPLE} liq, ${LEG_TUPLE} legs)`,
+  "event Liquidated(address indexed borrower, address indexed loanToken, address indexed collateralToken, uint256 repaid, uint256 seized, uint256 profit)",
   "function owner() view returns (address)",
   "function MORPHO() view returns (address)",
   "error SimulationResult(uint256 returned, uint256 owed)",
@@ -185,6 +208,7 @@ const S = {
     missNoRoster: 0, missBackfill: 0, missFar: 0, missSlow: 0, missNoPrior: 0,
     simErr: {},  // 取り消し理由 -> 件数(HEALTHY_POSITION が多ければ健全度の式がずれている)
     watchTicks: 0, watchMs: [],
+    sends: 0, sendOk: 0, sendFail: 0, sendProfitUsd: 0,
   },
 };
 
@@ -578,7 +602,85 @@ async function examine(r, repaidUsd, loanUsd) {
   if (net != null && net > 0) S.stats.simBest++;
   const seen = S.seen.get(keyOf(r.id, r.user));
   if (seen && best) { seen.simUsd = best.profitUsd; seen.simRaw = `${ethers.formatUnits(best.profitRaw, r.m.loan.decimals)} ${r.m.loan.symbol}`; }
-  console.log(`${head} → 確認 ${notes.join(" / ")}。ガス約$${gasUsd.toFixed(3)} 純利${net != null ? "$" + net.toFixed(2) : "?"}(DRY_RUN なので送りません)`);
+  console.log(`${head} → 確認 ${notes.join(" / ")}。ガス約$${gasUsd.toFixed(3)} 純利${net != null ? "$" + net.toFixed(2) : "?"}`
+    + (MORPHO_DRY_RUN ? "(DRY_RUN なので送りません)" : net != null && net >= MIN_NET_USD ? " → **送ります**" : `(下限$${MIN_NET_USD}未満で送りません)`));
+  if (MORPHO_DRY_RUN || !best || net == null || net < MIN_NET_USD) return;
+  await sendLiquidation(r, address, mp, liq, best, gasUsd, net, loanUsd, pair).catch((e) => {
+    S.stats.sendFail++;
+    resetNonce(MORPHO_LIQ_CHAIN);
+    console.warn(`[Morpho清算/送信] 失敗: ${(e.shortMessage || e.message || "").slice(0, 160)}`);
+  });
+}
+
+/// 実際に清算を送る。利益が minProfit に届かなければコントラクトが取り消す(失うのはガス代だけ)。
+async function sendLiquidation(r, address, mp, liq, best, gasUsd, net, loanUsd, pair) {
+  const privateKey = process.env.MAINNET_BOT_PRIVATE_KEY;
+  if (!privateKey) { console.warn("[Morpho清算/送信] MAINNET_BOT_PRIVATE_KEY が無いので送れません"); return; }
+  const { wallet, signer } = getSigner(MORPHO_LIQ_CHAIN, privateKey);
+  if (S.owner && wallet.address.toLowerCase() !== String(S.owner).toLowerCase()) {
+    console.warn(`[Morpho清算/送信] 送信の鍵(${short(wallet.address)})がコントラクトの持ち主(${short(S.owner)})と違うので送れません`);
+    return;
+  }
+  // 最低利益: 取り消し(ガス代だけ失う)より、少ない利益でも通した方が得。ガス代の約1割までは下げてよい
+  const bps = best.profitUsd > 0 && gasUsd > 0
+    ? Math.min(10000, Math.max(0, Math.round(((gasUsd * REVERT_GAS_SHARE) / best.profitUsd) * 10000))) : 500;
+  const minProfit = (best.profitRaw * BigInt(bps)) / 10000n;
+  // 入札: 利益の BID_SHARE を優先手数料に上乗せ(清算は優先手数料の高い順で取り合う)
+  const fee = await defaultFeeOverrides(MORPHO_LIQ_CHAIN);
+  const overrides = { gasLimit: SEND_GAS_LIMIT };
+  let bidNote = "";
+  if (fee.maxPriorityFeePerGas != null) {
+    const usdPerEth = await weiToUsd(MORPHO_LIQ_CHAIN, 10n ** 18n).catch(() => null);
+    let extra = 0n;
+    if (usdPerEth && best.profitUsd > 0 && BID_SHARE > 0) {
+      const bidUsd = best.profitUsd * BID_SHARE;
+      extra = BigInt(Math.floor((bidUsd / usdPerEth) * 1e18 / Number(GAS_UNITS)));
+      bidNote = ` 入札+$${bidUsd.toFixed(3)}`;
+    }
+    overrides.maxPriorityFeePerGas = fee.maxPriorityFeePerGas + extra;
+    overrides.maxFeePerGas = fee.maxFeePerGas + extra;
+  }
+  const legs = best.route.legs.map(({ pool, tokenOut, flags, feeBps }) => ({ pool, tokenOut, flags, feeBps }));
+  const contract = new ethers.Contract(address, LIQUIDATOR_IFACE, signer);
+  const startedAt = Date.now();
+  S.stats.sends++;
+  console.log(`[Morpho清算/送信 ${nowJst()}] ${pair} ${short(r.user)} ${best.route.label}: 見込み純利$${net.toFixed(2)} 最低利益${ethers.formatUnits(minProfit, r.m.loan.decimals)} ${r.m.loan.symbol}${bidNote} 送信します`);
+  const tx = await contract.liquidate(mp, { ...liq, minProfit }, legs, overrides);
+  console.log(`[Morpho清算/送信] ${tx.hash}`);
+  let receipt;
+  try {
+    receipt = await tx.wait();
+  } catch (e) {
+    S.stats.sendFail++;
+    resetNonce(MORPHO_LIQ_CHAIN);
+    console.warn(`[Morpho清算/送信] 確定待ちで失敗(先を越されたか取り消し): ${(e.shortMessage || e.message || "").slice(0, 120)}`);
+    return;
+  }
+  let profitRaw = null;
+  for (const log of receipt.logs) {
+    try {
+      const p = contract.interface.parseLog({ topics: log.topics, data: log.data });
+      if (p?.name === "Liquidated") profitRaw = p.args.profit;
+    } catch (e) {}
+  }
+  const profitUsd = profitRaw != null && loanUsd != null ? (Number(profitRaw) / 10 ** r.m.loan.decimals) * loanUsd : null;
+  let gasCostUsd = null;
+  try { gasCostUsd = await weiToUsd(MORPHO_LIQ_CHAIN, receipt.gasUsed * (receipt.gasPrice ?? receipt.effectiveGasPrice ?? 0n)); } catch (e) {}
+  const netUsd = profitUsd != null && gasCostUsd != null ? profitUsd - gasCostUsd : null;
+  S.stats.sendOk++;
+  S.stats.sendProfitUsd += netUsd ?? 0;
+  console.log(`[Morpho清算/確定 ${nowJst()}] ${pair} ブロック${receipt.blockNumber} ガス${receipt.gasUsed} 粗利+$${(profitUsd ?? 0).toFixed(4)} − ガス$${(gasCostUsd ?? 0).toFixed(4)} = 純利益+$${(netUsd ?? 0).toFixed(4)}(${Date.now() - startedAt}ms)`);
+  recordRealExecution({
+    timestamp: new Date().toISOString(),
+    pairLabel: `morpho-liquidation ${MORPHO_LIQ_CHAIN} ${pair} ${short(r.user)}`,
+    kind: "liquidation",
+    chain: MORPHO_LIQ_CHAIN, txHash: tx.hash, explorerUrl: getChainConfig(MORPHO_LIQ_CHAIN)?.explorerTxUrl?.(tx.hash) ?? null,
+    tradeAmountUsd: null,
+    predictedProfitUsd: net,
+    actualProfitUsd: profitUsd, actualGasCostUsd: gasCostUsd, actualL1FeeUsd: null, actualNetProfitUsd: netUsd,
+    gasUsed: receipt.gasUsed.toString(), gasCostUsd: gasUsd,
+  });
+  alertOwner("liquidation-success", "Morpho の清算が成立しました", `${pair} 純利益+$${(netUsd ?? 0).toFixed(2)}`, { quiet: true }).catch(() => {});
 }
 
 // ===== 巡回 =====
@@ -676,7 +778,7 @@ export async function startMorphoLiquidation(activeChains) {
   S.started = true;
   const addr = contractAddress();
   console.log(`[Morpho清算] 見張りを始めます: ${MORPHO_LIQ_CHAIN}(名簿${S.roster.size}人を引き継ぎ、全員${MORPHO_SWEEP_MS / 1000}秒ごと・危ない人${MORPHO_WATCH_MS / 1000}秒ごと)。`
-    + `**送信はしません**。契約 ${addr ? addr : `未配備(${morphoLiquidatorAddressEnvVar(MORPHO_LIQ_CHAIN)} が空)`}`);
+    + (MORPHO_DRY_RUN ? "**送信はしません**(DRY_RUN)。" : `**黒字なら送ります**(純利$${MIN_NET_USD}以上・入札は利益の${Math.round(BID_SHARE * 100)}%)。`) + `契約 ${addr ? addr : `未配備(${morphoLiquidatorAddressEnvVar(MORPHO_LIQ_CHAIN)} が空)`}`);
   setInterval(() => { sweep(); }, MORPHO_SWEEP_MS);
   setInterval(() => { watchTick(); }, MORPHO_WATCH_MS);
   setTimeout(() => { sweep(); }, 20 * 1000);
@@ -710,5 +812,7 @@ export function formatMorphoLine() {
     + ` 確認${st.simOk}/${st.simulated} 黒字${st.simBest} 経路なし${st.noRoute}${err ? ` 取消[${err}]` : ""}`
     + ` 実清算${st.liqEvents}=先に発見${st.liqSeenFirst}[2ブロック以上${st.gapMore} 1ブロック${st.gapOne} 同ブロック内${st.gapSame}]`
     + `/見逃し${st.liqMissed}[名簿なし${st.missNoRoster} 遡り中${st.missBackfill} 使用率低${st.missFar} 前の読みなし${st.missNoPrior} 間に合わず${st.missSlow}]`
-    + ` 報酬 発見分$${st.seenBonusUsd.toFixed(0)}/見逃し分$${st.missedBonusUsd.toFixed(0)} RPC${st.requests}(断${st.refusals})]`;
+    + ` 報酬 発見分$${st.seenBonusUsd.toFixed(0)}/見逃し分$${st.missedBonusUsd.toFixed(0)}`
+    + (MORPHO_DRY_RUN ? " DRY_RUN" : ` 送信${st.sends}(成立${st.sendOk} 失敗${st.sendFail} 純利$${st.sendProfitUsd.toFixed(2)})`)
+    + ` RPC${st.requests}(断${st.refusals})]`;
 }
