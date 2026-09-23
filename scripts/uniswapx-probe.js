@@ -331,6 +331,11 @@ async function measureDecision(chain, s, order, swap, mine, tokenOut, sizeUsd) {
     orderToFillSec: secOf(order.fillTimestamp) != null && secOf(order.createdAt) != null
       ? secOf(order.fillTimestamp) - secOf(order.createdAt) : null,
   };
+  // 秒数が出せなかった時は、実物の値を一度だけ出す(推測で形を決めない)。
+  if (row.orderToFillSec == null && !s.o2fLogged) {
+    s.o2fLogged = true;
+    console.log(`[UniswapX判断] ${chain}: 注文から約定までの秒数が出せません。実物 createdAt=${JSON.stringify(order.createdAt)} fillTimestamp=${JSON.stringify(order.fillTimestamp)}`);
+  }
   s.decisions.push(row);
   if (s.decisions.length > 300) s.decisions.shift();
   const ts = Number(order.fillTimestamp);
@@ -571,7 +576,7 @@ function restore() {
       // **足りない組は数ではなく表。** 上の「数なら数」の枝に落とさない。
       if (k === "missing") { if (v[k] && typeof v[k] === "object") s[k] = v[k]; continue; }
       // 「キー名を出した印」はデプロイごとにやり直す(読み戻すと新しいデプロイで一度も出なくなる)。
-      if (k === "keysLogged" || k === "settledShapeLogged") continue;
+      if (k === "keysLogged" || k === "settledShapeLogged" || k === "o2fLogged") continue;
       if (typeof s[k] === "number" && Number.isFinite(Number(v[k]))) s[k] = Number(v[k]);
       else if (v[k] != null && typeof s[k] !== "number") s[k] = v[k];
     }
