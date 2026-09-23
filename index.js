@@ -36,6 +36,7 @@ import { startOnchainFeeds, getSyncStats, isChainWsEnabled, isChainHealthy, setW
 import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
 import { runPoolSurvey } from "./scripts/pool-survey.js";
 import { runMainnetDepthSurvey } from "./scripts/mainnet-depth-survey.js";
+import { runMorphoSurvey, morphoSurveyChains } from "./scripts/morpho-liquidation-survey.js";
 import { runWickBacktestAll, wickBacktestSymbols } from "./scripts/wick-backtest.js";
 import { startMainnetEdgeWatch, formatMainnetEdgeLine, flushMainnetEdge } from "./scripts/mainnet-edge-watch.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
@@ -2847,6 +2848,14 @@ async function main() {
   const mainnetSurvey = process.env.RUN_MAINNET_SURVEY;
   if (mainnetSurvey && mainnetSurvey !== "false") {
     try { await runMainnetDepthSurvey(); } catch (e) { console.error("[メインネット調査] 失敗:", e.message); }
+  }
+
+  // Morpho Blue の過去の清算を実測する(読み取りのみ・送信しない)。
+  // 清算用コントラクトを作る価値があるかを、件数・大きさ・競争の数字で決めるため。
+  // 読む量が多いので**待たずに裏で**走らせる(裁定の起動を遅らせない)。
+  // 終わったら RUN_MORPHO_SURVEY を空に戻すこと。
+  if (morphoSurveyChains().length > 0) {
+    runMorphoSurvey().catch((e) => console.error("[Morpho調査] 失敗:", e.message));
   }
 
   // **「ロスカットの急落を買って戻ったら売る」を過去データで検証する**(オーナーの案)。
