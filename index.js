@@ -2129,7 +2129,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 税${reasons.taxToken} 冷却${reasons.cooldown} 罠${reasons.trap} 非黒字${reasons.notProfitable} 下限${reasons.belowMin} 同経路${reasons.executing} 送信中${reasons.sendBusy}(同時上限${reasons.sendBusyParallel}/同プール${reasons.sendBusyPool}) 見送${reasons.notSent} 失敗${reasons.failed}${reasonsResidual()}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${sizeLine()}${formatTierLine()}${formatSendBalanceLine()}${formatSendSkipLine()}${formatUniswapXLine()}${formatMissingPairsLine()}${formatPairFillLine()}${formatSolanaLine()}${formatMainnetEdgeLine()}${formatBigLine()}${formatAaveLine()}${formatLiquidationLine()}${formatMorphoLine()}${alertLine}`);
+  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 税${reasons.taxToken} 冷却${reasons.cooldown} 罠${reasons.trap} 非黒字${reasons.notProfitable} 下限${reasons.belowMin} 同経路${reasons.executing} 送信中${reasons.sendBusy}(同時上限${reasons.sendBusyParallel}/同プール${reasons.sendBusyPool}) 見送${reasons.notSent} 失敗${reasons.failed}${reasonsResidual()}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${formatTierLine()}${formatSendBalanceLine()}${formatSendSkipLine()}${formatUniswapXLine()}${formatMissingPairsLine()}${formatSolanaLine()}${formatMainnetEdgeLine()}${formatAaveLine()}${formatLiquidationLine()}${formatMorphoLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
@@ -2223,42 +2223,10 @@ function heartbeat() {
     // UniswapX の「勝てたか」の詳細。**送信も約定もしていない、読んで計算しただけの数字。**
     for (const line of formatUniswapXReport()) console.log(line);
 
-    const W = NEAR_MISS_REACHABLE_WALL_BPS;
-    const all = getNearMissStats();
-    const near = getNearMissStats(W);
-    for (const [chain, d] of Object.entries(all)) {
-      if (!d.total) continue;
-      const r = near[chain];
-      // 件数は「別々の経路の本数」。同じ経路を何度評価しても1本。
-      // 壁が高すぎて構造的に黒字にならない経路を除いた分も併記する。
-      const head = `経路${d.total.toLocaleString()}本(壁${W}bps以下${(r?.total || 0).toLocaleString()}本)`;
-      const parts = r
-        ? r.labels.map((l, i) => `${l}:${r.counts[i].toLocaleString()}`).join(" ")
-        : "壁の低い経路なし";
-      console.log(`[惜しい] ${chain}: ${head} / 壁${W}bps以下の内訳 ${parts} / 壁が${WALL_DROP_BPS}bps下がれば+${countIfWallDrops(chain, WALL_DROP_BPS, W).toLocaleString()}本`);
-    }
+    // 「[惜しい]」「[試算]」(あと何bpsで黒字か・壁が下がれば取れた額)は外した(2026年9月23日、オーナーの指示)。
+    // 裁定botの1回あたりの利益を増やす改善は決着済み(上限1日$0.156)で、判断に使わないため。
   } catch (e) {}
 
-  // 「壁が下がっていたら、いくら取れたか」。本数だけでは戦略の上限が
-  // 分からないため、ガス代を引いた後の金額で出す。必ず多めに出る
-  // (同じ価格差を複数の経路で重複して数えているため)。
-  try {
-    const wi = getWhatIfProfit();
-    for (const [chain, rows] of Object.entries(wi)) {
-      const parts = rows.map((r) =>
-        `壁-${r.drop}bps:${r.routes.toLocaleString()}本 $${r.totalUsd.toFixed(2)}(最大$${r.maxUsd.toFixed(4)}/投入$${r.maxTradeUsd.toFixed(0)})`
-      ).join(" ");
-      // 一番現実的な幅(最初の値)について、その最大の経路を名指しする。
-      // 「深い経路があと何bpsで黒字になるか」と「どのプールを直せばいいか」が
-      // これで分かる。不足が小さいほど、そのペアに安い手数料のプールを
-      // 足す価値が高い(2026年9月21日に追加)。
-      const top = rows[0];
-      const detail = top && top.maxLabel
-        ? ` / 最良の1本[${top.maxLabel} 壁${top.maxWallBps ?? "-"}bps 投入$${top.maxTradeUsd.toFixed(0)} 不足${top.maxShortfallBps != null ? top.maxShortfallBps.toFixed(1) : "-"}bps]`
-        : "";
-      if (parts) console.log(`[試算] ${chain}: ${parts}${detail}`);
-    }
-  } catch (e) {}
 }
 
 // ===== オーナーの判断が要ることだけを見張る(2026年9月21日) =====
@@ -2447,21 +2415,6 @@ a{color:#6fae62}.footerlink{margin-top:18px;font-size:11px}`;
 /// 取引量の余裕を1行で出す。**「上限を上げれば大きく取れるのか」への答え。**
 /// 最適額が上限のごく一部で、4倍にすると利益が大きく落ちるなら、
 /// 制限しているのは設定ではなく**プールの深さ**。上限を上げても意味がない。
-function sizeLine() {
-  const s = getSizeCurveStats();
-  if (!s.samples) return "";
-  const best = s.bestPctMedian != null ? `${s.bestPctMedian.toFixed(2)}%` : "-";
-  const at4 = s.at4xPctMedian != null ? `${s.at4xPctMedian.toFixed(0)}%` : "測定なし";
-  // 比率だけでは「上限$500が効いているのか、価格表の$2,000が効いているのか」
-  // が分からない。金額と出どころ、そして**実際に送る経路だけの取引量**を出す。
-  const usd = s.bestUsdMedian != null ? `$${s.bestUsdMedian.toFixed(2)}` : "-";
-  const capUsd = s.capUsdMedian != null ? `$${s.capUsdMedian.toFixed(0)}` : "-";
-  const c = s.capSource || { tradeCap: 0, table: 0, trusted: 0 };
-  const sent = s.sentSamples > 0
-    ? `送る経路${s.sentBestUsdMedian != null ? `$${s.sentBestUsdMedian.toFixed(2)}` : "-"}(上限の${s.sentBestPctMedian != null ? s.sentBestPctMedian.toFixed(2) : "-"}% 標本${s.sentSamples})`
-    : "送る経路まだ0件";
-  return ` 取引量[最適${usd}=上限の${best} 上限${capUsd} 出どころ 取引上限${c.tradeCap.toLocaleString()}/価格表${c.table.toLocaleString()}/検証${c.trusted.toLocaleString()} 4倍で利益${at4} 上限張付${s.hitCap.toLocaleString()} 標本${s.samples} ${sent}]`;
-}
 
 function shortenLabel(label) {
   return String(label ?? "").replace(/0x[0-9a-fA-F]{40}/g, (m) => `${m.slice(0, 8)}…`);
@@ -2517,107 +2470,11 @@ function renderPage() {
     .map(([k, n]) => `${OUTCOME_LABEL[k] || k} ${n.toLocaleString()}`)
     .join(' / ') || '記録なし';
 
-  // 黒字と判定したのに取れなかった上位。ここが改善の手がかりになる。
-  const missedRows = sum.topMissed.map((m, i) => `<tr><td>${i+1}</td>
-    <td style="font-size:9px">${m.kind || ''} ${m.chain || ''}${m.hasV3 ? ' <span style="color:#6fae62">V3</span>' : ''}<br>${shortenLabel(m.label)}</td>
-    <td style="font-size:9px">${OUTCOME_LABEL[m.outcome] || m.outcome}${m.shortfallBps != null ? `<br><span style="color:#888">実測${m.shortfallBps.toFixed(1)}bps</span>` : ''}${m.modelBps != null ? `<br><span style="color:#888">模型${m.modelBps >= 0 ? '+' : ''}${m.modelBps.toFixed(1)}bps</span>` : ''}${m.stage ? `<br><span style="color:#888">${m.stage}</span>` : ''}</td>
-    <td style="text-align:right">$${(m.tradeAmountUsd ?? 0).toFixed(2)}</td>
-    <td style="text-align:right;color:#e8a33d;font-weight:600">+$${(m.netProfitUsd ?? 0).toFixed(4)}</td></tr>`).join('')
-    || `<tr><td colspan="5" style="color:#888">取り逃した黒字はありません</td></tr>`;
-
-  // 原因ごとの「直せば取れる額」。**金額の大きい順**に並べ、直し方まで書く。
-  const CAUSE_FIX = {
-    failed: "送信は届いたが失敗。取り消しの中身(セレクタ)から原因を特定する",
-    not_sent: "判定と実測のずれ。価格表の精度か、反応の遅れ",
-    model_wrong: "**こちらの計算が違っていた。** 測った誤差の合計で、その額の投入をやめる(自動で上限を下げる)",
-    price_moved: "計算は合っていたが、判定から送信までに他者が取った。**速さの問題**で、計算は直さない",
-    below_gas: "チェーン上では黒字だが、ガス代に届かない。投入額を増やせるかが鍵",
-    race_lost: "送信は正しかったが、確定前に他者が先に取った。失われたのはガス代のみ。**速さの問題**",
-    below_min: "ガス代に埋もれている。投入額を増やせるかが鍵",
-    skipped_cooldown: "直前の失敗で冷却中。失敗の原因を直せば冷却も減る",
-    cooldown: "直前の失敗で冷却中。失敗の原因を直せば冷却も減る",
-    not_profitable_onchain: "チェーン上で赤字。判定の精度",
-    unprofitable: "チェーン上で赤字。判定の精度",
-  };
-  const causeRows = Object.entries(sum.missedByOutcome || {})
-    .sort((a, b) => b[1].usd - a[1].usd)
-    .map(([k, v]) => `<tr><td>${OUTCOME_LABEL[k] || k}</td>
-      <td style="text-align:right">${v.count.toLocaleString()}</td>
-      <td style="text-align:right;color:#e8a33d;font-weight:600">+$${v.usd.toFixed(4)}</td>
-      <td style="font-size:9px;color:#888">${CAUSE_FIX[k] || ""}</td></tr>`).join('')
-    || `<tr><td colspan="4" style="color:#888">取り逃しはありません</td></tr>`;
-
-  const phantomRows = (sum.topPhantom || []).map((m, i) => {
-    const ratio = (m.tradeAmountUsd > 0 ? (m.netProfitUsd / m.tradeAmountUsd) * 100 : 0);
-    return `<tr><td>${i+1}</td>
-    <td style="font-size:9px">${m.kind || ''} ${m.chain || ''}<br>${shortenLabel(m.label)}</td>
-    <td style="text-align:right">$${(m.tradeAmountUsd ?? 0).toFixed(2)}</td>
-    <td style="text-align:right;color:#888">+$${(m.netProfitUsd ?? 0).toFixed(4)}</td>
-    <td style="text-align:right;color:#e74c3c;font-weight:600">${ratio.toFixed(0)}%</td></tr>`;
-  }).join('') || `<tr><td colspan="5" style="color:#888">壊れた経路はありません</td></tr>`;
-
   const oppRows = stats.recent.slice(0, 10).map((o, i) => `<tr><td>${i+1}</td>
     <td style="font-size:9px">${o.kind} ${o.chain}${o.hasV3 ? ' <span style="color:#6fae62">V3</span>' : ''}<br>${shortenLabel(o.label)}</td>
     <td style="text-align:right">${o.feeWallPercent.toFixed(2)}%</td>
     <td style="text-align:right">$${o.tradeAmountUsd.toFixed(2)}</td>
     <td style="text-align:right;color:#2ecc71;font-weight:600">+$${o.netProfitUsd.toFixed(4)}</td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ黒字の機会が見つかっていません</td></tr>`;
-
-  // 「あと何bpsで黒字だったか」の分布。機会が0件のとき、原因が
-  // 「手数料の壁」なのか「そもそも価格が動いていない」のかを見分ける。
-  // 件数は「別々の経路の本数」で、同じ経路を何度評価しても1本。
-  const W = NEAR_MISS_REACHABLE_WALL_BPS;
-  const nmAll = getNearMissStats();
-  const nmNear = getNearMissStats(W);
-  const walls = getWallBreakdown();
-
-  const barRow = (label, n, scale, color) =>
-    `<tr><td>${label}</td>
-      <td><div style="background:#222;border-radius:3px;height:8px;width:100%"><div style="background:${color};height:8px;border-radius:3px;width:${Math.min(100, Math.round((n / scale) * 100))}%"></div></div></td>
-      <td style="text-align:right">${n.toLocaleString()}</td></tr>`;
-
-  // 「壁が下がっていたら、いくら取れたか」。戦略の上限を見るための試算。
-  const whatIf = getWhatIfProfit();
-  const whatIfRows = (chain) => {
-    const rows = whatIf[chain];
-    if (!rows || !rows.length) return '';
-    const body = rows.map((r) => `<tr>
-      <td>壁 −${r.drop}bps</td>
-      <td style="text-align:right">${r.routes.toLocaleString()}本</td>
-      <td style="text-align:right;color:${r.totalUsd > 0 ? '#e8a33d' : '#888'};font-weight:600">$${r.totalUsd.toFixed(2)}</td>
-      <td style="text-align:right;color:#888">$${r.maxUsd.toFixed(4)}<br><span style="font-size:9px">投入$${r.maxTradeUsd.toFixed(0)}</span></td></tr>`).join('');
-    return `<div class="note" style="border-top:none;padding-top:4px">壁が下がっていたら取れた金額(ガス代を引いた後):</div>
-<table class="t-whatif"><thead><tr><th></th><th style="text-align:right">経路</th><th style="text-align:right">合計</th><th style="text-align:right">最大の1本</th></tr></thead><tbody>${body}</tbody></table>
-<div class="note" style="border-top:none;padding-top:4px;color:#888">合計は<b>必ず多めに出ます</b>。同じ価格差を複数の経路で重複して数えており、実際には1つの価格差は1回しか取れません。自分が取れば価格も動きます。<b>期待できる金額ではなく、この戦略の天井</b>として見てください。</div>`;
-  };
-
-  const nearMissBlocks = Object.entries(nmAll).filter(([, d]) => d.total > 0).map(([chain, d]) => {
-    const w = walls[chain];
-    const wScale = Math.max(...(w ? w.counts : [1]), 1);
-    const wallRows = w ? w.labels.map((l, i) =>
-      barRow(l, w.counts[i], wScale, i <= 2 ? '#6fae62' : '#555')).join('') : '';
-
-    const r = nmNear[chain];
-    if (!r || !r.total) {
-      return `<h2 style="margin-top:14px">${chain}</h2>
-<div class="note" style="margin-top:0;border-top:none;padding-top:0">経路${d.total.toLocaleString()}本。壁の内訳:</div>
-<table class="t-miss"><tbody>${wallRows}</tbody></table>
-<div class="note">壁${W}bps以下の経路が1本もありません。手数料の高いプールしか無いため、価格がどれだけ動いても黒字になりません。</div>
-${whatIfRows(chain)}`;
-    }
-    // 棒の目盛りは最下段(-100bps未満)を除いた最大値に合わせる。
-    // 大半がそこに入るため、そこを基準にすると判断に使う上の段が潰れて読めない。
-    const scale = Math.max(...r.counts.slice(0, -1), 1);
-    const rows = r.labels.map((l, i) =>
-      barRow(l, r.counts[i], scale, i === 0 ? '#2ecc71' : i <= 3 ? '#e8a33d' : '#555')).join('');
-    const gain = countIfWallDrops(chain, WALL_DROP_BPS, W);
-    return `<h2 style="margin-top:14px">${chain}</h2>
-<div class="note" style="margin-top:0;border-top:none;padding-top:0">経路${d.total.toLocaleString()}本。まず壁の高さの内訳:</div>
-<table class="t-miss"><tbody>${wallRows}</tbody></table>
-<div class="note" style="border-top:none;padding-top:4px">このうち<b>壁${W}bps以下の${r.total.toLocaleString()}本</b>だけを取り出した、惜しさの分布:</div>
-<table class="t-miss"><tbody>${rows}</tbody></table>
-<div class="note">壁が${WALL_DROP_BPS}bps下がれば <b style="color:#e8a33d">+${gain.toLocaleString()}本</b> が粗利プラスに変わります(いま粗利プラスは${r.counts[0].toLocaleString()}本)。<br>段をまたぐ分は数えていないので、実際はこれより多くなります。</div>
-${whatIfRows(chain)}`;
-  }).join('') || '<div class="note" style="color:#888">まだ経路を計算していません</div>';
 
   const reasonRows = Object.entries(reasons).filter(([, v]) => v > 0).sort((a,b)=>b[1]-a[1]).map(([k, v]) =>
     `<tr><td>${REASON_LABEL[k] || k}</td><td style="text-align:right">${v.toLocaleString()}件</td></tr>`).join('') || `<tr><td colspan="2" style="color:#888">まだ記録がありません</td></tr>`;
@@ -2693,34 +2550,19 @@ ${renderLiquidationCard()}
 
 <div class="card"><h2>📒 24時間の記録簿</h2>
 <div class="stat"><div><div class="v" style="color:#2ecc71">+$${sum.realizedUsd.toFixed(4)}</div><div class="l">実際に得た利益</div></div>
-<div><div class="v" style="color:#e8a33d">+$${sum.missedUsd.toFixed(4)}</div><div class="l">取れた可能性がある額</div></div>
 <div><div class="v">${sum.count.toLocaleString()}</div><div class="l">記録件数</div></div>
 <div><div class="v" style="color:${sum.phantomCount ? '#e74c3c' : '#888'}">${sum.phantomCount.toLocaleString()}</div><div class="l">計算が壊れた経路</div></div></div>
 <div class="note">なぜそうなったか: ${outcomeLine}<br>
-送信まで進んだ判定額: +$${sum.sentUsd.toFixed(4)}</div>
-
-<h2 style="margin-top:14px">直せば取れる額(原因べつ)</h2>
-<div class="note" style="margin-top:0;border-top:none;padding-top:0"><b>ここが次に直す場所です。</b>金額の大きい原因から手を付けます。有り得ない利回りの判定(下の「計算が壊れた経路」)は除いてあります。</div>
-<table class="t-num"><thead><tr><th>原因</th><th style="text-align:right">件数</th><th style="text-align:right">取れた可能性</th><th>直し方</th></tr></thead><tbody>${causeRows}</tbody></table>
-
-<h2 style="margin-top:14px">取れたはずの上位</h2>
-<table class="t-num"><thead><tr><th>#</th><th>経路</th><th>理由</th><th style="text-align:right">投入</th><th style="text-align:right">判定額</th></tr></thead><tbody>${missedRows}</tbody></table>
-
-<h2 style="margin-top:14px">計算が壊れた経路(取り逃しではありません)</h2>
-<div class="note" style="margin-top:0;border-top:none;padding-top:0">投入額に対して<b>有り得ない利回り</b>を出した判定です。合計 +$${sum.phantomUsd.toFixed(2)}。<br><b>これは取り逃した金額ではなく、こちらの計算が壊れている証拠です。</b>金額として数えると、本当に直すべきものが埋もれます。</div>
-<table class="t-num"><thead><tr><th>#</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">判定額</th><th style="text-align:right">利回り</th></tr></thead><tbody>${phantomRows}</tbody></table>
+「取れた可能性がある額」「直せば取れる額」「あと何bpsで黒字だったか」は外しました(2026年9月23日、オーナーの指示)。
+検証の結果、大口の機会は本物0/10で、判定上の利益は取り逃した金ではなかったためです。</div>
 
 <h2 style="margin-top:14px">直近に検知した機会</h2>
 <table class="t-num"><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table></div>
 
-<div class="card"><h2>📏 あと何bpsで黒字だったか</h2>
-<div class="note" style="margin-top:0;border-top:none;padding-top:0">件数は<b>別々の経路の本数</b>です(同じ経路を何度評価しても1本)。<br>まず壁の高さで分けてから、届きうる経路だけの惜しさを見ます。<br><b>壁が高い=無理、ではありません。</b>浅いプールでは価格差が100〜160bpsに達するため、実際に黒字になった取引の壁は105bps・101bps・75bps・65bps・60bpsと、半分以上が60bpsを超えていました(2026年9月21日の実測)。<br>下の「惜しさ」は壁が低い経路ほど当てになります。壁が高い帯は、価格差が大きく動いた時だけ取れる場所です。</div>
-${nearMissBlocks}</div>
-
 <div class="footerlink"><a href="/about">→ 仕組みについて</a></div></body></html>`;
 }
 
-/// Avalanche の Aave 清算の見張りの状態。画面の1枚。
+/// Aave 清算の見張り(LIQUIDATION_CHAIN のチェーン)の状態。画面の1枚。
 function renderLiquidationCard() {
   const d = getLiquidationDashboard();
   if (!d.enabled) return "";
@@ -2732,7 +2574,7 @@ function renderLiquidationCard() {
   const recentRows = d.recent.length
     ? d.recent.map((r) => `<tr><td>${esc(formatLocalTime(r.at))}</td><td>${esc(r.user.slice(0, 10))}…</td><td>${esc(r.pair)}</td><td style="text-align:right">${r.hf.toFixed(4)}</td><td style="text-align:right">$${r.coverUsd.toFixed(2)}</td><td style="text-align:right">$${r.grossUsd.toFixed(2)}</td><td>${esc(r.result)}</td></tr>`).join("")
     : `<tr><td colspan="7" style="color:#888">まだ候補はありません</td></tr>`;
-  return `<div class="card"><h2>🏦 Aave 清算(Avalanche)${d.dryRun ? ' <span style="color:#e8a33d;font-size:0.8em">DRY_RUN(送信しない)</span>' : ' <span style="color:#e74c3c;font-size:0.8em">本番送信</span>'}</h2>
+  return `<div class="card"><h2>🏦 Aave 清算(${LIQUIDATION_CHAIN})${d.dryRun ? ' <span style="color:#e8a33d;font-size:0.8em">DRY_RUN(送信しない)</span>' : ' <span style="color:#e74c3c;font-size:0.8em">本番送信</span>'}</h2>
 <div class="stat"><div><div class="v">${d.roster.toLocaleString()}</div><div class="l">借り手の名簿(遡り${d.backfillPct}%)</div></div>
 <div><div class="v" style="color:#e8a33d">${d.watch}</div><div class="l">要注意(HF&lt;1.05)</div></div>
 <div><div class="v" style="color:#e74c3c">${d.found}</div><div class="l">清算できた候補</div></div>
