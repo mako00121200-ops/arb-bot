@@ -182,7 +182,7 @@ const S = {
     // 先行の内訳: 同じブロック内(Flashblock 単位の勝負) / 1ブロック(同着の勝負) / 2ブロック以上(先に出せた)
     gapSame: 0, gapOne: 0, gapMore: 0,
     // 見逃しの内訳: 名簿に無い / 遡りが終わる前 / 名簿にいて直前の使用率が低かった(急落か式のずれ) / 近かったが間に合わず
-    missNoRoster: 0, missBackfill: 0, missFar: 0, missSlow: 0,
+    missNoRoster: 0, missBackfill: 0, missFar: 0, missSlow: 0, missNoPrior: 0,
     simErr: {},  // 取り消し理由 -> 件数(HEALTHY_POSITION が多ければ健全度の式がずれている)
     watchTicks: 0, watchMs: [],
   },
@@ -415,9 +415,16 @@ async function noteLiquidation(log) {
   } else {
     S.stats.liqMissed++;
     S.stats.missedBonusUsd += bonusUsd ?? 0;
-    const last = S.last.get(key);
+    // **清算のブロックより前に読んだ値**だけを使う(後の読みは返済済みの状態で、原因の切り分けにならない)
+    const lastRaw = S.last.get(key);
+    const last = lastRaw && lastRaw.block != null && lastRaw.block < block ? lastRaw
+      : lastRaw?.prev && lastRaw.prev.block != null && lastRaw.prev.block < block ? lastRaw.prev : null;
     let why;
-    if (!S.roster.has(key) && !last) {
+    if (lastRaw && !last) {
+      // 名簿にはあったが、清算より前の読みが残っていない(読みの間隔より速く動いた)
+      S.stats.missNoPrior++;
+      why = `清算より前の読みが残っていない(最後の読みはブロック${lastRaw.block}=清算の後)。読みの間隔(${MORPHO_SWEEP_MS / 1000}秒)の間に危なくなったか、記録が遅れて届いた`;
+    } else if (!S.roster.has(key) && !last) {
       const backfilling = S.backTo != null && S.backTo > MORPHO_BLUE[MORPHO_LIQ_CHAIN].startBlock;
       if (backfilling) { S.stats.missBackfill++; why = "名簿に無い(遡りの途中)"; }
       else { S.stats.missNoRoster++; why = "**名簿に無い**(Borrow 以外の道で借りた人? 要調査)"; }
@@ -478,7 +485,10 @@ async function readHealth(entries, priority, blockTag) {
     if (pos.borrowShares === 0n) { S.roster.delete(key); S.watch.delete(key); return; }
     const m = S.markets.get(e.id);
     const h = healthOf(pos, mkt.get(e.id), price.get(e.id), m.params.lltv);
-    S.last.set(key, { ratio: h.ratio, block: stateBlock, at });
+    // 1つ前の読みも残す。清算の記録は数十秒遅れて届くので、「最後の読み」が清算の**後**の
+    // 状態(返済済みで使用率0%)になることがある(9/23 23:22 cbDOGE の見逃しで実際に起きた)。
+    const prevLast = S.last.get(key);
+    S.last.set(key, { ratio: h.ratio, block: stateBlock, at, prev: prevLast ? { ratio: prevLast.ratio, block: prevLast.block, at: prevLast.at } : null });
     results.push({ ...e, pos, h, price: price.get(e.id), m });
   });
   return { results, stateBlock, at };
@@ -699,6 +709,6 @@ export function formatMorphoLine() {
   return ` Morpho[名簿${S.roster.size} 遡り${done}% 危ない${S.watch.size}(読み${wm != null ? wm + "ms" : "-"}) 清算可${st.liquidatable}(塵${st.dust})${staleLine}`
     + ` 確認${st.simOk}/${st.simulated} 黒字${st.simBest} 経路なし${st.noRoute}${err ? ` 取消[${err}]` : ""}`
     + ` 実清算${st.liqEvents}=先に発見${st.liqSeenFirst}[2ブロック以上${st.gapMore} 1ブロック${st.gapOne} 同ブロック内${st.gapSame}]`
-    + `/見逃し${st.liqMissed}[名簿なし${st.missNoRoster} 遡り中${st.missBackfill} 使用率低${st.missFar} 間に合わず${st.missSlow}]`
+    + `/見逃し${st.liqMissed}[名簿なし${st.missNoRoster} 遡り中${st.missBackfill} 使用率低${st.missFar} 前の読みなし${st.missNoPrior} 間に合わず${st.missSlow}]`
     + ` 報酬 発見分$${st.seenBonusUsd.toFixed(0)}/見逃し分$${st.missedBonusUsd.toFixed(0)} RPC${st.requests}(断${st.refusals})]`;
 }
