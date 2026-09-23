@@ -610,6 +610,48 @@ async function watchTick() {
   }
 }
 
+/// **経路の点検(測り方の点検)。** 借り手の多い市場ごとに、担保 $1,000 ぶんを借金の通貨へ売る経路が
+/// 見つかるか・どれだけ目減りするかを出す。経路探しは Aave 用の仕組みを借りているので、
+/// base で大きい DEX(Aerodrome 等)を探せていなければ、主要な市場でも「経路なし」になり、
+/// 確認(eth_call)の利益が測れない。本物の清算が来る前に確かめる。
+async function selfCheckRoutes() {
+  if (EXECUTOR_CHAIN !== MORPHO_LIQ_CHAIN) {
+    console.log(`[Morpho清算/経路点検] 経路探しが ${EXECUTOR_CHAIN} 用のため点検できません`);
+    return;
+  }
+  const count = new Map();
+  for (const { id } of S.roster.values()) count.set(id, (count.get(id) || 0) + 1);
+  const ids = [...count.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([id]) => id);
+  await ensureMarkets(ids);
+  const morpho = MORPHO_BLUE[MORPHO_LIQ_CHAIN].address;
+  const live = ids.filter((id) => S.markets.get(id));
+  const r = await aggregate(live.map((id) => ({ target: S.markets.get(id).params.oracle, allowFailure: true, callData: ORACLE_IFACE.encodeFunctionData("price") })));
+  const lines = [];
+  let ok = 0;
+  for (const [i, id] of live.entries()) {
+    const m = S.markets.get(id);
+    const pair = `${m.coll.symbol}/${m.loan.symbol}(${count.get(id)}人)`;
+    try {
+      if (!r[i]?.success) { lines.push(`${pair}:価格読めず`); continue; }
+      const price = BigInt(ORACLE_IFACE.decodeFunctionResult("price", r[i].returnData)[0]);
+      const loanUsd = await loanUsdOf(m);
+      if (!loanUsd || price === 0n) { lines.push(`${pair}:ドル不明`); continue; }
+      // $1,000 ぶんの借金の通貨 → それに見合う担保の量(オラクル価格で)
+      const loanAmt = BigInt(Math.round((1000 / loanUsd) * 10 ** Math.min(m.loan.decimals, 12))) * 10n ** BigInt(Math.max(0, m.loan.decimals - 12));
+      const collAmt = (loanAmt * ORACLE_PRICE_SCALE) / price;
+      const routes = await buildAaveRoutes(m.params.collateralToken, m.params.loanToken, collAmt);
+      if (routes.length === 0) { lines.push(`${pair}:**経路なし**`); continue; }
+      const best = routes[0];
+      const lossBps = Number(((loanAmt - best.estimatedOut) * 10000n) / loanAmt);
+      ok++;
+      lines.push(`${pair}:${best.label} 目減り${lossBps}bps(報酬${((Number(m.lif) / 1e18 - 1) * 100).toFixed(1)}%)`);
+    } catch (e) {
+      lines.push(`${pair}:失敗(${(e.message || "").slice(0, 40)})`);
+    }
+  }
+  console.log(`[Morpho清算/経路点検] 借り手の多い${live.length}市場のうち経路あり${ok}。$1,000 を売った時: ${lines.join(" | ")}`);
+}
+
 export async function startMorphoLiquidation(activeChains) {
   if (!MORPHO_LIQ_CHAIN || !MORPHO_BLUE[MORPHO_LIQ_CHAIN]) return false;
   if (!activeChains.includes(MORPHO_LIQ_CHAIN)) {
@@ -624,6 +666,9 @@ export async function startMorphoLiquidation(activeChains) {
   setInterval(() => { sweep(); }, MORPHO_SWEEP_MS);
   setInterval(() => { watchTick(); }, MORPHO_WATCH_MS);
   setTimeout(() => { sweep(); }, 20 * 1000);
+  // 経路の点検は名簿がある程度そろってから(起動5分後)と、その後6時間ごと
+  setTimeout(() => { selfCheckRoutes().catch((e) => console.warn(`[Morpho清算/経路点検] 失敗: ${(e.message || "").slice(0, 100)}`)); }, 5 * 60 * 1000);
+  setInterval(() => { selfCheckRoutes().catch(() => {}); }, 6 * 3600 * 1000);
   return true;
 }
 
