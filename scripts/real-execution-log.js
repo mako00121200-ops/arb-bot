@@ -27,6 +27,16 @@ const REAL_EXECUTION_LOG_FILE = process.env.REAL_EXECUTION_LOG_FILE
   || (process.env.POOL_MAP_FILE
       ? path.join(path.dirname(process.env.POOL_MAP_FILE), "real-executions.json")
       : "/tmp/real-executions.json");
+/// **累計は別の保存先に持つ(2026年9月23日、オーナーの指摘「利益の総額が変わっている」)。**
+///
+/// [何が起きていたか]
+/// 記録は直近500件だけ残して古いものを捨てていた。画面の「累積利益」はその残った500件を
+/// 毎回足し直していたので、500件を超えてからは**1件増えるたびに一番古い1件が累計から消え**、
+/// 総額が勝手に変わっていた(減ることもある)。
+/// 累計は捨てない別の保存先で足し上げ、記録の一覧(表示用)とは切り離す。
+const REAL_TOTALS_FILE = path.join(path.dirname(REAL_EXECUTION_LOG_FILE), "real-executions-totals.json");
+/// 一覧として残す件数(ガスの中央値・画面の最近の取引に使う)。累計には関係しない。
+const LOG_KEEP = 5000;
 /// 平均を取る対象の件数(直近から数える)。
 const GAS_AVERAGE_SAMPLES = 20;
 
@@ -39,15 +49,71 @@ export function loadRealExecutions() {
   return [];
 }
 
+function netOf(e) {
+  if (e.actualNetProfitUsd != null) return e.actualNetProfitUsd;
+  return (e.actualProfitUsd || 0) - (e.actualGasCostUsd ?? e.gasCostUsd ?? 0);
+}
+function grossOf(e) { return e.actualProfitUsd || 0; }
+function gasOf(e) { return e.actualGasCostUsd ?? e.gasCostUsd ?? 0; }
+
+/// 一覧を足し上げた値(累計の保存が無い時の予備、再構成の突き合わせ用)。
+export function sumOfLog(log) {
+  return {
+    count: log.length,
+    grossUsd: log.reduce((a, e) => a + grossOf(e), 0),
+    gasUsd: log.reduce((a, e) => a + gasOf(e), 0),
+    netUsd: log.reduce((a, e) => a + netOf(e), 0),
+  };
+}
+
+export function loadRealTotals() {
+  try {
+    if (fs.existsSync(REAL_TOTALS_FILE)) return JSON.parse(fs.readFileSync(REAL_TOTALS_FILE, "utf8"));
+  } catch (e) {}
+  return null;
+}
+
+function saveRealTotals(t) {
+  try {
+    fs.writeFileSync(REAL_TOTALS_FILE, JSON.stringify({ ...t, updatedAt: new Date().toISOString() }));
+  } catch (e) {
+    console.warn("[実際の実行記録] 累計の保存に失敗:", e.message);
+  }
+}
+
 export function recordRealExecution(entry) {
   const log = loadRealExecutions();
+  // 累計が無ければ、今ある一覧から始める(既に捨てた分は再構成で埋める)
+  const totals = loadRealTotals() ?? { ...sumOfLog(log), source: "log" };
   log.push(entry);
-  const trimmed = log.length > 500 ? log.slice(-500) : log;
+  totals.count += 1;
+  totals.grossUsd += grossOf(entry);
+  totals.gasUsd += gasOf(entry);
+  totals.netUsd += netOf(entry);
+  saveRealTotals(totals);
+  const trimmed = log.length > LOG_KEEP ? log.slice(-LOG_KEEP) : log;
   try {
     fs.writeFileSync(REAL_EXECUTION_LOG_FILE, JSON.stringify(trimmed));
   } catch (e) {
     console.warn("[実際の実行記録] 保存に失敗:", e.message);
   }
+}
+
+/// チェーン上の記録から再構成した累計を採用する。
+/// cutoffIso より後に記録された分(再構成の最中に成立した取引)は一覧から足す。
+export function adoptRebuiltTotals(rebuilt, cutoffIso) {
+  const after = loadRealExecutions().filter((e) => (e.timestamp || "") > cutoffIso);
+  const add = sumOfLog(after);
+  const totals = {
+    count: rebuilt.count + add.count,
+    grossUsd: rebuilt.grossUsd + add.grossUsd,
+    gasUsd: rebuilt.gasUsd + add.gasUsd,
+    netUsd: rebuilt.netUsd + add.netUsd,
+    source: "chain",
+    rebuiltAt: cutoffIso,
+  };
+  saveRealTotals(totals);
+  return totals;
 }
 
 /// 記録から段数を取り出す。古い記録は kind を持たないので、
@@ -94,19 +160,15 @@ export function getAverageGasUnits(chain, kind) {
 
 export function getRealExecutionStats() {
   const log = loadRealExecutions();
-  // 粗利(ガスを引く前)と、ガス代を引いた純利益の両方を出す。
-  // 古い記録には純利益が無いので、その場合は粗利からガス代を引いて補う。
-  const totalGrossProfitUsd = log.reduce((s, e) => s + (e.actualProfitUsd || 0), 0);
-  const totalGasCostUsd = log.reduce((s, e) => s + (e.actualGasCostUsd ?? e.gasCostUsd ?? 0), 0);
-  const totalNetProfitUsd = log.reduce((s, e) => {
-    if (e.actualNetProfitUsd != null) return s + e.actualNetProfitUsd;
-    return s + (e.actualProfitUsd || 0) - (e.actualGasCostUsd ?? e.gasCostUsd ?? 0);
-  }, 0);
+  // 累計は捨てない保存先から読む。無ければ一覧を足す(古い記録には純利益が無いので粗利−ガスで補う)。
+  const t = loadRealTotals() ?? { ...sumOfLog(log), source: "log" };
   return {
-    count: log.length,
-    totalProfitUsd: totalNetProfitUsd, // 表示の主役はガス代を引いた後の額
-    totalGrossProfitUsd,
-    totalGasCostUsd,
+    count: t.count,
+    totalProfitUsd: t.netUsd, // 表示の主役はガス代を引いた後の額
+    totalGrossProfitUsd: t.grossUsd,
+    totalGasCostUsd: t.gasUsd,
+    totalsSource: t.source,
+    rebuiltAt: t.rebuiltAt ?? null,
     recent: [...log].reverse().slice(0, 15),
   };
 }
