@@ -66,12 +66,13 @@ const MAX_FACTORY_LOOKUPS_PER_CALL = parseInt(process.env.MULTICALL_FACTORY_PER_
 const multicallStats = { calls: 0, subcalls: 0, splits: 0 };
 export function getMulticallStats() { return { ...multicallStats }; }
 
-async function multicall(chain, calls, priority = false) {
+/// blockTag を渡せば**その時点の状態**で読む(既定は今までどおり)。
+async function multicall(chain, calls, priority = false, blockTag = null) {
   multicallStats.calls++;
   multicallStats.subcalls += calls.length;
   return callWithRpc(chain, (provider) =>
     // Flashblocks のチェーンでは確定前(pending)の状態を読む。他は latest(今までどおり)。
-    new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider).aggregate3(calls, { blockTag: readBlockTag(chain) }), priority);
+    new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider).aggregate3(calls, { blockTag: blockTag ?? readBlockTag(chain) }), priority);
 }
 
 /// 失敗したら半分に割って再試行する。1件まで割っても失敗した分は null。
@@ -285,7 +286,8 @@ export async function quoteV3Batch(chain, quoterAddress, requests, priority = fa
 ///
 /// @param requests [{ pool, tokenIn, amountIn }] の配列
 /// 戻り値: 同じ順番の配列。見積もれなかったものは null。
-export async function quoteV3ByPoolBatch(chain, contractAddress, requests, priority = false) {
+/// blockTag … 過去のブロック番号を渡すと**その時点の状態**で見積もる(UniswapX の約定直前の再現用)。
+export async function quoteV3ByPoolBatch(chain, contractAddress, requests, priority = false, blockTag = null) {
   const out = new Array(requests.length).fill(null);
   if (!contractAddress || requests.length === 0) return out;
   const target = ethers.getAddress(contractAddress);
@@ -300,7 +302,7 @@ export async function quoteV3ByPoolBatch(chain, contractAddress, requests, prior
     }));
     let returned;
     try {
-      returned = await multicall(chain, calls, priority);
+      returned = await multicall(chain, calls, priority, blockTag);
     } catch (e) {
       continue; // この塊は諦める。呼び出し側は null のまま扱う。
     }

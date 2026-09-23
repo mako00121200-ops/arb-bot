@@ -35,12 +35,17 @@
 //   UNISWAPX_PROBE_LIMIT  … 1回に取る注文数(既定20、APIの上限は50)
 
 import { bestOutputFor } from "./opportunity-scanner.js";
-import { extractSwap, readFilledAt, FILLED_AT_KEYS, splitByAge, amountKeyOf, orderTypeOf } from "./uniswapx-parse.js";
+import fs from "fs";
+import { ethers } from "ethers";
+import { extractSwap, readFilledAt, FILLED_AT_KEYS, splitByAge, amountKeyOf, orderTypeOf,
+  readV3Requirement, firstProfitableBlock } from "./uniswapx-parse.js";
+import { weiToUsd } from "./gas-cost.js";
+import { callWithRpc } from "./onchain-reserves.js";
 import { getTokenDecimals, getTokenPriceUsd, KIND_V3 } from "./pool-registry.js";
 import { getKnownTokens, toWrappedToken, isNativeToken } from "./borrowable-tokens.js";
 import { quoteV3ByPoolBatch } from "./multicall-reserves.js";
 import { getAnyChainConfig } from "../chain-config.js";
-import { loadState, saveState } from "./state-file.js";
+import { loadState, saveState, stateFilePath } from "./state-file.js";
 
 /// UniswapX の公開API。**鍵は要らない**(注文の取得は誰でもできる)。
 const API_BASE = process.env.UNISWAPX_API_BASE || "https://api.uniswap.org/v2";
@@ -124,6 +129,12 @@ function statFor(chain) {
       /// **模型の値**(V3も x·y=k 近似 = 我々の受取を多めに見る側)なので、
       /// 本当の不足はこれより**大きい**。つまりこの数字は「最低でもこれだけ足りない」。
       gapBps: [],
+      /// **注文ごとの判断材料**(2026年9月23日、オーナーの指示)。下の measureDecision を参照。
+      decisions: [],
+      /// 判断材料を作れなかった理由(測れていない件数を隠さない)。
+      decisionSkip: { notV3: 0, noFillBlock: 0, noCurve: 0, noHistory: 0, noReceipt: 0, noPrice: 0 },
+      /// 1ブロックの実時間を**実測**するための端点(約定ブロックと約定時刻の組)。
+      clock: null,
       settledShapeLogged: false,
       // **確認できた勝ちを「齢つき」で持つ。** 値動きの残りかすかどうかを、
       // これで判定する(§下の formatUniswapXReport)。
@@ -174,7 +185,7 @@ async function fetchFilledOrders(chain) {
 /// 2段なら2回。候補は毎回ごく少数なので費用は無視できる。
 ///
 /// @returns 最終的な受取量 / 確かめられなければ null
-async function verifyOnChain(chain, legs, amountIn) {
+async function verifyOnChain(chain, legs, amountIn, blockTag = null) {
   const cfg = getAnyChainConfig(chain);
   const contractAddress = cfg && process.env[cfg.contractAddressEnvVar];
   if (!contractAddress) return null;
@@ -182,11 +193,114 @@ async function verifyOnChain(chain, legs, amountIn) {
   for (const leg of legs) {
     if (leg.kind !== KIND_V3) return null; // V2 を含む経路は「確かめた」と言えない
     const [out] = await quoteV3ByPoolBatch(
-      chain, contractAddress, [{ pool: leg.pool, tokenIn: leg.tokenIn, amountIn: amount }], false);
+      chain, contractAddress, [{ pool: leg.pool, tokenIn: leg.tokenIn, amountIn: amount }], false, blockTag);
     if (out == null || !(out > 0n)) return null;
     amount = out;
   }
   return amount;
+}
+
+/// UniswapX の反応器が約定ごとに出すイベント(`ReactorEvents.sol`):
+/// `Fill(bytes32 indexed orderHash, address indexed filler, address indexed swapper, uint256 nonce)`
+const FILL_TOPIC = ethers.id("Fill(bytes32,address,address,uint256)");
+
+/// 勝者の約定取引のレシートを読む。**1注文あたりのガス代**と**勝者の住所**を返す。
+/// 1つの取引で複数の注文を埋めていることがあるので、Fill の数で割る。
+async function readWinnerCost(chain, txHash, orderHash) {
+  const r = await callWithRpc(chain, (p) => p.send("eth_getTransactionReceipt", [txHash]), false);
+  if (!r || r.gasUsed == null) return null;
+  const gasUsed = BigInt(r.gasUsed);
+  const price = BigInt(r.effectiveGasPrice ?? r.gasPrice ?? 0);
+  // OP Stack(base / optimism)は L1 のデータ手数料が別にかかる。レシートにそのまま載っている。
+  const l1 = typeof r.l1Fee === "string" && r.l1Fee.startsWith("0x") ? BigInt(r.l1Fee) : 0n;
+  const fills = (r.logs || []).filter((l) => l?.topics?.[0] === FILL_TOPIC);
+  const nFills = Math.max(1, fills.length);
+  const mine = fills.find((l) => (l.topics[1] || "").toLowerCase() === String(orderHash || "").toLowerCase());
+  const fillerTopic = (mine || fills[0])?.topics?.[2];
+  const filler = fillerTopic ? ("0x" + fillerTopic.slice(-40)).toLowerCase() : null;
+  const totalWei = gasUsed * price + l1;
+  return { weiPerOrder: totalWei / BigInt(nFills), nFills, filler, gasUsed: Number(gasUsed) };
+}
+
+/// **注文1件の判断材料を作る。** 「どれだけ速ければ勝てるか」「ガス代込みでいくら残るか」に
+/// 直接答えるための数字だけを、**実測で**集める(2026年9月23日、オーナーの指示)。
+///
+///   delayBlocks … 競売の開始(decayStartBlock)から勝者が埋めるまでのブロック数 = **勝者の速さ**
+///   gasUsd      … 勝者の約定取引の実ガス代(1注文あたり)= **手数料の実額**
+///   oursAtFill  … **約定の直前のブロックの状態**で、我々の経路が出せた額(値動きの汚染が無い)
+///   sameBlockNetUsd … 勝者と同じブロックで出していたら残った額(我々の額 − 実額 − ガス代)
+///   leadBlocks  … 曲線を再現し、ガス代込みで我々が黒字になる最初のブロックが、
+///                 勝者のブロックより**何ブロック前か**(+なら勝てた / −なら届かない / null は曲線の最後まで赤字)
+///
+/// V3 だけの経路に限る(過去の状態で**チェーンに**見積もらせられるのは V3 だけ)。
+async function measureDecision(chain, s, order, swap, mine, tokenOut, sizeUsd) {
+  const skip = s.decisionSkip;
+  if (mine.legs.some((l) => l.kind !== KIND_V3)) { skip.notV3++; return; }
+  const fillBlock = Number(order.fillBlock);
+  if (!Number.isFinite(fillBlock) || fillBlock <= 0) { skip.noFillBlock++; return; }
+  // 曲線は**注文の元の住所**で探す(ネイティブ ETH はゼロ住所のまま)。価格の換算だけ包んだ版で行う。
+  const req = readV3Requirement(order, swap.tokenOut);
+  if (!req) {
+    skip.noCurve++;
+    if (skip.noCurve === 1) {
+      console.log(`[UniswapX判断] ${chain}: 値の曲線が読めません。実物 cosignerData=${JSON.stringify(order.cosignerData ?? null).slice(0, 200)}`
+        + ` outputs[0].curve=${JSON.stringify(order.outputs?.[0]?.curve ?? null).slice(0, 150)}`);
+    }
+    return;
+  }
+
+  // 約定の直前(前のブロックの終わり)の状態で、我々の経路を見積もる。
+  let oursAtFill = null;
+  try { oursAtFill = await verifyOnChain(chain, mine.legs, swap.amountIn, fillBlock - 1); } catch (e) {}
+  if (oursAtFill == null) { skip.noHistory++; return; }
+
+  let cost = null;
+  try { cost = order.txHash ? await readWinnerCost(chain, order.txHash, order.orderHash) : null; } catch (e) {}
+  if (!cost) { skip.noReceipt++; return; }
+  const gasUsd = await weiToUsd(chain, cost.weiPerOrder);
+  const dec = getTokenDecimals(chain, tokenOut);
+  const px = getTokenPriceUsd(chain, tokenOut);
+  if (gasUsd == null || dec == null || !(px > 0)) { skip.noPrice++; return; }
+  // ガス代を出力の通貨に直す(曲線と同じ単位で比べるため)。
+  const costTok = BigInt(Math.ceil((gasUsd / px) * Math.pow(10, dec)));
+
+  const settled = swap.amountOut;
+  // 曲線は開始額から決まるが、実額には基本手数料の調整などが乗る。**約定ブロックで実額に合わせる**。
+  const offset = settled - req.at(fillBlock);
+  const delayBlocks = fillBlock - req.decayStartBlock;
+  const sameBlockNetUsd = toUsd(chain, tokenOut, oursAtFill - settled) - gasUsd;
+  const gapBps = Number((oursAtFill - settled) * 100000n / settled) / 10;
+  const be = firstProfitableBlock(req, oursAtFill, costTok, offset);
+  const leadBlocks = be == null ? null : fillBlock - be;
+
+  const row = {
+    at: new Date().toISOString(), chain, order: order.orderHash, tx: order.txHash,
+    sizeUsd: sizeUsd != null ? Math.round(sizeUsd) : null, route: mine.label,
+    fillBlock, decayStartBlock: req.decayStartBlock, curveEndBlock: req.endBlock, delayBlocks,
+    gapBps, gasUsd: Number(gasUsd.toFixed(5)), nFills: cost.nFills, gasUsed: cost.gasUsed, filler: cost.filler,
+    sameBlockNetUsd: Number(sameBlockNetUsd.toFixed(5)), leadBlocks,
+    offsetBps: Number((offset * 100000n / settled)) / 10,
+  };
+  s.decisions.push(row);
+  if (s.decisions.length > 300) s.decisions.shift();
+  const ts = Number(order.fillTimestamp);
+  if (Number.isFinite(ts)) {
+    const c = s.clock || { b0: fillBlock, t0: ts, b1: fillBlock, t1: ts };
+    if (fillBlock < c.b0) { c.b0 = fillBlock; c.t0 = ts; }
+    if (fillBlock > c.b1) { c.b1 = fillBlock; c.t1 = ts; }
+    s.clock = c;
+  }
+  writeDecision(row);
+}
+
+/// 明細を1件1行で残す(日本時間で日を切る)。**後から別の切り口で分析し直せるように**生の値を持つ。
+let decisionDay = "", decisionLines = 0;
+const MAX_DECISION_LINES = 20000;
+function writeDecision(row) {
+  const jst = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+  if (jst !== decisionDay) { decisionDay = jst; decisionLines = 0; }
+  if (decisionLines >= MAX_DECISION_LINES) return;
+  try { fs.appendFileSync(stateFilePath(`uniswapx-decisions-${jst}.jsonl`), JSON.stringify(row) + "\n"); decisionLines++; } catch (e) {}
 }
 
 function toUsd(chain, token, raw) {
@@ -316,6 +430,10 @@ async function probeChain(chain) {
       const gap = Number((mine.amountOut - swap.amountOut) * 100000n / swap.amountOut) / 10;
       if (Number.isFinite(gap)) { s.gapBps.push(gap); if (s.gapBps.length > 300) s.gapBps.shift(); }
     }
+    // **勝ち負けに関わらず**判断材料を作る(負けこそ「何が足りないか」を教える)。
+    try {
+      await measureDecision(chain, s, order, swap, mine, tokenOut, toUsd(chain, tokenIn, swap.amountIn));
+    } catch (e) { /* 計測のために本体を止めない */ }
     if (diffUsd <= 0) { s.lost++; continue; }
 
     // ここまでは**模型の答え**。初回計測で34%という有り得ない値が出たので、
@@ -434,6 +552,39 @@ function fmtGap(arr) {
   return `中央${f(q(0.5))}bps 上位10%${f(q(0.9))}bps 最良${f(a[a.length - 1])}bps(${a.length}件)`;
 }
 
+/// 判断材料の要約。**これが「速さはどれだけ要るか」「手数料はいくらか」の答え。**
+export function formatDecisionLine(chain, s) {
+  const d = s.decisions || [];
+  const sk = s.decisionSkip || {};
+  const skipNote = `測れず[V2経路${sk.notV3 || 0} 曲線${sk.noCurve || 0} 過去の状態${sk.noHistory || 0} レシート${sk.noReceipt || 0} 価格${sk.noPrice || 0}]`;
+  if (d.length === 0) return `${chain} 判断材料0件 ${skipNote}`;
+  const med = (arr) => { const a = arr.filter((v) => v != null && Number.isFinite(v)).sort((x, y) => x - y); return a.length ? a[Math.floor(a.length / 2)] : null; };
+  const q = (arr, p) => { const a = arr.filter((v) => v != null && Number.isFinite(v)).sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(a.length * p))] : null; };
+  const c = s.clock;
+  const msPerBlock = c && c.b1 - c.b0 >= 20 ? ((c.t1 - c.t0) * 1000) / (c.b1 - c.b0) : null;
+  const delays = d.map((r) => r.delayBlocks);
+  const dMed = med(delays), d10 = q(delays, 0.1);
+  const toMs = (b) => (msPerBlock != null && b != null ? `≈${Math.round(b * msPerBlock)}ms` : "");
+  const sameWin = d.filter((r) => r.sameBlockNetUsd > 0).length;
+  const couldWin = d.filter((r) => r.leadBlocks != null && r.leadBlocks >= 0).length;
+  const winUsd = d.filter((r) => r.sameBlockNetUsd > 0).reduce((a, r) => a + r.sameBlockNetUsd, 0);
+  const leads = d.map((r) => r.leadBlocks).filter((v) => v != null);
+  const never = d.filter((r) => r.leadBlocks == null).length;
+  // 勝者の顔ぶれ(上位3者の占有率)
+  const byFiller = {};
+  for (const r of d) if (r.filler) byFiller[r.filler] = (byFiller[r.filler] || 0) + 1;
+  const top = Object.entries(byFiller).sort((a, b) => b[1] - a[1]).slice(0, 3)
+    .map(([a, n]) => `${a.slice(0, 8)}…${Math.round((n / d.length) * 100)}%`).join(" ");
+  return `${chain} 判断材料${d.length}件`
+    + ` 勝者の速さ[開始から中央${dMed}ブロック${toMs(dMed)} 速い1割${d10}ブロック${toMs(d10)}${msPerBlock != null ? ` 1ブロック${Math.round(msPerBlock)}ms(実測)` : ""}]`
+    + ` 勝者のガス[中央$${med(d.map((r) => r.gasUsd))?.toFixed(4)} 1取引で平均${(d.reduce((a, r) => a + r.nFills, 0) / d.length).toFixed(1)}件]`
+    + ` 約定直前の我々−実額[中央${med(d.map((r) => r.gapBps))?.toFixed(1)}bps 上位1割${q(d.map((r) => r.gapBps), 0.9)?.toFixed(1)}bps]`
+    + ` **同じブロックで出せたら黒字${sameWin}件(${Math.round((sameWin / d.length) * 100)}%) 計$${winUsd.toFixed(2)}**`
+    + ` 曲線上で勝てた${couldWin}件 黒字化に要る差[中央${med(leads) ?? "-"}ブロック 最後まで赤字${never}件]`
+    + (top ? ` 勝者[${top}]` : "")
+    + ` ${skipNote}`;
+}
+
 function fmtCounts(o) {
   return Object.entries(o).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k}:${n}`).join(" ");
 }
@@ -477,6 +628,11 @@ export function formatUniswapXLine() {
 /// 詳しい報告(30分ごと)。勝てた最良の1本を出す。
 export function formatUniswapXReport() {
   const lines = [];
+  for (const [chain, s] of stats) {
+    if ((s.decisions || []).length > 0 || Object.values(s.decisionSkip || {}).some((v) => v > 0)) {
+      lines.push(`[UniswapX判断] ${formatDecisionLine(chain, s)}`);
+    }
+  }
   for (const [chain, s] of stats) {
     if (!s.best) continue;
     lines.push(`[UniswapX計測] ${chain}: **チェーンで確認した**最良 ${s.best.label} で $${s.bestUsd.toFixed(4)} の取り分`
