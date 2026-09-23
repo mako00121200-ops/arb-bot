@@ -41,7 +41,7 @@ import { extractSwap, readFilledAt, FILLED_AT_KEYS, splitByAge, amountKeyOf, ord
   readV3Requirement, firstProfitableBlock } from "./uniswapx-parse.js";
 import { weiToUsd } from "./gas-cost.js";
 import { callWithRpc } from "./onchain-reserves.js";
-import { getTokenDecimals, getTokenPriceUsd, KIND_V3 } from "./pool-registry.js";
+import { getTokenDecimals, getTokenPriceUsd, KIND_V3, getPoolsForPair } from "./pool-registry.js";
 import { getKnownTokens, toWrappedToken, isNativeToken } from "./borrowable-tokens.js";
 import { quoteV3ByPoolBatch, fetchReservesBatch } from "./multicall-reserves.js";
 import { getAnyChainConfig } from "../chain-config.js";
@@ -231,6 +231,47 @@ async function quoteRouteAt(chain, legs, amountIn, blockTag) {
   return { out: amount, hasV2 };
 }
 
+/// **価格表を通さず、チェーンに直接聞いた最良の受取量**(2026年9月24日、比べ方の見直し)。
+///
+/// [なぜ要るか]
+/// 我々の経路(bestOutputFor)は、V3 の段を**価格表がある時だけ**使う。価格表は小さい額の範囲しか
+/// 持たないので、$1,000〜$10,000 の注文では深い V3 プールが候補から落ち、薄い V2 経由の経路が選ばれる。
+/// 実際、base の判断材料232件のうち185件が V2 を含み、我々−実額の中央は −2,585bps(−26%)だった。
+/// これは「市場で届かない差」ではなく、**我々の模型の届く範囲**を測っていた可能性が高い。
+/// 地図にある V3 プールを全部、約定直前のブロックでチェーンに試算させ、1段と(中継通貨を挟んだ)2段の
+/// 最良を取る。これが「同じ地図で、正しく経路を選べていたら出せた額」になる。
+async function directBestAt(chain, tokenIn, tokenOut, amountIn, hubs, blockTag) {
+  const cfg = getAnyChainConfig(chain);
+  const contractAddress = cfg && process.env[cfg.contractAddressEnvVar];
+  if (!contractAddress) return null;
+  const v3 = (a, b) => getPoolsForPair(chain, a, b).filter((p) => p.kind === KIND_V3).slice(0, 12);
+  const from = String(tokenIn).toLowerCase(), to = String(tokenOut).toLowerCase();
+  let best = null;
+  // 1段
+  const direct = v3(from, to);
+  if (direct.length > 0) {
+    const outs = await quoteV3ByPoolBatch(chain, contractAddress,
+      direct.map((p) => ({ pool: p.address, tokenIn: from, amountIn })), false, blockTag);
+    outs.forEach((o, i) => { if (o != null && (!best || o > best.out)) best = { out: o, label: `直接V3 ${direct[i].dexId}` }; });
+  }
+  // 2段(中継通貨ごとに、1段目の最良から2段目を試算)
+  for (const hub of hubs || []) {
+    const mid = String(hub).toLowerCase();
+    if (mid === from || mid === to) continue;
+    const firsts = v3(from, mid), seconds = v3(mid, to);
+    if (firsts.length === 0 || seconds.length === 0) continue;
+    const o1 = await quoteV3ByPoolBatch(chain, contractAddress,
+      firsts.map((p) => ({ pool: p.address, tokenIn: from, amountIn })), false, blockTag);
+    let midBest = null;
+    for (const o of o1) if (o != null && (midBest == null || o > midBest)) midBest = o;
+    if (midBest == null) continue;
+    const o2 = await quoteV3ByPoolBatch(chain, contractAddress,
+      seconds.map((p) => ({ pool: p.address, tokenIn: mid, amountIn: midBest })), false, blockTag);
+    o2.forEach((o, i) => { if (o != null && (!best || o > best.out)) best = { out: o, label: `直接V3 2段(${seconds[i].dexId})` }; });
+  }
+  return best;
+}
+
 /// UniswapX の反応器が約定ごとに出すイベント(`ReactorEvents.sol`):
 /// `Fill(bytes32 indexed orderHash, address indexed filler, address indexed swapper, uint256 nonce)`
 const FILL_TOPIC = ethers.id("Fill(bytes32,address,address,uint256)");
@@ -269,7 +310,7 @@ async function readWinnerCost(chain, txHash, orderHash) {
 /// `decayStartBlock` までは**その者しか**埋められない(他者は `exclusivityOverrideBps` 分を上乗せしない限り不可)。
 /// 初回の2件で勝者が「値下がり開始の2ブロック前」に埋めていたため、**速さの問題か、
 /// quoter(見積もりの審査が要る役)になる問題か**を、これで決着させる。
-async function measureDecision(chain, s, order, swap, mine, tokenOut, sizeUsd) {
+async function measureDecision(chain, s, order, swap, mine, tokenOut, sizeUsd, tokenIn = null, hubs = []) {
   const skip = s.decisionSkip;
   const fillBlock = Number(order.fillBlock);
   if (!Number.isFinite(fillBlock) || fillBlock <= 0) { skip.noFillBlock++; return; }
@@ -288,7 +329,11 @@ async function measureDecision(chain, s, order, swap, mine, tokenOut, sizeUsd) {
   let quoted = null;
   try { quoted = await quoteRouteAt(chain, mine.legs, swap.amountIn, fillBlock - 1); } catch (e) {}
   if (quoted == null) { skip.noHistory++; return; }
-  const oursAtFill = quoted.out;
+  // 価格表を通さない直接の試算と比べ、良い方を「我々の額」とする(模型の経路選びの弱さを差から外す)
+  let direct = null;
+  if (tokenIn) { try { direct = await directBestAt(chain, tokenIn, tokenOut, swap.amountIn, hubs, fillBlock - 1); } catch (e) {} }
+  const modelAtFill = quoted.out;
+  const oursAtFill = direct && direct.out > modelAtFill ? direct.out : modelAtFill;
 
   let cost = null;
   try { cost = order.txHash ? await readWinnerCost(chain, order.txHash, order.orderHash) : null; } catch (e) {}
@@ -306,6 +351,7 @@ async function measureDecision(chain, s, order, swap, mine, tokenOut, sizeUsd) {
   const delayBlocks = fillBlock - req.decayStartBlock;
   const sameBlockNetUsd = toUsd(chain, tokenOut, oursAtFill - settled) - gasUsd;
   const gapBps = Number((oursAtFill - settled) * 100000n / settled) / 10;
+  const gapBpsModel = Number((modelAtFill - settled) * 100000n / settled) / 10;
   const be = firstProfitableBlock(req, oursAtFill, costTok, offset);
   const leadBlocks = be == null ? null : fillBlock - be;
   // 独占の有無と、勝者が独占者本人か。ゼロ住所は「独占なし」。
@@ -313,15 +359,30 @@ async function measureDecision(chain, s, order, swap, mine, tokenOut, sizeUsd) {
   const ex = cd.exclusiveFiller ? String(cd.exclusiveFiller).toLowerCase() : null;
   const exclusiveFiller = ex && !/^0x0{40}$/.test(ex) ? ex : null;
   const exclOverrideBps = Number.isFinite(Number(cd.exclusivityOverrideBps)) ? Number(cd.exclusivityOverrideBps) : null;
+  if (!s.cdKeysLogged) {
+    s.cdKeysLogged = true;
+    console.log(`[UniswapX判断] ${chain}: cosignerData の実物 ${JSON.stringify(order.cosignerData ?? null).slice(0, 300)}`);
+  }
+  // **独占期間中に他者が埋めるには、ユーザーへ exclusivityOverrideBps を上乗せしなければならない**
+  // (V3 Dutch の仕組み)。独占中の約定を「同じブロックで出せたら黒字」と数えるのは甘い。
+  // 上乗せ額が分からない時は「取れた」に数えない(null)。
+  const inExcl = exclusiveFiller != null && fillBlock < req.decayStartBlock;
+  const needOut = !inExcl ? settled
+    : exclOverrideBps != null ? (settled * BigInt(10000 + exclOverrideBps)) / 10000n : null;
+  const obDiffUsd = needOut == null ? null : toUsd(chain, tokenOut, oursAtFill - needOut);
+  const obtainableNetUsd = obDiffUsd == null ? null : obDiffUsd - gasUsd;
 
   const row = {
     at: new Date().toISOString(), chain, order: order.orderHash, tx: order.txHash,
     sizeUsd: sizeUsd != null ? Math.round(sizeUsd) : null, route: mine.label,
     fillBlock, decayStartBlock: req.decayStartBlock, curveEndBlock: req.endBlock, delayBlocks,
-    gapBps, gasUsd: Number(gasUsd.toFixed(5)), nFills: cost.nFills, gasUsed: cost.gasUsed, filler: cost.filler,
+    gapBps, gapBpsModel, directLabel: direct?.label ?? null, directBetter: !!(direct && direct.out > modelAtFill),
+    obtainableNetUsd: obtainableNetUsd == null ? null : Number(obtainableNetUsd.toFixed(5)),
+    gasUsd: Number(gasUsd.toFixed(5)), nFills: cost.nFills, gasUsed: cost.gasUsed, filler: cost.filler,
     sameBlockNetUsd: Number(sameBlockNetUsd.toFixed(5)), leadBlocks,
     offsetBps: Number((offset * 100000n / settled)) / 10,
-    hasV2: quoted.hasV2,
+    // 直接V3の方が良ければ、使った経路に V2 は含まれない
+    hasV2: direct && direct.out > modelAtFill ? false : quoted.hasV2,
     exclusiveFiller, exclOverrideBps,
     // 独占期間中(値下がり開始前)に埋められたか / 埋めたのが独占者本人か
     inExclusive: exclusiveFiller != null && fillBlock < req.decayStartBlock,
@@ -496,7 +557,7 @@ async function probeChain(chain) {
     }
     // **勝ち負けに関わらず**判断材料を作る(負けこそ「何が足りないか」を教える)。
     try {
-      await measureDecision(chain, s, order, swap, mine, tokenOut, toUsd(chain, tokenIn, swap.amountIn));
+      await measureDecision(chain, s, order, swap, mine, tokenOut, toUsd(chain, tokenIn, swap.amountIn), tokenIn, hubs);
     } catch (e) { /* 計測のために本体を止めない */ }
     if (diffUsd <= 0) { s.lost++; continue; }
 
@@ -510,7 +571,10 @@ async function probeChain(chain) {
     s.verifyTried++;
     let trueOut = null;
     try {
-      trueOut = await verifyOnChain(chain, mine.legs, swap.amountIn);
+      // **約定の直前のブロックで**確かめる。今の状態(約定から1分以上後)で比べると、その間の値動きが
+      // 「取り分」に混ざる(2026年9月24日に直す。それまでは今の状態で比べていた)。
+      const fb = Number(order.fillBlock);
+      trueOut = await verifyOnChain(chain, mine.legs, swap.amountIn, Number.isFinite(fb) && fb > 0 ? fb - 1 : null);
     } catch (e) { /* 確かめられなければ数えないだけ */ }
     if (trueOut == null) { s.verifyFailed++; continue; }
 
@@ -647,6 +711,11 @@ export function formatDecisionLine(chain, s) {
   const o2f = d.map((r) => r.orderToFillSec).filter((v) => v != null);
   const ovr = med(d.filter((r) => r.exclusiveFiller).map((r) => r.exclOverrideBps));
   const v2n = d.filter((r) => r.hasV2).length;
+  const dirKnown = d.filter((r) => r.gapBpsModel !== undefined);
+  const dirBetter = dirKnown.filter((r) => r.directBetter).length;
+  const obKnown = d.filter((r) => r.obtainableNetUsd !== undefined);
+  const obWin = obKnown.filter((r) => r.obtainableNetUsd != null && r.obtainableNetUsd > 0);
+  const obUnknown = obKnown.filter((r) => r.obtainableNetUsd == null).length;
   const v2win = d.filter((r) => r.hasV2 && r.sameBlockNetUsd > 0).length;
   return `${chain} 判断材料${d.length}件(V2含む${v2n}件)`
     + ` **独占[${exKnown.length}件中 あり${exN}件 独占期間中に約定${exIn}件 独占者本人が埋めた${exBy}件${ovr != null ? ` 横取りの上乗せ中央${ovr}bps` : ""}]**`
@@ -654,6 +723,8 @@ export function formatDecisionLine(chain, s) {
     + ` 勝者の速さ[開始から中央${dMed}ブロック${toMs(dMed)} 速い1割${d10}ブロック${toMs(d10)}${msPerBlock != null ? ` 1ブロック${Math.round(msPerBlock)}ms(実測)` : ""}]`
     + ` 勝者のガス[中央$${med(d.map((r) => r.gasUsd))?.toFixed(4)} 1取引で平均${(d.reduce((a, r) => a + r.nFills, 0) / d.length).toFixed(1)}件]`
     + ` 約定直前の我々−実額[中央${med(d.map((r) => r.gapBps))?.toFixed(1)}bps 上位1割${q(d.map((r) => r.gapBps), 0.9)?.toFixed(1)}bps]`
+    + (dirKnown.length > 0 ? ` 経路選びの差[模型の経路 中央${med(dirKnown.map((r) => r.gapBpsModel))?.toFixed(1)}bps → 直接V3込み 中央${med(dirKnown.map((r) => r.gapBps))?.toFixed(1)}bps 直接が良い${dirBetter}/${dirKnown.length}件]` : "")
+    + (obKnown.length > 0 ? ` **独占の上乗せ込みで取れた${obWin.length}/${obKnown.length}件 計$${obWin.reduce((a, r) => a + r.obtainableNetUsd, 0).toFixed(2)}(上乗せ不明${obUnknown}件)**` : "")
     + ` **同じブロックで出せたら黒字${sameWin}件(${Math.round((sameWin / d.length) * 100)}%、うちV2含む${v2win}件) 計$${winUsd.toFixed(2)}**`
     + ` 曲線上で勝てた${couldWin}件 黒字化に要る差[中央${med(leads) ?? "-"}ブロック 最後まで赤字${never}件]`
     + (top ? ` 勝者[${top}]` : "")
