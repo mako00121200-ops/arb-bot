@@ -326,6 +326,10 @@ async function measureDecision(chain, s, order, swap, mine, tokenOut, sizeUsd) {
     // 独占期間中(値下がり開始前)に埋められたか / 埋めたのが独占者本人か
     inExclusive: exclusiveFiller != null && fillBlock < req.decayStartBlock,
     byExclusive: exclusiveFiller != null && cost.filler === exclusiveFiller,
+    // **注文が出てから約定までの秒数**(2026年9月23日に追加)。値下がり開始前に誰でも開始額で
+    // 埋められる(独占なし)なら、勝負は「先に埋めた者」= この秒数が要る速さそのもの。
+    orderToFillSec: secOf(order.fillTimestamp) != null && secOf(order.createdAt) != null
+      ? secOf(order.fillTimestamp) - secOf(order.createdAt) : null,
   };
   s.decisions.push(row);
   if (s.decisions.length > 300) s.decisions.shift();
@@ -337,6 +341,15 @@ async function measureDecision(chain, s, order, swap, mine, tokenOut, sizeUsd) {
     s.clock = c;
   }
   writeDecision(row);
+}
+
+/// 時刻を秒にする(秒・ミリ秒の両方を桁で見分ける。どちらとも言えなければ null)。
+function secOf(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  if (n >= 1e9 && n < 1e11) return n;
+  if (n >= 1e12 && n < 1e14) return n / 1000;
+  return null;
 }
 
 /// 明細を1件1行で残す(日本時間で日を切る)。**後から別の切り口で分析し直せるように**生の値を持つ。
@@ -621,14 +634,18 @@ export function formatDecisionLine(chain, s) {
   for (const r of d) if (r.filler) byFiller[r.filler] = (byFiller[r.filler] || 0) + 1;
   const top = Object.entries(byFiller).sort((a, b) => b[1] - a[1]).slice(0, 3)
     .map(([a, n]) => `${a.slice(0, 8)}…${Math.round((n / d.length) * 100)}%`).join(" ");
-  const exN = d.filter((r) => r.exclusiveFiller).length;
-  const exIn = d.filter((r) => r.inExclusive).length;
-  const exBy = d.filter((r) => r.byExclusive).length;
+  // 独占の項目を持つ記録だけで数える(項目を足す前の記録は「独占なし」ではなく「不明」)。
+  const exKnown = d.filter((r) => r.exclusiveFiller !== undefined);
+  const exN = exKnown.filter((r) => r.exclusiveFiller).length;
+  const exIn = exKnown.filter((r) => r.inExclusive).length;
+  const exBy = exKnown.filter((r) => r.byExclusive).length;
+  const o2f = d.map((r) => r.orderToFillSec).filter((v) => v != null);
   const ovr = med(d.filter((r) => r.exclusiveFiller).map((r) => r.exclOverrideBps));
   const v2n = d.filter((r) => r.hasV2).length;
   const v2win = d.filter((r) => r.hasV2 && r.sameBlockNetUsd > 0).length;
   return `${chain} 判断材料${d.length}件(V2含む${v2n}件)`
-    + ` **独占[あり${exN}件 独占期間中に約定${exIn}件 独占者本人が埋めた${exBy}件${ovr != null ? ` 横取りの上乗せ中央${ovr}bps` : ""}]**`
+    + ` **独占[${exKnown.length}件中 あり${exN}件 独占期間中に約定${exIn}件 独占者本人が埋めた${exBy}件${ovr != null ? ` 横取りの上乗せ中央${ovr}bps` : ""}]**`
+    + (o2f.length > 0 ? ` **注文から約定まで[中央${med(o2f).toFixed(1)}秒 速い1割${q(o2f, 0.1).toFixed(1)}秒 ${o2f.length}件]**` : "")
     + ` 勝者の速さ[開始から中央${dMed}ブロック${toMs(dMed)} 速い1割${d10}ブロック${toMs(d10)}${msPerBlock != null ? ` 1ブロック${Math.round(msPerBlock)}ms(実測)` : ""}]`
     + ` 勝者のガス[中央$${med(d.map((r) => r.gasUsd))?.toFixed(4)} 1取引で平均${(d.reduce((a, r) => a + r.nFills, 0) / d.length).toFixed(1)}件]`
     + ` 約定直前の我々−実額[中央${med(d.map((r) => r.gapBps))?.toFixed(1)}bps 上位1割${q(d.map((r) => r.gapBps), 0.9)?.toFixed(1)}bps]`
