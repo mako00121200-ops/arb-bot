@@ -901,7 +901,8 @@ const skippedByChain = new Map();
 /// チェーンに聞かない限り、**送信を再開すべきかが永久に分からない**。
 ///
 /// 本番と同じ `simulateRoute`(eth_call)を当てるだけで、**送信しない・ガスを払わない**。
-/// 経路の除外・価格表の破棄など、**本番の状態を変えることは一切しない**。
+/// 赤字・拒否の時は**本番と同じ手当て**(経路の再判定停止・手数料の読み直し・段ごとの診断)をする
+/// (下の shadowCheck の注記を参照。当初は何もしなかったが、それでは模型が直らなかった)。
 ///
 ///   本物   … チェーン上で黒字、かつガス代を引いても下限以上 = 送っていれば取れた見込み
 ///   ガス負け … チェーン上で黒字だがガス代を引くと下限未満
@@ -947,9 +948,31 @@ async function shadowCheck(opp) {
     const legArgs = buildLegArgs(chain, opp, version.version);
     const sim = await simulate(chain, contractAddress, wallet.address,
       ethers.getAddress(opp.tokenA), amountIn, legArgs, version.iface);
-    if (sim.error) { entry.rejected++; return; }
+    // **赤字・拒否は、本番と同じ手当てをする**(2026年9月23日に変更)。
+    //
+    // [なぜ(オーナーの指示で base の模型のずれを調べて判明)]
+    // 模型を直す仕組み — K検算の拒否で手数料を読み直す / 赤字なら段ごとに診断して
+    // 価格表の信用上限を下げ、プールに責任を付ける / 経路を「プールが動くまで再判定しない」 —
+    // は**全部、送信した時にしか動かない**。送信を止めた base では模型が
+    // **間違ったまま固まり**、同じ幻の経路が何百回も「黒字」と出続けていた
+    // (`uniswap-v3(0.30%)→aerodrome→uniswap-v3(0.05%)` が15分で $0.0001→$0.0387 と育つ等)。
+    // 当初は「本番の状態を変えない」としたが、それでは**直らないまま数え続ける**だけだった。
+    // 手当ての対象はこの経路とそのプールだけで、送ってよいチェーンには影響しない。
+    if (sim.error) {
+      entry.rejected++;
+      if (isKRevert(sim.error)) forceFeeReprobe(opp, "影の確認でK検算に拒否(受取量が多すぎる)");
+      markRouteRejected(opp);
+      return;
+    }
     const profitRaw = sim.returned - sim.owed;
-    if (profitRaw <= 0n) { entry.loss++; return; }
+    if (profitRaw <= 0n) {
+      entry.loss++;
+      markRouteRejected(opp);
+      if (opp.hasV3) clearV3TablesOfRoute(chain, opp);
+      // **どの段が嘘をついていたかを名指しする**(本番と同じ `[段ごとの答え合わせ]` の行が出る)。
+      try { await diagnoseRejectedRoute(chain, contractAddress, opp); } catch (e) {}
+      return;
+    }
     const grossUsd = (Number(profitRaw) / Math.pow(10, decimals)) * priceUsd;
     const gasUsd = await estimateGasCostUsd(chain, opp.kind);
     const netUsd = grossUsd - gasUsd;
