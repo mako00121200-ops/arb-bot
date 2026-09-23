@@ -64,6 +64,52 @@ export async function runLiquidatorDeploy(chains) {
   return done;
 }
 
+/// Morpho Blue の住所: morpho-org/sdks packages/morpho-ts/src/addresses.ts
+/// (scripts/morpho-liquidation.js の MORPHO_BLUE と同じ。思い込みで書かない)
+const MORPHO_BY_CHAIN = {
+  base: "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb",
+};
+
+/// Morpho 清算コントラクト(contracts/MorphoLiquidator.sol)をデプロイする。
+/// 使い方: RUN_MORPHO_LIQUIDATOR_DEPLOY=base。終わったら表示された住所を
+/// MORPHO_LIQUIDATOR_ADDRESS_<CHAIN> に入れ、RUN_MORPHO_LIQUIDATOR_DEPLOY を空に戻す。
+/// **住所が既に設定されているチェーンは飛ばす**(変数を戻し忘れて再起動しても、二重に置かない)。
+export async function runMorphoLiquidatorDeploy(chains) {
+  const list = String(chains || "").split(",").map((c) => c.trim().toLowerCase()).filter(Boolean);
+  for (const c of list) {
+    const envVar = `MORPHO_LIQUIDATOR_ADDRESS_${c.toUpperCase()}`;
+    if (process.env[envVar]) {
+      console.log(`[Morpho清算デプロイ] ${c}: ${envVar} が既にあるので飛ばします(RUN_MORPHO_LIQUIDATOR_DEPLOY を空に戻してください)`);
+      continue;
+    }
+    const morpho = MORPHO_BY_CHAIN[c];
+    const config = getAnyChainConfig(c);
+    if (!morpho || !config) { console.error(`[Morpho清算デプロイ] 未対応のチェーン: ${c}`); continue; }
+    const privateKey = process.env.MAINNET_BOT_PRIVATE_KEY;
+    if (!privateKey) { console.error("[Morpho清算デプロイ] MAINNET_BOT_PRIVATE_KEY が未設定です"); continue; }
+    try {
+      console.log(`[Morpho清算デプロイ] ${c} へのデプロイを開始します(Morpho ${morpho})`);
+      const { abi, bytecode } = compileContract("MorphoLiquidator");
+      console.log(`[Morpho清算デプロイ] コンパイル完了: ${(bytecode.length - 2) / 2}バイト`);
+      const provider = new ethers.JsonRpcProvider(config.rpcUrl, ethers.Network.from(config.chainId), {
+        staticNetwork: ethers.Network.from(config.chainId),
+      });
+      const wallet = new ethers.Wallet(privateKey, provider);
+      const balance = await provider.getBalance(wallet.address);
+      console.log(`[Morpho清算デプロイ] ウォレット ${wallet.address} の残高: ${ethers.formatEther(balance)}`);
+      if (balance === 0n) { console.error("[Morpho清算デプロイ] 残高が0のためデプロイできません"); continue; }
+      const contract = await new ethers.ContractFactory(abi, bytecode, wallet).deploy(morpho);
+      console.log("[Morpho清算デプロイ] 送信しました。確定を待っています…");
+      await contract.waitForDeployment();
+      const address = await contract.getAddress();
+      console.log(`[Morpho清算デプロイ] ${c} 完了: ${address}`);
+      console.log(`[Morpho清算デプロイ] 環境変数 ${envVar} = ${address} を設定し、RUN_MORPHO_LIQUIDATOR_DEPLOY を空に戻してください`);
+    } catch (e) {
+      console.error(`[Morpho清算デプロイ] ${c} で失敗: ${(e.message || "").slice(0, 160)}`);
+    }
+  }
+}
+
 async function deployOne(chain) {
   const chainKey = (chain || "").toLowerCase();
   const config = getAnyChainConfig(chainKey);
