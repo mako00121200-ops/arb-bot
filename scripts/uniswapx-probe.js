@@ -115,6 +115,15 @@ function statFor(chain) {
       keysLogged: {},
       /// **開始額が実額より何bps大きかったか**(実額が読めた注文ごと)。直す前の誤差の大きさ。
       startVsSettledBps: [],
+      /// **我々の経路の受取 − 実際にユーザーが受け取った額(bps)。** 勝ち負けの両方。
+      ///
+      /// [なぜ(2026年9月23日、オーナーの問い「実際の約定額に合わせる/上回ることはできないか」)]
+      /// 勝ち負けの件数だけでは「あと何bps足りないか」が分からない。
+      /// 負けが −1〜3bps なら経路の改善で届きうる。−20bps なら構造的に届かない
+      /// (勝者は我々の知らない流動性=在庫や他の取引所を使っている)。
+      /// **模型の値**(V3も x·y=k 近似 = 我々の受取を多めに見る側)なので、
+      /// 本当の不足はこれより**大きい**。つまりこの数字は「最低でもこれだけ足りない」。
+      gapBps: [],
       settledShapeLogged: false,
       // **確認できた勝ちを「齢つき」で持つ。** 値動きの残りかすかどうかを、
       // これで判定する(§下の formatUniswapXReport)。
@@ -303,6 +312,10 @@ async function probeChain(chain) {
     if (diffUsd == null) { s.noDecimals++; continue; }
     s.quotable++;
 
+    if (swap.amountOut > 0n) {
+      const gap = Number((mine.amountOut - swap.amountOut) * 100000n / swap.amountOut) / 10;
+      if (Number.isFinite(gap)) { s.gapBps.push(gap); if (s.gapBps.length > 300) s.gapBps.shift(); }
+    }
     if (diffUsd <= 0) { s.lost++; continue; }
 
     // ここまでは**模型の答え**。初回計測で34%という有り得ない値が出たので、
@@ -411,6 +424,16 @@ export async function probeUniswapXOnce(activeChains) {
   persist(); // **1周ごとに保存。** 次のデプロイで消えないように
 }
 
+/// 差の分布を「中央 / 上位10% / 最良」で出す。**上位10%が0を超えていれば、
+/// 経路を少し良くするだけで勝てる注文が1割ある**という読み方をする。
+function fmtGap(arr) {
+  if (!arr || arr.length === 0) return "";
+  const a = [...arr].sort((x, y) => x - y);
+  const q = (p) => a[Math.min(a.length - 1, Math.floor(a.length * p))];
+  const f = (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}`;
+  return `中央${f(q(0.5))}bps 上位10%${f(q(0.9))}bps 最良${f(a[a.length - 1])}bps(${a.length}件)`;
+}
+
 function fmtCounts(o) {
   return Object.entries(o).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k}:${n}`).join(" ");
 }
@@ -442,6 +465,7 @@ export function formatUniswapXLine() {
       // **種類と、額を読んだ項目。** 勝ちが Priority/amount に偏っていたら水増しを疑う。
       + (Object.keys(s.types).length > 0 ? ` 種類[${fmtCounts(s.types)}]` : "")
       + (Object.keys(s.outKeys).length > 0 ? ` 額の項目[${fmtCounts(s.outKeys)}]` : "")
+      + (s.gapBps.length > 0 ? ` 我々−実額 ${fmtGap(s.gapBps)}` : "")
       + (s.startVsSettledBps.length > 0
         ? ` 開始額−実額 中央${[...s.startVsSettledBps].sort((a, b) => a - b)[Math.floor(s.startVsSettledBps.length / 2)].toFixed(1)}bps(${s.startVsSettledBps.length}件)` : "")
       + (Object.keys(s.winTypes).length > 0
