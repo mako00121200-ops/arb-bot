@@ -293,7 +293,26 @@ export async function getEstimatedGasPriceWei(chain) {
   return adjusted > 0n ? adjusted : raw;
 }
 
+/// **同じネイティブ通貨(ETH)を使うチェーン。** 自分のチェーンで価格が取れない時に借りる。
+///
+/// [なぜ(2026年9月23日、optimism の送信再開の準備で発覚)]
+/// base と optimism は WETH の住所が同じ(0x4200…0006)。DexScreener に聞くと返る候補が
+/// 取引量の多い base の組で埋まり、optimism の組が1つも入らず**価格不明**になっていた。
+/// その結果 optimism では、ガス代の見積もりが予備の既定値のまま、優先手数料は入札されず、
+/// 約定後のガス代もドルに直せなかった。**ETH の値段はどのチェーンでも同じ**なので借りてよい。
+const SAME_NATIVE = { optimism: ["base", "arbitrum"], base: ["arbitrum", "optimism"], arbitrum: ["base", "optimism"] };
+
 async function getNativePriceUsd(chain) {
+  const own = await getNativePriceUsdOwn(chain);
+  if (own != null) return own;
+  for (const alt of SAME_NATIVE[chain] || []) {
+    const v = await getNativePriceUsdOwn(alt);
+    if (v != null) return v;
+  }
+  return null;
+}
+
+async function getNativePriceUsdOwn(chain) {
   const cached = nativePriceCache.get(chain);
   if (cached && Date.now() - cached.at < NATIVE_PRICE_CACHE_MS) return cached.value;
   const token = NATIVE_TOKEN_FOR_PRICE[chain];
