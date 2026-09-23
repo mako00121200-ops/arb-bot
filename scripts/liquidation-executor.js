@@ -77,6 +77,22 @@ const HUBS = (HUB_SYMBOLS[CHAIN] || [])
 if (BOOK && HUBS.length === 0) {
   console.warn(`[${TAG}] 中継通貨が1つも見つかりません(記号の綴り違い?)。経路探しが弱くなります`);
 }
+/// 清算の売却経路だけに使う追加の工場(裁定側のプール探索には入れない)。
+///
+/// [なぜ(2026年9月23日の Morpho 経路点検)]
+/// base の Morpho で借り手の多い12市場を $1,000 売ってみると、cbDOGE −43%・cbADA −60%・cbLTC −6.5% と
+/// 大きく目減りした(algebra-b→WETH→uniswap-v3 の遠回り)。これらは base で最大の Aerodrome の
+/// 集中流動性(Slipstream)で主に取引されており、今の探索に入っていなかった。
+/// 住所は aerodrome-finance/slipstream の README / script/constants/output/DeployCL-Base.json(工場は2つ)。
+/// スワップの呼び返しは uniswapV3SwapCallback なので、コントラクトはそのまま使える。
+const EXTRA_V3_FACTORIES = {
+  base: [
+    { address: "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A", dexId: "aerodrome-cl", style: "slipstream" },
+    { address: "0xaDe65c38CD4849aDBA595a4323a8C7DdfE89716a", dexId: "aerodrome-cl2", style: "slipstream" },
+  ],
+};
+/// Slipstream の刻み幅(工場の tickSpacings() の既定の組)。無い組は住所0が返るだけ。
+const SLIPSTREAM_TICK_SPACINGS = [1, 10, 50, 100, 200, 2000];
 /// プールの探索結果を覚えておく時間。
 const POOL_CACHE_MS = 6 * 60 * 60 * 1000;
 
@@ -137,9 +153,11 @@ async function findPools(tokenA, tokenB) {
   }
   // ② V3 のファクトリー。Uniswap 系は token0 = 住所の小さい方(計算で分かる)。
   const [t0, t1] = [tokenA.toLowerCase(), tokenB.toLowerCase()].sort();
-  for (const f of V3_FACTORIES[CHAIN] || []) {
+  for (const f of [...(V3_FACTORIES[CHAIN] || []), ...(EXTRA_V3_FACTORIES[CHAIN] || [])]) {
     try {
-      const reqs = f.style === "algebra" ? [{ tokenA: t0, tokenB: t1 }] : FEE_TIERS.map((feeTier) => ({ tokenA: t0, tokenB: t1, feeTier }));
+      const reqs = f.style === "algebra" ? [{ tokenA: t0, tokenB: t1 }]
+        : f.style === "slipstream" ? SLIPSTREAM_TICK_SPACINGS.map((tickSpacing) => ({ tokenA: t0, tokenB: t1, tickSpacing }))
+        : FEE_TIERS.map((feeTier) => ({ tokenA: t0, tokenB: t1, feeTier }));
       const addrs = await findV3PoolsBatch(CHAIN, f.address, f.style, reqs);
       addrs.forEach((a, i) => { if (a) add({ address: a, kind: KIND_V3, token0: t0, token1: t1, dexId: f.dexId, feeTier: reqs[i].feeTier ?? null, feeBps: 0 }); });
     } catch (e) {}
