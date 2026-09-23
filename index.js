@@ -2364,12 +2364,16 @@ async function checkGasBalances() {
   for (const chain of chainReady) {
     try {
       const provider = getProviderForChain(chain);
-      if (!provider) continue;
+      if (!provider) { parts.push(`${chain}:読めず(RPCなし)`); continue; }
       const wei = await provider.getBalance(address);
       // 残高と、1回あたりのガス代を、どちらもUSDに直して比べる。
       const balanceUsd = await weiToUsd(chain, wei);
       const perSendUsd = await estimateGasCostUsd(chain, "2step");
-      if (balanceUsd == null || !(perSendUsd > 0)) continue;
+      // **読めなかったチェーンを黙って飛ばさない**(2026年9月23日、optimism だけ行に出なかった)。
+      if (balanceUsd == null || !(perSendUsd > 0)) {
+        parts.push(`${chain}:${parseFloat(ethers.formatEther(wei)).toFixed(5)}(${balanceUsd == null ? "価格不明" : "ガス代不明"})`);
+        continue;
+      }
       const remaining = Math.floor(balanceUsd / perSendUsd);
       parts.push(`${chain}:${parseFloat(ethers.formatEther(wei)).toFixed(5)}(約$${balanceUsd.toFixed(2)} あと約${remaining}回)`);
       if (remaining < ALERT_MIN_REMAINING_SENDS) {
@@ -2380,7 +2384,9 @@ async function checkGasBalances() {
           `尽きると ${chain} で取引を送れなくなります。\n` +
           `補充をお願いします: ${address}`);
       }
-    } catch (e) {}
+    } catch (e) {
+      parts.push(`${chain}:読めず(${(e.shortMessage || e.message || "").slice(0, 40)})`);
+    }
   }
   if (parts.length > 0) console.log(`[ガス残高] ${parts.join(" ")}(下限 ${ALERT_MIN_REMAINING_SENDS}回)`);
 }
