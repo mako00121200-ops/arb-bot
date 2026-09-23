@@ -390,7 +390,7 @@ async function recentPriorityFloor(chain) {
 }
 
 const feeDataCache = new Map(); // chain -> { at, fee } 送信の速さを落とさないよう2秒だけ使い回す
-async function defaultFeeOverrides(chain) {
+export async function defaultFeeOverrides(chain) {
   try {
     const c = feeDataCache.get(chain);
     const fee = c && Date.now() - c.at < 2000 ? c.fee : await getProviderForChain(chain).getFeeData();
