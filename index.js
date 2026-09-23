@@ -77,7 +77,7 @@ import {
   getWhatIfProfit, getSpotScreenStats, takeQuoteDemand, getQuoteDemandTotal,
   getQuarantineStats, getSizeCurveStats,
 } from "./scripts/opportunity-scanner.js";
-import { executeOpportunity, formatSendSkipLine, flushSendSkips, ExecutionError, TAX_TOKEN_FEE_BPS, resetNonce, checkContractVersions } from "./scripts/execute-opportunity.js";
+import { executeOpportunity, formatSendSkipLine, flushSendSkips, ExecutionError, TAX_TOKEN_FEE_BPS, resetNonce, checkContractVersions, noteChainSendResult } from "./scripts/execute-opportunity.js";
 import {
   getKnownTokens, isBorrowable,
   markUsableStart, clearUsableStarts, countUsableStarts,
@@ -1923,6 +1923,7 @@ async function handleOpportunity(opp, meta = {}) {
       stats.executed++; reasons.success++;
       // **収支の実測。** 手元に残った純利益を足す。
       noteSendOutcome(opp.chain, true, opp.actualNetProfitUsd ?? opp.netProfitUsd ?? 0);
+      noteChainSendResult(opp.chain, true, opp.actualNetProfitUsd ?? opp.netProfitUsd ?? 0);
       cooldownUntil.delete(key);
       record(opp, "success", meta);
       noteBigOutcome(opp, "success");
@@ -1948,7 +1949,10 @@ async function handleOpportunity(opp, meta = {}) {
     // **勝率の実測(負けた側)。**
     // ガス代を失うのは `wait`(送った後に取り消された)だけ。
     // simulate / estimateGas / send での失敗はガス代がかからないので数えない。
-    if (stage === "wait") noteSendOutcome(opp.chain, false, opp.gasCostUsd ?? 0);
+    if (stage === "wait") {
+      noteSendOutcome(opp.chain, false, opp.gasCostUsd ?? 0);
+      noteChainSendResult(opp.chain, false, opp.gasCostUsd ?? 0);
+    }
     // **「失敗」と「負け」を同じ箱に入れない。**
     // `wait`(確定待ちで取り消された)は、送った後に他者が先に取った時に起きる。
     // 直し方が「取り消しの中身から原因を特定する」ではなく「速さ」なので分ける。
@@ -2313,7 +2317,7 @@ function checkOwnerAlerts(usage) {
 
   // ③ 送信用ウォレットのガス残高。尽きると送信できなくなる。
   //    補充はオーナーにしかできないので、これは必ず知らせる。
-  if (process.env.MAINNET_BOT_ADDRESS && now - lastGasBalanceCheck >= GAS_BALANCE_CHECK_MS) {
+  if (botAddress() && now - lastGasBalanceCheck >= GAS_BALANCE_CHECK_MS) {
     lastGasBalanceCheck = now;
     checkGasBalances().catch(() => {});
   }
@@ -2336,10 +2340,27 @@ function checkOwnerAlerts(usage) {
   }
 }
 
+/// 送信用ウォレットの住所。`MAINNET_BOT_ADDRESS` が無ければ、送信に使っている鍵から導く
+/// (住所は公開情報。**鍵そのものはどこにも出さない**)。
+///
+/// [2026年9月23日] `MAINNET_BOT_ADDRESS` が未設定だと、下の残高確認が**一度も走っていなかった**
+/// 可能性がある(LINE も未設定なので、走っても誰にも見えなかった)。optimism の送信再開の準備で発覚。
+let cachedBotAddress = null;
+function botAddress() {
+  if (cachedBotAddress) return cachedBotAddress;
+  if (process.env.MAINNET_BOT_ADDRESS) return (cachedBotAddress = process.env.MAINNET_BOT_ADDRESS);
+  const key = process.env.MAINNET_BOT_PRIVATE_KEY;
+  if (!key) return null;
+  try { cachedBotAddress = new ethers.Wallet(key).address; } catch (e) { return null; }
+  return cachedBotAddress;
+}
+
 /// 各チェーンの送信用ウォレットのガス残高を「あと何回送れるか」で確かめる。
+/// **ログにも必ず出す**(通知が未設定でも見えるように)。
 async function checkGasBalances() {
-  const address = process.env.MAINNET_BOT_ADDRESS;
+  const address = botAddress();
   if (!address) return;
+  const parts = [];
   for (const chain of chainReady) {
     try {
       const provider = getProviderForChain(chain);
@@ -2350,6 +2371,7 @@ async function checkGasBalances() {
       const perSendUsd = await estimateGasCostUsd(chain, "2step");
       if (balanceUsd == null || !(perSendUsd > 0)) continue;
       const remaining = Math.floor(balanceUsd / perSendUsd);
+      parts.push(`${chain}:${parseFloat(ethers.formatEther(wei)).toFixed(5)}(約$${balanceUsd.toFixed(2)} あと約${remaining}回)`);
       if (remaining < ALERT_MIN_REMAINING_SENDS) {
         const native = parseFloat(ethers.formatEther(wei));
         alertOwner(`gas-balance:${chain}`, `${chain} のガス残高が残り少ないです`,
@@ -2360,6 +2382,7 @@ async function checkGasBalances() {
       }
     } catch (e) {}
   }
+  if (parts.length > 0) console.log(`[ガス残高] ${parts.join(" ")}(下限 ${ALERT_MIN_REMAINING_SENDS}回)`);
 }
 
 // ===== ダッシュボード =====
