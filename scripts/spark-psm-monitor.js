@@ -73,6 +73,13 @@ const GSM_IFACE = new ethers.Interface([
   "function getAssetAmountForBuyAsset(uint256 maxGhoAmount) view returns (uint256, uint256, uint256, uint256)",
 ]);
 const ERC20_IFACE = new ethers.Interface(["function balanceOf(address) view returns (uint256)"]);
+/// GSM の担保が素の USDC ではなく、USDC を預けた利息付きの包み(ERC-4626。Aave の stata トークン)の場合に使う。
+/// 預け入れ・引き出しはその場で終わるので、USDC →(預ける)→ 包み →(GSM)→ GHO の形で1つの取引にできる
+const ERC4626_IFACE = new ethers.Interface([
+  "function asset() view returns (address)",
+  "function previewDeposit(uint256 assets) view returns (uint256)",
+  "function previewRedeem(uint256 shares) view returns (uint256)",
+]);
 
 const verified = new Map(); // `${venue}:${chain}` -> true / false
 /// `${venue}:${chain}` -> { reads, byRoute: { key -> {...} }, shortStock, noDex, maxNetUsd, durations: [秒], tracking: Set }
@@ -102,11 +109,19 @@ async function verifyGsm(chain, g) {
   if (verified.has(k)) return verified.get(k);
   try {
     const [gho, under] = await Promise.all([view(chain, g.gsm, GSM_IFACE, "GHO_TOKEN"), view(chain, g.gsm, GSM_IFACE, "UNDERLYING_ASSET")]);
-    const known = getKnownTokens(chain)[String(under).toLowerCase()];
-    // 担保が素の USDC でなければ(利息付きの包み USDC 等)、1:1 の前提が崩れるので測らない
+    let known = getKnownTokens(chain)[String(under).toLowerCase()];
+    let base = String(under);
+    // 担保が利息付きの包み(ERC-4626)なら、中身の通貨を聞く(2026年9月24日の初回で、arbitrum の GSM の担保は
+    // 素の USDC ではなく 0xE6D5…d5C1 だった)。中身が手書きのステーブルなら「預けて → GSM」で測る
+    if (!known?.stable) {
+      const inner = await view(chain, under, ERC4626_IFACE, "asset").catch(() => null);
+      const innerKnown = inner ? getKnownTokens(chain)[String(inner).toLowerCase()] : null;
+      if (innerKnown?.stable) { g.wrapper = String(under); base = String(inner); known = innerKnown; }
+    }
     const ok = same(gho, g.gho) && !!known?.stable;
-    console.log(`[Spark計測] ${chain}: GHO の GSM 照合 ${ok ? "OK" : "不一致のため測らない"}(GHO ${gho} / 担保 ${under}${known ? ` ${known.symbol}` : " 手書きに無い通貨"})`);
-    if (ok) g.usdc = String(under);
+    console.log(`[Spark計測] ${chain}: GHO の GSM 照合 ${ok ? "OK" : "不一致のため測らない"}(GHO ${gho} / 担保 ${under}`
+      + `${g.wrapper ? `(${known.symbol} を預けた包み)` : known ? ` ${known.symbol}` : " 手書きに無い通貨"})`);
+    if (ok) g.usdc = base;
     verified.set(k, ok);
     return ok;
   } catch (e) {
@@ -140,16 +155,23 @@ function routes(chain, venue, ctx) {
     } else {
       const g = ctx;
       list.push({ key: `GHO 交換所→DEX $${usd}`, usd, eval: async () => {
-        const r = await view(chain, g.gsm, GSM_IFACE, "getGhoAmountForSellAsset", [x]);
+        // 包みなら先に預ける(USDC → 包み)。GSM に入れるのは包みの枚数
+        const shares = g.wrapper ? BigInt(await view(chain, g.wrapper, ERC4626_IFACE, "previewDeposit", [x])) : x;
+        const r = await view(chain, g.gsm, GSM_IFACE, "getGhoAmountForSellAsset", [shares]);
         const used = BigInt(r[0]), gho = BigInt(r[1]);
+        // 実際に使った USDC(GSM が端数を残した分は使っていない)
+        const usedUsdc = g.wrapper ? (used === shares ? x : (x * used) / shares) : used;
         const s = await bestSellQuote(chain, g.gho, g.usdc, gho, hubs);
-        return { out: s ? s.out : null, x: used, label: s?.label || "", needExposure: used };
+        return { out: s ? s.out : null, x: usedUsdc, label: s?.label || "", needExposure: used };
       } });
       list.push({ key: `GHO DEX→交換所 $${usd}`, usd, eval: async () => {
         const b = await bestSellQuote(chain, g.usdc, g.gho, x, hubs);
         if (!b) return { out: null, x };
         const r = await view(chain, g.gsm, GSM_IFACE, "getAssetAmountForBuyAsset", [b.out]);
-        return { out: BigInt(r[0]), x, label: b.label, needLiquidity: BigInt(r[0]) };
+        const got = BigInt(r[0]);
+        // 包みなら引き出す(包み → USDC)
+        const out = g.wrapper ? BigInt(await view(chain, g.wrapper, ERC4626_IFACE, "previewRedeem", [got])) : got;
+        return { out, x, label: b.label, needLiquidity: got };
       } });
     }
   }
