@@ -235,6 +235,27 @@ async function sellCheck(r, amt, repaidLoan) {
   return { ok: net > 0, netUsd: net, fee: best.fee };
 }
 
+const sellQueue = [];
+let sellRunning = false;
+const noRouteMarket = new Map(); // 市場id -> 経路なしと分かった時刻
+async function drainSellQueue() {
+  if (sellRunning) return;
+  sellRunning = true;
+  try {
+    while (sellQueue.length) {
+      const { r, amt, repaidLoan, entry } = sellQueue.shift();
+      const nr = noRouteMarket.get(r.id);
+      entry.sell = nr && Date.now() - nr < 30 * 60 * 1000
+        ? { ok: false }
+        : await sellCheck(r, amt, repaidLoan).catch(() => ({ ok: false }));
+      if (!entry.sell.ok && entry.sell.netUsd == null && !entry.sell.unknownPrice) noRouteMarket.set(r.id, Date.now());
+      if (entry.sell.ok) { S.stats.sellOk++; S.stats.sellNetUsd.push(entry.sell.netUsd); } else S.stats.sellNo++;
+      console.log(`[Morpho本体/候補 ${nowJst()}] ${entry.pair} ${r.user.slice(0, 8)}… 使用率${(r.h.ratio * 100).toFixed(2)}% 返済約$${entry.repaidUsd?.toFixed(0) ?? "?"} 報酬見込み$${entry.bonusUsd?.toFixed(0) ?? "?"} ブロック${r.block}`
+        + ` → Uniswap V3 で${entry.sell.ok ? `売って返せる(ガス後 約$${entry.sell.netUsd.toFixed(0)}、手数料帯${entry.sell.fee})` : entry.sell.unknownPrice ? "売る経路はあるが借金の通貨の値段が不明" : entry.sell.netUsd != null ? `売ると赤字(約$${entry.sell.netUsd.toFixed(0)})` : "直接売れる経路なし"}(送りません)`);
+    }
+  } finally { sellRunning = false; }
+}
+
 async function handle(results) {
   for (const r of results) {
     if (r.h.ratio >= WATCH_RATIO) S.watch.set(r.key, r.h.ratio); else S.watch.delete(r.key);
@@ -250,10 +271,11 @@ async function handle(results) {
     S.seen.set(r.key, entry);
     if (repaidUsd != null && repaidUsd < MIN_REPAID_USD) { entry.dust = true; continue; }
     S.stats.liquidatable++;
-    entry.sell = await sellCheck(r, amt, repaidLoan).catch(() => ({ ok: false }));
-    if (entry.sell.ok) { S.stats.sellOk++; S.stats.sellNetUsd.push(entry.sell.netUsd); } else S.stats.sellNo++;
-    console.log(`[Morpho本体/候補 ${nowJst()}] ${entry.pair} ${r.user.slice(0, 8)}… 使用率${(r.h.ratio * 100).toFixed(2)}% 返済約$${repaidUsd?.toFixed(0) ?? "?"} 報酬見込み$${entry.bonusUsd?.toFixed(0) ?? "?"} ブロック${r.block}`
-      + ` → Uniswap V3 で${entry.sell.ok ? `売って返せる(ガス後 約$${entry.sell.netUsd.toFixed(0)}、手数料帯${entry.sell.fee})` : entry.sell.unknownPrice ? "売る経路はあるが借金の通貨の値段が不明" : entry.sell.netUsd != null ? `売ると赤字(約$${entry.sell.netUsd.toFixed(0)})` : "直接売れる経路なし"}(送りません)`);
+    // 売れるかの見積もり(1人4〜5回の問い合わせ)は**待たずに裏で**行う。
+    // 待つと、清算できる人が188人いた再起動直後に全員の読み直しと毎ブロックの見張りが10分以上止まった(23:23 JST)。
+    // 同じ市場で「直接売れる経路なし」と分かったものは30分聞き直さない。
+    sellQueue.push({ r, amt, repaidLoan, entry });
+    drainSellQueue();
   }
 }
 
