@@ -69,7 +69,7 @@ function ethereumProvider() {
   return ethProvider;
 }
 /// チェーンに合わせて RPC を呼ぶ。ethereum は自前の接続(一時的な失敗は2回まで取り直す)、他は既存の仕組み。
-async function rpc(chain, fn) {
+export async function rpc(chain, fn) {
   if (chain !== "ethereum") return callWithRpc(chain, fn);
   let last;
   for (let i = 0; i < 3; i++) {
@@ -159,14 +159,14 @@ async function readLogs(chain, from, to) {
   return { logs: out, requests, refusals, reachedBlock: cursor - 1 };
 }
 
-async function readMarket(chain, id) {
+export async function readMarket(chain, id) {
   const r = await rpc(chain, (p) => p.call({ to: MORPHO[chain].address, data: IFACE.encodeFunctionData("idToMarketParams", [id]) }));
   const [loanToken, collateralToken, oracle, irm, lltv] = IFACE.decodeFunctionResult("idToMarketParams", r);
   return { loanToken, collateralToken, oracle, irm, lltv: Number(lltv) / 1e18, lltvWad: BigInt(lltv) };
 }
 
 const tokenInfoCache = new Map();
-async function readToken(chain, token) {
+export async function readToken(chain, token) {
   const key = `${chain}:${token.toLowerCase()}`;
   if (tokenInfoCache.has(key)) return tokenInfoCache.get(key);
   let symbol = token.slice(0, 8);
@@ -268,13 +268,13 @@ export function lagBucket(lag) {
   return "26ブロック以上";
 }
 
-function short(a) { return a ? `${a.slice(0, 6)}…${a.slice(-4)}` : "?"; }
+export function short(a) { return a ? `${a.slice(0, 6)}…${a.slice(-4)}` : "?"; }
 function median(xs) {
   if (xs.length === 0) return null;
   const s = [...xs].sort((a, b) => a - b);
   return s[Math.floor(s.length / 2)];
 }
-const usd = (v) => (v == null ? "?" : `$${v >= 100 ? Math.round(v).toLocaleString() : v.toFixed(2)}`);
+export const usd = (v) => (v == null ? "?" : `$${v >= 100 ? Math.round(v).toLocaleString() : v.toFixed(2)}`);
 
 /// 1件の清算を、ドル換算して行にする(テストしやすいよう純粋関数)。
 export function toRow({ id, caller, borrower, repaidAssets, seizedAssets, badDebtAssets, blockNumber, txHash }, market, loan, coll) {

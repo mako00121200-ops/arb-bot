@@ -37,6 +37,7 @@ import { runMainnetDeploy } from "./scripts/mainnet-deploy.js";
 import { runPoolSurvey } from "./scripts/pool-survey.js";
 import { runMainnetDepthSurvey } from "./scripts/mainnet-depth-survey.js";
 import { runMorphoSurvey, morphoSurveyChains } from "./scripts/morpho-liquidation-survey.js";
+import { runMorphoDeepdive, morphoDeepdiveChains } from "./scripts/morpho-lag-deepdive.js";
 import { runWickBacktestAll, wickBacktestSymbols } from "./scripts/wick-backtest.js";
 import { startMainnetEdgeWatch, formatMainnetEdgeLine, flushMainnetEdge } from "./scripts/mainnet-edge-watch.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
@@ -2758,6 +2759,10 @@ async function main() {
   // 終わったら RUN_MORPHO_SURVEY を空に戻すこと。
   if (morphoSurveyChains().length > 0) {
     runMorphoSurvey().catch((e) => console.error("[Morpho調査] 失敗:", e.message));
+  }
+  // 長く放置された清算の解剖(第1.5段。前回の調査の保存を読む。読み取りのみ)
+  if (morphoDeepdiveChains().length > 0) {
+    runMorphoDeepdive().catch((e) => console.error("[Morpho解剖] 失敗:", e.message));
   }
 
 
