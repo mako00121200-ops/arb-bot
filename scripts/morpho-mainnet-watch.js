@@ -335,7 +335,12 @@ async function tick() {
   S.busy = true;
   try {
     const latest = await eth().getBlockNumber();
-    if (S.backfill.cursor <= latest) await backfillStep(latest);
+    if (S.backfill.cursor <= latest) {
+      await backfillStep(latest);
+      // 遡りの途中でも1分ごとに保存する。**再起動で遡りが最初からやり直しにならないように**
+      // (22:40 JST、全員の読み直しの前に再起動が入り、25分ぶんの遡りをやり直した)
+      if (Date.now() - (S.lastSave || 0) > 60_000) { S.lastSave = Date.now(); save(); }
+    }
     const backfillDone = S.backfill.cursor > latest;
     if (S.lastBlock != null && latest > S.lastBlock) {
       // 危ない人を、新しいブロックの状態で読み直す
