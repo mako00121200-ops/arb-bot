@@ -172,10 +172,26 @@ async function aggregate(calls, blockTag) {
   const raw = await eth().call({ to: MULTICALL3, data, blockTag: blockTag ?? "latest" });
   return MC.decodeFunctionResult("aggregate3", raw)[0];
 }
+// 束を**同時に**投げる本数。順番に投げると危ない人2,600人で8.2秒かかり、12秒のブロックに間に合わなかった
+// (2026年9月25日 01:23 JST の実測)
+const PARALLEL = 4;
 async function readHealth(entries, blockTag) {
   const out = [];
-  for (let i = 0; i < entries.length; i += BATCH) {
-    const part = entries.slice(i, i + BATCH);
+  const parts = [];
+  for (let i = 0; i < entries.length; i += BATCH) parts.push(entries.slice(i, i + BATCH));
+  let next = 0;
+  const worker = async () => {
+    while (next < parts.length) {
+      const part = parts[next++];
+      await readPart(part, blockTag, out);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(PARALLEL, parts.length) }, worker));
+  S.stats.reads += entries.length;
+  return out;
+}
+async function readPart(part, blockTag, out) {
+  {
     const ids = [...new Set(part.map((e) => e.id))];
     await ensureMarkets(ids);
     const liveIds = ids.filter((id) => S.markets.get(id));
@@ -210,8 +226,6 @@ async function readHealth(entries, blockTag) {
       out.push({ ...e, key, pos, price: price.get(e.id), m, block, h: healthOf(pos, mkt.get(e.id), price.get(e.id), m.params.lltv) });
     });
   }
-  S.stats.reads += entries.length;
-  return out;
 }
 
 /// その担保を Uniswap V3 で売ったら、返済額を上回るか(1段のみ・公式の見積もり)。
@@ -366,7 +380,17 @@ async function tick() {
     const backfillDone = S.backfill.cursor > latest;
     if (S.lastBlock != null && latest > S.lastBlock) {
       // 危ない人を、新しいブロックの状態で読み直す
-      const entries = [...S.watch.keys()].map((k) => S.roster.get(k)).filter(Boolean);
+      // 段分け: 使用率98%以上は毎ブロック、95〜98%は5ブロックに1回、
+      // 清算できるのに10分以上誰も取らない人(売れない担保)は10ブロックに1回
+      const now = Date.now();
+      const entries = [];
+      for (const [k, ratio] of S.watch) {
+        const e = S.roster.get(k);
+        if (!e) continue;
+        const seen = S.seen.get(k);
+        const stale = seen && now - seen.at > 10 * 60 * 1000;
+        if (stale ? latest % 10 === 0 : ratio >= 0.98 || latest % 5 === 0) entries.push(e);
+      }
       const t0 = Date.now();
       await handle(await readHealth(entries, latest));
       S.stats.readMs.push(Date.now() - t0); if (S.stats.readMs.length > 200) S.stats.readMs.shift();
