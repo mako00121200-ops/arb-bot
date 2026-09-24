@@ -53,6 +53,14 @@ export const MORPHO_LIQ_CHAIN = (process.env.MORPHO_LIQ_CHAIN ?? "base").trim().
 export const MORPHO_SWEEP_MS = parseInt(process.env.MORPHO_LIQ_SWEEP_MS || "120000", 10);
 /// 危ない人だけを読み直す間隔。
 export const MORPHO_WATCH_MS = parseInt(process.env.MORPHO_LIQ_WATCH_MS || "1000", 10);
+// **見張りの段分け**(2026年9月24日、オーナーの指示「速さの改善」)。
+// 危ない人 約1,200人を毎秒まとめて読むと 1.0〜1.5秒かかり、1秒ごとの見張りが実質1.5秒おきになっていた。
+//   ・使用率 HOT_RATIO 以上 → 毎回読む(清算の直前にいる人)
+//   ・それ未満(WATCH_RATIO 以上)→ WARM_EVERY 回に1回
+//   ・塵、または清算できるのに STALE_MS 以上放置されている人 → COLD_EVERY 回に1回(誰も取りに来ない人)
+const HOT_RATIO = parseFloat(process.env.MORPHO_LIQ_HOT_RATIO || "0.985");
+const WARM_EVERY = Math.max(1, parseInt(process.env.MORPHO_LIQ_WARM_EVERY || "5", 10));
+const COLD_EVERY = Math.max(1, parseInt(process.env.MORPHO_LIQ_COLD_EVERY || "30", 10));
 /// 「危ない」とみなす借金の使用率(借金 ÷ 借りられる上限)。
 const WATCH_RATIO = parseFloat(process.env.MORPHO_LIQ_WATCH_RATIO || "0.95");
 /// これ未満の清算は相手にしない(ガス代に負ける)。返済額のドル。
@@ -561,6 +569,10 @@ async function examine(r, repaidUsd, loanUsd) {
   if (!address) { console.log(`${head} → 契約未配備のため確認なし`); return; }
   if (EXECUTOR_CHAIN !== MORPHO_LIQ_CHAIN) { console.log(`${head} → 経路探しは ${EXECUTOR_CHAIN} 用のため確認なし`); return; }
 
+  // 送るときに要る手数料とガス代は、経路探し・確認と**同時に**取りに行く(送る直前に待たない)
+  const feePromise = MORPHO_DRY_RUN ? null : defaultFeeOverrides(MORPHO_LIQ_CHAIN).catch(() => ({}));
+  const gasPromise = gasUnitsToUsd(MORPHO_LIQ_CHAIN, GAS_UNITS).catch(() => null);
+  const t0 = Date.now();
   const routes = await buildAaveRoutes(r.m.params.collateralToken, r.m.params.loanToken, amt.expectedSeized);
   if (routes.length === 0) { S.stats.noRoute++; console.log(`${head} → 売る経路なし`); return; }
   if (!S.owner) {
@@ -571,41 +583,48 @@ async function examine(r, repaidUsd, loanUsd) {
   const liq = { borrower: r.user, seizedAssets: amt.seizedAssets, repaidShares: amt.repaidShares, minProfit: 0n };
   let best = null;
   const notes = [];
-  for (const route of routes.slice(0, SIMULATE_TOP_N)) {
-    S.stats.simulated++;
+  const tRoutes = Date.now();
+  // 経路ごとの確認(eth_call)は互いに独立なので**同時に**投げる(順番だと経路の数だけ往復を待つ)
+  const tops = routes.slice(0, SIMULATE_TOP_N);
+  const blockTag = readBlockTag(MORPHO_LIQ_CHAIN);
+  const outcomes = await Promise.all(tops.map(async (route) => {
     const legs = route.legs.map(({ pool, tokenOut, flags, feeBps }) => ({ pool, tokenOut, flags, feeBps }));
     const data = LIQUIDATOR_IFACE.encodeFunctionData("simulateLiquidation", [mp, liq, legs]);
     try {
-      await callWithRpc(MORPHO_LIQ_CHAIN, (p) => p.call({ to: address, from: S.owner, data, blockTag: readBlockTag(MORPHO_LIQ_CHAIN) }), true);
-      notes.push(`${route.label}: 結果なし`);
-    } catch (e) {
-      const d = e?.data ?? e?.info?.error?.data ?? e?.error?.data ?? null;
-      let parsed = null;
-      try { parsed = typeof d === "string" ? LIQUIDATOR_IFACE.parseError(d) : null; } catch (inner) {}
-      if (parsed?.name === "SimulationResult") {
-        S.stats.simOk++;
-        const profitRaw = parsed.args.returned - parsed.args.owed;
-        const profitUsd = loanUsd != null ? (Number(profitRaw) / 10 ** r.m.loan.decimals) * loanUsd : null;
-        notes.push(`${route.label}: 利益${profitUsd != null ? "$" + profitUsd.toFixed(2) : `${ethers.formatUnits(profitRaw, r.m.loan.decimals)} ${r.m.loan.symbol}`}`);
-        if (!best || profitRaw > best.profitRaw) best = { route, profitRaw, profitUsd };
-      } else {
-        const reason = (e.reason || e.shortMessage || "不明").slice(0, 60);
-        // "position is healthy" が多ければ、こちらの健全度の式が Morpho とずれている
-        const k = /healthy/i.test(reason) ? "健全(式のずれ?)" : reason.slice(0, 30);
-        S.stats.simErr[k] = (S.stats.simErr[k] || 0) + 1;
-        notes.push(`${route.label}: 取り消し(${reason})`);
-      }
+      await callWithRpc(MORPHO_LIQ_CHAIN, (p) => p.call({ to: address, from: S.owner, data, blockTag }), true);
+      return { route, e: null };
+    } catch (e) { return { route, e }; }
+  }));
+  for (const { route, e } of outcomes) {
+    S.stats.simulated++;
+    if (!e) { notes.push(`${route.label}: 結果なし`); continue; }
+    const d = e?.data ?? e?.info?.error?.data ?? e?.error?.data ?? null;
+    let parsed = null;
+    try { parsed = typeof d === "string" ? LIQUIDATOR_IFACE.parseError(d) : null; } catch (inner) {}
+    if (parsed?.name === "SimulationResult") {
+      S.stats.simOk++;
+      const profitRaw = parsed.args.returned - parsed.args.owed;
+      const profitUsd = loanUsd != null ? (Number(profitRaw) / 10 ** r.m.loan.decimals) * loanUsd : null;
+      notes.push(`${route.label}: 利益${profitUsd != null ? "$" + profitUsd.toFixed(2) : `${ethers.formatUnits(profitRaw, r.m.loan.decimals)} ${r.m.loan.symbol}`}`);
+      if (!best || profitRaw > best.profitRaw) best = { route, profitRaw, profitUsd };
+    } else {
+      const reason = (e.reason || e.shortMessage || "不明").slice(0, 60);
+      // "position is healthy" が多ければ、こちらの健全度の式が Morpho とずれている
+      const k = /healthy/i.test(reason) ? "健全(式のずれ?)" : reason.slice(0, 30);
+      S.stats.simErr[k] = (S.stats.simErr[k] || 0) + 1;
+      notes.push(`${route.label}: 取り消し(${reason})`);
     }
   }
-  const gasUsd = (await gasUnitsToUsd(MORPHO_LIQ_CHAIN, GAS_UNITS).catch(() => null)) ?? 0.05;
+  const gasUsd = (await gasPromise) ?? 0.05;
+  const timing = `経路${tRoutes - t0}ms 確認${Date.now() - tRoutes}ms`;
   const net = best?.profitUsd != null ? best.profitUsd - gasUsd : null;
   if (net != null && net > 0) S.stats.simBest++;
   const seen = S.seen.get(keyOf(r.id, r.user));
   if (seen && best) { seen.simUsd = best.profitUsd; seen.simRaw = `${ethers.formatUnits(best.profitRaw, r.m.loan.decimals)} ${r.m.loan.symbol}`; }
-  console.log(`${head} → 確認 ${notes.join(" / ")}。ガス約$${gasUsd.toFixed(3)} 純利${net != null ? "$" + net.toFixed(2) : "?"}`
+  console.log(`${head} → 確認 ${notes.join(" / ")}(${timing})。ガス約$${gasUsd.toFixed(3)} 純利${net != null ? "$" + net.toFixed(2) : "?"}`
     + (MORPHO_DRY_RUN ? "(DRY_RUN なので送りません)" : net != null && net >= MIN_NET_USD ? " → **送ります**" : `(下限$${MIN_NET_USD}未満で送りません)`));
   if (MORPHO_DRY_RUN || !best || net == null || net < MIN_NET_USD) return;
-  await sendLiquidation(r, address, mp, liq, best, gasUsd, net, loanUsd, pair).catch((e) => {
+  await sendLiquidation(r, address, mp, liq, best, gasUsd, net, loanUsd, pair, feePromise, t0).catch((e) => {
     S.stats.sendFail++;
     resetNonce(MORPHO_LIQ_CHAIN);
     console.warn(`[Morpho清算/送信] 失敗: ${(e.shortMessage || e.message || "").slice(0, 160)}`);
@@ -613,7 +632,7 @@ async function examine(r, repaidUsd, loanUsd) {
 }
 
 /// 実際に清算を送る。利益が minProfit に届かなければコントラクトが取り消す(失うのはガス代だけ)。
-async function sendLiquidation(r, address, mp, liq, best, gasUsd, net, loanUsd, pair) {
+async function sendLiquidation(r, address, mp, liq, best, gasUsd, net, loanUsd, pair, feePromise = null, t0 = Date.now()) {
   const privateKey = process.env.MAINNET_BOT_PRIVATE_KEY;
   if (!privateKey) { console.warn("[Morpho清算/送信] MAINNET_BOT_PRIVATE_KEY が無いので送れません"); return; }
   const { wallet, signer } = getSigner(MORPHO_LIQ_CHAIN, privateKey);
@@ -626,7 +645,7 @@ async function sendLiquidation(r, address, mp, liq, best, gasUsd, net, loanUsd, 
     ? Math.min(10000, Math.max(0, Math.round(((gasUsd * REVERT_GAS_SHARE) / best.profitUsd) * 10000))) : 500;
   const minProfit = (best.profitRaw * BigInt(bps)) / 10000n;
   // 入札: 利益の BID_SHARE を優先手数料に上乗せ(清算は優先手数料の高い順で取り合う)
-  const fee = await defaultFeeOverrides(MORPHO_LIQ_CHAIN);
+  const fee = (await feePromise) ?? await defaultFeeOverrides(MORPHO_LIQ_CHAIN);
   const overrides = { gasLimit: SEND_GAS_LIMIT };
   let bidNote = "";
   if (fee.maxPriorityFeePerGas != null) {
@@ -646,7 +665,7 @@ async function sendLiquidation(r, address, mp, liq, best, gasUsd, net, loanUsd, 
   S.stats.sends++;
   console.log(`[Morpho清算/送信 ${nowJst()}] ${pair} ${short(r.user)} ${best.route.label}: 見込み純利$${net.toFixed(2)} 最低利益${ethers.formatUnits(minProfit, r.m.loan.decimals)} ${r.m.loan.symbol}${bidNote} 送信します`);
   const tx = await contract.liquidate(mp, { ...liq, minProfit }, legs, overrides);
-  console.log(`[Morpho清算/送信] ${tx.hash}`);
+  console.log(`[Morpho清算/送信] ${tx.hash}(確認を始めてから送り終えるまで${Date.now() - t0}ms)`);
   let receipt;
   try {
     receipt = await tx.wait();
@@ -711,7 +730,21 @@ async function watchTick() {
   if (S.watchBusy || S.watch.size === 0) return;
   S.watchBusy = true;
   try {
-    const entries = [...S.watch.keys()].map((k) => S.roster.get(k)).filter(Boolean);
+    const tick = S.stats.watchTicks;
+    const now = Date.now();
+    const tiers = { hot: 0, warm: 0, cold: 0 };
+    const entries = [];
+    for (const [k, ratio] of S.watch) {
+      const e = S.roster.get(k);
+      if (!e) continue;
+      const seen = S.seen.get(k);
+      // 放置・塵の扱いは「今も清算できる」人だけ(一度清算可になって健全に戻った人は普通に見張る)
+      const tier = seen && ratio >= 1 && (seen.dust || now - seen.at > STALE_MS) ? "cold" : ratio >= HOT_RATIO ? "hot" : "warm";
+      tiers[tier]++;
+      if (tier === "hot" || (tier === "warm" && tick % WARM_EVERY === 0) || (tier === "cold" && tick % COLD_EVERY === 0)) entries.push(e);
+    }
+    S.stats.watchTiers = tiers;
+    if (entries.length === 0) { S.stats.watchTicks++; return; }
     // 危ない人は**確定前(pending)の状態**を1回の束で読む。Flashblocks のチェーンでは
     // 200ms ごとに更新される作りかけのブロックが見えるので、確定(2秒)を待たずに気づける。
     const t0 = Date.now();
@@ -808,7 +841,7 @@ export function formatMorphoLine() {
   const staleMarkets = new Map();
   for (const v of stale) if (v.pair) staleMarkets.set(v.pair, (staleMarkets.get(v.pair) || 0) + 1);
   const staleLine = stale.length ? ` 放置${stale.length}(10分以上。${[...staleMarkets].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, v]) => `${k}:${v}`).join(" ")})` : "";
-  return ` Morpho[名簿${S.roster.size} 遡り${done}% 危ない${S.watch.size}(読み${wm != null ? wm + "ms" : "-"}) 清算可${st.liquidatable}(塵${st.dust})${staleLine}`
+  return ` Morpho[名簿${S.roster.size} 遡り${done}% 危ない${S.watch.size}(読み${wm != null ? wm + "ms" : "-"}${st.watchTiers ? ` 毎回${st.watchTiers.hot}/${WARM_EVERY}回毎${st.watchTiers.warm}/${COLD_EVERY}回毎${st.watchTiers.cold}` : ""}) 清算可${st.liquidatable}(塵${st.dust})${staleLine}`
     + ` 確認${st.simOk}/${st.simulated} 黒字${st.simBest} 経路なし${st.noRoute}${err ? ` 取消[${err}]` : ""}`
     + ` 実清算${st.liqEvents}=先に発見${st.liqSeenFirst}[2ブロック以上${st.gapMore} 1ブロック${st.gapOne} 同ブロック内${st.gapSame}]`
     + `/見逃し${st.liqMissed}[名簿なし${st.missNoRoster} 遡り中${st.missBackfill} 使用率低${st.missFar} 前の読みなし${st.missNoPrior} 間に合わず${st.missSlow}]`

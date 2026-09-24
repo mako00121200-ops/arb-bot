@@ -356,7 +356,12 @@ export function getSigner(chain, privateKey) {
 /// いたので自然に直っていた。index.js の失敗処理からも呼べるように公開する。
 export function resetNonce(chain) {
   const entry = signers.get((chain || "").toLowerCase());
-  if (entry) { try { entry.signer.reset(); } catch (e) {} }
+  if (entry) {
+    try { entry.signer.reset(); } catch (e) {}
+    // **次の送信の前に番号を読み直しておく**(送る瞬間に1往復待たないため。増やしはしない)
+    // 読み損ねた時は失敗した答えが覚えられたままにならないよう、もう一度忘れさせる
+    try { entry.signer.getNonce("pending").catch(() => { try { entry.signer.reset(); } catch (e) {} }); } catch (e) {}
+  }
 }
 
 /// 手数料の上限に取る「基準手数料の何倍」。払うのは(基準+優先)だけなので、上限を上げても
@@ -389,16 +394,44 @@ async function recentPriorityFloor(chain) {
   return wei;
 }
 
+/// **速さの実測**(チェーンごと、直近200件)。生存ログの `速さ[…]` に出す
+const speed = new Map(); // chain -> { simMs: [], readyMs: [], sentMs: [], landedMs: [] }
+function noteSpeed(chain, v) {
+  const s = speed.get(chain) || { simMs: [], readyMs: [], sentMs: [], landedMs: [] };
+  for (const [k, x] of Object.entries(v)) { if (Number.isFinite(x)) { s[k].push(x); if (s[k].length > 200) s[k].shift(); } }
+  speed.set(chain, s);
+}
+export function formatSpeedLine() {
+  if (speed.size === 0) return "";
+  const med = (a) => { if (!a.length) return "-"; const b = [...a].sort((x, y) => x - y); return b[Math.floor(b.length / 2)]; };
+  const parts = [...speed].map(([c, s]) => `${c}:確認${med(s.simMs)} 準備${med(s.readyMs)} 送信${med(s.sentMs)} 確定${med(s.landedMs)}ms(${s.readyMs.length}件)`);
+  return ` 速さ中央[${parts.join(" ")}]`;
+}
+
 const feeDataCache = new Map(); // chain -> { at, fee } 送信の速さを落とさないよう2秒だけ使い回す
+/// 手数料の情報(getFeeData)を2秒だけ使い回す。**同時に来た問い合わせは1回の RPC にまとめる**
+/// (送信の準備で defaultFeeOverrides と decidePriorityFee が別々に聞いていた。2026年9月24日)
+async function cachedFeeData(chain) {
+  const c = feeDataCache.get(chain);
+  if (c && Date.now() - c.at < 2000) return c.fee ?? c.promise;
+  const promise = getProviderForChain(chain).getFeeData();
+  feeDataCache.set(chain, { at: Date.now(), promise });
+  try {
+    const fee = await promise;
+    feeDataCache.set(chain, { at: Date.now(), fee });
+    return fee;
+  } catch (e) {
+    feeDataCache.delete(chain);
+    throw e;
+  }
+}
 export async function defaultFeeOverrides(chain) {
   try {
-    const c = feeDataCache.get(chain);
-    const fee = c && Date.now() - c.at < 2000 ? c.fee : await getProviderForChain(chain).getFeeData();
-    if (!c || c.fee !== fee) feeDataCache.set(chain, { at: Date.now(), fee });
+    // 手数料と「直近の優先手数料の中央値」は互いに独立なので**同時に**聞く(順番に待つと2往復)
+    const [fee, floor] = await Promise.all([cachedFeeData(chain), recentPriorityFloor(chain)]);
     if (fee.maxFeePerGas == null || fee.maxPriorityFeePerGas == null) return {};
     const suggested = fee.maxPriorityFeePerGas;
     const baseFee = fee.maxFeePerGas > suggested ? (fee.maxFeePerGas - suggested) / 2n : 0n;
-    const floor = await recentPriorityFloor(chain);
     const priority = floor > suggested ? floor : suggested;
     const maxFee = baseFee * FEE_CAP_BASE_MULTIPLIER + priority;
     // extraPerGas は判定用(送信には渡さない)。提案値より上げた分 = ガス代の見積もりに入っていない分
@@ -737,9 +770,7 @@ async function decidePriorityFee(chain, availableUsd, gasUnits) {
   if (!PRIORITY_FEE_CHAINS.has(key)) return null;
   if (!(availableUsd > 0) || !(gasUnits > 0n)) return null;
   try {
-    const provider = getProviderForChain(key);
-    if (!provider) return null;
-    const fee = await provider.getFeeData();
+    const fee = await cachedFeeData(key);
     const suggestedPriority = fee.maxPriorityFeePerGas ?? 0n;
     // ethers は maxFeePerGas = baseFee×2 + priority で作る。そこから baseFee を戻す。
     const baseFee = (fee.maxFeePerGas != null && fee.maxFeePerGas > suggestedPriority)
@@ -1296,6 +1327,8 @@ async function executeOpportunityInner(opp) {
   //
   // 安全性は落とさない。送信の可否は今までどおり確認(sim)の結果で決め、
   // 実際に送る時の minProfit も今までどおり確認の結果から作る。
+  // 手数料の情報は取引の中身と無関係なので、確認と**同時に**取りに行く(送る直前に待たない)
+  const feePromise = defaultFeeOverrides(chain);
   const simPromise = simulate(chain, contractAddress, wallet.address, asset, amountIn, legArgs, contractVersion.iface);
   const contract = new ethers.Contract(contractAddress, contractVersion.abi, signer);
   // 失敗しても Promise.all を倒さないように包む(確認の失敗の方を先に報せたい)。
@@ -1394,11 +1427,13 @@ async function executeOpportunityInner(opp) {
     }
   }
   // 単価の学習に使うため、この時点の見積もり単価を控えておく。
+  const checksMs = Date.now() - startedAt;
   const estimatedGasPriceWei = await getEstimatedGasPriceWei(chain);
 
   // **順番を買う。** 残る純利益の一部だけを優先手数料に積む。
   // 積んだ後にもう一度「手数料負けしないか」を確かめ、割れるなら積まない。
-  const { extraPerGas: floorExtraPerGas = 0n, ...feeOverrides } = await defaultFeeOverrides(chain);
+  const { extraPerGas: floorExtraPerGas = 0n, ...feeOverrides } = await feePromise;
+  const feeMs = Date.now() - startedAt;
   const overrides = { gasLimit: gasWithBuffer, ...feeOverrides };
   let bidNote = "";
   // 混雑で優先手数料を上げた分は、ガス代の見積もりに入っていない。上げた後も黒字かを確かめる。
@@ -1430,9 +1465,13 @@ async function executeOpportunityInner(opp) {
   markRouteConfirmed(opp);
   opp.sendResult = "confirmed";
   const readyMs = Date.now() - startedAt;
-  console.log(`[実行] ${opp.kind} ${chain} ${opp.label}: 送信します(投入$${tradeUsd.toFixed(2)} 粗利$${grossProfitUsd.toFixed(4)}/+${profitBps.toFixed(1)}bps ガス$${gasCostUsd.toFixed(4)}${bidNote} 確認${simMs}ms 準備${readyMs}ms)`);
+  // **準備の内訳**(どこで待っているかを測る。2026年9月24日、オーナーの指示「速さの改善」)
+  //   確認=eth_call とガス見積もり / 判定=ガス代の換算と下限 / 手数料=手数料の情報 / 入札=優先手数料の計算
+  const prepNote = `確認${simMs}ms 準備${readyMs}ms[判定${checksMs - simMs} 手数料${feeMs - checksMs} 入札${readyMs - feeMs}]`;
+  console.log(`[実行] ${opp.kind} ${chain} ${opp.label}: 送信します(投入$${tradeUsd.toFixed(2)} 粗利$${grossProfitUsd.toFixed(4)}/+${profitBps.toFixed(1)}bps ガス$${gasCostUsd.toFixed(4)}${bidNote} ${prepNote})`);
 
   let tx;
+  const sendStarted = Date.now();
   try {
     tx = await contract.executeRoute(asset, amountIn, legArgs, minProfit, overrides);
   } catch (e) {
@@ -1444,7 +1483,9 @@ async function executeOpportunityInner(opp) {
     throw new ExecutionError(msg.slice(0, 160), { reverted: msg.includes("execution reverted"), stage: "send" });
   }
 
-  console.log(`[実行] 送信: ${tx.hash}`);
+  const sentMs = Date.now() - sendStarted;
+  noteSpeed(chain, { simMs, readyMs, sentMs });
+  console.log(`[実行] 送信: ${tx.hash}(署名と送信に${sentMs}ms。見つけてから送り終えるまで${readyMs + sentMs}ms)`);
   let receipt;
   try {
     receipt = await tx.wait();
@@ -1452,7 +1493,8 @@ async function executeOpportunityInner(opp) {
     resetNonce(chain);
     throw new ExecutionError(`確定待ちで失敗: ${(e.message || "").slice(0, 120)}`, { reverted: true, stage: "wait" });
   }
-  console.log(`[実行] 完了: ブロック${receipt.blockNumber} ガス${receipt.gasUsed.toString()}`);
+  noteSpeed(chain, { landedMs: Date.now() - sendStarted });
+  console.log(`[実行] 完了: ブロック${receipt.blockNumber} ガス${receipt.gasUsed.toString()}(送ってから確定まで${Date.now() - sendStarted}ms)`);
 
   let actualProfitTokens = null;
   for (const log of receipt.logs) {
