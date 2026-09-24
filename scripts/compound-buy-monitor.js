@@ -55,12 +55,25 @@ const COMET_IFACE = new ethers.Interface([
   "function getAssetInfo(uint8 i) view returns ((uint8 offset, address asset, address priceFeed, uint64 scale, uint64 borrowCollateralFactor, uint64 liquidateCollateralFactor, uint64 liquidationFactor, uint128 supplyCap))",
   "function getCollateralReserves(address asset) view returns (uint256)",
   "function quoteCollateral(address asset, uint256 baseAmount) view returns (uint256)",
+  // 出典: comet の contracts/CometMainInterface.sol
+  "event AbsorbCollateral(address indexed absorber, address indexed borrower, address indexed asset, uint collateralAbsorbed, uint usdValue)",
+  "event BuyCollateral(address indexed buyer, address indexed asset, uint baseAmount, uint collateralAmount)",
 ]);
+const ABSORB_TOPIC = COMET_IFACE.getEvent("AbsorbCollateral").topicHash;
+const BUY_TOPIC = COMET_IFACE.getEvent("BuyCollateral").topicHash;
+/// 過去をどこまで遡るか(日)と、1回の巡回で投げる getLogs の上限
+const HISTORY_DAYS = parseInt(process.env.COMPOUND_MONITOR_HISTORY_DAYS || "7", 10);
+const LOG_REQUESTS_PER_TICK = 12;
+/// 1ブロックの秒数の目安(遡る範囲と「買われるまでの時間」の換算に使う。概算)
+const BLOCK_SEC = { base: 2, optimism: 2, polygon: 2, arbitrum: 0.25 };
 const ERC20_IFACE = new ethers.Interface(["function symbol() view returns (string)"]);
 const MC_ABI = ["function aggregate3((address target,bool allowFailure,bytes callData)[] calls) view returns ((bool success,bytes returnData)[])"];
 
 const markets = new Map(); // `${chain}:${name}` -> { base, baseScale, target, assets: [{ asset, symbol, scale }] , bad }
 const stats = new Map();   // key -> { reads, forSale, stock: [..], best, positives, maxNetUsd, last }
+/// **他者の実績**: 清算で担保が入った記録と、誰かが買った記録(過去 HISTORY_DAYS 日から)
+/// key -> { from, to, head, chunk, absorbs: [..], buys: [..], lastPrice: {asset: usdPerUnit}, pending: {asset: [{amount, block}]}, delays: [] }
+const history = new Map();
 
 async function aggregate(chain, calls) {
   return callWithRpc(chain, (p) => new ethers.Contract(MULTICALL3_ADDRESS, MC_ABI, p).aggregate3(calls), false);
@@ -147,12 +160,79 @@ async function measure(chain, c) {
   }
   st.stockUsd = stockUsd;
   st.best = best;
+  await scanEvents(chain, c, m).catch((e) => console.warn(`[Compound計測] ${key} 記録の読み取りに失敗 ${(e.shortMessage || e.message || "").slice(0, 80)}`));
   if (best && !best.noRoute && best.netUsd > 0) {
     st.positives++;
     if (st.maxNetUsd == null || best.netUsd > st.maxNetUsd) st.maxNetUsd = best.netUsd;
     console.log(`[Compound計測/機会 ${nowJst()}] ${key} ${best.symbol} を $${best.sizeUsd.toFixed(0)} で買い ${best.label} で売ると`
       + ` 差${best.edgeBps.toFixed(1)}bps 純利$${best.netUsd.toFixed(2)}(ガス$${gasUsd.toFixed(3)}・借りる費用${BORROW_COST_BPS}bps込み)。**送っていません**`);
   }
+}
+
+/// 清算(AbsorbCollateral)と買い取り(BuyCollateral)の記録を読む。
+/// **「在庫が $0 = 誰も売っていない」ではなく「入った瞬間に誰かが買っている」かもしれない**ので、
+/// どれだけ入って、誰が、どれだけの速さ・割引で買ったかを実績で見る(2026年9月24日)。
+async function scanEvents(chain, c, m) {
+  const key = `${chain}:${c.name}`;
+  const latest = await callWithRpc(chain, (p) => p.getBlockNumber(), false);
+  let h = history.get(key);
+  if (!h) {
+    const back = Math.round((HISTORY_DAYS * 86400) / (BLOCK_SEC[chain] || 2));
+    h = { start: Math.max(0, latest - back), next: Math.max(0, latest - back), chunk: 10000,
+      absorbs: [], buys: [], price: {}, pending: {}, delays: [], buyers: new Map() };
+    history.set(key, h);
+  }
+  const scale = Object.fromEntries(m.assets.map((a) => [a.asset, a.scale]));
+  const sym = Object.fromEntries(m.assets.map((a) => [a.asset, a.symbol]));
+  let n = 0;
+  while (h.next <= latest && n < LOG_REQUESTS_PER_TICK) {
+    const to = Math.min(latest, h.next + h.chunk - 1);
+    let logs;
+    try {
+      logs = await callWithRpc(chain, (p) => p.getLogs({ address: c.address, fromBlock: h.next, toBlock: to, topics: [[ABSORB_TOPIC, BUY_TOPIC]] }), false);
+    } catch (e) {
+      n++;
+      if (h.chunk > 500) { h.chunk = Math.floor(h.chunk / 2); continue; } // 範囲が広すぎると断られるので狭める
+      throw e;
+    }
+    n++;
+    for (const log of logs.sort((x, y) => Number(x.blockNumber) - Number(y.blockNumber) || Number(x.index ?? x.logIndex) - Number(y.index ?? y.logIndex))) {
+      let ev; try { ev = COMET_IFACE.parseLog(log); } catch (e) { continue; }
+      const asset = String(ev.args.asset).toLowerCase();
+      const block = Number(log.blockNumber);
+      const sc = scale[asset] || 10n ** 18n;
+      if (ev.name === "AbsorbCollateral") {
+        const units = Number(ev.args.collateralAbsorbed) / Number(sc);
+        const usd = Number(ev.args.usdValue) / 1e8; // Comet の価格は8桁
+        if (units > 0) h.price[asset] = usd / units;
+        h.absorbs.push({ block, asset, usd });
+        (h.pending[asset] = h.pending[asset] || []).push({ block, units });
+      } else {
+        const units = Number(ev.args.collateralAmount) / Number(sc);
+        const paid = Number(ev.args.baseAmount) / Number(m.baseScale);
+        const ref = h.price[asset];
+        // 買い手の割引 = 1 − 払った単価 ÷ 直近の清算時の価格(同じ担保の、清算時のオラクル価格)
+        const discBps = ref && units > 0 ? (1 - paid / units / ref) * 10000 : null;
+        h.buys.push({ block, asset, paid, discBps, buyer: String(ev.args.buyer).toLowerCase() });
+        h.buyers.set(String(ev.args.buyer).toLowerCase(), (h.buyers.get(String(ev.args.buyer).toLowerCase()) || 0) + paid);
+        // 清算で入ってから買われるまで(古い在庫から順に買われたとみなす)
+        let left = units;
+        const q = h.pending[asset] || [];
+        while (left > 0 && q.length > 0) {
+          const head = q[0];
+          const take = Math.min(left, head.units);
+          h.delays.push(block - head.block);
+          head.units -= take; left -= take;
+          if (head.units <= 1e-12) q.shift();
+        }
+      }
+    }
+    h.next = to + 1;
+    if (h.chunk < 10000) h.chunk = Math.min(10000, h.chunk * 2);
+  }
+  if (h.delays.length > 2000) h.delays = h.delays.slice(-2000);
+  h.latest = latest;
+  h.sym = sym;
 }
 
 export function startCompoundMonitor(activeChains) {
@@ -168,6 +248,25 @@ export function startCompoundMonitor(activeChains) {
   setTimeout(() => { run(); setInterval(run, INTERVAL_MS); }, 3 * 60 * 1000);
 }
 
+/// 他者の実績の要約。**買い取りの競争がどれだけ速く、どれだけの割引で行われているか。**
+function formatHistory(key) {
+  const h = history.get(key);
+  if (!h) return "";
+  const chain = key.split(":")[0];
+  const span = Math.max(1, (h.latest ?? h.next) - h.start);
+  const done = Math.min(100, Math.round(((h.next - h.start) / span) * 100));
+  const days = (((h.next - h.start) * (BLOCK_SEC[chain] || 2)) / 86400) || 0;
+  const inUsd = h.absorbs.reduce((a, x) => a + x.usd, 0);
+  const outUsd = h.buys.reduce((a, x) => a + x.paid, 0);
+  const med = (arr) => { const a = arr.filter((v) => v != null && Number.isFinite(v)).sort((x, y) => x - y); return a.length ? a[Math.floor(a.length / 2)] : null; };
+  const dMed = med(h.delays), disc = med(h.buys.map((b) => b.discBps));
+  const top = [...h.buyers.entries()].sort((a, b) => b[1] - a[1]);
+  const topShare = outUsd > 0 && top.length ? Math.round((top[0][1] / outUsd) * 100) : null;
+  return ` 実績[遡り${done}%(${days.toFixed(1)}日) 清算で入った$${inUsd.toFixed(0)}(${h.absorbs.length}回) 買われた$${outUsd.toFixed(0)}(${h.buys.length}回 買い手${h.buyers.size}人${topShare != null ? ` 1位${topShare}%` : ""})`
+    + `${dMed != null ? ` 入ってから買われるまで中央${dMed}ブロック(約${Math.round(dMed * (BLOCK_SEC[chain] || 2))}秒)` : ""}`
+    + `${disc != null ? ` 買い手の割引中央${disc.toFixed(0)}bps` : ""}]`;
+}
+
 /// 生存ログ用
 export function formatCompoundLine() {
   if (stats.size === 0) return "";
@@ -180,7 +279,7 @@ export function formatCompoundLine() {
     const b = st.best;
     const bestTxt = !b ? "" : b.noRoute ? ` 最良:${b.symbol}売る経路なし`
       : ` 最良:${b.symbol} $${b.sizeUsd.toFixed(0)} 差${b.edgeBps.toFixed(1)}bps 純利$${b.netUsd.toFixed(2)}`;
-    parts.push(`${key} 売出${st.forSale}/${st.reads}回(準備金${res}/目標${tgt}) 在庫$${st.stockUsd.toFixed(0)}${bestTxt} 黒字${st.positives}回${st.maxNetUsd != null ? ` 最大$${st.maxNetUsd.toFixed(2)}` : ""}`);
+    parts.push(`${key} 売出${st.forSale}/${st.reads}回(準備金${res}/目標${tgt}) 在庫$${st.stockUsd.toFixed(0)}${bestTxt} 黒字${st.positives}回${st.maxNetUsd != null ? ` 最大$${st.maxNetUsd.toFixed(2)}` : ""}${formatHistory(key)}`);
   }
   return parts.length ? ` Compound[${parts.join(" / ")}]` : "";
 }
