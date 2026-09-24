@@ -85,14 +85,14 @@ if (BOOK && HUBS.length === 0) {
 /// 集中流動性(Slipstream)で主に取引されており、今の探索に入っていなかった。
 /// 住所は aerodrome-finance/slipstream の README / script/constants/output/DeployCL-Base.json(工場は2つ)。
 /// スワップの呼び返しは uniswapV3SwapCallback なので、コントラクトはそのまま使える。
-const EXTRA_V3_FACTORIES = {
+export const EXTRA_V3_FACTORIES = {
   base: [
     { address: "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A", dexId: "aerodrome-cl", style: "slipstream" },
     { address: "0xaDe65c38CD4849aDBA595a4323a8C7DdfE89716a", dexId: "aerodrome-cl2", style: "slipstream" },
   ],
 };
 /// Slipstream の刻み幅(工場の tickSpacings() の既定の組)。無い組は住所0が返るだけ。
-const SLIPSTREAM_TICK_SPACINGS = [1, 10, 50, 100, 200, 2000];
+export const SLIPSTREAM_TICK_SPACINGS = [1, 10, 50, 100, 200, 2000];
 /// プールの探索結果を覚えておく時間。
 const POOL_CACHE_MS = 6 * 60 * 60 * 1000;
 

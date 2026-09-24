@@ -55,6 +55,8 @@ import { startLiquidationMonitor, setCandidateHandler, formatLiquidationLine, ge
 import { handleLiquidationCandidate, selfCheckLiquidationExecutor } from "./scripts/liquidation-executor.js";
 import { runLiquidatorDeploy, runMorphoLiquidatorDeploy } from "./scripts/liquidator-deploy.js";
 import { startMorphoLiquidation, formatMorphoLine } from "./scripts/morpho-liquidation.js";
+import { startCompoundMonitor, formatCompoundLine } from "./scripts/compound-buy-monitor.js";
+import { startSparkMonitor, formatSparkLine } from "./scripts/spark-psm-monitor.js";
 import { readPoolFeeOnchain } from "./scripts/pool-fee-onchain.js";
 import { minProfitUsd, describeMinProfit, noteSendOutcome, formatSendBalanceLine } from "./scripts/min-profit.js";
 // 画面とログの時刻は**すべて日本時間**に揃える(保存は UTC のまま)。
@@ -2169,7 +2171,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 税${reasons.taxToken} 冷却${reasons.cooldown} 罠${reasons.trap} 非黒字${reasons.notProfitable} 下限${reasons.belowMin} 同経路${reasons.executing} 送信中${reasons.sendBusy}(同時上限${reasons.sendBusyParallel}/同プール${reasons.sendBusyPool}) 見送${reasons.notSent} 失敗${reasons.failed}${reasonsResidual()}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${formatTierLine()}${formatSendBalanceLine()}${formatSendSkipLine()}${formatUniswapXLine()}${formatMissingPairsLine()}${formatSolanaLine()}${formatMainnetEdgeLine()}${formatAaveLine()}${formatLiquidationLine()}${formatMorphoLine()}${alertLine}`);
+  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 税${reasons.taxToken} 冷却${reasons.cooldown} 罠${reasons.trap} 非黒字${reasons.notProfitable} 下限${reasons.belowMin} 同経路${reasons.executing} 送信中${reasons.sendBusy}(同時上限${reasons.sendBusyParallel}/同プール${reasons.sendBusyPool}) 見送${reasons.notSent} 失敗${reasons.failed}${reasonsResidual()}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${formatTierLine()}${formatSendBalanceLine()}${formatSendSkipLine()}${formatUniswapXLine()}${formatMissingPairsLine()}${formatSolanaLine()}${formatMainnetEdgeLine()}${formatAaveLine()}${formatLiquidationLine()}${formatMorphoLine()}${formatCompoundLine()}${formatSparkLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
@@ -2400,6 +2402,15 @@ async function checkGasBalances() {
     }
   }
   if (parts.length > 0) console.log(`[ガス残高] ${parts.join(" ")}(下限 ${ALERT_MIN_REMAINING_SENDS}回)`);
+  // **実際のお金で見た収支の材料**(2026年9月24日、オーナーの質問「ガス代に対して利益はプラスか」)。
+  // 送信の収支はガス代の見積もりで数えるので、実物(コントラクトに貯まった利益)を隣に並べる。
+  // 「貯まった利益の増え方 − ガス残高の減り方(入金を除く)」が本当の損益。
+  const held = Object.entries(contractBalances)
+    .map(([c, list]) => `${c}:$${list.reduce((a, h) => a + (h.usd || 0), 0).toFixed(4)}`);
+  if (held.length > 0) {
+    console.log(`[貯まった利益] ${held.join(" ")} 計$${heldProfitUsd().toFixed(4)}`
+      + `(${contractBalancesAt ? Math.round((Date.now() - contractBalancesAt) / 60000) + "分前に読んだ値" : "未読"})`);
+  }
 }
 
 // ===== ダッシュボード =====
@@ -2830,6 +2841,11 @@ async function main() {
   } catch (e) {
     console.warn(`[Morpho清算] 始められませんでした: ${(e.message || "").slice(0, 100)}`);
   }
+
+  // 新しい戦略の**送らない計測**(オーナーの指示で案1・案2を進める、2026年9月24日)。
+  // Compound III の割引担保 / Spark PSM と DEX のずれ。読むだけで、ガスも元手も使わない。
+  try { startCompoundMonitor(Object.keys(CHAIN_CONFIG)); } catch (e) { console.warn(`[Compound計測] 始められませんでした: ${(e.message || "").slice(0, 100)}`); }
+  try { startSparkMonitor(Object.keys(CHAIN_CONFIG)); } catch (e) { console.warn(`[Spark計測] 始められませんでした: ${(e.message || "").slice(0, 100)}`); }
 
   // Aave V3 の清算の機会を**測るだけ**(第1段。送信は一切しない)。
   // 住所は公開情報だが、応答するかを実測で確かめてから見張る。
