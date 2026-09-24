@@ -21,6 +21,10 @@ import { stateFilePath } from "./state-file.js";
 
 /// 住所と配備ブロック: morpho-org/sdks packages/morpho-ts/src/addresses.ts
 const MORPHO = {
+  // Ethereum 本体(2026年9月24日、オーナーの指示「難しい担保の清算の調査」)。
+  // 住所は他チェーンの base と同じ 0xBBBB…(CREATE2)。配備ブロックは morpho-org/sdks の addresses.ts の値。
+  // RPC は chain-config に無いので ETHEREUM_RPC_URL を直接使う(下の rpc())。
+  ethereum: { address: "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb", startBlock: 18883124 },
   base: { address: "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb", startBlock: 13977148 },
   arbitrum: { address: "0x6c247b1F6182318877311737BaC0844bAa518F5e", startBlock: 296446593 },
   optimism: { address: "0xce95AfbB8EA029495c66020883F87aaE8864AF92", startBlock: 130770075 },
@@ -31,7 +35,10 @@ const MORPHO = {
 const IFACE = new ethers.Interface([
   "event Liquidate(bytes32 indexed id, address indexed caller, address indexed borrower, uint256 repaidAssets, uint256 repaidShares, uint256 seizedAssets, uint256 badDebtAssets, uint256 badDebtShares)",
   "function idToMarketParams(bytes32 id) view returns (address loanToken, address collateralToken, address oracle, address irm, uint256 lltv)",
+  "function position(bytes32 id, address user) view returns (uint256 supplyShares, uint128 borrowShares, uint128 collateral)",
+  "function market(bytes32 id) view returns (uint128 totalSupplyAssets, uint128 totalSupplyShares, uint128 totalBorrowAssets, uint128 totalBorrowShares, uint128 lastUpdate, uint128 fee)",
 ]);
+const ORACLE = new ethers.Interface(["function price() view returns (uint256)"]);
 const ERC20 = new ethers.Interface([
   "function symbol() view returns (string)",
   "function decimals() view returns (uint8)",
@@ -44,8 +51,38 @@ const CHUNK_MAX = 5_000_000;
 const PAUSE_MS = 150;       // 裁定の RPC を圧迫しないよう、1回ごとに少し待つ
 const MAX_REQUESTS = 4_000; // 暴走止め
 const RECEIPT_SAMPLES = 30; // ガス代を実測する件数(大きい順)
+// 「清算できるようになってから何ブロック放置されたか」を測る件数(大きい順)。
+// 過去のブロックの状態を読むので、アーカイブに対応した RPC が要る(無ければ測らずに理由を出す)。
+const LAG_SAMPLES = parseInt(process.env.MORPHO_SURVEY_LAG_SAMPLES || "80", 10);
+const LAG_MAX_BLOCKS = 50_000; // これより前まで遡らない(Ethereum 本体で約1週間)
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Ethereum 本体だけは chain-config の外なので、ETHEREUM_RPC_URL の接続を自前で持つ。
+// **URL はログに出さない。**
+let ethProvider = null;
+function ethereumProvider() {
+  if (ethProvider) return ethProvider;
+  const url = (process.env.ETHEREUM_RPC_URL || "").trim();
+  if (!url) throw new Error("ETHEREUM_RPC_URL が未設定");
+  ethProvider = new ethers.JsonRpcProvider(url, 1, { staticNetwork: true, batchMaxCount: 1 });
+  return ethProvider;
+}
+/// チェーンに合わせて RPC を呼ぶ。ethereum は自前の接続(一時的な失敗は2回まで取り直す)、他は既存の仕組み。
+async function rpc(chain, fn) {
+  if (chain !== "ethereum") return callWithRpc(chain, fn);
+  let last;
+  for (let i = 0; i < 3; i++) {
+    try { return await fn(ethereumProvider()); } catch (e) {
+      last = e;
+      if (isRangeRefusal(e.message || "") || /revert|execution reverted|CALL_EXCEPTION/i.test(e.message || "")) throw e;
+      await sleep(500 * (i + 1));
+    }
+  }
+  throw last;
+}
+/// ガス代(wei)をドルに。ETH の値段はどのチェーンでも同じなので、ethereum は base の値段を借りる。
+const gasWeiToUsd = (chain, wei) => weiToUsd(chain === "ethereum" ? "base" : chain, wei);
 
 export function morphoSurveyChains() {
   const raw = (process.env.RUN_MORPHO_SURVEY || "").trim();
@@ -76,7 +113,7 @@ function isRangeRefusal(msg) {
 }
 
 async function blockTime(chain, n) {
-  const b = await callWithRpc(chain, (p) => p.getBlock(n));
+  const b = await rpc(chain, (p) => p.getBlock(n));
   return b ? Number(b.timestamp) : null;
 }
 
@@ -99,7 +136,7 @@ async function readLogs(chain, from, to) {
     const end = Math.min(to, cursor + chunk - 1);
     requests++;
     try {
-      const logs = await callWithRpc(chain, (p) => p.send("eth_getLogs", [{
+      const logs = await rpc(chain, (p) => p.send("eth_getLogs", [{
         address: MORPHO[chain].address,
         topics: [LIQUIDATE_TOPIC],
         fromBlock: "0x" + cursor.toString(16),
@@ -123,9 +160,9 @@ async function readLogs(chain, from, to) {
 }
 
 async function readMarket(chain, id) {
-  const r = await callWithRpc(chain, (p) => p.call({ to: MORPHO[chain].address, data: IFACE.encodeFunctionData("idToMarketParams", [id]) }));
+  const r = await rpc(chain, (p) => p.call({ to: MORPHO[chain].address, data: IFACE.encodeFunctionData("idToMarketParams", [id]) }));
   const [loanToken, collateralToken, oracle, irm, lltv] = IFACE.decodeFunctionResult("idToMarketParams", r);
-  return { loanToken, collateralToken, oracle, irm, lltv: Number(lltv) / 1e18 };
+  return { loanToken, collateralToken, oracle, irm, lltv: Number(lltv) / 1e18, lltvWad: BigInt(lltv) };
 }
 
 const tokenInfoCache = new Map();
@@ -135,11 +172,11 @@ async function readToken(chain, token) {
   let symbol = token.slice(0, 8);
   let decimals = 18;
   try {
-    const s = await callWithRpc(chain, (p) => p.call({ to: token, data: ERC20.encodeFunctionData("symbol") }));
+    const s = await rpc(chain, (p) => p.call({ to: token, data: ERC20.encodeFunctionData("symbol") }));
     symbol = ERC20.decodeFunctionResult("symbol", s)[0];
   } catch (e) {}
   try {
-    const d = await callWithRpc(chain, (p) => p.call({ to: token, data: ERC20.encodeFunctionData("decimals") }));
+    const d = await rpc(chain, (p) => p.call({ to: token, data: ERC20.encodeFunctionData("decimals") }));
     decimals = Number(ERC20.decodeFunctionResult("decimals", d)[0]);
   } catch (e) {}
   const info = { symbol, decimals, priceUsd: await dexPriceUsd(chain, token) };
@@ -162,6 +199,73 @@ async function dexPriceUsd(chain, token) {
   } finally {
     await sleep(250); // DexScreener の回数制限よけ
   }
+}
+
+/// 担保の種類分け(**知識で勝てる担保か**を見るため)。上から順に当てはめる。
+/// PT(Pendle)・Ethena・LRT は、売り方(満期・引き出し待ち・薄い流動性)を知らないと現金に戻せない担保。
+export function collateralCategory(symbol) {
+  const s = String(symbol || "");
+  if (/^PT-/i.test(s)) return "PT(Pendle)";
+  if (/USDe/i.test(s)) return "Ethena系";
+  if (/(weETH|ezETH|rsETH|pufETH|rswETH|rstETH|eETH|agETH|pzETH|mETH|osETH|ETHx|LBTC|eBTC|uniBTC|solvBTC|pumpBTC)/i.test(s)) return "LRT/再ステーク";
+  if (/(wstETH|stETH|rETH|cbETH|sfrxETH|OETH)/i.test(s)) return "LST";
+  if (/^(WETH|WBTC|cbBTC|tBTC|ETH|BTC)$/i.test(s)) return "主要";
+  if (/(USD|DAI|FRAX|GHO|EUR)/i.test(s)) return "ステーブル系";
+  return "その他";
+}
+
+/// 過去のあるブロックの時点で、その借り手が清算できたか(Morpho の式: 借金 > 担保×価格×LLTV)。
+/// 読めなければ例外(アーカイブ非対応など)。
+async function liquidatableAt(chain, id, borrower, mk, block) {
+  const tag = "0x" + block.toString(16);
+  const [pr, mr, or] = await Promise.all([
+    rpc(chain, (p) => p.call({ to: MORPHO[chain].address, data: IFACE.encodeFunctionData("position", [id, borrower]), blockTag: tag })),
+    rpc(chain, (p) => p.call({ to: MORPHO[chain].address, data: IFACE.encodeFunctionData("market", [id]), blockTag: tag })),
+    rpc(chain, (p) => p.call({ to: mk.m.oracle, data: ORACLE.encodeFunctionData("price"), blockTag: tag })),
+  ]);
+  const pos = IFACE.decodeFunctionResult("position", pr);
+  const mkt = IFACE.decodeFunctionResult("market", mr);
+  const price = BigInt(ORACLE.decodeFunctionResult("price", or)[0]);
+  const borrowShares = BigInt(pos.borrowShares);
+  if (borrowShares === 0n) return false;
+  const tBA = BigInt(mkt.totalBorrowAssets), tBS = BigInt(mkt.totalBorrowShares);
+  const borrowed = tBS > 0n ? (borrowShares * tBA + tBS - 1n) / tBS : 0n;
+  const maxBorrow = (((BigInt(pos.collateral) * price) / 10n ** 36n) * mk.m.lltvWad) / 10n ** 18n;
+  return borrowed > maxBorrow;
+}
+
+/// 清算された時点から遡って、**清算できる状態が何ブロック続いていたか**を測る。
+/// 0 = 清算の直前のブロックではまだ健全(同じブロックの中で値段が動き、即座に取られた=速さ・入札の勝負)。
+/// 大きい = 誰も取らずに放置されていた(=売り方の知識で勝てる余地)。
+export async function measureLag(chain, row, mk, at = (b) => liquidatableAt(chain, row.id, row.borrower, mk, b), pauseMs = PAUSE_MS) {
+  const B = row.blockNumber;
+  if (!(await at(B - 1))) return 0;
+  // 倍々に遡って健全だったブロックを見つけ、その間を二分探索する
+  let good = null, bad = B - 1, step = 1;
+  while (true) {
+    const b = B - 1 - step;
+    if (!(await at(b))) { good = b; break; }
+    bad = b;
+    if (step >= LAG_MAX_BLOCKS) break;
+    step = Math.min(step * 2, LAG_MAX_BLOCKS);
+    await sleep(pauseMs);
+  }
+  if (good == null) return LAG_MAX_BLOCKS; // 上限まで遡っても清算できる状態のまま
+  while (bad - good > 1) {
+    const mid = Math.floor((good + bad) / 2);
+    if (await at(mid)) bad = mid; else good = mid;
+    await sleep(pauseMs);
+  }
+  return B - bad; // 清算できるようになったブロックから、清算されたブロックまで
+}
+
+/// 放置の長さの区分け。
+export function lagBucket(lag) {
+  if (lag == null) return "不明";
+  if (lag === 0) return "同じブロック";
+  if (lag <= 2) return "1〜2ブロック";
+  if (lag <= 25) return "3〜25ブロック";
+  return "26ブロック以上";
 }
 
 function short(a) { return a ? `${a.slice(0, 6)}…${a.slice(-4)}` : "?"; }
@@ -194,7 +298,8 @@ export function toRow({ id, caller, borrower, repaidAssets, seizedAssets, badDeb
 
 async function surveyChain(chain, days) {
   const t0 = Date.now();
-  const latest = await callWithRpc(chain, (p) => p.getBlockNumber());
+  let meta_lag = {};
+  const latest = await rpc(chain, (p) => p.getBlockNumber());
   const { from, secPerBlock, tLatest } = await fromBlockForDays(chain, latest, days);
   const actualDays = ((latest - from) * secPerBlock) / 86400;
   console.log(`[Morpho調査] ${chain}: ブロック ${from.toLocaleString()}〜${latest.toLocaleString()}(約${actualDays.toFixed(1)}日)を読みます`);
@@ -231,10 +336,10 @@ async function surveyChain(chain, days) {
   for (const r of bySize.slice(0, RECEIPT_SAMPLES)) {
     try {
       // 生の受領書を読む(OP Stack の L1 手数料 l1Fee は ethers の整形で落ちるため)
-      const rc = await callWithRpc(chain, (p) => p.send("eth_getTransactionReceipt", [r.txHash]));
+      const rc = await rpc(chain, (p) => p.send("eth_getTransactionReceipt", [r.txHash]));
       if (!rc) continue;
       const wei = BigInt(rc.gasUsed) * BigInt(rc.effectiveGasPrice ?? "0x0") + BigInt(rc.l1Fee ?? "0x0");
-      r.gasUsd = await weiToUsd(chain, wei);
+      r.gasUsd = await gasWeiToUsd(chain, wei);
       r.gasUsed = Number(BigInt(rc.gasUsed));
       r.txTo = rc.to;
       r.txIndex = Number(BigInt(rc.transactionIndex));
@@ -242,12 +347,30 @@ async function surveyChain(chain, days) {
     await sleep(PAUSE_MS);
   }
 
+  // 担保の種類
+  for (const r of rows) r.category = collateralCategory(r.pair.split("/")[0]);
+
+  // 放置の長さ(大きい順)。最初の数件で過去の状態が読めなければ、アーカイブ非対応として打ち切る
+  let lagErrors = 0, lagDone = 0, lagNote = "";
+  for (const r of bySize.filter((x) => x.repaidUsd != null).slice(0, LAG_SAMPLES)) {
+    const mk = markets.get(r.id);
+    if (!mk) continue;
+    try {
+      r.lagBlocks = await measureLag(chain, r, mk);
+      lagDone++;
+    } catch (e) {
+      lagErrors++;
+      if (lagDone === 0 && lagErrors >= 3) { lagNote = `過去の状態を読めません(アーカイブ非対応の可能性): ${(e.shortMessage || e.message || "").slice(0, 80)}`; break; }
+    }
+  }
+  meta_lag = { lagDone, lagErrors, lagNote };
+
   try {
     const file = stateFilePath(`morpho-liquidations-${chain}.jsonl`);
     fs.writeFileSync(file, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
   } catch (e) {}
 
-  report(chain, rows, { readDays, requests, refusals, markets: markets.size, sec: (Date.now() - t0) / 1000, reachedBlock, latest, secPerBlock });
+  report(chain, rows, { ...meta_lag, readDays, requests, refusals, markets: markets.size, sec: (Date.now() - t0) / 1000, reachedBlock, latest, secPerBlock });
 }
 
 function report(chain, rows, meta) {
@@ -321,6 +444,34 @@ function report(chain, rows, meta) {
     console.log(`${P} 大きい清算 上位5: ` + sampled.slice(0, 5)
       .map((r) => `${r.pair} 返済${usd(r.repaidUsd)} 報酬${usd(r.bonusUsd)} ガス${usd(r.gasUsd)} 位置${r.txIndex} by ${short(r.caller)}`).join(" | "));
   }
+  reportByCategory(P, rows, meta, meta.secPerBlock);
+}
+
+/// **担保の種類別**: 件数・報酬・清算者の数・1位の占有・放置の長さ。
+/// 「難しい担保ほど清算者が少なく、放置が長い」なら、知識で勝てる場所がある。
+export function reportByCategory(P, rows, meta, secPerBlock) {
+  const cats = new Map();
+  for (const r of rows) {
+    const c = r.category || "その他";
+    const e = cats.get(c) || { n: 0, bonus: 0, callers: new Map(), lags: [] };
+    e.n++; e.bonus += r.bonusUsd ?? 0;
+    e.callers.set(r.caller, (e.callers.get(r.caller) || 0) + (r.bonusUsd ?? 0));
+    if (r.lagBlocks != null) e.lags.push(r.lagBlocks);
+    cats.set(c, e);
+  }
+  const order = [...cats.entries()].sort((a, b) => b[1].bonus - a[1].bonus);
+  for (const [c, e] of order) {
+    const top = Math.max(0, ...e.callers.values());
+    const lb = new Map();
+    for (const l of e.lags) lb.set(lagBucket(l), (lb.get(lagBucket(l)) || 0) + 1);
+    const lagLine = e.lags.length
+      ? ` 放置[${["同じブロック", "1〜2ブロック", "3〜25ブロック", "26ブロック以上"].filter((k) => lb.has(k)).map((k) => `${k}${lb.get(k)}`).join(" ")} 中央${median(e.lags)}ブロック≒${Math.round((median(e.lags) * secPerBlock) / 60)}分](${e.lags.length}件測定)`
+      : "";
+    console.log(`${P} 担保の種類 ${c}: ${e.n}件 報酬${usd(e.bonus)} 清算者${e.callers.size}人 1位の占有${e.bonus > 0 ? Math.round((top / e.bonus) * 100) : 0}%${lagLine}`);
+  }
+  if (meta.lagNote) console.log(`${P} 放置の長さ: ${meta.lagNote}`);
+  else if (meta.lagDone != null) console.log(`${P} 放置の長さ: 大きい順に${meta.lagDone}件を測定(失敗${meta.lagErrors})。`
+    + `「同じブロック」は値段が動いたブロックの中で即座に取られた=速さと入札の勝負、「26ブロック以上」は誰も取らなかった=売り方を知っていれば取れた可能性`);
 }
 
 export async function runMorphoSurvey() {
