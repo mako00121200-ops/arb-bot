@@ -168,9 +168,24 @@ export async function readL1FeeFromReceipt(chain, txHash) {
 
 /// 実際に払う見込みのガス単価(wei)。上限(maxFeePerGas)ではない。
 /// EIP-1559のチェーンでは baseFeePerGas + maxPriorityFeePerGas を払う。
+// **古くなりかけの値は、待たずに使って裏で取り直す**(2026年9月24日、オーナーの指示「速さの改善」)。
+// #179 で送信の準備の内訳を測ると、avalanche で準備 519〜731ms のうち 350〜550ms が
+// この単価の取り直し(getFeeData と getBlock を公開 RPC に聞く)を**送信の途中で待っていた**時間だった。
+// 15秒以内は今まで通りそのまま使い、15〜60秒なら手元の値で判定しながら裏で取り直す。
+// 60秒より古い時だけ待つ(相場が急に動いた時に古すぎる単価で送らないため)。
+const GAS_PRICE_STALE_MAX_MS = 60 * 1000;
+const gasPriceInflight = new Map();
 async function getGasPriceWei(chain) {
   const cached = gasPriceCache.get(chain);
-  if (cached && Date.now() - cached.at < GAS_PRICE_CACHE_MS) return cached.value;
+  const age = cached ? Date.now() - cached.at : Infinity;
+  if (age < GAS_PRICE_CACHE_MS) return cached.value;
+  const refresh = gasPriceInflight.get(chain) || fetchGasPriceWei(chain).finally(() => gasPriceInflight.delete(chain));
+  gasPriceInflight.set(chain, refresh);
+  if (age < GAS_PRICE_STALE_MAX_MS) return cached.value;
+  return refresh;
+}
+async function fetchGasPriceWei(chain) {
+  const cached = gasPriceCache.get(chain);
   try {
     const [feeData, block] = await Promise.all([
       callWithRpc(chain, (p) => p.getFeeData()),
@@ -312,9 +327,22 @@ async function getNativePriceUsd(chain) {
   return null;
 }
 
+// ネイティブ通貨の値段も同じ考え方: 10分を過ぎても1時間以内なら手元の値で判定し、裏で取り直す
+// (DexScreener への問い合わせを送信の途中で待たない)。
+const NATIVE_PRICE_STALE_MAX_MS = 60 * 60 * 1000;
+const nativePriceInflight = new Map();
 async function getNativePriceUsdOwn(chain) {
   const cached = nativePriceCache.get(chain);
-  if (cached && Date.now() - cached.at < NATIVE_PRICE_CACHE_MS) return cached.value;
+  const age = cached ? Date.now() - cached.at : Infinity;
+  if (age < NATIVE_PRICE_CACHE_MS) return cached.value;
+  if (!NATIVE_TOKEN_FOR_PRICE[chain]) return null;
+  const refresh = nativePriceInflight.get(chain) || fetchNativePriceUsd(chain).finally(() => nativePriceInflight.delete(chain));
+  nativePriceInflight.set(chain, refresh);
+  if (age < NATIVE_PRICE_STALE_MAX_MS) return cached.value;
+  return refresh;
+}
+async function fetchNativePriceUsd(chain) {
+  const cached = nativePriceCache.get(chain);
   const token = NATIVE_TOKEN_FOR_PRICE[chain];
   if (!token) return null;
   try {
