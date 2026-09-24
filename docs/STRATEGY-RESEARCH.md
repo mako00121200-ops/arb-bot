@@ -716,3 +716,19 @@ DEX 側は模型を使わず、`scripts/onchain-quote.js` で**ファクトリ�
 **送信する部分はまだ無い。** 本番化にはコントラクトの追加が要る(オーナーに相談)。
 
 **読み方:** `黒字N回` が1日を通して0なら、その案は見送り。出ていれば `機会` の行の額・頻度・DEX の経路を見て相談に進む。
+
+### §16 の追記(2026年9月24日)— 案2の仲間を足し、「ずれが何秒続くか」を測る
+
+オーナーの指示「同じようなものが無いかリサーチ」「どれぐらいの速さが必要か実測で」。
+
+**足したもの:** Aave GHO の GSM(arbitrum、USDC↔GHO。USDC→GHO は手数料0、GHO→USDC は 0.10%)。
+住所は aave-dao/aave-address-book `src/GhoArbitrum.sol` の `GSM_USDC`、関数は aave/gho-core の `IGsm.sol`。
+起動時に `GHO_TOKEN()` と `UNDERLYING_ASSET()`(手書きのステーブルか)を照合する。base / avalanche には GSM が無い(同じ address-book で確認)。
+
+**調べたが今回は足していないもの:**
+- Angle の Transmuter(USDA / EURA をオラクル価格で発行・償還)… L2 に Transmuter があるか未確認
+- Pendle の満期後の PT(1:1 で償還)… Morpho に満期後の PT-USR が残っていた。市場ごとに住所が要る
+- Lido の L2 での直接ステーキング … 公開資料で確認できず
+
+**速さ:** 黒字のずれを見つけたら、その経路だけ2秒ごとに測り直し、赤字に戻るまでの秒数を
+`[Spark計測/持続]` / `[GHO計測/持続]` に出す。生存ログ `固定レート[… 続いた秒数[中央 最短 件数]]`。
