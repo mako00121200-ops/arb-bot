@@ -126,6 +126,9 @@ async function measure(chain, c) {
       .then((x) => COMET_IFACE.decodeFunctionResult("quoteCollateral", x)[0]).catch(() => null);
     if (!perBase || BigInt(perBase) === 0n) continue;
     const allBase = (BigInt(stock) * m.baseScale) / BigInt(perBase);
+    // 1ドル未満の在庫は塵。四捨五入で差が何千bpsにも見えるので、機会にも在庫にも数えない
+    //(2026年9月24日の初回で、在庫$0 の MaticX が「差1596bps」と出た)
+    if (allBase < m.baseScale) continue;
     stockUsd += (Number(allBase) / Number(m.baseScale)) * baseUsd;
     if (!forSale) continue; // 在庫はあるが売っていない(準備金が目標以上)
     const sizes = [...new Set([...TRY_SIZES.map((s) => BigInt(s) * m.baseScale).filter((s) => s < allBase), allBase])];
