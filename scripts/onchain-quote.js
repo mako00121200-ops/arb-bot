@@ -18,10 +18,54 @@ import { ethers } from "ethers";
 import { getAnyChainConfig } from "../chain-config.js";
 import { V3_FACTORIES } from "./v3-pools.js";
 import { findV3PoolsBatch, quoteV3ByPoolBatch } from "./multicall-reserves.js";
+import { callWithRpc } from "./onchain-reserves.js";
 // base の Aerodrome Slipstream(清算の売却経路と同じ工場。住所の出典はそちらのコメント)
 import { EXTRA_V3_FACTORIES, SLIPSTREAM_TICK_SPACINGS } from "./liquidation-executor.js";
 
 const FEE_TIERS = [100, 500, 3000, 10000];
+
+/// Solidly 型(Aerodrome / Velodrome の旧来型)のプール工場。安定型(stable)と変動型の2種類がある。
+/// ステーブル同士(sUSDS・USDS など)は V3 ではなくこちらにあることが多い(2026年9月24日の Spark 計測で、
+/// V3 の工場だけでは sUSDS の取引所が1つも見つからなかった)。
+/// 住所の出典: aerodrome-finance/contracts と velodrome-finance/contracts の README の配備表。
+const SOLIDLY_FACTORIES = {
+  base: [{ address: "0x420DD381b31aEf6683db6B902084cB0FFECe40Da", dexId: "aerodrome" }],
+  optimism: [{ address: "0xF1046053aa5682b4F9a81b5481394DA16BE5FF5a", dexId: "velodrome" }],
+};
+const SOLIDLY_FACTORY_IFACE = new ethers.Interface(["function getPool(address tokenA, address tokenB, bool stable) view returns (address)"]);
+const SOLIDLY_POOL_IFACE = new ethers.Interface(["function getAmountOut(uint256 amountIn, address tokenIn) view returns (uint256)"]);
+const solidlyCache = new Map();
+
+async function findSolidlyPools(chain, tokenA, tokenB) {
+  const [t0, t1] = [tokenA.toLowerCase(), tokenB.toLowerCase()].sort();
+  const k = `${chain}|${t0}|${t1}`;
+  const c = solidlyCache.get(k);
+  if (c && Date.now() - c.at < POOL_CACHE_MS) return c.pools;
+  const pools = [];
+  for (const f of SOLIDLY_FACTORIES[chain] || []) {
+    for (const stable of [true, false]) {
+      try {
+        const raw = await callWithRpc(chain, (p) => p.call({ to: f.address, data: SOLIDLY_FACTORY_IFACE.encodeFunctionData("getPool", [t0, t1, stable]) }), false);
+        const a = SOLIDLY_FACTORY_IFACE.decodeFunctionResult("getPool", raw)[0];
+        if (a && a !== ethers.ZeroAddress) pools.push({ address: a.toLowerCase(), dexId: `${f.dexId}(${stable ? "安定" : "変動"})` });
+      } catch (e) {}
+    }
+  }
+  solidlyCache.set(k, { at: Date.now(), pools });
+  return pools;
+}
+
+/// Solidly 型のプールに、その場の受取量を聞く(プール自身の getAmountOut。手数料込み)
+async function solidlyQuotes(chain, pools, tokenIn, amountIn, blockTag) {
+  const out = [];
+  for (const p of pools) {
+    try {
+      const raw = await callWithRpc(chain, (pr) => pr.call({ to: p.address, data: SOLIDLY_POOL_IFACE.encodeFunctionData("getAmountOut", [amountIn, tokenIn]), blockTag: blockTag ?? "latest" }), false);
+      out.push(BigInt(SOLIDLY_POOL_IFACE.decodeFunctionResult("getAmountOut", raw)[0]));
+    } catch (e) { out.push(null); }
+  }
+  return out;
+}
 const POOL_CACHE_MS = 6 * 60 * 60 * 1000;
 const poolCache = new Map(); // `${chain}|${t0}|${t1}` -> { at, pools: [{ address, dexId }] }
 
@@ -68,6 +112,12 @@ export async function bestSellQuote(chain, tokenIn, tokenOut, amountIn, hubs = [
     const outs = await quoteV3ByPoolBatch(chain, quoter,
       direct.map((p) => ({ pool: p.address, tokenIn: from, amountIn })), false, blockTag);
     outs.forEach((o, i) => { if (o != null && (!best || o > best.out)) best = { out: o, label: direct[i].dexId }; });
+  }
+  // Solidly 型(1段だけ)
+  const sol = await findSolidlyPools(chain, from, to);
+  if (sol.length > 0) {
+    const outs = await solidlyQuotes(chain, sol, from, amountIn, blockTag);
+    outs.forEach((o, i) => { if (o != null && o > 0n && (!best || o > best.out)) best = { out: o, label: sol[i].dexId }; });
   }
   for (const hub of hubs) {
     const mid = String(hub).toLowerCase();
