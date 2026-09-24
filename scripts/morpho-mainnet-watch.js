@@ -318,6 +318,18 @@ async function backfillStep(latest) {
   }
 }
 
+async function sweep(latest) {
+  try {
+    const t0 = Date.now();
+    await handle(await readHealth([...S.roster.values()], latest));
+    S.stats.sweeps++;
+    S.stats.sweepMs = Date.now() - t0;
+    // 古い「気づいた」記録は捨てる(清算されずに1日以上残るものは競争の場ではない)
+    for (const [k, v] of S.seen) if (Date.now() - v.at > 24 * 3600 * 1000) S.seen.delete(k);
+    save();
+  } catch (e) { noteError(e); }
+}
+
 async function tick() {
   if (S.busy) return;
   S.busy = true;
@@ -334,14 +346,12 @@ async function tick() {
       await checkLiquidations(S.lastBlock + 1, latest);
     }
     S.lastBlock = latest;
-    // 全員の読み直し(名簿ができてから)
-    if (backfillDone && Date.now() - S.lastSweep > SWEEP_MS) {
+    // 全員の読み直し(名簿ができてから)。**待たずに裏で回す**:
+    // 名簿4万人を読むと数分かかり、その間 毎ブロックの見張りが止まっていた(2026年9月24日 22:22 JST の実測)
+    if (backfillDone && !S.sweeping && Date.now() - S.lastSweep > SWEEP_MS) {
       S.lastSweep = Date.now();
-      await handle(await readHealth([...S.roster.values()], latest));
-      S.stats.sweeps++;
-      // 古い「気づいた」記録は捨てる(清算されずに1日以上残るものは競争の場ではない)
-      for (const [k, v] of S.seen) if (Date.now() - v.at > 24 * 3600 * 1000) S.seen.delete(k);
-      save();
+      S.sweeping = true;
+      sweep(latest).finally(() => { S.sweeping = false; });
     }
   } catch (e) {
     noteError(e);
@@ -368,7 +378,7 @@ export function formatMorphoMainnetLine() {
   const done = Math.min(100, Math.round(((S.backfill.cursor - START_BLOCK) / span) * 100));
   const lead = median(st.lead);
   const top = [...st.winners.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([a, n]) => `${a.slice(0, 6)}:${n}`).join(" ");
-  return ` Morpho本体[名簿${S.roster.size} 遡り${done}% 危ない${S.watch.size}(読み${median(st.readMs) ?? "-"}ms) 清算可${st.liquidatable}(売って返せる${st.sellOk}/不可${st.sellNo})`
+  return ` Morpho本体[名簿${S.roster.size} 遡り${done}% 危ない${S.watch.size}(読み${median(st.readMs) ?? "-"}ms 全員${st.sweeps}回${st.sweepMs ? `/${Math.round(st.sweepMs / 1000)}秒` : ""}) 清算可${st.liquidatable}(売って返せる${st.sellOk}/不可${st.sellNo})`
     + ` 実清算${st.liq}=先に気づいた${st.first}(先行中央${lead ?? "-"}ブロック)/見逃し[名簿なし${st.missNoRoster} 急変${st.missLow} 同ブロック${st.missSameBlock}]`
     + ` 報酬 気づいた分$${Math.round(st.bonusSeenUsd)}/見逃し分$${Math.round(st.bonusMissUsd)}${top ? ` 勝者[${top}]` : ""}`
     + `${st.errors ? ` 失敗${st.errors}(${st.lastError})` : ""} 送信しない]`;
