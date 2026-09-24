@@ -1,22 +1,26 @@
 // scripts/spark-psm-monitor.js
 //
-// **Spark PSM(固定レートの交換所)と DEX の価格のずれを、送らずに測る。**
+// **固定レートの交換所と DEX の価格のずれを、送らずに測る。**(案2とその仲間)
 //
 // [仕組み(オーナーの指示で調査 → 案2、2026年9月24日)]
-// Spark PSM3 は base / arbitrum / optimism で USDC・USDS・sUSDS を交換する。
-// USDC↔USDS は 1:1、sUSDS は公式レート(rateProvider)で、**滑りも手数料もない**。
-// DEX の sUSDS(や USDS)の価格がこのレートからずれた時、
-//   A: USDC → (PSM) → sUSDS → (DEX) → USDC
-//   B: USDC → (DEX) → sUSDS → (PSM) → USDC
+// 「いつでも決まった値段で交換してくれる場所」と、値段が動く DEX の間にずれがあれば、
+//   A: USDC → (交換所) → X → (DEX) → USDC
+//   B: USDC → (DEX) → X → (交換所) → USDC
 // のどちらかで差額が取れる。片側の価格が確定しているので、見積もりの外れが起きにくい。
 //
-// [ここでやること(送信はしない)]
-// 額($100 / $1,000 / $10,000)ごとに、PSM 側は previewSwapExactIn(PSM 自身の見積もり)、
-// DEX 側はチェーンに直接試算させて(onchain-quote.js)、A と B の差額 − ガス代 を記録する。
-// PSM の在庫(受け取る側の通貨の残高)が足りない額は「在庫不足」として別に数える。
+// 対象(オーナーの指示「同じようなものが無いかリサーチ」で広げた):
+//   1. Spark PSM3(base / arbitrum / optimism): USDC↔USDS は 1:1、sUSDS は公式レート。滑り・手数料なし
+//      住所: sparkdotfi/spark-address-registry の src/Base.sol・Arbitrum.sol・Optimism.sol
+//   2. Aave GHO の GSM(arbitrum): USDC→GHO は 1:1(手数料0)、GHO→USDC は 1:1 − 手数料(0.10%)
+//      住所: aave-dao/aave-address-book の src/GhoArbitrum.sol(GSM_USDC)。関数は aave/gho-core の IGsm.sol
 //
-// [住所の出典] sparkdotfi/spark-address-registry の src/Base.sol・Arbitrum.sol・Optimism.sol
-// (2026年9月24日に確認)。初回に PSM の usdc()/usds()/susds() を読み、表と違えば測らない。
+// [測ること(送信はしない)]
+// 額($100 / $1,000 / $10,000)ごとに、交換所側は交換所自身の見積もり関数、DEX 側はチェーンに直接
+// 試算させて(onchain-quote.js)、A と B の差額 − ガス代 を記録する。在庫不足も数える。
+//
+// **速さの実測**(オーナーの指示「実際どれぐらいの速さが必要か実測で」):
+// 黒字のずれを見つけたら、その経路だけを2秒ごとに測り直し、**ずれが何秒続いたか**を記録する。
+// 続いた時間が長ければ速さの勝負ではない。短ければ、その秒数が要る速さの上限になる。
 //
 // [環境変数]
 //   SPARK_MONITOR_ENABLED     … "false" で止める
@@ -30,9 +34,12 @@ import { nowJst } from "./jst.js";
 
 const ENABLED = process.env.SPARK_MONITOR_ENABLED !== "false";
 const INTERVAL_MS = parseInt(process.env.SPARK_MONITOR_INTERVAL_MS || String(2 * 60 * 1000), 10);
-/// PSM の交換 + DEX 1〜2段のガス量の見込み
+/// 交換所 + DEX 1〜2段のガス量の見込み
 const GAS_UNITS = 350000n;
 const SIZES_USD = [100, 1000, 10000];
+/// ずれが続く時間の追跡: 何ミリ秒ごとに測り直し、最長で何ミリ秒追うか
+const TRACK_EVERY_MS = 2000;
+const TRACK_MAX_MS = 10 * 60 * 1000;
 
 const PSMS = {
   base: { psm: "0x1601843c5E9bC251A3272907010AFa41Fa18347E", usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
@@ -42,6 +49,9 @@ const PSMS = {
   optimism: { psm: "0xe0F9978b907853F354d79188A3dEfbD41978af62", usdc: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
     usds: "0x4F13a96EC5C4Cf34e442b46Bbd98a0791F20edC3", susds: "0xb5B2dc7fd34C249F4be7fB1fCea07950784229e0" },
 };
+const GSMS = {
+  arbitrum: { gsm: "0x53E0cE250d06043414070100458546AaF4e284eD", gho: "0x7dfF72693f6A4149b17e7C6314655f6A9F7c8B33" },
+};
 
 const PSM_IFACE = new ethers.Interface([
   "function usdc() view returns (address)",
@@ -50,105 +60,204 @@ const PSM_IFACE = new ethers.Interface([
   "function pocket() view returns (address)",
   "function previewSwapExactIn(address assetIn, address assetOut, uint256 amountIn) view returns (uint256)",
 ]);
+const GSM_IFACE = new ethers.Interface([
+  "function GHO_TOKEN() view returns (address)",
+  "function UNDERLYING_ASSET() view returns (address)",
+  "function getIsFrozen() view returns (bool)",
+  "function getIsSeized() view returns (bool)",
+  "function getAvailableLiquidity() view returns (uint256)",
+  "function getAvailableUnderlyingExposure() view returns (uint256)",
+  // 返り値: 実際に使う資産の量, 受け取る GHO(手数料後), 総額, 手数料
+  "function getGhoAmountForSellAsset(uint256 maxAssetAmount) view returns (uint256, uint256, uint256, uint256)",
+  // 返り値: 受け取る資産の量, 実際に払う GHO, 総額, 手数料
+  "function getAssetAmountForBuyAsset(uint256 maxGhoAmount) view returns (uint256, uint256, uint256, uint256)",
+]);
 const ERC20_IFACE = new ethers.Interface(["function balanceOf(address) view returns (uint256)"]);
 
-const verified = new Map(); // chain -> true / false
-const stats = new Map();    // chain -> { reads, byRoute: { key -> { bestBps, bestNetUsd, positives } }, shortStock, noDex, maxNetUsd, last }
+const verified = new Map(); // `${venue}:${chain}` -> true / false
+/// `${venue}:${chain}` -> { reads, byRoute: { key -> {...} }, shortStock, noDex, maxNetUsd, durations: [秒], tracking: Set }
+const stats = new Map();
 
 async function view(chain, to, iface, fn, args = []) {
   const raw = await callWithRpc(chain, (p) => p.call({ to, data: iface.encodeFunctionData(fn, args) }), false);
-  return iface.decodeFunctionResult(fn, raw)[0];
+  const r = iface.decodeFunctionResult(fn, raw);
+  return r.length === 1 ? r[0] : r;
 }
+const same = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
 
-async function verify(chain, a) {
-  if (verified.has(chain)) return verified.get(chain);
+async function verifyPsm(chain, a) {
+  const k = `Spark:${chain}`;
+  if (verified.has(k)) return verified.get(k);
   try {
     const [u, s, ss] = await Promise.all(["usdc", "usds", "susds"].map((fn) => view(chain, a.psm, PSM_IFACE, fn)));
-    const ok = [[u, a.usdc], [s, a.usds], [ss, a.susds]].every(([x, y]) => String(x).toLowerCase() === y.toLowerCase());
+    const ok = same(u, a.usdc) && same(s, a.usds) && same(ss, a.susds);
     if (!ok) console.warn(`[Spark計測] ${chain}: PSM の通貨が表と違うので測りません(usdc ${u} / usds ${s} / susds ${ss})`);
-    verified.set(chain, ok);
+    verified.set(k, ok);
     return ok;
-  } catch (e) {
-    return false; // 次回また確かめる
-  }
+  } catch (e) { return false; }
 }
 
-async function measure(chain) {
-  const a = PSMS[chain];
-  if (!(await verify(chain, a))) return;
-  const st = stats.get(chain) || { reads: 0, byRoute: {}, shortStock: 0, noDex: 0, maxNetUsd: null };
-  stats.set(chain, st);
+async function verifyGsm(chain, g) {
+  const k = `GHO:${chain}`;
+  if (verified.has(k)) return verified.get(k);
+  try {
+    const [gho, under] = await Promise.all([view(chain, g.gsm, GSM_IFACE, "GHO_TOKEN"), view(chain, g.gsm, GSM_IFACE, "UNDERLYING_ASSET")]);
+    const known = getKnownTokens(chain)[String(under).toLowerCase()];
+    // 担保が素の USDC でなければ(利息付きの包み USDC 等)、1:1 の前提が崩れるので測らない
+    const ok = same(gho, g.gho) && !!known?.stable;
+    console.log(`[Spark計測] ${chain}: GHO の GSM 照合 ${ok ? "OK" : "不一致のため測らない"}(GHO ${gho} / 担保 ${under}${known ? ` ${known.symbol}` : " 手書きに無い通貨"})`);
+    if (ok) g.usdc = String(under);
+    verified.set(k, ok);
+    return ok;
+  } catch (e) { return false; }
+}
+
+/// 1本の経路を評価する関数を作る。戻り値の関数は { out, x, label, short } を返す(out=null は経路なし)
+function routes(chain, venue, ctx) {
+  const list = [];
+  const hubs = [...Object.keys(getKnownTokens(chain))];
+  for (const usd of SIZES_USD) {
+    const x = BigInt(usd) * 1000000n; // USDC は6桁
+    if (venue === "Spark") {
+      const a = ctx;
+      for (const [name, tok] of [["sUSDS", a.susds], ["USDS", a.usds]]) {
+        list.push({ key: `${name} 交換所→DEX $${usd}`, usd, eval: async () => {
+          const got = await view(chain, a.psm, PSM_IFACE, "previewSwapExactIn", [a.usdc, tok, x]);
+          const s = await bestSellQuote(chain, tok, a.usdc, BigInt(got), [...hubs, a.usds]);
+          return { out: s ? s.out : null, x, label: s?.label || "", need: { token: tok, amount: BigInt(got) } };
+        } });
+        list.push({ key: `${name} DEX→交換所 $${usd}`, usd, eval: async () => {
+          const b = await bestSellQuote(chain, a.usdc, tok, x, [...hubs, a.usds]);
+          if (!b) return { out: null, x };
+          const out = await view(chain, a.psm, PSM_IFACE, "previewSwapExactIn", [tok, a.usdc, b.out]);
+          return { out: BigInt(out), x, label: b.label, need: { token: a.usdc, amount: BigInt(out) } };
+        } });
+      }
+    } else {
+      const g = ctx;
+      list.push({ key: `GHO 交換所→DEX $${usd}`, usd, eval: async () => {
+        const r = await view(chain, g.gsm, GSM_IFACE, "getGhoAmountForSellAsset", [x]);
+        const used = BigInt(r[0]), gho = BigInt(r[1]);
+        const s = await bestSellQuote(chain, g.gho, g.usdc, gho, hubs);
+        return { out: s ? s.out : null, x: used, label: s?.label || "", needExposure: used };
+      } });
+      list.push({ key: `GHO DEX→交換所 $${usd}`, usd, eval: async () => {
+        const b = await bestSellQuote(chain, g.usdc, g.gho, x, hubs);
+        if (!b) return { out: null, x };
+        const r = await view(chain, g.gsm, GSM_IFACE, "getAssetAmountForBuyAsset", [b.out]);
+        return { out: BigInt(r[0]), x, label: b.label, needLiquidity: BigInt(r[0]) };
+      } });
+    }
+  }
+  return list;
+}
+
+/// 黒字のずれが**何秒続いたか**を測る。2秒ごとに同じ経路を測り直し、赤字に戻った時点で終える。
+async function track(st, chain, venue, route, gasUsd, firstNet) {
+  const id = route.key;
+  if (st.tracking.has(id)) return;
+  st.tracking.add(id);
+  const started = Date.now();
+  let maxNet = firstNet, reads = 1;
+  try {
+    while (Date.now() - started < TRACK_MAX_MS) {
+      await new Promise((r) => setTimeout(r, TRACK_EVERY_MS));
+      let net = null;
+      try {
+        const r = await route.eval();
+        if (r.out != null) net = Number(r.out - r.x) / 1e6 - gasUsd;
+      } catch (e) {}
+      reads++;
+      if (net == null || net <= 0) break;
+      if (net > maxNet) maxNet = net;
+    }
+  } finally {
+    st.tracking.delete(id);
+  }
+  const sec = (Date.now() - started) / 1000;
+  const capped = Date.now() - started >= TRACK_MAX_MS;
+  st.durations.push({ sec, capped, maxNet });
+  if (st.durations.length > 500) st.durations.shift();
+  console.log(`[${venue}計測/持続 ${nowJst()}] ${chain} ${id}: 黒字のずれが${capped ? `${Math.round(sec)}秒以上(追跡の上限)` : `約${Math.round(sec)}秒`}続いた`
+    + `(${reads}回測定、最大純利$${maxNet.toFixed(3)})。**これより速く送れば取れた**`);
+}
+
+async function measureVenue(chain, venue, ctx) {
+  const k = `${venue}:${chain}`;
+  const st = stats.get(k) || { reads: 0, byRoute: {}, shortStock: 0, noDex: 0, maxNetUsd: null, durations: [], tracking: new Set() };
+  stats.set(k, st);
   st.reads++;
   const gasUsd = (await gasUnitsToUsd(chain, GAS_UNITS).catch(() => null)) ?? 0.05;
-  const hubs = [...Object.keys(getKnownTokens(chain)), a.usds];
-  // PSM の在庫: USDC は pocket、USDS / sUSDS は PSM 自身が持つ
-  const pocket = await view(chain, a.psm, PSM_IFACE, "pocket").catch(() => a.psm);
-  const stock = {
-    [a.usdc.toLowerCase()]: await view(chain, a.usdc, ERC20_IFACE, "balanceOf", [pocket]).catch(() => null),
-    [a.usds.toLowerCase()]: await view(chain, a.usds, ERC20_IFACE, "balanceOf", [a.psm]).catch(() => null),
-    [a.susds.toLowerCase()]: await view(chain, a.susds, ERC20_IFACE, "balanceOf", [a.psm]).catch(() => null),
-  };
-  for (const [name, tok] of [["sUSDS", a.susds], ["USDS", a.usds]]) {
-    for (const usd of SIZES_USD) {
-      const x = BigInt(usd) * 1000000n; // USDC は6桁
-      // A: PSM で買って DEX で売る
-      const viaPsm = await view(chain, a.psm, PSM_IFACE, "previewSwapExactIn", [a.usdc, tok, x]).catch(() => null);
-      let aOut = null, aLabel = "";
-      if (viaPsm != null) {
-        if (stock[tok.toLowerCase()] != null && BigInt(stock[tok.toLowerCase()]) < BigInt(viaPsm)) st.shortStock++;
-        const s = await bestSellQuote(chain, tok, a.usdc, BigInt(viaPsm), hubs).catch(() => null);
-        if (s) { aOut = s.out; aLabel = s.label; } else st.noDex++;
-      }
-      // B: DEX で買って PSM で売る
-      const viaDex = await bestSellQuote(chain, a.usdc, tok, x, hubs).catch(() => null);
-      let bOut = null;
-      if (viaDex) {
-        bOut = await view(chain, a.psm, PSM_IFACE, "previewSwapExactIn", [tok, a.usdc, viaDex.out]).catch(() => null);
-        if (bOut != null && stock[a.usdc.toLowerCase()] != null && BigInt(stock[a.usdc.toLowerCase()]) < BigInt(bOut)) st.shortStock++;
-      } else st.noDex++;
-      for (const [dir, out, label] of [["PSM→DEX", aOut, aLabel], ["DEX→PSM", bOut != null ? BigInt(bOut) : null, viaDex?.label || ""]]) {
-        if (out == null) continue;
-        const bps = Number(((out - x) * 100000n) / x) / 10;
-        const netUsd = Number(out - x) / 1e6 - gasUsd;
-        const k = `${name}${dir}$${usd}`;
-        const r = st.byRoute[k] || { bestBps: null, bestNetUsd: null, positives: 0, lastBps: null };
-        r.lastBps = bps;
-        if (r.bestBps == null || bps > r.bestBps) r.bestBps = bps;
-        if (r.bestNetUsd == null || netUsd > r.bestNetUsd) r.bestNetUsd = netUsd;
-        if (netUsd > 0) {
-          r.positives++;
-          if (st.maxNetUsd == null || netUsd > st.maxNetUsd) st.maxNetUsd = netUsd;
-          console.log(`[Spark計測/機会 ${nowJst()}] ${chain} ${name} ${dir} $${usd}: 差${bps.toFixed(1)}bps 純利$${netUsd.toFixed(3)}`
-            + `(DEX ${label} / ガス$${gasUsd.toFixed(3)})。**送っていません**`);
-        }
-        st.byRoute[k] = r;
-      }
+  // 在庫: Spark は USDC を pocket、USDS / sUSDS を PSM 自身が持つ。GHO の GSM は関数で聞く
+  let stock = {}, gsmLiq = null, gsmExp = null, frozen = false;
+  if (venue === "Spark") {
+    const pocket = await view(chain, ctx.psm, PSM_IFACE, "pocket").catch(() => ctx.psm);
+    for (const [t, holder] of [[ctx.usdc, pocket], [ctx.usds, ctx.psm], [ctx.susds, ctx.psm]]) {
+      stock[t.toLowerCase()] = await view(chain, t, ERC20_IFACE, "balanceOf", [holder]).catch(() => null);
+    }
+  } else {
+    frozen = (await view(chain, ctx.gsm, GSM_IFACE, "getIsFrozen").catch(() => false))
+      || (await view(chain, ctx.gsm, GSM_IFACE, "getIsSeized").catch(() => false));
+    gsmLiq = await view(chain, ctx.gsm, GSM_IFACE, "getAvailableLiquidity").catch(() => null);
+    gsmExp = await view(chain, ctx.gsm, GSM_IFACE, "getAvailableUnderlyingExposure").catch(() => null);
+    st.frozen = frozen;
+    if (frozen) return;
+  }
+  for (const route of routes(chain, venue, ctx)) {
+    let r;
+    try { r = await route.eval(); } catch (e) { r = { out: null }; }
+    if (r.out == null) { st.noDex++; continue; }
+    if (r.need && stock[r.need.token.toLowerCase()] != null && BigInt(stock[r.need.token.toLowerCase()]) < r.need.amount) st.shortStock++;
+    if (r.needLiquidity != null && gsmLiq != null && BigInt(gsmLiq) < r.needLiquidity) st.shortStock++;
+    if (r.needExposure != null && gsmExp != null && BigInt(gsmExp) < r.needExposure) st.shortStock++;
+    const bps = Number(((r.out - r.x) * 100000n) / r.x) / 10;
+    const netUsd = Number(r.out - r.x) / 1e6 - gasUsd;
+    const rr = st.byRoute[route.key] || { bestBps: null, positives: 0, lastBps: null };
+    rr.lastBps = bps;
+    if (rr.bestBps == null || bps > rr.bestBps) rr.bestBps = bps;
+    st.byRoute[route.key] = rr;
+    if (netUsd > 0) {
+      rr.positives++;
+      if (st.maxNetUsd == null || netUsd > st.maxNetUsd) st.maxNetUsd = netUsd;
+      console.log(`[${venue}計測/機会 ${nowJst()}] ${chain} ${route.key}: 差${bps.toFixed(1)}bps 純利$${netUsd.toFixed(3)}`
+        + `(DEX ${r.label} / ガス$${gasUsd.toFixed(3)})。**送っていません**`);
+      track(st, chain, venue, route, gasUsd, netUsd).catch(() => {}); // 待たない(他の経路の計測を止めない)
     }
   }
 }
 
 export function startSparkMonitor(activeChains) {
   if (!ENABLED || !(INTERVAL_MS > 0)) return;
-  const chains = activeChains.filter((c) => PSMS[c]);
-  if (chains.length === 0) return;
-  console.log(`[Spark計測] ${INTERVAL_MS / 60000}分ごとに PSM と DEX のずれを読みます(${chains.join(",")})。**送信はしません**`);
+  const sparkChains = activeChains.filter((c) => PSMS[c]);
+  const ghoChains = activeChains.filter((c) => GSMS[c]);
+  if (sparkChains.length + ghoChains.length === 0) return;
+  console.log(`[Spark計測] ${INTERVAL_MS / 60000}分ごとに固定レートの交換所と DEX のずれを読みます`
+    + `(Spark: ${sparkChains.join(",") || "なし"} / GHO: ${ghoChains.join(",") || "なし"})。黒字なら何秒続くかも測ります。**送信はしません**`);
   const run = async () => {
-    for (const chain of chains) {
-      await measure(chain).catch((e) => console.warn(`[Spark計測] ${chain} 失敗 ${(e.shortMessage || e.message || "").slice(0, 80)}`));
+    for (const chain of sparkChains) {
+      if (!(await verifyPsm(chain, PSMS[chain]))) continue;
+      await measureVenue(chain, "Spark", PSMS[chain]).catch((e) => console.warn(`[Spark計測] ${chain} 失敗 ${(e.shortMessage || e.message || "").slice(0, 80)}`));
+    }
+    for (const chain of ghoChains) {
+      if (!(await verifyGsm(chain, GSMS[chain]))) continue;
+      await measureVenue(chain, "GHO", GSMS[chain]).catch((e) => console.warn(`[GHO計測] ${chain} 失敗 ${(e.shortMessage || e.message || "").slice(0, 80)}`));
     }
   };
   setTimeout(() => { run(); setInterval(run, INTERVAL_MS); }, 4 * 60 * 1000);
 }
 
-/// 生存ログ用。額ごとに「今回の差」と「これまでの最良」
+/// 生存ログ用。経路ごとに「今回の差」と「これまでの最良」、黒字のずれが続いた秒数
 export function formatSparkLine() {
   if (stats.size === 0) return "";
   const parts = [];
-  for (const [chain, st] of stats) {
-    const routes = Object.entries(st.byRoute)
+  for (const [k, st] of stats) {
+    const routesTxt = Object.entries(st.byRoute)
       .sort((x, y) => (y[1].bestBps ?? -1e9) - (x[1].bestBps ?? -1e9)).slice(0, 3)
-      .map(([k, r]) => `${k} 今${r.lastBps?.toFixed(1)}bps/最良${r.bestBps?.toFixed(1)}bps 黒字${r.positives}回`).join(" ");
-    parts.push(`${chain} 読み${st.reads}回 ${routes || "経路なし"}${st.shortStock ? ` 在庫不足${st.shortStock}` : ""}${st.noDex ? ` DEX経路なし${st.noDex}` : ""}${st.maxNetUsd != null ? ` 最大$${st.maxNetUsd.toFixed(3)}` : ""}`);
+      .map(([rk, r]) => `${rk} 今${r.lastBps?.toFixed(1)}bps/最良${r.bestBps?.toFixed(1)}bps 黒字${r.positives}回`).join(" ");
+    const d = st.durations.map((x) => x.sec).sort((a, b) => a - b);
+    const durTxt = d.length ? ` 続いた秒数[中央${Math.round(d[Math.floor(d.length / 2)])} 最短${Math.round(d[0])} ${d.length}件]` : "";
+    parts.push(`${k} 読み${st.reads}回${st.frozen ? " **停止中**" : ""} ${routesTxt || "経路なし"}${st.shortStock ? ` 在庫不足${st.shortStock}` : ""}`
+      + `${st.noDex ? ` DEX経路なし${st.noDex}` : ""}${st.maxNetUsd != null ? ` 最大$${st.maxNetUsd.toFixed(3)}` : ""}${durTxt}`);
   }
-  return ` Spark[${parts.join(" / ")}]`;
+  return ` 固定レート[${parts.join(" / ")}]`;
 }
