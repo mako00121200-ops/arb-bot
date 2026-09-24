@@ -109,7 +109,11 @@ async function verifyGsm(chain, g) {
     if (ok) g.usdc = String(under);
     verified.set(k, ok);
     return ok;
-  } catch (e) { return false; }
+  } catch (e) {
+    // 黙って失敗し続けないよう、理由を一度だけ出す(2026年9月24日、GHO の行が一度も出なかった)
+    if (!g.errLogged) { g.errLogged = true; console.warn(`[GHO計測] ${chain}: GSM の照合に失敗 ${(e.shortMessage || e.message || "").slice(0, 120)}`); }
+    return false;
+  }
 }
 
 /// 1本の経路を評価する関数を作る。戻り値の関数は { out, x, label, short } を返す(out=null は経路なし)

@@ -61,6 +61,9 @@ const COMET_IFACE = new ethers.Interface([
 ]);
 const ABSORB_TOPIC = COMET_IFACE.getEvent("AbsorbCollateral").topicHash;
 const BUY_TOPIC = COMET_IFACE.getEvent("BuyCollateral").topicHash;
+/// **読み取りが本当に働いているかの確かめ用**。清算が0件だった時に「無かった」のか「読めていない」のかを
+/// 分けるため、頻繁に起きる Supply(預け入れ)も一緒に数える(2026年9月24日、7日で清算0件と出たため)
+const SUPPLY_TOPIC = ethers.id("Supply(address,address,uint256)");
 /// 過去をどこまで遡るか(日)と、1回の巡回で投げる getLogs の上限
 const HISTORY_DAYS = parseInt(process.env.COMPOUND_MONITOR_HISTORY_DAYS || "7", 10);
 const LOG_REQUESTS_PER_TICK = 12;
@@ -189,7 +192,7 @@ async function scanEvents(chain, c, m) {
     const to = Math.min(latest, h.next + h.chunk - 1);
     let logs;
     try {
-      logs = await callWithRpc(chain, (p) => p.getLogs({ address: c.address, fromBlock: h.next, toBlock: to, topics: [[ABSORB_TOPIC, BUY_TOPIC]] }), false);
+      logs = await callWithRpc(chain, (p) => p.getLogs({ address: c.address, fromBlock: h.next, toBlock: to, topics: [[ABSORB_TOPIC, BUY_TOPIC, SUPPLY_TOPIC]] }), false);
     } catch (e) {
       n++;
       if (h.chunk > 500) { h.chunk = Math.floor(h.chunk / 2); continue; } // 範囲が広すぎると断られるので狭める
@@ -197,6 +200,7 @@ async function scanEvents(chain, c, m) {
     }
     n++;
     for (const log of logs.sort((x, y) => Number(x.blockNumber) - Number(y.blockNumber) || Number(x.index ?? x.logIndex) - Number(y.index ?? y.logIndex))) {
+      if (log.topics?.[0] === SUPPLY_TOPIC) { h.supplies = (h.supplies || 0) + 1; continue; }
       let ev; try { ev = COMET_IFACE.parseLog(log); } catch (e) { continue; }
       const asset = String(ev.args.asset).toLowerCase();
       const block = Number(log.blockNumber);
@@ -262,7 +266,7 @@ function formatHistory(key) {
   const dMed = med(h.delays), disc = med(h.buys.map((b) => b.discBps));
   const top = [...h.buyers.entries()].sort((a, b) => b[1] - a[1]);
   const topShare = outUsd > 0 && top.length ? Math.round((top[0][1] / outUsd) * 100) : null;
-  return ` 実績[遡り${done}%(${days.toFixed(1)}日) 清算で入った$${inUsd.toFixed(0)}(${h.absorbs.length}回) 買われた$${outUsd.toFixed(0)}(${h.buys.length}回 買い手${h.buyers.size}人${topShare != null ? ` 1位${topShare}%` : ""})`
+  return ` 実績[遡り${done}%(${days.toFixed(1)}日) 読めた預け入れ${h.supplies || 0}件 清算で入った$${inUsd.toFixed(0)}(${h.absorbs.length}回) 買われた$${outUsd.toFixed(0)}(${h.buys.length}回 買い手${h.buyers.size}人${topShare != null ? ` 1位${topShare}%` : ""})`
     + `${dMed != null ? ` 入ってから買われるまで中央${dMed}ブロック(約${Math.round(dMed * (BLOCK_SEC[chain] || 2))}秒)` : ""}`
     + `${disc != null ? ` 買い手の割引中央${disc.toFixed(0)}bps` : ""}]`;
 }
