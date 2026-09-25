@@ -39,6 +39,7 @@ import { runMainnetDepthSurvey } from "./scripts/mainnet-depth-survey.js";
 import { runMorphoSurvey, morphoSurveyChains } from "./scripts/morpho-liquidation-survey.js";
 import { runMorphoDeepdive, morphoDeepdiveChains } from "./scripts/morpho-lag-deepdive.js";
 import { runChainMoveSurvey, chainMoveSurveyEnabled } from "./scripts/chain-move-survey.js";
+import { runWoofiForensics, woofiForensicsEnabled } from "./scripts/woofi-forensics.js";
 import { runWickBacktestAll, wickBacktestSymbols } from "./scripts/wick-backtest.js";
 import { startMainnetEdgeWatch, formatMainnetEdgeLine, flushMainnetEdge } from "./scripts/mainnet-edge-watch.js";
 import { getRealExecutionStats } from "./scripts/real-execution-log.js";
@@ -2784,7 +2785,11 @@ async function main() {
   if (chainMoveSurveyEnabled()) {
     runChainMoveSurvey().catch((e) => console.error("[チェーン値動き調査] 失敗:", e.message));
   }
-
+  // WOOFi の黒字のずれを過去のブロックで再現する(読み取りのみ。RUN_WOOFI_FORENSICS=true の時だけ1回)
+  if (woofiForensicsEnabled()) {
+    // 起動直後の混雑を避けて2分後に(RPC の枠を本番と取り合わない)
+    setTimeout(() => runWoofiForensics().catch((e) => console.error("[WOOFi再現] 失敗:", e.message)), 2 * 60 * 1000);
+  }
 
   // **「ロスカットの急落を買って戻ったら売る」を過去データで検証する**(オーナーの案)。
   // Binance の無料の公開ダンプ(1分足)を読んで計算するだけ。**取引も送金もしない。**
