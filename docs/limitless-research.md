@@ -11,7 +11,7 @@
 | 論点 | 結論 |
 |---|---|
 | 日本から行えるか | **技術的・規約的には可能**(日本は禁止国リストに無い、KYC無し、ウォレットとAPIキーだけ)。ただし**法的にはグレー**で、利用者側に賭博罪リスクが残る。詳細は §1 |
-| バイナンス/バイバイで先読みできるか | **「オラクルの先読み」としては使えない**。決済オラクル(Pyth Pro)の対Binance遅延は p99 で約70ms、時にマイナス。**板の気配より速い情報源にはならない**。ただし**σ推定・板の厚み・約定フロー**の材料としては必須。詳細は §2 |
+| バイナンス/バイバイで先読みできるか | **【9/25訂正】1時間市場は Binance の足が決済そのもの**なので、Binance の kline/約定ストリームが決済変数を直接くれる(オラクルとの基差リスクがゼロ)。5分/15分市場は Chainlink 60秒TWAP で、こちらは Binance を見ても先読みにはならない。§12 |
 | 速度は影響するか | **する。ただし「テイク速度」ではなく「キャンセル速度」**。Limitlessには**テイカー・ディレイ(速度制限)**が実装されており、テイカーの一撃必殺は構造的に潰されている。**有利な席はメイカー側**。詳細は §3 |
 | 運営の判定方法 | **Pyth Pro(旧Lazer)の BTC/USD を毎時ちょうどに1点サンプリング**し、前の時刻より「厳密に高ければ Up、それ以外は Down」。同値は Down。短期クリプト市場は Chainlink Data Streams も併用。詳細は §4 |
 | 一番利益が出そうな戦略 | **①寄り付きのオラクル乖離を取る → ②理論価格モデルによるメイカー専業(手数料0 + リベート + LP報酬)**。ラストセカンドのスナイピングは本命にしない。詳細は §6 |
@@ -419,3 +419,46 @@ p_up = Φ( ln(S_t / openPrice) / (σ * sqrt(τ)) )
 第2段階($200〜500) 記録簿・答え合わせ・段階上限を index.js から移植し、1市場だけメイカー指値
 第3段階           1・2が黒なら市場数と資金を段階的に増やす。ダッシュボードを共通化
 ```
+
+---
+
+## 12. 【重要な訂正】決済ルールの実測(2026年9月25日)
+
+Railway で collector を動かし、市場JSONの `description` と `metadata` を読んだ。
+§4 に書いた「Pyth Pro を毎時1点サンプリング、同値は Down」は **2026年7月時点の旧市場(`btc-up-or-down-hourly-<秒>`)のルール**で、**現在の市場は種別ごとに別のルール**だった。
+
+### 1時間市場 `btc-up-or-down-hourly-p-<ミリ秒>` / `eth-…`
+
+> This market will resolve to "Up" if the close price is greater than or equal to the open price for the **BTC/USDT 1 hour candle** that begins on the time and date specified in the title. Otherwise "Down". **The resolution source for this market is information from Binance, specifically the BTC/USDT pair.** The close « C » and open « O » displayed at the top of the graph for the relevant "1H" candle will be used once the data for that candle is finalized.
+
+- 決済ソースは **Binance の1時間足**。オラクルではない
+- 行使価格 = `metadata.openPrice`(足の始値、例 `84610.74`)、開始時刻 = `startAt`
+- **同値(終値 = 始値)は Up**
+- slug の数字は市場の**作成時刻**(ミリ秒)で、時刻に揃っていない。開始時刻は `startAt` から取る
+
+### 5分・15分市場 `btc-up-or-down-5-min-<秒>` / `-15-min-`
+
+> "Up" if the **Chainlink BTC/USD 60-second TWAP** at 02:30 UTC is **greater than or equal to** the Price to Beat captured from the same TWAP at 02:15 UTC. Otherwise "Down". The report at the exact resolution time is used first. If it is unavailable, the first Chainlink observation within the following 5 seconds will be used. If no report exists in that window, the market will not resolve automatically.
+
+- 決済ソースは **Chainlink Data Streams の60秒TWAP**(`metadata.chainlinkDataStream.twapWindowSeconds = 60`)
+- 行使価格 = `metadata.openPrice`(開始時のTWAP、18桁の文字列)
+- **同値は Up**
+- Limitless の WS `oraclePriceData`(`source: "chainlink"`)で**この決済値そのもの**が流れてくる(実測)。決済は満期の約60秒後(5分市場 02:20 満期 → 02:21:03 決済)
+
+### これで変わること
+
+| 論点 | 訂正前 | 訂正後 |
+|---|---|---|
+| Binance の使い道 | σと板の材料だけ | **1時間市場では決済変数そのもの**。`kline_1h` の終値がそのまま答え。基差リスクゼロ |
+| 寄り付きの「ヒゲ」仮説(戦略A) | 1点サンプリングのヒゲ | 1時間市場: 足の始値は Binance の最初の約定なので**ヒゲはほぼ無い**。5分/15分市場: 60秒TWAPなので**さらに平滑**。戦略Aの根拠は弱まった。ただし TWAP は実勢より約30秒遅れるので、**開始直後は「TWAP(=行使価格) vs 実勢」に系統的なズレ**が出る。これが新しい仮説 |
+| 満期直前の確からしさ | 1点サンプリングなので最後の1秒まで不確実 | **5分/15分市場は TWAP なので、満期30秒前には決済値の半分が確定している**。残り t 秒の不確実性は 1点モデルより小さく、理論価格は今の `Φ(ln(S/K)/(σ√τ))` より鋭くなる。**TWAP を明示的に扱う価格モデルが次の一手** |
+| 同値 | Down | **Up**(YES側に微小な有利) |
+| 決済遅延 | 即時 | 5分市場で満期後約60秒。資金の回転に効く |
+
+### collector 側の対応(実装済み)
+
+- 行使価格を `metadata.openPrice`、開始時刻を `startAt` から読む
+- 参照価格の優先: 1時間市場 = Binance 約定、5分/15分 = Limitless の Chainlink TWAP
+- σは Binance の約定だけから推定(TWAPと混ぜると基差が偽の収益率になり、0.93%と過大に出ていた)
+- Pyth Hermes は 401(キー必須)だったので既定で無効
+- 記録量: 板は市場ごとに秒1回、理論価格は寄り付き60秒と満期前120秒だけ毎秒。前日分は gzip、14日で削除
