@@ -24,12 +24,17 @@
 //   BINANCE_WS_URL      既定 wss://data-stream.binance.vision/stream (空文字で無効化)
 //   KEEP_DAYS           JSONL を何日分残すか。既定 14(前日分は gzip される)
 //   MIN_FREE_MB         空き容量がこれを下回ったら記録を止める。既定 50
+//   BASE_RPC_URL        Base の RPC。設定するとオンチェーンの約定(誰が・いつ・いくらで)を読む。未設定なら読まない
+//   EVENTS_INTERVAL_MS  公開の市場イベント(/markets/{slug}/events)の取得間隔。既定 20000。0 で無効
+//   LATENCY_PROBE_MS    HTTP往復の計測間隔。既定 15000
 
 import { io } from 'socket.io-client';
 import WebSocket from 'ws';
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import { LatencyStats } from './latency.js';
+import { startChainWatcher, decodeOrderFilled, TOPICS } from './onchain.js';
 
 const env = (k, d) => (process.env[k] === undefined || process.env[k] === '' ? d : process.env[k]);
 const API_URL = env('LIMITLESS_API_URL', 'https://api.limitless.exchange').replace(/\/$/, '');
@@ -133,6 +138,10 @@ let stream = null;
 let streamDate = null;
 const KEEP_DAYS = Number(env('KEEP_DAYS', 14));
 const MIN_FREE_MB = Number(env('MIN_FREE_MB', 50));
+const BASE_RPC_URL = process.env.BASE_RPC_URL ?? '';
+const EVENTS_INTERVAL_MS = Number(env('EVENTS_INTERVAL_MS', 20000));
+const LATENCY_PROBE_MS = Number(env('LATENCY_PROBE_MS', 15000));
+const latency = new LatencyStats();
 let lowDiskWarnedAt = 0;
 // 前日分を gzip し、KEEP_DAYS より古いファイルを消す(失敗しても記録は止めない)
 function rotateFiles(prevDate) {
@@ -220,6 +229,21 @@ const refs = Object.fromEntries(ASSETS.map((a) => [a, {
 }]));
 // slug -> 市場
 const markets = new Map();
+// tokenId -> { slug, outcome }、conditionId -> slug(オンチェーンの約定を市場に結びつける)。決済後も当日中は残す
+const tokenIndex = new Map();
+const conditionIndex = new Map();
+function resolveToken(tokenId) {
+  const hit = tokenIndex.get(String(tokenId));
+  if (!hit) return null;
+  const m = markets.get(hit.slug);
+  return { slug: hit.slug, outcome: hit.outcome, kind: m?.kind ?? hit.kind ?? null, expiryTs: m?.expiryTs ?? hit.expiryTs ?? null, openPrice: m?.openPrice ?? null };
+}
+function resolveCondition(conditionId) {
+  const slug = conditionIndex.get(String(conditionId).toLowerCase());
+  if (!slug) return null;
+  const m = markets.get(slug);
+  return { slug, kind: m?.kind ?? null };
+}
 let socket = null;
 
 // 市場の種別で参照価格の優先順位を変える。
@@ -247,10 +271,43 @@ function bookSummary(m) {
 }
 
 // ---------------------------------------------------------------- Limitless REST
-async function getJson(pathname) {
+async function getJson(pathname, latencyKey = null) {
+  const t0 = Date.now();
   const res = await fetch(API_URL + pathname, { headers: { accept: 'application/json' } });
+  if (latencyKey) latency.push(latencyKey, Date.now() - t0);
   if (!res.ok) throw new Error(`${res.status} ${pathname}`);
   return res.json();
+}
+// 「注文を送れる速さ」の代理指標: 板の取得(小さいGET)の往復時間を定期的に測る。
+// 注文APIは署名付きPOSTなので実測はもう少し遅くなるが、ネットワーク距離はこれで分かる
+async function latencyProbe() {
+  const m = [...markets.values()].find((x) => !x.resolved);
+  if (!m) return;
+  try { await getJson(`/markets/${m.slug}/orderbook`, 'http_orderbook'); } catch (e) { writeRow('error', { where: 'latencyProbe', msg: e.message }); }
+}
+// 公開の市場イベント(ORDER_PLACED 等)。誰が・どんな注文を出したかが取れるかは中身次第なので、まず生で貯める
+const seenEventIds = new Map(); // slug -> Set
+async function pollMarketEvents() {
+  for (const m of markets.values()) {
+    if (m.resolved) continue;
+    try {
+      const res = await getJson(`/markets/${m.slug}/events?page=1&limit=50`, 'http_events');
+      logRawOnce('rest:events', res);
+      const events = Array.isArray(res?.events) ? res.events : Array.isArray(res) ? res : [];
+      const seen = seenEventIds.get(m.slug) ?? new Set();
+      for (const ev of events) {
+        const key = ev?.id ?? `${ev?.type}:${ev?.timestamp}:${JSON.stringify(ev?.data ?? {}).slice(0, 80)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        writeRow('mevent', { slug: m.slug, id: ev?.id ?? null, kind: ev?.type ?? null, srcTs: normTs(ev?.timestamp), data: ev?.data ?? ev });
+        logRawOnce(`rest:events:${ev?.type ?? 'unknown'}`, ev);
+      }
+      seenEventIds.set(m.slug, seen);
+    } catch (e) {
+      writeRow('error', { where: 'marketEvents', msg: e.message });
+    }
+  }
+  for (const slug of seenEventIds.keys()) if (!markets.has(slug)) seenEventIds.delete(slug);
 }
 
 // 種別文字列から市場の長さ(秒)を出す。hourly-p / hourly → 3600、5-min → 300
@@ -354,7 +411,13 @@ async function refreshMarket(m) {
     const openPriceWasNull = m.openPrice === null;
     Object.assign(m, { asset: p.asset ?? m.asset, kind: p.kind ?? m.kind, openTs: p.openTs ?? m.openTs, expiryTs: p.expiryTs ?? m.expiryTs, pythId: p.pythId ?? m.pythId, status: p.status, winningIndex: p.winningIndex, resolutionSource: p.resolutionSource ?? m.resolutionSource });
     if (p.openPrice !== null) { m.openPrice = p.openPrice; m.openPriceSrc = 'api'; }
-    writeRow('market', { slug: m.slug, ...p });
+    // オンチェーンの約定を市場に結びつけるための索引
+    const yes = raw.tokens?.yes ?? raw.outcomeTokens?.[0] ?? null;
+    const no = raw.tokens?.no ?? raw.outcomeTokens?.[1] ?? null;
+    if (yes) tokenIndex.set(String(yes), { slug: m.slug, outcome: 'YES', kind: m.kind, expiryTs: m.expiryTs });
+    if (no) tokenIndex.set(String(no), { slug: m.slug, outcome: 'NO', kind: m.kind, expiryTs: m.expiryTs });
+    if (raw.conditionId) { m.conditionId = String(raw.conditionId).toLowerCase(); conditionIndex.set(m.conditionId, m.slug); }
+    writeRow('market', { slug: m.slug, ...p, tokens: raw.tokens ?? null, conditionId: raw.conditionId ?? null, venue: raw.venue ?? null });
     if (openPriceWasNull && m.openPrice !== null) console.log(`[市場] ${m.slug} 始値確定 ${m.openPrice}`);
     if (m.asset && m.pythId && !PYTH_FEED_IDS[m.asset]) PYTH_FEED_IDS[m.asset] = m.pythId;
   } catch (e) {
@@ -386,7 +449,7 @@ function applyBook(m, ob, src) {
 async function discover() {
   let list;
   try {
-    list = await getJson('/markets/active/slugs');
+    list = await getJson('/markets/active/slugs', 'http_active_slugs');
   } catch (e) {
     writeRow('error', { where: 'discover', msg: e.message });
     return;
@@ -432,6 +495,8 @@ function connectLimitlessWs() {
   socket.on('orderbookUpdate', (d) => {
     logRawOnce('ws:orderbookUpdate', d);
     const m = markets.get(d?.marketSlug);
+    const st = normTs(d?.timestamp);
+    if (st) latency.push('ws_book_lag', Date.now() - st);
     if (m) applyBook(m, d, 'ws');
   });
   socket.on('oraclePriceData', (d) => {
@@ -440,6 +505,7 @@ function connectLimitlessWs() {
     const asset = m?.asset ?? null;
     const price = Number(d?.value);
     const t = normTs(d?.timestamp) ?? Date.now();
+    if (Number.isFinite(t)) latency.push('ws_oracle_lag', Date.now() - t);
     writeRow('oracle', { slug: d?.marketSlug ?? null, asset, price, srcTs: t, source: d?.source ?? null, marketAddress: d?.marketAddress ?? null });
     // APIに始値が無い市場: 開始時刻から±15秒以内で最初に届いたオラクル値を行使価格にする
     if (m && m.openPrice === null && m.openTs && Number.isFinite(price) && Math.abs(t - m.openTs) <= 15000) {
@@ -540,6 +606,7 @@ function runBinance() {
       const price = Number(d?.p);
       if (!asset || !Number.isFinite(price)) return;
       const t = normTs(d?.T) ?? Date.now();
+      if (d?.E) latency.push('binance_lag', Date.now() - Number(d.E));
       refs[asset].cex = { price, t: Date.now() };
       refs[asset].sigma.push(price, t);
       // 約定は多いので記録は秒に1回まで
@@ -631,7 +698,11 @@ async function pollExpired() {
     if (m.winningIndex === 0 || m.winningIndex === 1) finishMarket(m, m.winningIndex, 'rest');
   }
   // 決済から1時間経った市場は忘れる
-  for (const [slug, m] of markets) if (m.resolved && now - m.resolved.t > 3600000) markets.delete(slug);
+  for (const [slug, m] of markets) if (m.resolved && now - m.resolved.t > 3600000) {
+    markets.delete(slug);
+    for (const [k, v] of tokenIndex) if (v.slug === slug) tokenIndex.delete(k);
+    if (m.conditionId) conditionIndex.delete(m.conditionId);
+  }
 }
 
 function heartbeat() {
@@ -642,7 +713,8 @@ function heartbeat() {
     return `${a}: ${r ? `${r.price.toFixed(1)}(${r.src})` : '参照なし'} σ1h=${s === null ? `推定中(${refs[a].sigma.n}件)` : (s * 100).toFixed(3) + '%'}`;
   }).join(' / ');
   console.log(`[生存] 監視中=${active.length}件 ${active.join(',')} | ${refLine} | 記録=${JSON.stringify(counts)}`);
-  writeRow('heartbeat', { active, counts: { ...counts } });
+  console.log(`[遅延] ${latency.format()}`);
+  writeRow('heartbeat', { active, counts: { ...counts }, latency: latency.summary() });
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -696,6 +768,16 @@ async function selftest() {
   await new Promise((r) => ensureStream().end(r));
   const back = fs.readFileSync(path.join(DATA_DIR, `${new Date().toISOString().slice(0, 10)}.jsonl`), 'utf8').trim();
   if (JSON.parse(back).t !== row.t) fails.push('writeRow');
+  // 遅延統計
+  const ls = new LatencyStats();
+  for (let i = 1; i <= 100; i++) ls.push('x', i);
+  const sm = ls.summary().x;
+  if (!sm || sm.n !== 100 || sm.p50 !== 50 || sm.p95 !== 95 || sm.max !== 100) fails.push(`LatencyStats ${JSON.stringify(sm)}`);
+  // OrderFilled の decode(maker が USDC 12.5 を出して YES 25枚を買った = 価格 0.50)
+  const { AbiCoder, zeroPadValue } = await import('ethers');
+  const data = AbiCoder.defaultAbiCoder().encode(['uint256', 'uint256', 'uint256', 'uint256', 'uint256'], [0n, 123n, 12_500_000n, 25_000_000n, 50_000n]);
+  const of = decodeOrderFilled({ topics: [TOPICS.OrderFilled, '0x' + '11'.repeat(32), zeroPadValue('0x' + 'ab'.repeat(20), 32), zeroPadValue('0x' + 'cd'.repeat(20), 32)], data });
+  if (of.makerSide !== 'BUY' || of.tokenId !== '123' || of.price !== 0.5 || of.shares !== 25 || of.feeUsdc !== 0.05 || !/^0xAbAb/i.test(of.maker)) fails.push(`decodeOrderFilled ${JSON.stringify(of)}`);
   if (fails.length) { console.error('自己診断 失敗:', fails); process.exit(1); }
   console.log('自己診断 OK');
 }
@@ -713,6 +795,14 @@ async function main() {
   setInterval(theoTick, THEO_INTERVAL_MS);
   setInterval(() => pollExpired().catch((e) => writeRow('error', { where: 'pollExpired', msg: e.message })), 60000);
   setInterval(heartbeat, 5 * 60000);
+  if (LATENCY_PROBE_MS > 0) setInterval(latencyProbe, LATENCY_PROBE_MS);
+  if (EVENTS_INTERVAL_MS > 0) setInterval(() => pollMarketEvents().catch((e) => writeRow('error', { where: 'events-loop', msg: e.message })), EVENTS_INTERVAL_MS);
+  if (BASE_RPC_URL) {
+    console.log('[チェーン] Base の約定・払い戻しの監視を開始');
+    startChainWatcher({ rpcUrl: BASE_RPC_URL, writeRow, logRawOnce, resolveToken, resolveCondition, onLatency: (k, ms) => latency.push(k, ms) });
+  } else {
+    console.log('[チェーン] BASE_RPC_URL が未設定なのでオンチェーンの約定は読まない');
+  }
   heartbeat();
 }
 
