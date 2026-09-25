@@ -52,12 +52,16 @@ class Acc {
     this.bPoint += (r.p - y) ** 2;
     if (pTwap !== null && Number.isFinite(pTwap)) { this.nTwap++; this.bTwap += (pTwap - y) ** 2; }
     if (opp) this.opp++;
-    if (r.bookAgeMs !== null && r.bookAgeMs !== undefined) { this.ageSum += r.bookAgeMs; this.ageN++; if (r.bookAgeMs > 30000) this.stale = (this.stale || 0) + 1; }
+    if (r.bookAgeMs !== null && r.bookAgeMs !== undefined) {
+      this.ageSum += r.bookAgeMs; this.ageN++; if (r.bookAgeMs > 30000) this.stale = (this.stale || 0) + 1;
+      // 直近1時間だけの鮮度(購読の修正が効いているかを見る)
+      if (r.t >= Date.now() - 3600000) { this.recentN = (this.recentN || 0) + 1; if (r.bookAgeMs > 30000) this.recentStale = (this.recentStale || 0) + 1; }
+    }
   }
   out() {
     const d = (a, b) => (b ? +(a / b).toFixed(4) : null);
     return { n: this.n, brierMid: d(this.bMid, this.nMid), brierPoint: d(this.bPoint, this.n), brierTwap: d(this.bTwap, this.nTwap), oppRate: d(this.opp, this.n),
-      twoSided: d(this.twoSided, this.n), oneSided: d(this.oneSided, this.n), empty: d(this.empty, this.n), extreme: d(this.extreme, this.nMid), midRight: d(this.midRight, this.nMid), bookAgeMs: this.ageN ? Math.round(this.ageSum / this.ageN) : null, stale: d(this.stale || 0, this.ageN) };
+      twoSided: d(this.twoSided, this.n), oneSided: d(this.oneSided, this.n), empty: d(this.empty, this.n), extreme: d(this.extreme, this.nMid), midRight: d(this.midRight, this.nMid), bookAgeMs: this.ageN ? Math.round(this.ageSum / this.ageN) : null, stale: d(this.stale || 0, this.ageN), recentStale: this.recentN ? d(this.recentStale || 0, this.recentN) : null, recentN: this.recentN || 0 };
   }
 }
 
@@ -188,16 +192,16 @@ export async function runBacktest({ dataDir, days = 3 }) {
 export function formatBacktest(rep) {
   const f = (v) => (v === null || v === undefined ? '-' : v);
   const lines = [`[検証] 対象=${rep.days}日分 行数=${rep.rows.toLocaleString()} 5分/15分市場=${rep.short.markets}件 1時間市場=${rep.hourly.markets}件 (Brier: 小さいほど当たる。板=中値、1点=今の理論、TWAP=案1)`];
-  lines.push('  案1 5分/15分 満期前(残り秒) | 行数 | 板 | 1点 | TWAP | 2¢超 | 両側板 | 片側 | 空 | 板が0.98超 | 板の正解率 | 板の鮮度ms | 30秒超の古さ');
-  for (const [k, v] of Object.entries(rep.short.buckets)) lines.push(`    ${k.padEnd(10)} | ${String(v.n).padStart(6)} | ${f(v.brierMid)} | ${f(v.brierPoint)} | ${f(v.brierTwap)} | ${f(v.oppRate)} | ${f(v.twoSided)} | ${f(v.oneSided)} | ${f(v.empty)} | ${f(v.extreme)} | ${f(v.midRight)} | ${f(v.bookAgeMs)} | ${f(v.stale)}`);
+  lines.push('  案1 5分/15分 満期前(残り秒) | 行数 | 板 | 1点 | TWAP | 2¢超 | 両側板 | 片側 | 空 | 板が0.98超 | 板の正解率 | 板の鮮度ms | 30秒超の古さ | 直近1hの古さ(行数)');
+  for (const [k, v] of Object.entries(rep.short.buckets)) lines.push(`    ${k.padEnd(10)} | ${String(v.n).padStart(6)} | ${f(v.brierMid)} | ${f(v.brierPoint)} | ${f(v.brierTwap)} | ${f(v.oppRate)} | ${f(v.twoSided)} | ${f(v.oneSided)} | ${f(v.empty)} | ${f(v.extreme)} | ${f(v.midRight)} | ${f(v.bookAgeMs)} | ${f(v.stale)} | ${f(v.recentStale)}(${v.recentN})`);
   for (const x of rep.samples) lines.push(`    見本: ${x.slug} 残り${x.tau}s 買${x.bid}/売${x.ask} 中値${x.mid} 1点${x.pPoint} TWAP${x.pTwap} S=${x.S} K=${x.K} 結果=${x.up ? 'Up' : 'Down'} 鮮度=${x.bookAgeMs}ms`);
   for (const [k, d] of Object.entries(rep.fillDist)) lines.push(`    約定の満期前分布(${k === 'short' ? '5分/15分' : '1時間'}): ` + Object.entries(d).map(([b, v]) => `${b}=${v.n}件/$${Math.round(v.usdc)}`).join(' '));
   for (const [k, v] of Object.entries(rep.makerByBucket)) lines.push(`    メイカー模擬 ${k}: 合図=${v.signals} 約定近似=${v.filled} 損益=${v.pnl.toFixed(3)}/株 勝率=${v.filled ? Math.round(v.wins / v.filled * 100) : '-'}%`);
   const t = rep.short.taker, mk = rep.short.maker.twap;
   lines.push(`    テイカー(2¢超で1回): TWAP n=${t.twap.n} 損益=${t.twap.pnl.toFixed(3)}/株 勝率=${t.twap.n ? Math.round(t.twap.wins / t.twap.n * 100) : '-'}% | 1点 n=${t.point.n} 損益=${t.point.pnl.toFixed(3)}/株 勝率=${t.point.n ? Math.round(t.point.wins / t.point.n * 100) : '-'}%`);
   lines.push(`    メイカー(確率−3¢に指値): 合図=${mk.signals} 約定近似=${mk.filled} 損益=${mk.pnl.toFixed(3)}/株 勝率=${mk.filled ? Math.round(mk.wins / mk.filled * 100) : '-'}%`);
-  lines.push('  案2 1時間 満期前(残り秒) | 行数 | 板 | 1点 | 2¢超 | 両側板 | 片側 | 空 | 板の正解率 | 板の鮮度ms | 30秒超の古さ');
-  for (const [k, v] of Object.entries(rep.hourly.buckets)) lines.push(`    ${k.padEnd(10)} | ${String(v.n).padStart(6)} | ${f(v.brierMid)} | ${f(v.brierPoint)} | ${f(v.oppRate)} | ${f(v.twoSided)} | ${f(v.oneSided)} | ${f(v.empty)} | ${f(v.midRight)} | ${f(v.bookAgeMs)} | ${f(v.stale)}`);
+  lines.push('  案2 1時間 満期前(残り秒) | 行数 | 板 | 1点 | 2¢超 | 両側板 | 片側 | 空 | 板の正解率 | 板の鮮度ms | 30秒超の古さ | 直近1hの古さ(行数)');
+  for (const [k, v] of Object.entries(rep.hourly.buckets)) lines.push(`    ${k.padEnd(10)} | ${String(v.n).padStart(6)} | ${f(v.brierMid)} | ${f(v.brierPoint)} | ${f(v.oppRate)} | ${f(v.twoSided)} | ${f(v.oneSided)} | ${f(v.empty)} | ${f(v.midRight)} | ${f(v.bookAgeMs)} | ${f(v.stale)} | ${f(v.recentStale)}(${v.recentN})`);
   const h = rep.hourly.taker.point, hm = rep.hourly.maker.point;
   lines.push(`    テイカー(2¢超で1回): n=${h.n} 損益=${h.pnl.toFixed(3)}/株 勝率=${h.n ? Math.round(h.wins / h.n * 100) : '-'}%`);
   lines.push(`    メイカー(確率−3¢に指値): 合図=${hm.signals} 約定近似=${hm.filled} 損益=${hm.pnl.toFixed(3)}/株 勝率=${hm.filled ? Math.round(hm.wins / hm.filled * 100) : '-'}%`);
