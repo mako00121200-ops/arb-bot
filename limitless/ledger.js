@@ -39,17 +39,21 @@ export class FillLedger {
   }
   // 市場の結果を当てて損益を確定する。up=1 なら YES 勝ち
   resolve(slug, up) {
-    if (up !== 0 && up !== 1) return 0;
-    let n = 0;
+    if (up !== 0 && up !== 1) return [];
+    const done = [];
     for (const r of this.fills) {
       if (r.slug !== slug || r.up !== null) continue;
       const win = (r.outcome === 'YES') === (up === 1);
       const gross = r.side === 'BUY' ? (win ? r.shares * (1 - r.price) : -r.shares * r.price) : (win ? -r.shares * (1 - r.price) : r.shares * r.price);
       r.up = up;
       r.pnl = gross - r.fee;
-      n++;
+      done.push(r);
     }
-    return n;
+    return done;
+  }
+  // 最近の約定(新しい順)
+  recent(n = 50) {
+    return this.fills.slice(-n).reverse().map((r) => ({ ...r, name: this.names.get(r.owner) ?? null }));
   }
   prune() {
     const cutoff = Date.now() - this.keepMs;

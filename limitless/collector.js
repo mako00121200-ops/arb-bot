@@ -27,6 +27,8 @@
 //   BASE_RPC_URL        Base の RPC。設定するとオンチェーンの約定(誰が・いつ・いくらで)を読む。未設定なら読まない
 //   EVENTS_INTERVAL_MS  公開の市場イベント(/markets/{slug}/events)の取得間隔。既定 20000。0 で無効
 //   LATENCY_PROBE_MS    HTTP往復の計測間隔。既定 15000
+//   PORT                ダッシュボードの待受ポート。既定 8080(Railway のドメインは 8080 に向けてある)
+//   DASHBOARD_TOKEN     設定すると画面に ?token=… が要る。未設定なら誰でも見られる(読み取り専用)
 
 import { io } from 'socket.io-client';
 import WebSocket from 'ws';
@@ -36,6 +38,8 @@ import zlib from 'node:zlib';
 import { LatencyStats } from './latency.js';
 import { startChainWatcher, decodeOrderFilled, TOPICS, CONTRACTS } from './onchain.js';
 import { FillLedger, formatLeader } from './ledger.js';
+import { Stats, EDGE_LABELS } from './stats.js';
+import { startServer } from './server.js';
 
 const env = (k, d) => (process.env[k] === undefined || process.env[k] === '' ? d : process.env[k]);
 const API_URL = env('LIMITLESS_API_URL', 'https://api.limitless.exchange').replace(/\/$/, '');
@@ -145,6 +149,9 @@ const LATENCY_PROBE_MS = Number(env('LATENCY_PROBE_MS', 15000));
 const latency = new LatencyStats();
 const ledger = new FillLedger({ exchangeAddresses: CONTRACTS.exchanges });
 const LEADER_REPORT_MS = Number(env('LEADER_REPORT_MS', 3600000));
+const PORT = Number(env('PORT', 8080));
+const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN ?? '';
+const stats = new Stats({ dataDir: DATA_DIR, keepDays: 14 });
 let lowDiskWarnedAt = 0;
 // 前日分を gzip し、KEEP_DAYS より古いファイルを消す(失敗しても記録は止めない)
 function rotateFiles(prevDate) {
@@ -193,6 +200,7 @@ function writeRow(type, obj) {
     const last = errorLastShown.get(obj.where) ?? 0;
     if (row.t - last > 5 * 60000) { errorLastShown.set(obj.where, row.t); console.error(`[エラー] ${obj.where}: ${obj.msg}`); }
   }
+  try { stats.onRow(type, row); } catch (e) { console.error('[集計失敗]', e.message); }
   try {
     if (diskOk()) ensureStream().write(JSON.stringify(row) + '\n');
   } catch (e) {
@@ -675,6 +683,30 @@ function theoTick() {
   }
 }
 
+// 画面(/api/state)に渡す状態
+function getState() {
+  const now = Date.now();
+  const active = [...markets.values()].filter((m) => !m.resolved && m.expiryTs).sort((a, b) => a.expiryTs - b.expiryTs).map((m) => {
+    const ref = m.asset ? pickRef(m.asset, m.kind) : null;
+    const tauSec = Math.max(0, Math.round((m.expiryTs - now) / 1000));
+    const th = ref && m.openPrice !== null ? theoUp(ref.price, m.openPrice, sigmaFor(m.asset), tauSec) : null;
+    const bs = bookSummary(m);
+    return { slug: m.slug, kind: m.kind, K: m.openPrice, S: ref?.price ?? null, src: ref?.src ?? null, tauSec, pTheo: th?.p ?? null, z: th?.z ?? null, bid: bs?.bid ?? null, ask: bs?.ask ?? null,
+      edgeBuyYes: th && bs?.ask !== null && bs?.ask !== undefined ? th.p - bs.ask : null, edgeSellYes: th && bs?.bid !== null && bs?.bid !== undefined ? bs.bid - th.p : null };
+  });
+  const todayKey = new Date().toISOString().slice(0, 10);
+  const days = Object.keys(stats.days).sort().slice(-14).map((date) => ({ date, ...stats.days[date], addr: undefined }));
+  const today = stats.days[todayKey] ?? { markets: {}, edge: new Array(EDGE_LABELS.length).fill(0), theoRows: 0, fills: 0 };
+  return {
+    now, startedAt: stats.startedAt, assets: ASSETS, counts,
+    latency: latency.summary(), latencyHistory: stats.latency,
+    markets: active, days, today: { markets: today.markets, edge: today.edge, theoRows: today.theoRows, fills: today.fills }, edgeLabels: EDGE_LABELS,
+    lead24: ledger.report({ hours: 24, top: 15 }), lead7: stats.leaderboard(7, 15, ledger.names),
+    recentSummaries: stats.recentSummaries, recentFills: ledger.recent(50),
+    sigma: Object.fromEntries(ASSETS.map((a) => [a, refs[a].sigma.sigma1h()])),
+  };
+}
+
 // 直近24時間で「誰が勝っているか」。損益が確定した約定だけで集計する
 function leaderReport() {
   const r = ledger.report({ hours: 24, top: 10 });
@@ -691,7 +723,8 @@ function finishMarket(m, winningIndex, via) {
   m.resolved = { winningIndex, via, t: Date.now() };
   const up = winningIndex === 0 ? 1 : winningIndex === 1 ? 0 : null; // YES(=0) が Up
   const settled = ledger.resolve(m.slug, up);
-  if (settled) console.log(`[台帳] ${m.slug} の約定${settled}件の損益を確定`);
+  for (const r of settled) stats.onResolvedFill(r);
+  if (settled.length) console.log(`[台帳] ${m.slug} の約定${settled.length}件の損益を確定`);
   const s5 = m.snapshots[5] ?? null;
   const openGapBps = s5 && m.openPrice ? Math.log(s5.S / m.openPrice) * 1e4 : null;
   const summary = {
@@ -807,10 +840,20 @@ async function selftest() {
   const lg = new FillLedger({ exchangeAddresses: ['0x05c748E2f4DcDe0ec9Fa8DDc40DE6b867f923fa5'] });
   lg.addFill({ maker: '0xAAAA000000000000000000000000000000000001', taker: '0x05c748E2f4DcDe0ec9Fa8DDc40DE6b867f923fa5', slug: 'm', outcome: 'YES', kind: '5-min', makerSide: 'BUY', price: 0.4, shares: 10, usdc: 4, feeUsdc: 0.02, secToExpiry: 30, blockTime: Date.now() });
   lg.addFill({ maker: '0xBBBB000000000000000000000000000000000002', taker: '0xAAAA000000000000000000000000000000000001', slug: 'm', outcome: 'NO', kind: '5-min', makerSide: 'BUY', price: 0.6, shares: 10, usdc: 6, feeUsdc: 0, secToExpiry: 30, blockTime: Date.now() });
-  if (lg.resolve('m', 1) !== 2) fails.push('ledger resolve');
+  if (lg.resolve('m', 1).length !== 2) fails.push('ledger resolve');
   const lr = lg.report({ hours: 1, top: 2 });
   const a = lr.topByPnl[0], b = lr.topByPnl[1];
   if (!a || Math.abs(a.pnl - 5.98) > 1e-9 || a.takerRate !== 1 || !b || Math.abs(b.pnl + 6) > 1e-9 || b.takerRate !== 0) fails.push(`ledger report ${JSON.stringify(lr.topByPnl)}`);
+  // 集計: 乖離のビン分け、的中率、7日の常連
+  const st = new Stats({ dataDir: null });
+  st.onRow('theo', { t: Date.now(), edgeBuyYes: 0.03, edgeSellYes: -0.5 });
+  st.onRow('theo', { t: Date.now(), edgeBuyYes: -0.2, edgeSellYes: -0.5 });
+  st.onRow('summary', { t: Date.now(), kind: '5-min', slug: 'x', up: 1, theo5sRight: true, mid5sRight: false, open5s: { pTheo: 0.6, mid: 0.5 } });
+  for (const r of lg.fills) st.onResolvedFill(r);
+  const td = st.days[new Date().toISOString().slice(0, 10)];
+  if (!td || td.edge[3] !== 1 || td.edge[0] !== 1 || td.markets['5-min']?.theoRight !== 1 || td.markets['5-min']?.midRight !== 0) fails.push(`Stats ${JSON.stringify(td)}`);
+  const lb = st.leaderboard(7, 5);
+  if (lb.byConsistency[0]?.daysTop10 !== 1 || lb.addresses !== 2) fails.push(`Stats leaderboard ${JSON.stringify(lb)}`);
   if (fails.length) { console.error('自己診断 失敗:', fails); process.exit(1); }
   console.log('自己診断 OK');
 }
@@ -820,6 +863,9 @@ async function main() {
   if (process.argv.includes('--selftest')) { await selftest(); return; }
   console.log(`[起動] API=${API_URL} WS=${WS_URL} 保存先=${DATA_DIR} 対象=${ASSETS.join(',')} パターン=${SLUG_RE}`);
   writeRow('start', { apiUrl: API_URL, wsUrl: WS_URL, assets: ASSETS, pattern: String(SLUG_RE), node: process.version });
+  if (stats.load()) console.log(`[集計] stats.json を読込(${Object.keys(stats.days).length}日分)`);
+  setInterval(() => stats.save(), 60000);
+  startServer({ port: PORT, getState, token: DASHBOARD_TOKEN });
   connectLimitlessWs();
   runHermes();
   runBinance();
@@ -844,6 +890,6 @@ async function main() {
 }
 
 process.on('unhandledRejection', (e) => writeRow('error', { where: 'unhandledRejection', msg: e?.message ?? String(e) }));
-process.on('SIGTERM', () => { writeRow('stop', {}); if (stream) stream.end(() => process.exit(0)); else process.exit(0); });
+process.on('SIGTERM', () => { writeRow('stop', {}); stats.save(); if (stream) stream.end(() => process.exit(0)); else process.exit(0); });
 
 main().catch((e) => { console.error('[致命的]', e); process.exit(1); });
