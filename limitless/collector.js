@@ -20,13 +20,16 @@
 //   THEO_INTERVAL_MS    理論価格の記録間隔。既定 1000
 //   DISCOVER_INTERVAL_MS 新市場の探索間隔。既定 60000
 //   SIGMA_FALLBACK_1H   σの推定材料が足りない時の1時間σ。既定 0.0045 (=0.45%)
-//   PYTH_HERMES_URL     既定 https://hermes.pyth.network (空文字で無効化)
+//   PYTH_HERMES_URL     既定は無効(2026年9月25日に401=キー必須になっていた)。URLを入れると有効
 //   BINANCE_WS_URL      既定 wss://data-stream.binance.vision/stream (空文字で無効化)
+//   KEEP_DAYS           JSONL を何日分残すか。既定 14(前日分は gzip される)
+//   MIN_FREE_MB         空き容量がこれを下回ったら記録を止める。既定 50
 
 import { io } from 'socket.io-client';
 import WebSocket from 'ws';
 import fs from 'node:fs';
 import path from 'node:path';
+import zlib from 'node:zlib';
 
 const env = (k, d) => (process.env[k] === undefined || process.env[k] === '' ? d : process.env[k]);
 const API_URL = env('LIMITLESS_API_URL', 'https://api.limitless.exchange').replace(/\/$/, '');
@@ -40,7 +43,8 @@ const THEO_INTERVAL_MS = Number(env('THEO_INTERVAL_MS', 1000));
 const DISCOVER_INTERVAL_MS = Number(env('DISCOVER_INTERVAL_MS', 60000));
 const SIGMA_FALLBACK_1H = Number(env('SIGMA_FALLBACK_1H', 0.0045));
 // PYTH_HERMES_URL / BINANCE_WS_URL は「未設定なら既定、空文字なら無効」にしたいので env() を通さない
-const PYTH_HERMES_URL = process.env.PYTH_HERMES_URL === undefined ? 'https://hermes.pyth.network' : process.env.PYTH_HERMES_URL;
+// 2026年9月25日の実測で Hermes は 401(キー必須)を返したので既定は無効。決済値は Limitless の oraclePriceData から取れる
+const PYTH_HERMES_URL = process.env.PYTH_HERMES_URL ?? '';
 const BINANCE_WS_URL = process.env.BINANCE_WS_URL === undefined ? 'wss://data-stream.binance.vision/stream' : process.env.BINANCE_WS_URL;
 
 // Pyth の本番フィードID(市場の priceOracleMetadata.pythAddress が取れればそちらを優先)
@@ -127,13 +131,46 @@ export class SigmaEstimator {
 const counts = {};
 let stream = null;
 let streamDate = null;
+const KEEP_DAYS = Number(env('KEEP_DAYS', 14));
+const MIN_FREE_MB = Number(env('MIN_FREE_MB', 50));
+let lowDiskWarnedAt = 0;
+// 前日分を gzip し、KEEP_DAYS より古いファイルを消す(失敗しても記録は止めない)
+function rotateFiles(prevDate) {
+  try {
+    if (prevDate) {
+      const src = path.join(DATA_DIR, `${prevDate}.jsonl`);
+      if (fs.existsSync(src)) {
+        const gz = zlib.createGzip();
+        fs.createReadStream(src).pipe(gz).pipe(fs.createWriteStream(`${src}.gz`)).on('finish', () => fs.unlink(src, () => {}));
+      }
+    }
+    const cutoff = Date.now() - KEEP_DAYS * 86400000;
+    for (const f of fs.readdirSync(DATA_DIR)) {
+      const mm = /^(\d{4}-\d{2}-\d{2})\.jsonl(\.gz)?$/.exec(f);
+      if (mm && Date.parse(mm[1]) < cutoff) fs.unlink(path.join(DATA_DIR, f), () => {});
+    }
+  } catch (e) {
+    console.error('[ファイル整理失敗]', e.message);
+  }
+}
+function diskOk() {
+  try {
+    const st = fs.statfsSync(DATA_DIR);
+    const freeMb = (st.bavail * st.bsize) / 1048576;
+    if (freeMb >= MIN_FREE_MB) return true;
+    if (Date.now() - lowDiskWarnedAt > 5 * 60000) { lowDiskWarnedAt = Date.now(); console.error(`[空き容量不足] ${freeMb.toFixed(0)}MB。記録を止めている(ログ出力は続く)`); }
+    return false;
+  } catch { return true; }
+}
 function ensureStream() {
   const d = new Date().toISOString().slice(0, 10);
   if (stream && streamDate === d) return stream;
   if (stream) stream.end();
   fs.mkdirSync(DATA_DIR, { recursive: true });
+  const prev = streamDate;
   stream = fs.createWriteStream(path.join(DATA_DIR, `${d}.jsonl`), { flags: 'a' });
   streamDate = d;
+  rotateFiles(prev);
   return stream;
 }
 const errorLastShown = new Map();
@@ -145,7 +182,7 @@ function writeRow(type, obj) {
     if (row.t - last > 5 * 60000) { errorLastShown.set(obj.where, row.t); console.error(`[エラー] ${obj.where}: ${obj.msg}`); }
   }
   try {
-    ensureStream().write(JSON.stringify(row) + '\n');
+    if (diskOk()) ensureStream().write(JSON.stringify(row) + '\n');
   } catch (e) {
     console.error('[記録失敗]', e.message);
   }
@@ -176,18 +213,23 @@ function normTs(v) {
 // ---------------------------------------------------------------- 状態
 // asset -> 参照価格と σ
 const refs = Object.fromEntries(ASSETS.map((a) => [a, {
-  lmts: null, pyth: null, cex: null, // { price, t }
-  sigma: new SigmaEstimator(),
+  lmts: null, pyth: null, cex: null, // { price, t }  lmts は Limitless の oraclePriceData(発行元は lmtsSource)
+  lmtsSource: null,
+  sigma: new SigmaEstimator(), // Binance の約定だけから作る。TWAPを混ぜると基差が偽の収益率になる
   cexLastLogSec: 0,
 }]));
 // slug -> 市場
 const markets = new Map();
 let socket = null;
 
-function pickRef(asset) {
+// 市場の種別で参照価格の優先順位を変える。
+//   1時間市場は Binance の足が決済そのものなので Binance を最優先
+//   5分/15分市場は Chainlink 60秒TWAP が決済なので Limitless のオラクル値を最優先
+function pickRef(asset, kind) {
   const r = refs[asset];
   const now = Date.now();
-  for (const src of ['lmts', 'pyth', 'cex']) {
+  const order = kind && kind.startsWith('hourly') ? ['cex', 'lmts', 'pyth'] : ['lmts', 'cex', 'pyth'];
+  for (const src of order) {
     const v = r[src];
     if (v && now - v.t <= REF_STALE_MS) return { src, ...v };
   }
@@ -252,9 +294,17 @@ function parseMarket(slug, raw) {
   const expiry = normTs(raw.expirationTimestamp) ?? normTs(raw.deadline) ?? normTs(raw.expirationDate)
     ?? (slugTs && durationSec ? slugTs + durationSec * 1000 : null);
   // 開始時刻は slug の数字に頼らず「満期 − 長さ」から出す(-p- 市場の数字は作成時刻で、時刻に揃っていない)
-  const openTs = expiry && durationSec ? expiry - durationSec * 1000 : slugTs;
-  const openPrice = raw.openPrice !== undefined && raw.openPrice !== null && raw.openPrice !== '' ? Number(raw.openPrice) : null;
+  // 2026年9月25日の実測: 行使価格は metadata.openPrice(文字列)、開始時刻は startAt
+  const openRaw = raw.openPrice ?? raw.metadata?.openPrice;
+  const openPrice = openRaw !== undefined && openRaw !== null && openRaw !== '' ? Number(openRaw) : null;
+  const startTs = normTs(raw.startAt) ?? normTs(raw.metadata?.openPriceCapturedAt);
   const pythId = typeof raw.priceOracleMetadata?.pythAddress === 'string' ? raw.priceOracleMetadata.pythAddress.replace(/^0x/, '').toLowerCase() : null;
+  const desc = String(raw.description ?? '');
+  const resolutionSource = raw.metadata?.chainlinkDataStream
+    ? `chainlink_twap${raw.metadata.chainlinkDataStream.twapWindowSeconds ?? ''}s`
+    : /binance/i.test(desc) ? 'binance_candle' : /pyth/i.test(desc) ? 'pyth' : /chainlink/i.test(desc) ? 'chainlink' : null;
+  // 開始時刻は startAt を最優先。無ければ「満期 − 長さ」(-p- 市場の slug の数字は作成時刻で、時刻に揃っていない)
+  const openTs = startTs ?? (expiry && durationSec ? expiry - durationSec * 1000 : slugTs);
   return {
     asset,
     kind,
@@ -262,6 +312,8 @@ function parseMarket(slug, raw) {
     openTs,
     expiryTs: expiry,
     openPrice: Number.isFinite(openPrice) ? openPrice : null,
+    resolutionSource,
+    tieRule: 'up', // 実測: どちらの種別も「以上(≥)で Up」
     pythId,
     status: raw.status ?? null,
     tradeType: raw.tradeType ?? raw.marketType ?? null,
@@ -300,7 +352,7 @@ async function refreshMarket(m) {
     const p = parseMarket(m.slug, raw);
     describeMarketOnce(p.kind ?? 'unknown', raw);
     const openPriceWasNull = m.openPrice === null;
-    Object.assign(m, { asset: p.asset ?? m.asset, kind: p.kind ?? m.kind, openTs: p.openTs ?? m.openTs, expiryTs: p.expiryTs ?? m.expiryTs, pythId: p.pythId ?? m.pythId, status: p.status, winningIndex: p.winningIndex });
+    Object.assign(m, { asset: p.asset ?? m.asset, kind: p.kind ?? m.kind, openTs: p.openTs ?? m.openTs, expiryTs: p.expiryTs ?? m.expiryTs, pythId: p.pythId ?? m.pythId, status: p.status, winningIndex: p.winningIndex, resolutionSource: p.resolutionSource ?? m.resolutionSource });
     if (p.openPrice !== null) { m.openPrice = p.openPrice; m.openPriceSrc = 'api'; }
     writeRow('market', { slug: m.slug, ...p });
     if (openPriceWasNull && m.openPrice !== null) console.log(`[市場] ${m.slug} 始値確定 ${m.openPrice}`);
@@ -319,6 +371,9 @@ function applyBook(m, ob, src) {
     .sort((a, b) => (desc ? b.price - a.price : a.price - b.price));
   m.book = { bids: norm(book.bids, true), asks: norm(book.asks, false), tokenId: book.tokenId ?? null };
   m.bookTs = Date.now();
+  // 記録は市場ごとに秒1回まで(メモリ上の板は毎回更新する)
+  if (src === 'ws' && m.bookLogTs && m.bookTs - m.bookLogTs < 1000) return;
+  m.bookLogTs = m.bookTs;
   writeRow('book', {
     slug: m.slug, src,
     bids: m.book.bids.slice(0, BOOK_DEPTH), asks: m.book.asks.slice(0, BOOK_DEPTH),
@@ -395,7 +450,7 @@ function connectLimitlessWs() {
     }
     if (asset && refs[asset] && Number.isFinite(price)) {
       refs[asset].lmts = { price, t: Date.now() };
-      refs[asset].sigma.push(price, t);
+      refs[asset].lmtsSource = d?.source ?? null;
     }
   });
   socket.on('newPriceData', (d) => logRawOnce('ws:newPriceData', d));
@@ -453,7 +508,6 @@ async function runHermes() {
             const t = normTs(pr.publish_time) ?? Date.now();
             if (!Number.isFinite(price)) continue;
             refs[asset].pyth = { price, t: Date.now() };
-            refs[asset].sigma.push(price, t);
             writeRow('pyth', { asset, price, srcTs: t, conf: pr.conf !== undefined ? Number(pr.conf) * 10 ** Number(pr.expo) : null });
           }
         }
@@ -511,14 +565,18 @@ function theoTick() {
       if (m.fetchTries < 3 && now - m.discoveredAt > m.fetchTries * 30000) refreshMarket(m);
       continue;
     }
-    const ref = pickRef(m.asset);
+    const ref = pickRef(m.asset, m.kind);
     const tauSec = (m.expiryTs - now) / 1000;
     if (!ref || tauSec < 0) continue;
+    // 記録量を抑える: 寄り付き60秒と満期前120秒は毎秒、それ以外は5秒に1回
+    const sinceOpen = m.openTs ? (now - m.openTs) / 1000 : Infinity;
+    const dense = sinceOpen <= 60 || tauSec <= 120;
+    if (!dense && m.lastTheo && now - m.lastTheo.t < 5000) continue;
     const sigma = sigmaFor(m.asset);
     const th = theoUp(ref.price, m.openPrice, sigma, tauSec);
     const bs = bookSummary(m);
     const row = {
-      slug: m.slug, S: ref.price, src: ref.src, K: m.openPrice, Ksrc: m.openPriceSrc ?? null, tauSec: Math.round(tauSec),
+      t: now, slug: m.slug, kind: m.kind ?? null, S: ref.price, src: ref.src, K: m.openPrice, Ksrc: m.openPriceSrc ?? null, tauSec: Math.round(tauSec),
       sigma1h: sigma, sigmaEst: refs[m.asset].sigma.sigma1h() !== null,
       z: th?.z ?? null, pTheo: th?.p ?? null,
       bid: bs?.bid ?? null, ask: bs?.ask ?? null, mid: bs?.mid ?? null,
@@ -546,7 +604,7 @@ function finishMarket(m, winningIndex, via) {
   const s5 = m.snapshots[5] ?? null;
   const openGapBps = s5 && m.openPrice ? Math.log(s5.S / m.openPrice) * 1e4 : null;
   const summary = {
-    slug: m.slug, asset: m.asset, kind: m.kind ?? null, K: m.openPrice, Ksrc: m.openPriceSrc ?? null, up, via,
+    slug: m.slug, asset: m.asset, kind: m.kind ?? null, resolutionSource: m.resolutionSource ?? null, K: m.openPrice, Ksrc: m.openPriceSrc ?? null, up, via,
     open5s: s5, open30s: m.snapshots[30] ?? null, open120s: m.snapshots[120] ?? null,
     openGapBps,
     // 寄り付き5秒時点の理論価格が正しい側を指していたか
@@ -557,7 +615,7 @@ function finishMarket(m, winningIndex, via) {
   writeRow('summary', summary);
   const f = (v, d = 3) => (v === null || v === undefined ? '-' : Number(v).toFixed(d));
   console.log(
-    `[要約] ${m.slug} 結果=${up === 1 ? 'Up' : up === 0 ? 'Down' : '不明'} 始値=${f(m.openPrice, 2)} ` +
+    `[要約] ${m.slug} 結果=${up === 1 ? 'Up' : up === 0 ? 'Down' : '不明'} 始値=${f(m.openPrice, 2)}(${m.openPriceSrc ?? '-'}) ` +
     `寄付5s: 乖離=${f(openGapBps, 1)}bps z=${f(s5?.z, 2)} 理論=${f(s5?.pTheo)} 板中値=${f(s5?.mid)} ` +
     `| 30s 理論=${f(m.snapshots[30]?.pTheo)} 板=${f(m.snapshots[30]?.mid)} ` +
     `| 理論5sが正解側=${summary.theo5sRight ?? '-'} 板5sが正解側=${summary.mid5sRight ?? '-'}`
@@ -627,6 +685,11 @@ async function selftest() {
   if (normTs(1785049200) !== 1785049200000 || normTs('2026-07-26T07:00:00.000Z') !== 1785049200000) fails.push('normTs');
   // 市場の解釈
   const pm = parseMarket('eth-up-or-down-hourly-1785049200', { openPrice: '3456.78', expirationTimestamp: 1785052800, priceOracleMetadata: { pythAddress: '0xFF61491A931112DDF1BD8147CD1B641375F79F5825126D665480874634FD0ACE' } });
+  // 2026年9月25日の実データの形
+  const real = parseMarket('btc-up-or-down-15-min-1790302500', { expirationTimestamp: 1790303400000, startAt: '2026-09-25T02:15:00.000Z', metadata: { chainlinkDataStream: { twapWindowSeconds: 60 }, openPrice: '84809.575903638396600320' } });
+  if (real.openPrice !== 84809.5759036384 || real.openTs !== 1790302500000 || real.resolutionSource !== 'chainlink_twap60s') fails.push(`parseMarket 実データ ${JSON.stringify(real)}`);
+  const realH = parseMarket('btc-up-or-down-hourly-p-1790291103668', { expirationTimestamp: 1790305200000, startAt: '2026-09-25T02:00:00.000Z', description: 'information from Binance, specifically the BTC/USDT pair', metadata: { openPrice: '84610.74' } });
+  if (realH.openPrice !== 84610.74 || realH.openTs !== 1790301600000 || realH.resolutionSource !== 'binance_candle') fails.push(`parseMarket 実データ hourly ${JSON.stringify(realH)}`);
   if (pm.asset !== 'eth' || pm.openPrice !== 3456.78 || pm.expiryTs !== 1785052800000 || pm.openTs !== 1785049200000 || pm.pythId !== PYTH_FEED_IDS.eth) fails.push(`parseMarket ${JSON.stringify(pm)}`);
   // 記録: 一時ディレクトリに1行書いて読み戻す
   DATA_DIR = fs.mkdtempSync(path.join(process.env.TMPDIR ?? '/tmp', 'lmts-'));

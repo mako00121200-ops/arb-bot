@@ -6,6 +6,15 @@
 本番のDEX裁定bot(リポジトリ直下)とは**依存も起動も完全に別**。
 このディレクトリに独自の `package.json` があり、Railway では別サービスとして動かす。
 
+## 決済ルール(2026年9月25日に市場JSONの説明文で実測)
+
+| 市場 | 決済ソース | 行使価格 | 同値 |
+|---|---|---|---|
+| 1時間 `-hourly-p-` | **Binance BTC/USDT の1時間足** の終値 ≥ 始値 | `metadata.openPrice`(足の始値) | Up |
+| 5分・15分 `-N-min-` | **Chainlink 60秒TWAP** の満期値 ≥ 開始時の値。ちょうどの時刻のレポートが無ければ5秒以内の最初の観測値 | `metadata.openPrice`(開始時のTWAP) | Up |
+
+`oraclePriceData`(`source: "chainlink"`)は5分/15分市場の決済値そのもの。1時間市場の参照は Binance の約定(`cex`)を優先する。
+
 ## 何を貯めるか(`DATA_DIR/YYYY-MM-DD.jsonl`、1行1レコード)
 
 | type | 内容 |
@@ -33,6 +42,7 @@
 3. Start Command は自動で `npm start`(= `node collector.js`)
 4. **Volume** を追加してマウント先を `/data` にし、環境変数 `DATA_DIR=/data` を設定
    - Volume を付けないと再デプロイのたびに JSONL が消える。ログの `[要約]` 行だけで良ければ無くても動く
+   - 記録量は約150MB/日(当日分は非圧縮、前日以前はgzipで約1/10)。500MBのVolumeなら `KEEP_DAYS=14` で収まる。もっと残したければダッシュボードでVolumeを拡張する(MCPからは容量変更できない)
 5. 環境変数は全て任意(既定値で動く)。秘密情報は無い
 
 | 変数 | 既定 | 用途 |
@@ -42,9 +52,11 @@
 | `HOURLY_SLUG_PATTERN` | `^(btc\|eth)-up-or-down-(hourly-p\|hourly\|\d+-min)-(\d+)$` | 2026年9月25日の実測では 1時間市場は `-hourly-p-<ミリ秒>`、5分/15分市場は `-5-min-<秒>`。合わなかった「それっぽい」slugは `raw_sample` に残る |
 | `THEO_INTERVAL_MS` | `1000` | 理論価格の記録間隔。容量が気になれば `2000` |
 | `BOOK_DEPTH` | `5` | 板の記録段数 |
-| `PYTH_HERMES_URL` | `https://hermes.pyth.network` | 空文字で無効 |
 | `BINANCE_WS_URL` | `wss://data-stream.binance.vision/stream` | 空文字で無効 |
 | `SIGMA_FALLBACK_1H` | `0.0045` | σ推定が育つまでの仮の1時間σ(0.45%) |
+| `KEEP_DAYS` | `14` | JSONLを何日分残すか。前日分は自動でgzip、それより古いものは削除 |
+| `MIN_FREE_MB` | `50` | Volumeの空きがこれを下回ったら記録を止める(ログ出力は続く) |
+| `PYTH_HERMES_URL` | (無効) | 2026年9月25日に401(キー必須)を確認。URLを入れると有効 |
 
 ## 起動して最初の10分で確認すること
 
