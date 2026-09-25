@@ -31,6 +31,7 @@
 | `chain_topics` | 5分ごとの、コントラクト×イベント署名の件数。**署名が Polymarket 系と同じかの確認用**(違えば `raw_sample` の `chain:unknown:…` に生データが残る) |
 | `mevent` | 公開の市場イベント `/markets/{slug}/events`(ORDER_PLACED 等)。中身は生のまま |
 | `latency` / `heartbeat.latency` | HTTP往復(`http_orderbook` 等)、WS受信遅れ(`ws_oracle_lag` / `ws_book_lag`)、Binance受信遅れ、RPC往復の p50/p95 |
+| `leaderboard` | 1時間ごと(起動10分後から)。直近24時間で損益が確定した約定をアドレス別に集計し、損益上位10・出来高上位を `[勝者 24h]` としてログにも出す |
 | `raw_sample` | 各イベント種別の**最初の1件の生データ**。受信形式の確認用 |
 | `error` / `ws` / `heartbeat` | 運用ログ |
 
@@ -65,6 +66,7 @@
 | `BASE_RPC_URL` | (無効) | Base の RPC。Railway では本番サービスの値を `${{secure-amazement.BASE_RPC_URL}}` で参照。設定すると約定・払い戻しを読む |
 | `EVENTS_INTERVAL_MS` | `20000` | 公開の市場イベントの取得間隔。0 で無効 |
 | `LATENCY_PROBE_MS` | `15000` | HTTP往復の計測間隔 |
+| `LEADER_REPORT_MS` | `3600000` | `[勝者 24h]` の出力間隔 |
 
 ## 「勝っている人の注文を覗く」ための材料
 

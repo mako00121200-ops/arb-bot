@@ -34,7 +34,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { LatencyStats } from './latency.js';
-import { startChainWatcher, decodeOrderFilled, TOPICS } from './onchain.js';
+import { startChainWatcher, decodeOrderFilled, TOPICS, CONTRACTS } from './onchain.js';
+import { FillLedger, formatLeader } from './ledger.js';
 
 const env = (k, d) => (process.env[k] === undefined || process.env[k] === '' ? d : process.env[k]);
 const API_URL = env('LIMITLESS_API_URL', 'https://api.limitless.exchange').replace(/\/$/, '');
@@ -142,6 +143,8 @@ const BASE_RPC_URL = process.env.BASE_RPC_URL ?? '';
 const EVENTS_INTERVAL_MS = Number(env('EVENTS_INTERVAL_MS', 20000));
 const LATENCY_PROBE_MS = Number(env('LATENCY_PROBE_MS', 15000));
 const latency = new LatencyStats();
+const ledger = new FillLedger({ exchangeAddresses: CONTRACTS.exchanges });
+const LEADER_REPORT_MS = Number(env('LEADER_REPORT_MS', 3600000));
 let lowDiskWarnedAt = 0;
 // 前日分を gzip し、KEEP_DAYS より古いファイルを消す(失敗しても記録は止めない)
 function rotateFiles(prevDate) {
@@ -292,15 +295,19 @@ async function pollMarketEvents() {
     if (m.resolved) continue;
     try {
       const res = await getJson(`/markets/${m.slug}/events?page=1&limit=50`, 'http_events');
-      logRawOnce('rest:events', res);
       const events = Array.isArray(res?.events) ? res.events : Array.isArray(res) ? res : [];
+      if (events.length) {
+        if (!seenRaw.has('rest:events:full')) console.log(`[生データ] rest:events 1件全文: ${JSON.stringify(events[0]).slice(0, 1500)}`);
+        logRawOnce('rest:events:full', events[0]);
+      }
       const seen = seenEventIds.get(m.slug) ?? new Set();
       for (const ev of events) {
         const key = ev?.id ?? `${ev?.type}:${ev?.timestamp}:${JSON.stringify(ev?.data ?? {}).slice(0, 80)}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        writeRow('mevent', { slug: m.slug, id: ev?.id ?? null, kind: ev?.type ?? null, srcTs: normTs(ev?.timestamp), data: ev?.data ?? ev });
-        logRawOnce(`rest:events:${ev?.type ?? 'unknown'}`, ev);
+        const kind = ev?.type ?? ev?.eventType ?? ev?.kind ?? null;
+        writeRow('mevent', { slug: m.slug, id: ev?.id ?? null, kind, srcTs: normTs(ev?.timestamp ?? ev?.createdAt), data: ev?.data ?? ev });
+        ledger.setName(ev?.profile?.account ?? ev?.data?.profile?.account, ev?.profile?.username ?? ev?.data?.profile?.username);
       }
       seenEventIds.set(m.slug, seen);
     } catch (e) {
@@ -390,12 +397,17 @@ async function addMarket(slug, via) {
   };
   markets.set(slug, m);
   await refreshMarket(m);
-  try {
-    const ob = await getJson(`/markets/${slug}/orderbook`);
-    logRawOnce('rest:orderbook', ob);
-    applyBook(m, ob, 'rest');
-  } catch (e) {
-    writeRow('error', { where: 'orderbook', slug, msg: e.message });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const ob = await getJson(`/markets/${slug}/orderbook`);
+      logRawOnce('rest:orderbook', ob);
+      applyBook(m, ob, 'rest');
+      break;
+    } catch (e) {
+      // 作成直後は板がまだ無く 404 になるので、3秒おいて1回だけ取り直す
+      if (attempt === 0 && /404/.test(e.message)) { await sleep(3000); continue; }
+      writeRow('error', { where: 'orderbook', slug, msg: e.message });
+    }
   }
   subscribePrices([slug]);
   console.log(`[市場] 発見 ${slug} (${via}) 始値=${m.openPrice ?? '未確定'} 満期=${m.expiryTs ? new Date(m.expiryTs).toISOString() : '不明'}`);
@@ -663,10 +675,21 @@ function theoTick() {
   }
 }
 
+// 直近24時間で「誰が勝っているか」。損益が確定した約定だけで集計する
+function leaderReport() {
+  const r = ledger.report({ hours: 24, top: 10 });
+  writeRow('leaderboard', r);
+  console.log(`[勝者 24h] 確定約定=${r.resolvedFills}件 アドレス=${r.addresses} 合計損益=${r.totalPnl >= 0 ? '+' : ''}$${r.totalPnl.toFixed(2)} 未確定=${r.unresolved}件`);
+  r.topByPnl.forEach((x, i) => console.log('  ' + formatLeader(x, i)));
+  if (r.topByVolume.length) console.log(`[出来高上位 24h] ${r.topByVolume.slice(0, 5).map((x, i) => `#${i + 1} ${x.owner.slice(0, 6)}…${x.name ? `(${x.name})` : ''} $${x.notional.toFixed(0)} 損益${x.pnl >= 0 ? '+' : ''}$${x.pnl.toFixed(0)}`).join(' / ')}`);
+}
+
 function finishMarket(m, winningIndex, via) {
   if (m.resolved) return;
   m.resolved = { winningIndex, via, t: Date.now() };
   const up = winningIndex === 0 ? 1 : winningIndex === 1 ? 0 : null; // YES(=0) が Up
+  const settled = ledger.resolve(m.slug, up);
+  if (settled) console.log(`[台帳] ${m.slug} の約定${settled}件の損益を確定`);
   const s5 = m.snapshots[5] ?? null;
   const openGapBps = s5 && m.openPrice ? Math.log(s5.S / m.openPrice) * 1e4 : null;
   const summary = {
@@ -778,6 +801,14 @@ async function selftest() {
   const data = AbiCoder.defaultAbiCoder().encode(['uint256', 'uint256', 'uint256', 'uint256', 'uint256'], [0n, 123n, 12_500_000n, 25_000_000n, 50_000n]);
   const of = decodeOrderFilled({ topics: [TOPICS.OrderFilled, '0x' + '11'.repeat(32), zeroPadValue('0x' + 'ab'.repeat(20), 32), zeroPadValue('0x' + 'cd'.repeat(20), 32)], data });
   if (of.makerSide !== 'BUY' || of.tokenId !== '123' || of.price !== 0.5 || of.shares !== 25 || of.feeUsdc !== 0.05 || !/^0xAbAb/i.test(of.maker)) fails.push(`decodeOrderFilled ${JSON.stringify(of)}`);
+  // 台帳: YES を 0.40 で 10枚買い(テイカー)、別人が NO を 0.60 で 10枚買い(メイカー)。Up なら前者 +6、後者 −6
+  const lg = new FillLedger({ exchangeAddresses: ['0x05c748E2f4DcDe0ec9Fa8DDc40DE6b867f923fa5'] });
+  lg.addFill({ maker: '0xAAAA000000000000000000000000000000000001', taker: '0x05c748E2f4DcDe0ec9Fa8DDc40DE6b867f923fa5', slug: 'm', outcome: 'YES', kind: '5-min', makerSide: 'BUY', price: 0.4, shares: 10, usdc: 4, feeUsdc: 0.02, secToExpiry: 30, blockTime: Date.now() });
+  lg.addFill({ maker: '0xBBBB000000000000000000000000000000000002', taker: '0xAAAA000000000000000000000000000000000001', slug: 'm', outcome: 'NO', kind: '5-min', makerSide: 'BUY', price: 0.6, shares: 10, usdc: 6, feeUsdc: 0, secToExpiry: 30, blockTime: Date.now() });
+  if (lg.resolve('m', 1) !== 2) fails.push('ledger resolve');
+  const lr = lg.report({ hours: 1, top: 2 });
+  const a = lr.topByPnl[0], b = lr.topByPnl[1];
+  if (!a || Math.abs(a.pnl - 5.98) > 1e-9 || a.takerRate !== 1 || !b || Math.abs(b.pnl + 6) > 1e-9 || b.takerRate !== 0) fails.push(`ledger report ${JSON.stringify(lr.topByPnl)}`);
   if (fails.length) { console.error('自己診断 失敗:', fails); process.exit(1); }
   console.log('自己診断 OK');
 }
@@ -799,7 +830,11 @@ async function main() {
   if (EVENTS_INTERVAL_MS > 0) setInterval(() => pollMarketEvents().catch((e) => writeRow('error', { where: 'events-loop', msg: e.message })), EVENTS_INTERVAL_MS);
   if (BASE_RPC_URL) {
     console.log('[チェーン] Base の約定・払い戻しの監視を開始');
-    startChainWatcher({ rpcUrl: BASE_RPC_URL, writeRow, logRawOnce, resolveToken, resolveCondition, onLatency: (k, ms) => latency.push(k, ms) });
+    startChainWatcher({
+      rpcUrl: BASE_RPC_URL, logRawOnce, resolveToken, resolveCondition, onLatency: (k, ms) => latency.push(k, ms),
+      writeRow: (type, obj) => { const row = writeRow(type, obj); if (type === 'fill') ledger.addFill(row); return row; },
+    });
+    setTimeout(function rep() { leaderReport(); setTimeout(rep, LEADER_REPORT_MS); }, 10 * 60000);
   } else {
     console.log('[チェーン] BASE_RPC_URL が未設定なのでオンチェーンの約定は読まない');
   }
