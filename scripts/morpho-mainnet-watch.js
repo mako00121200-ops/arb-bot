@@ -252,6 +252,13 @@ async function sellCheck(r, amt, repaidLoan) {
 const sellQueue = [];
 let sellRunning = false;
 const noRouteMarket = new Map(); // 市場id -> 経路なしと分かった時刻
+// [2026年9月25日 15時 JST に追加] Resolv の USR/RLP/wstUSR が崩れ、清算可が数千人に膨らんだ
+// (使用率3,000%超の貸し倒れが大半)。再起動のたびに全員の売り確認と1人1行のログが走り、
+// 本番が4〜5分ごとに再起動を繰り返した時間帯と重なった。**1人ずつ処理しなくてよいものは件数だけ数える。**
+const DEEP_BAD_DEBT_RATIO = 2;      // 使用率200%超 = 担保が借金の半分未満。清算しても返しきれない
+const SELL_QUEUE_MAX = 100;         // 売り確認の待ち行列の上限(超えた分は数えるだけ)
+const LOG_EVERY_MARKET_MS = 30 * 60 * 1000;
+const loggedMarket = new Map();     // 市場id -> 最後に候補ログを出した時刻
 async function drainSellQueue() {
   if (sellRunning) return;
   sellRunning = true;
@@ -263,7 +270,13 @@ async function drainSellQueue() {
         ? { ok: false }
         : await sellCheck(r, amt, repaidLoan).catch(() => ({ ok: false }));
       if (!entry.sell.ok && entry.sell.netUsd == null && !entry.sell.unknownPrice) noRouteMarket.set(r.id, Date.now());
-      if (entry.sell.ok) { S.stats.sellOk++; S.stats.sellNetUsd.push(entry.sell.netUsd); } else S.stats.sellNo++;
+      if (entry.sell.ok) { S.stats.sellOk++; S.stats.sellNetUsd.push(entry.sell.netUsd); if (S.stats.sellNetUsd.length > 500) S.stats.sellNetUsd.shift(); } else S.stats.sellNo++;
+      // 売れない候補のログは市場ごとに30分に1行まで(売れるものは必ず出す)
+      if (!entry.sell.ok) {
+        const last = loggedMarket.get(r.id) || 0;
+        if (Date.now() - last < LOG_EVERY_MARKET_MS) continue;
+        loggedMarket.set(r.id, Date.now());
+      }
       console.log(`[Morpho本体/候補 ${nowJst()}] ${entry.pair} ${r.user.slice(0, 8)}… 使用率${(r.h.ratio * 100).toFixed(2)}% 返済約$${entry.repaidUsd?.toFixed(0) ?? "?"} 報酬見込み$${entry.bonusUsd?.toFixed(0) ?? "?"} ブロック${r.block}`
         + ` → Uniswap V3 で${entry.sell.ok ? `売って返せる(ガス後 約$${entry.sell.netUsd.toFixed(0)}、手数料帯${entry.sell.fee})` : entry.sell.unknownPrice ? "売る経路はあるが借金の通貨の値段が不明" : entry.sell.netUsd != null ? `売ると赤字(約$${entry.sell.netUsd.toFixed(0)})` : "直接売れる経路なし"}(送りません)`);
     }
@@ -285,6 +298,10 @@ async function handle(results) {
     S.seen.set(r.key, entry);
     if (repaidUsd != null && repaidUsd < MIN_REPAID_USD) { entry.dust = true; continue; }
     S.stats.liquidatable++;
+    if (r.h.ratio >= DEEP_BAD_DEBT_RATIO) { entry.deep = true; S.stats.deepBadDebt = (S.stats.deepBadDebt || 0) + 1; continue; }
+    const nr = noRouteMarket.get(r.id);
+    if (nr && Date.now() - nr < 30 * 60 * 1000) { S.stats.sellNo++; continue; }
+    if (sellQueue.length >= SELL_QUEUE_MAX) { S.stats.queueDrop = (S.stats.queueDrop || 0) + 1; continue; }
     // 売れるかの見積もり(1人4〜5回の問い合わせ)は**待たずに裏で**行う。
     // 待つと、清算できる人が188人いた再起動直後に全員の読み直しと毎ブロックの見張りが10分以上止まった(23:23 JST)。
     // 同じ市場で「直接売れる経路なし」と分かったものは30分聞き直さない。
@@ -387,6 +404,8 @@ async function tick() {
       for (const [k, ratio] of S.watch) {
         const e = S.roster.get(k);
         if (!e) continue;
+        // 深い貸し倒れ(使用率200%超)は30ブロックに1回で足りる(誰も取れない・取らない)
+        if (ratio >= DEEP_BAD_DEBT_RATIO && latest % 30 !== 0) continue;
         const seen = S.seen.get(k);
         const stale = seen && now - seen.at > 10 * 60 * 1000;
         if (stale ? latest % 10 === 0 : ratio >= 0.98 || latest % 5 === 0) entries.push(e);
@@ -429,7 +448,7 @@ export function formatMorphoMainnetLine() {
   const done = Math.min(100, Math.round(((S.backfill.cursor - START_BLOCK) / span) * 100));
   const lead = median(st.lead);
   const top = [...st.winners.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([a, n]) => `${a.slice(0, 6)}:${n}`).join(" ");
-  return ` Morpho本体[名簿${S.roster.size} 遡り${done}% 危ない${S.watch.size}(読み${median(st.readMs) ?? "-"}ms 全員${st.sweeps}回${st.sweepMs ? `/${Math.round(st.sweepMs / 1000)}秒` : ""}) 清算可${st.liquidatable}(売って返せる${st.sellOk}/不可${st.sellNo})`
+  return ` Morpho本体[名簿${S.roster.size} 遡り${done}% 危ない${S.watch.size}(読み${median(st.readMs) ?? "-"}ms 全員${st.sweeps}回${st.sweepMs ? `/${Math.round(st.sweepMs / 1000)}秒` : ""}) 清算可${st.liquidatable}(売って返せる${st.sellOk}/不可${st.sellNo}${st.deepBadDebt ? ` 深い貸し倒れ${st.deepBadDebt}` : ""}${st.queueDrop ? ` 行列あふれ${st.queueDrop}` : ""})`
     + ` 実清算${st.liq}=先に気づいた${st.first}(先行中央${lead ?? "-"}ブロック)/見逃し[名簿なし${st.missNoRoster} 急変${st.missLow} 同ブロック${st.missSameBlock}]`
     + ` 報酬 気づいた分$${Math.round(st.bonusSeenUsd)}/見逃し分$${Math.round(st.bonusMissUsd)}${top ? ` 勝者[${top}]` : ""}`
     + `${st.errors ? ` 失敗${st.errors}(${st.lastError})` : ""} 送信しない]`;
