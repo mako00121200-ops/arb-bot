@@ -406,7 +406,7 @@ async function addMarket(slug, via) {
       writeRow('error', { where: 'orderbook', slug, msg: e.message });
     }
   }
-  subscribePrices([slug]);
+  subscribePrices();
   console.log(`[市場] 発見 ${slug} (${via}) 始値=${m.openPrice ?? '未確定'} 満期=${m.expiryTs ? new Date(m.expiryTs).toISOString() : '不明'}`);
 }
 
@@ -469,19 +469,26 @@ async function discover() {
     if (item?.slug) flat.push(item.slug);
     for (const sub of item?.markets ?? []) if (sub?.slug) flat.push(sub.slug);
   }
+  let added = false;
   for (const slug of flat) {
     if (SLUG_RE.test(slug)) {
+      if (!markets.has(slug)) added = true;
       await addMarket(slug, 'rest');
     } else if (/hourly|up-or-down/i.test(slug)) {
       // 命名規則の確認用。パターンに合わなかった「それっぽい」slugを1回だけ残す
       logRawOnce(`slug:${slug.replace(/\d+/g, 'N')}`, { slug });
     }
   }
+  if (!added) subscribePrices();
 }
 
 // ---------------------------------------------------------------- Limitless WS (socket.io)
-function subscribePrices(slugs) {
-  if (!socket?.connected || slugs.length === 0) return;
+// 購読は毎回「監視中の全 slug」で送る。市場ごとに1件ずつ送ると、サーバーが上書き型の場合に
+// 古い市場の板が更新されなくなる(2026年9月25日、板の鮮度が平均4〜5分になっていた原因の疑い)
+function subscribePrices() {
+  if (!socket?.connected) return;
+  const slugs = [...markets.values()].filter((m) => !m.resolved).map((m) => m.slug);
+  if (slugs.length === 0) return;
   socket.emit('subscribe_market_prices', { marketSlugs: slugs });
 }
 function connectLimitlessWs() {
@@ -497,7 +504,7 @@ function connectLimitlessWs() {
     console.log('[WS] Limitless 接続');
     writeRow('ws', { ev: 'connect' });
     socket.emit('subscribe_market_lifecycle', {});
-    subscribePrices([...markets.keys()].filter((s) => !markets.get(s).resolved));
+    subscribePrices();
   });
   socket.on('disconnect', (reason) => { writeRow('ws', { ev: 'disconnect', reason }); console.log('[WS] Limitless 切断', reason); });
   socket.on('connect_error', (e) => writeRow('ws', { ev: 'connect_error', msg: e?.message }));
@@ -653,7 +660,7 @@ function theoTick() {
       t: now, slug: m.slug, kind: m.kind ?? null, S: ref.price, src: ref.src, K: m.openPrice, Ksrc: m.openPriceSrc ?? null, tauSec: Math.round(tauSec),
       sigma1h: sigma, sigmaEst: refs[m.asset].sigma.sigma1h() !== null,
       z: th?.z ?? null, pTheo: th?.p ?? null,
-      bid: bs?.bid ?? null, ask: bs?.ask ?? null, mid: bs?.mid ?? null,
+      bid: bs?.bid ?? null, ask: bs?.ask ?? null, mid: bs?.mid ?? null, bidSize: bs?.bidSize ?? null, askSize: bs?.askSize ?? null,
       bookAgeMs: m.bookTs ? now - m.bookTs : null,
       // 正なら「板が理論より安い=YESを買う余地」/「板が理論より高い=YESを売る余地」
       edgeBuyYes: th && bs?.ask !== null && bs?.ask !== undefined ? th.p - bs.ask : null,
@@ -872,7 +879,7 @@ async function selftest() {
     const b = rep.short.buckets['30〜10s'];
     if (rep.short.markets !== 1 || !b || b.brierTwap === null || b.brierTwap > 0.001 || b.brierMid < 0.01) fails.push(`backtest ${JSON.stringify(rep.short)}`);
     if (rep.short.taker.twap.n !== 1 || rep.short.taker.twap.pnl < 0.09) fails.push(`backtest taker ${JSON.stringify(rep.short.taker)}`);
-    if (rep.short.maker.twap.signals !== 1 || rep.short.maker.twap.filled !== 1) fails.push(`backtest maker ${JSON.stringify(rep.short.maker)}`);
+    if (rep.short.maker.twap.signals < 1 || rep.short.maker.twap.filled !== rep.short.maker.twap.signals) fails.push(`backtest maker ${JSON.stringify(rep.short.maker)}`);
     formatBacktest(rep);
   }
   if (fails.length) { console.error('自己診断 失敗:', fails); process.exit(1); }

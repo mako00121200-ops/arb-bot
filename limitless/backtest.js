@@ -22,6 +22,9 @@ import { normCdf } from './math.js';
 const TAKER_FEE = 0.005;
 const TAKER_EDGE = 0.02;
 const MAKER_OFFSET = 0.03;
+// 板の枚数がこれ未満の気配は「見せ板」として無いものとみなす(枚数は 1e6 = 1株)
+const MIN_SIZE_SHARES = 5;
+const FILL_BINS = [Infinity, 300, 120, 60, 30, 10, 0];
 
 async function* readRows(dataDir, days) {
   const files = fs.readdirSync(dataDir).filter((f) => /^\d{4}-\d{2}-\d{2}\.jsonl(\.gz)?$/.test(f)).sort().slice(-days);
@@ -49,12 +52,12 @@ class Acc {
     this.bPoint += (r.p - y) ** 2;
     if (pTwap !== null && Number.isFinite(pTwap)) { this.nTwap++; this.bTwap += (pTwap - y) ** 2; }
     if (opp) this.opp++;
-    if (r.bookAgeMs !== null && r.bookAgeMs !== undefined) { this.ageSum += r.bookAgeMs; this.ageN++; }
+    if (r.bookAgeMs !== null && r.bookAgeMs !== undefined) { this.ageSum += r.bookAgeMs; this.ageN++; if (r.bookAgeMs > 30000) this.stale = (this.stale || 0) + 1; }
   }
   out() {
     const d = (a, b) => (b ? +(a / b).toFixed(4) : null);
     return { n: this.n, brierMid: d(this.bMid, this.nMid), brierPoint: d(this.bPoint, this.n), brierTwap: d(this.bTwap, this.nTwap), oppRate: d(this.opp, this.n),
-      twoSided: d(this.twoSided, this.n), oneSided: d(this.oneSided, this.n), empty: d(this.empty, this.n), extreme: d(this.extreme, this.nMid), midRight: d(this.midRight, this.nMid), bookAgeMs: this.ageN ? Math.round(this.ageSum / this.ageN) : null };
+      twoSided: d(this.twoSided, this.n), oneSided: d(this.oneSided, this.n), empty: d(this.empty, this.n), extreme: d(this.extreme, this.nMid), midRight: d(this.midRight, this.nMid), bookAgeMs: this.ageN ? Math.round(this.ageSum / this.ageN) : null, stale: d(this.stale || 0, this.ageN) };
   }
 }
 
@@ -74,14 +77,21 @@ export async function runBacktest({ dataDir, days = 3 }) {
     } else if (r.type === 'open_price') {
       const m = markets.get(r.slug); if (m && m.K === null) m.K = r.K;
     } else if (r.type === 'theo') {
-      const m = markets.get(r.slug); if (m) m.theo.push({ t: r.t, tau: r.tauSec, S: r.S, K: r.K, sigma1h: r.sigma1h, p: r.pTheo, bid: r.bid, ask: r.ask, mid: r.mid, bookAgeMs: r.bookAgeMs ?? null });
+      const m = markets.get(r.slug);
+      if (m) {
+        // 見せ板(極小枚数)は無いものとして扱う。枚数が記録されていない古い行はそのまま
+        const bid = r.bidSize !== null && r.bidSize !== undefined && r.bidSize / 1e6 < MIN_SIZE_SHARES ? null : r.bid;
+        const ask = r.askSize !== null && r.askSize !== undefined && r.askSize / 1e6 < MIN_SIZE_SHARES ? null : r.ask;
+        const mid = bid !== null && ask !== null ? (bid + ask) / 2 : null;
+        m.theo.push({ t: r.t, tau: r.tauSec, S: r.S, K: r.K, sigma1h: r.sigma1h, p: r.pTheo, bid, ask, mid, bookAgeMs: r.bookAgeMs ?? null });
+      }
     } else if (r.type === 'cex') {
       if (cex[r.asset]) cex[r.asset].set(Math.floor((r.srcTs ?? r.t) / 1000), r.price);
     } else if (r.type === 'oracle') {
       if (!r.slug) continue;
       const a = oracle.get(r.slug) ?? []; a.push({ sec: Math.floor((r.srcTs ?? r.t) / 1000), v: r.price }); oracle.set(r.slug, a);
     } else if (r.type === 'fill') {
-      const m = markets.get(r.slug); if (m && r.price !== null) m.fills.push({ t: r.blockTime ?? r.t, outcome: r.outcome, side: r.makerSide, price: r.price, shares: r.shares });
+      const m = markets.get(r.slug); if (m && r.price !== null) m.fills.push({ t: r.blockTime ?? r.t, outcome: r.outcome, side: r.makerSide, price: r.price, shares: r.shares, usdc: r.usdc ?? 0, secToExpiry: r.secToExpiry ?? null, kind: r.kind ?? null });
     }
   }
 
@@ -93,7 +103,17 @@ export async function runBacktest({ dataDir, days = 3 }) {
     ? ((f.outcome === 'YES' && f.side === 'SELL' && f.price <= q) || (f.outcome === 'NO' && f.side === 'BUY' && 1 - f.price <= q))
     : ((f.outcome === 'NO' && f.side === 'SELL' && f.price <= q) || (f.outcome === 'YES' && f.side === 'BUY' && 1 - f.price <= q))));
 
-  const report = { rows, days, generatedAt: Date.now(), samples: [], short: { markets: 0, buckets: {}, taker: { twap: { n: 0, pnl: 0, wins: 0 }, point: { n: 0, pnl: 0, wins: 0 } }, maker: { twap: { signals: 0, filled: 0, pnl: 0, wins: 0 } } },
+  // 約定が満期の何秒前に集中しているか(種別ごと)。板が「いつ存在するか」を知る
+  const fillDist = {};
+  for (const m of markets.values()) for (const f of m.fills) {
+    if (f.secToExpiry === null) continue;
+    const k = /min/.test(m.kind ?? '') ? 'short' : 'hourly';
+    const d = fillDist[k] ?? (fillDist[k] = {});
+    let label = null; for (let i = 0; i < FILL_BINS.length - 1; i++) if (f.secToExpiry <= FILL_BINS[i] && f.secToExpiry > FILL_BINS[i + 1]) { label = `${FILL_BINS[i] === Infinity ? '300+' : FILL_BINS[i] + '〜' + FILL_BINS[i + 1]}s`; break; }
+    if (!label) continue;
+    const b = d[label] ?? (d[label] = { n: 0, usdc: 0 }); b.n++; b.usdc += f.usdc;
+  }
+  const report = { rows, days, generatedAt: Date.now(), samples: [], fillDist, makerByBucket: {}, short: { markets: 0, buckets: {}, taker: { twap: { n: 0, pnl: 0, wins: 0 }, point: { n: 0, pnl: 0, wins: 0 } }, maker: { twap: { signals: 0, filled: 0, pnl: 0, wins: 0 } } },
     hourly: { markets: 0, buckets: {}, taker: { point: { n: 0, pnl: 0, wins: 0 } }, maker: { point: { signals: 0, filled: 0, pnl: 0, wins: 0 } } } };
 
   for (const m of markets.values()) {
@@ -103,7 +123,7 @@ export async function runBacktest({ dataDir, days = 3 }) {
     const R = isShort ? report.short : report.hourly;
     R.markets++;
     m.theo.sort((a, b) => a.t - b.t);
-    let takerDone = { twap: false, point: false }, makerDone = false;
+    let takerDone = { twap: false, point: false }, makerDone = {};
     for (const r of m.theo) {
       const tau = (m.expiryTs - r.t) / 1000;
       if (tau <= 0 || r.p === null) continue;
@@ -145,10 +165,19 @@ export async function runBacktest({ dataDir, days = 3 }) {
         else if (r.bid !== null && r.bid - pp >= TAKER_EDGE) { const cost = 1 - r.bid; const pnl = (1 - y) - cost - cost * TAKER_FEE; R.taker[name].n++; R.taker[name].pnl += pnl; if (pnl > 0) R.taker[name].wins++; takerDone[name] = true; }
       }
       // メイカー: 確率 ≥ 0.9 の側に「確率 − 3¢」で指値(市場ごとに1回)
-      const pm = isShort ? pTwap : r.p; const M = isShort ? R.maker.twap : R.maker.point;
-      if (pm !== null && Number.isFinite(pm) && !makerDone && (isShort ? tau <= 120 : tau <= 1800 && tau > 120)) {
-        if (pm >= 0.9) { const q = +(pm - MAKER_OFFSET).toFixed(2); M.signals++; makerDone = true; if (makerFilled(m, true, q, r.t)) { M.filled++; const pnl = y - q; M.pnl += pnl; if (pnl > 0) M.wins++; } }
-        else if (pm <= 0.1) { const q = +((1 - pm) - MAKER_OFFSET).toFixed(2); M.signals++; makerDone = true; if (makerFilled(m, false, q, r.t)) { M.filled++; const pnl = (1 - y) - q; M.pnl += pnl; if (pnl > 0) M.wins++; } }
+      // メイカー模擬: 帯ごとに「確率 ≥ 0.9 の側へ確率−3¢で指値」を最初の合図で1回。約定は逆側約定で近似
+      const pm = isShort ? (pTwap ?? r.p) : r.p; const M = isShort ? R.maker.twap : R.maker.point;
+      const mbEdges = isShort ? [300, 120, 60, 30, 0] : [3600, 1800, 600, 120, 0];
+      const mb = bucketOf(tau, mbEdges);
+      if (pm !== null && Number.isFinite(pm) && mb && !makerDone[mb] && (isShort || tau > 120)) {
+        const key = `${isShort ? '案1' : '案2'} ${mb}`;
+        const B = report.makerByBucket[key] ?? (report.makerByBucket[key] = { signals: 0, filled: 0, pnl: 0, wins: 0 });
+        const want = pm >= 0.9 ? true : pm <= 0.1 ? false : null;
+        if (want !== null) {
+          const q = +((want ? pm : 1 - pm) - MAKER_OFFSET).toFixed(2);
+          makerDone[mb] = true; B.signals++; M.signals++;
+          if (makerFilled(m, want, q, r.t)) { const pnl = (want ? y : 1 - y) - q; B.filled++; B.pnl += pnl; if (pnl > 0) B.wins++; M.filled++; M.pnl += pnl; if (pnl > 0) M.wins++; }
+        }
       }
     }
   }
@@ -159,14 +188,16 @@ export async function runBacktest({ dataDir, days = 3 }) {
 export function formatBacktest(rep) {
   const f = (v) => (v === null || v === undefined ? '-' : v);
   const lines = [`[検証] 対象=${rep.days}日分 行数=${rep.rows.toLocaleString()} 5分/15分市場=${rep.short.markets}件 1時間市場=${rep.hourly.markets}件 (Brier: 小さいほど当たる。板=中値、1点=今の理論、TWAP=案1)`];
-  lines.push('  案1 5分/15分 満期前(残り秒) | 行数 | 板 | 1点 | TWAP | 2¢超 | 両側板 | 片側 | 空 | 板が0.98超 | 板の正解率 | 板の鮮度ms');
-  for (const [k, v] of Object.entries(rep.short.buckets)) lines.push(`    ${k.padEnd(10)} | ${String(v.n).padStart(6)} | ${f(v.brierMid)} | ${f(v.brierPoint)} | ${f(v.brierTwap)} | ${f(v.oppRate)} | ${f(v.twoSided)} | ${f(v.oneSided)} | ${f(v.empty)} | ${f(v.extreme)} | ${f(v.midRight)} | ${f(v.bookAgeMs)}`);
+  lines.push('  案1 5分/15分 満期前(残り秒) | 行数 | 板 | 1点 | TWAP | 2¢超 | 両側板 | 片側 | 空 | 板が0.98超 | 板の正解率 | 板の鮮度ms | 30秒超の古さ');
+  for (const [k, v] of Object.entries(rep.short.buckets)) lines.push(`    ${k.padEnd(10)} | ${String(v.n).padStart(6)} | ${f(v.brierMid)} | ${f(v.brierPoint)} | ${f(v.brierTwap)} | ${f(v.oppRate)} | ${f(v.twoSided)} | ${f(v.oneSided)} | ${f(v.empty)} | ${f(v.extreme)} | ${f(v.midRight)} | ${f(v.bookAgeMs)} | ${f(v.stale)}`);
   for (const x of rep.samples) lines.push(`    見本: ${x.slug} 残り${x.tau}s 買${x.bid}/売${x.ask} 中値${x.mid} 1点${x.pPoint} TWAP${x.pTwap} S=${x.S} K=${x.K} 結果=${x.up ? 'Up' : 'Down'} 鮮度=${x.bookAgeMs}ms`);
+  for (const [k, d] of Object.entries(rep.fillDist)) lines.push(`    約定の満期前分布(${k === 'short' ? '5分/15分' : '1時間'}): ` + Object.entries(d).map(([b, v]) => `${b}=${v.n}件/$${Math.round(v.usdc)}`).join(' '));
+  for (const [k, v] of Object.entries(rep.makerByBucket)) lines.push(`    メイカー模擬 ${k}: 合図=${v.signals} 約定近似=${v.filled} 損益=${v.pnl.toFixed(3)}/株 勝率=${v.filled ? Math.round(v.wins / v.filled * 100) : '-'}%`);
   const t = rep.short.taker, mk = rep.short.maker.twap;
   lines.push(`    テイカー(2¢超で1回): TWAP n=${t.twap.n} 損益=${t.twap.pnl.toFixed(3)}/株 勝率=${t.twap.n ? Math.round(t.twap.wins / t.twap.n * 100) : '-'}% | 1点 n=${t.point.n} 損益=${t.point.pnl.toFixed(3)}/株 勝率=${t.point.n ? Math.round(t.point.wins / t.point.n * 100) : '-'}%`);
   lines.push(`    メイカー(確率−3¢に指値): 合図=${mk.signals} 約定近似=${mk.filled} 損益=${mk.pnl.toFixed(3)}/株 勝率=${mk.filled ? Math.round(mk.wins / mk.filled * 100) : '-'}%`);
-  lines.push('  案2 1時間 満期前(残り秒) | 行数 | 板 | 1点 | 2¢超 | 両側板 | 片側 | 空 | 板の正解率 | 板の鮮度ms');
-  for (const [k, v] of Object.entries(rep.hourly.buckets)) lines.push(`    ${k.padEnd(10)} | ${String(v.n).padStart(6)} | ${f(v.brierMid)} | ${f(v.brierPoint)} | ${f(v.oppRate)} | ${f(v.twoSided)} | ${f(v.oneSided)} | ${f(v.empty)} | ${f(v.midRight)} | ${f(v.bookAgeMs)}`);
+  lines.push('  案2 1時間 満期前(残り秒) | 行数 | 板 | 1点 | 2¢超 | 両側板 | 片側 | 空 | 板の正解率 | 板の鮮度ms | 30秒超の古さ');
+  for (const [k, v] of Object.entries(rep.hourly.buckets)) lines.push(`    ${k.padEnd(10)} | ${String(v.n).padStart(6)} | ${f(v.brierMid)} | ${f(v.brierPoint)} | ${f(v.oppRate)} | ${f(v.twoSided)} | ${f(v.oneSided)} | ${f(v.empty)} | ${f(v.midRight)} | ${f(v.bookAgeMs)} | ${f(v.stale)}`);
   const h = rep.hourly.taker.point, hm = rep.hourly.maker.point;
   lines.push(`    テイカー(2¢超で1回): n=${h.n} 損益=${h.pnl.toFixed(3)}/株 勝率=${h.n ? Math.round(h.wins / h.n * 100) : '-'}%`);
   lines.push(`    メイカー(確率−3¢に指値): 合図=${hm.signals} 約定近似=${hm.filled} 損益=${hm.pnl.toFixed(3)}/株 勝率=${hm.filled ? Math.round(hm.wins / hm.filled * 100) : '-'}%`);
