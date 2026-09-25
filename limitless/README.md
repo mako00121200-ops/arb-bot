@@ -1,4 +1,4 @@
-# limitless/ — Limitless Exchange 1時間 Up/Down 市場の観測(第1段階)
+# limitless/ — Limitless Exchange の Up/Down 市場(1時間・15分・5分)の観測(第1段階)
 
 **注文は一切出さない。** APIキーも秘密鍵も不要(公開チャネルだけを読む)。
 背景と戦略は `../docs/limitless-research.md`。
@@ -39,7 +39,7 @@
 |---|---|---|
 | `DATA_DIR` | `./data` | JSONL 保存先 |
 | `ASSETS` | `btc,eth` | 対象 |
-| `HOURLY_SLUG_PATTERN` | `^(btc\|eth)-up-or-down-hourly-(\d+)$` | 市場slugの命名が違ったらここを直す。合わなかった「それっぽい」slugは `raw_sample` に残る |
+| `HOURLY_SLUG_PATTERN` | `^(btc\|eth)-up-or-down-(hourly-p\|hourly\|\d+-min)-(\d+)$` | 2026年9月25日の実測では 1時間市場は `-hourly-p-<ミリ秒>`、5分/15分市場は `-5-min-<秒>`。合わなかった「それっぽい」slugは `raw_sample` に残る |
 | `THEO_INTERVAL_MS` | `1000` | 理論価格の記録間隔。容量が気になれば `2000` |
 | `BOOK_DEPTH` | `5` | 板の記録段数 |
 | `PYTH_HERMES_URL` | `https://hermes.pyth.network` | 空文字で無効 |

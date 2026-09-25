@@ -14,7 +14,8 @@
 //   LIMITLESS_WS_URL    既定 wss://ws.limitless.exchange
 //   DATA_DIR            JSONL の保存先。既定 ./data (Railway では Volume を /data に付けて指定)
 //   ASSETS              既定 btc,eth
-//   HOURLY_SLUG_PATTERN 既定 ^(btc|eth)-up-or-down-hourly-(\d+)$ (ASSETS から生成)
+//   HOURLY_SLUG_PATTERN 既定 ^(btc|eth)-up-or-down-(hourly-p|hourly|\d+-min)-(\d+)$ (ASSETS から生成)
+//                       2026年9月25日の実測: 1時間市場は -hourly-p-<ミリ秒>、5分/15分市場は -5-min-<秒>
 //   BOOK_DEPTH          板を何段まで記録するか。既定 5
 //   THEO_INTERVAL_MS    理論価格の記録間隔。既定 1000
 //   DISCOVER_INTERVAL_MS 新市場の探索間隔。既定 60000
@@ -32,7 +33,8 @@ const API_URL = env('LIMITLESS_API_URL', 'https://api.limitless.exchange').repla
 const WS_URL = env('LIMITLESS_WS_URL', 'wss://ws.limitless.exchange').replace(/\/$/, '');
 let DATA_DIR = env('DATA_DIR', path.resolve('data'));
 const ASSETS = env('ASSETS', 'btc,eth').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-const SLUG_RE = new RegExp(env('HOURLY_SLUG_PATTERN', `^(${ASSETS.join('|')})-up-or-down-hourly-(\\d+)$`));
+// 1群=資産, 2群=種別(hourly-p / hourly / 5-min …), 3群=slugの数字(秒でもミリ秒でも可)
+const SLUG_RE = new RegExp(env('HOURLY_SLUG_PATTERN', `^(${ASSETS.join('|')})-up-or-down-(hourly-p|hourly|\\d+-min)-(\\d+)$`));
 const BOOK_DEPTH = Number(env('BOOK_DEPTH', 5));
 const THEO_INTERVAL_MS = Number(env('THEO_INTERVAL_MS', 1000));
 const DISCOVER_INTERVAL_MS = Number(env('DISCOVER_INTERVAL_MS', 60000));
@@ -151,7 +153,7 @@ function logRawOnce(key, payload) {
   seenRaw.add(key);
   let s;
   try { s = JSON.stringify(payload); } catch { s = String(payload); }
-  writeRow('raw_sample', { key, sample: s.slice(0, 1500) });
+  writeRow('raw_sample', { key, sample: s.slice(0, 4000) });
   console.log(`[生データ] ${key}: ${s.slice(0, 300)}`);
 }
 function normTs(v) {
@@ -204,16 +206,31 @@ async function getJson(pathname) {
   return res.json();
 }
 
+// 種別文字列から市場の長さ(秒)を出す。hourly-p / hourly → 3600、5-min → 300
+export function durationSecOf(kind) {
+  if (!kind) return null;
+  if (kind.startsWith('hourly')) return 3600;
+  const mm = /^(\d+)-min$/.exec(kind);
+  return mm ? Number(mm[1]) * 60 : null;
+}
+
 function parseMarket(slug, raw) {
   const m = SLUG_RE.exec(slug);
   const asset = m ? m[1].toLowerCase() : null;
-  const slugTs = m && m[2] ? Number(m[2]) * 1000 : null;
-  const expiry = normTs(raw.expirationTimestamp) ?? normTs(raw.deadline) ?? normTs(raw.expirationDate) ?? (slugTs ? slugTs + 3600 * 1000 : null);
+  const kind = m ? m[2] : null;
+  const durationSec = durationSecOf(kind);
+  const slugTs = m && m[3] ? normTs(m[3]) : null;
+  const expiry = normTs(raw.expirationTimestamp) ?? normTs(raw.deadline) ?? normTs(raw.expirationDate)
+    ?? (slugTs && durationSec ? slugTs + durationSec * 1000 : null);
+  // 開始時刻は slug の数字に頼らず「満期 − 長さ」から出す(-p- 市場の数字は作成時刻で、時刻に揃っていない)
+  const openTs = expiry && durationSec ? expiry - durationSec * 1000 : slugTs;
   const openPrice = raw.openPrice !== undefined && raw.openPrice !== null && raw.openPrice !== '' ? Number(raw.openPrice) : null;
   const pythId = typeof raw.priceOracleMetadata?.pythAddress === 'string' ? raw.priceOracleMetadata.pythAddress.replace(/^0x/, '').toLowerCase() : null;
   return {
     asset,
-    openTs: slugTs,
+    kind,
+    durationSec,
+    openTs,
     expiryTs: expiry,
     openPrice: Number.isFinite(openPrice) ? openPrice : null,
     pythId,
@@ -253,7 +270,7 @@ async function refreshMarket(m) {
     logRawOnce('rest:market', raw);
     const p = parseMarket(m.slug, raw);
     const openPriceWasNull = m.openPrice === null;
-    Object.assign(m, { asset: p.asset ?? m.asset, openTs: p.openTs ?? m.openTs, expiryTs: p.expiryTs ?? m.expiryTs, pythId: p.pythId ?? m.pythId, status: p.status, winningIndex: p.winningIndex });
+    Object.assign(m, { asset: p.asset ?? m.asset, kind: p.kind ?? m.kind, openTs: p.openTs ?? m.openTs, expiryTs: p.expiryTs ?? m.expiryTs, pythId: p.pythId ?? m.pythId, status: p.status, winningIndex: p.winningIndex });
     if (p.openPrice !== null) m.openPrice = p.openPrice;
     writeRow('market', { slug: m.slug, ...p });
     if (openPriceWasNull && m.openPrice !== null) console.log(`[市場] ${m.slug} 始値確定 ${m.openPrice}`);
@@ -492,7 +509,7 @@ function finishMarket(m, winningIndex, via) {
   const s5 = m.snapshots[5] ?? null;
   const openGapBps = s5 && m.openPrice ? Math.log(s5.S / m.openPrice) * 1e4 : null;
   const summary = {
-    slug: m.slug, asset: m.asset, K: m.openPrice, up, via,
+    slug: m.slug, asset: m.asset, kind: m.kind ?? null, K: m.openPrice, up, via,
     open5s: s5, open30s: m.snapshots[30] ?? null, open120s: m.snapshots[120] ?? null,
     openGapBps,
     // 寄り付き5秒時点の理論価格が正しい側を指していたか
@@ -558,11 +575,22 @@ async function selftest() {
   if (new SigmaEstimator().sigma1h() !== null) fails.push('σ 初期値は null');
   // slug と時刻
   const m = SLUG_RE.exec('btc-up-or-down-hourly-1785049200');
-  if (!m || m[1] !== 'btc' || Number(m[2]) !== 1785049200) fails.push('SLUG_RE');
+  if (!m || m[1] !== 'btc' || m[2] !== 'hourly' || Number(m[3]) !== 1785049200) fails.push('SLUG_RE hourly');
+  const mp = SLUG_RE.exec('btc-up-or-down-hourly-p-1790291103668');
+  if (!mp || mp[2] !== 'hourly-p' || durationSecOf(mp[2]) !== 3600) fails.push('SLUG_RE hourly-p');
+  const m5 = SLUG_RE.exec('eth-up-or-down-5-min-1790302500');
+  if (!m5 || m5[1] !== 'eth' || m5[2] !== '5-min' || durationSecOf(m5[2]) !== 300) fails.push('SLUG_RE 5-min');
+  if (SLUG_RE.test('btc-up-or-down-daily-p-1790255123524') || SLUG_RE.test('doge-up-or-down-hourly-p-1')) fails.push('SLUG_RE 除外');
+  // -p- 市場: 開始時刻は満期−長さ(slugの数字は使わない)
+  const pp = parseMarket('btc-up-or-down-hourly-p-1790291103668', { expirationTimestamp: 1790294400 });
+  if (pp.kind !== 'hourly-p' || pp.expiryTs !== 1790294400000 || pp.openTs !== 1790290800000) fails.push(`parseMarket -p- ${JSON.stringify(pp)}`);
+  // 5分市場: APIに満期が無くても slug の数字(開始秒)+300秒
+  const p5 = parseMarket('eth-up-or-down-5-min-1790302500', {});
+  if (p5.durationSec !== 300 || p5.expiryTs !== 1790302800000 || p5.openTs !== 1790302500000) fails.push(`parseMarket 5-min ${JSON.stringify(p5)}`);
   if (normTs(1785049200) !== 1785049200000 || normTs('2026-07-26T07:00:00.000Z') !== 1785049200000) fails.push('normTs');
   // 市場の解釈
   const pm = parseMarket('eth-up-or-down-hourly-1785049200', { openPrice: '3456.78', expirationTimestamp: 1785052800, priceOracleMetadata: { pythAddress: '0xFF61491A931112DDF1BD8147CD1B641375F79F5825126D665480874634FD0ACE' } });
-  if (pm.asset !== 'eth' || pm.openPrice !== 3456.78 || pm.expiryTs !== 1785052800000 || pm.pythId !== PYTH_FEED_IDS.eth) fails.push(`parseMarket ${JSON.stringify(pm)}`);
+  if (pm.asset !== 'eth' || pm.openPrice !== 3456.78 || pm.expiryTs !== 1785052800000 || pm.openTs !== 1785049200000 || pm.pythId !== PYTH_FEED_IDS.eth) fails.push(`parseMarket ${JSON.stringify(pm)}`);
   // 記録: 一時ディレクトリに1行書いて読み戻す
   DATA_DIR = fs.mkdtempSync(path.join(process.env.TMPDIR ?? '/tmp', 'lmts-'));
   const row = writeRow('selftest', { ok: true });
