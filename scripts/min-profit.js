@@ -87,7 +87,14 @@ export function noteSendOutcome(chain, won, usd = 0) {
   const key = (chain || "").toLowerCase();
   if (!key) return;
   const v = outcomes.get(key) || blank();
-  const amount = Number.isFinite(Number(usd)) ? Math.abs(Number(usd)) : 0;
+  const raw = Number.isFinite(Number(usd)) ? Number(usd) : 0;
+  // **成立しても純利益がマイナスなら「負け」に数える。**
+  // [なぜ(2026年9月25日 朝、オーナーに夜間の取引記録を見せる時に発覚)]
+  // 以前は成立を常に「勝ち」とし、金額を絶対値にしていた。そのため
+  //   optimism: 粗利+$0.0017 − ガス$0.5168 = 純利益 −$0.5151 が「勝ち +$0.5151」
+  // と記録され、収支の表示が実際より約$1.03 良く見えていた(avalanche も7件・計$0.13 の赤字が勝ちに化けていた)。
+  if (won && raw < 0) won = false;
+  const amount = Math.abs(raw);
   if (won) { v.wins++; v.gainedUsd += amount; }
   else { v.losses++; v.lostGasUsd += amount; }
   // 件数も金額も半分にする(比率と収支の向きは保たれる)。
