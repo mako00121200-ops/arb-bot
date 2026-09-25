@@ -679,9 +679,11 @@ function theoTick() {
 function leaderReport() {
   const r = ledger.report({ hours: 24, top: 10 });
   writeRow('leaderboard', r);
-  console.log(`[勝者 24h] 確定約定=${r.resolvedFills}件 アドレス=${r.addresses} 合計損益=${r.totalPnl >= 0 ? '+' : ''}$${r.totalPnl.toFixed(2)} 未確定=${r.unresolved}件`);
-  r.topByPnl.forEach((x, i) => console.log('  ' + formatLeader(x, i)));
-  if (r.topByVolume.length) console.log(`[出来高上位 24h] ${r.topByVolume.slice(0, 5).map((x, i) => `#${i + 1} ${x.owner.slice(0, 6)}…${x.name ? `(${x.name})` : ''} $${x.notional.toFixed(0)} 損益${x.pnl >= 0 ? '+' : ''}$${x.pnl.toFixed(0)}`).join(' / ')}`);
+  // Railway のログは同一ミリ秒の行の順番が崩れるので、1つの複数行メッセージにまとめる
+  const lines = [`[勝者 24h] 確定約定=${r.resolvedFills}件 アドレス=${r.addresses} 合計損益=${r.totalPnl >= 0 ? '+' : ''}$${r.totalPnl.toFixed(2)} 未確定=${r.unresolved}件`];
+  r.topByPnl.forEach((x, i) => lines.push('  ' + formatLeader(x, i)));
+  if (r.topByVolume.length) lines.push(`[出来高上位 24h] ${r.topByVolume.slice(0, 5).map((x, i) => `#${i + 1} ${x.owner.slice(0, 6)}…${x.name ? `(${x.name})` : ''} $${x.notional.toFixed(0)} 損益${x.pnl >= 0 ? '+' : ''}$${x.pnl.toFixed(0)}`).join(' / ')}`);
+  console.log(lines.join('\n'));
 }
 
 function finishMarket(m, winningIndex, via) {
