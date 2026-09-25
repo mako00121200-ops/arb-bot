@@ -124,8 +124,8 @@ async function refresh(){
   if (bt) {
     document.getElementById('btNote').textContent = '対象 '+bt.days+'日分 / 5分・15分市場 '+bt.short.markets+'件 / 1時間市場 '+bt.hourly.markets+'件 / 計算 '+fmt.t(bt.generatedAt)+'。Brier = 平均(確率−結果)²、小さいほど当たる。';
     const bfmt = (v)=> v===null||v===undefined?'-':v.toFixed(3);
-    table('bt1', ['案1 残り秒','行数','板','1点','TWAP','2¢超'], Object.entries(bt.short.buckets).map(([k,v])=>[k, v.n, bfmt(v.brierMid), bfmt(v.brierPoint), el('span',{class:(v.brierTwap!==null&&v.brierMid!==null&&v.brierTwap<v.brierMid)?'up':''},bfmt(v.brierTwap)), fmt.pct(v.oppRate)]), '5分/15分市場の決済がまだありません');
-    table('bt2', ['案2 残り秒','行数','板','1点','2¢超'], Object.entries(bt.hourly.buckets).map(([k,v])=>[k, v.n, bfmt(v.brierMid), el('span',{class:(v.brierPoint!==null&&v.brierMid!==null&&v.brierPoint<v.brierMid)?'up':''},bfmt(v.brierPoint)), fmt.pct(v.oppRate)]), '1時間市場の決済がまだありません');
+    table('bt1', ['案1 残り秒','行数','板','1点','TWAP','2¢超','両側板','板0.98超','板の正解率'], Object.entries(bt.short.buckets).map(([k,v])=>[k, v.n, bfmt(v.brierMid), bfmt(v.brierPoint), el('span',{class:(v.brierTwap!==null&&v.brierMid!==null&&v.brierTwap<v.brierMid)?'up':''},bfmt(v.brierTwap)), fmt.pct(v.oppRate), fmt.pct(v.twoSided), fmt.pct(v.extreme), fmt.pct(v.midRight)]), '5分/15分市場の決済がまだありません');
+    table('bt2', ['案2 残り秒','行数','板','1点','2¢超','両側板','板の正解率'], Object.entries(bt.hourly.buckets).map(([k,v])=>[k, v.n, bfmt(v.brierMid), el('span',{class:(v.brierPoint!==null&&v.brierMid!==null&&v.brierPoint<v.brierMid)?'up':''},bfmt(v.brierPoint)), fmt.pct(v.oppRate), fmt.pct(v.twoSided), fmt.pct(v.midRight)]), '1時間市場の決済がまだありません');
     const t=bt.short.taker, mk=bt.short.maker.twap, h=bt.hourly.taker.point, hm=bt.hourly.maker.point;
     table('bt3', ['模擬売買(1市場1回)','回数','約定(近似)','損益/株 合計','勝率'], [
       ['案1 テイカー TWAP 2¢超', t.twap.n, '-', fmt.usd(t.twap.pnl), fmt.pct(t.twap.n?t.twap.wins/t.twap.n:null)],
