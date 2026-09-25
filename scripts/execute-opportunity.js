@@ -1128,6 +1128,45 @@ async function shadowCheck(opp) {
   }
 }
 
+/// **嵐の時に見送った機会を、あとからチェーンに聞くだけの確認**(送らない・ガスを払わない・状態を変えない)。
+///
+/// [なぜ(2026年9月25日、オーナーの承認「両方始めてください」)]
+/// avalanche の嵐(06:29〜07:59 JST)で大物197件のうち取れたのは1/31。逃した理由は
+/// 無効なプール92・同じ経路を送信中33・同じプールが使用中29・送信直前で見送り27。
+/// **見送った機会が、少し後に撃ち直していれば取れたのか**が分からないと、
+/// 「同じプールの2本目を許す」「撃ち直す」といった手を打つべきか決められない。
+/// 上の shadowCheck と違い、**経路の停止や手数料の読み直しなどの手当てはしない**
+/// (送信中の本番の経路に干渉させないため)。結果を返すだけ。
+/// 戻り値: { status: "real"|"gas_loss"|"loss"|"rejected"|"skip", netUsd?, error? }
+export async function stormShadowSimulate(opp) {
+  const chain = opp.chain;
+  const chainConfig = getChainConfig(chain);
+  const contractAddress = chainConfig && process.env[chainConfig.contractAddressEnvVar];
+  const privateKey = process.env.MAINNET_BOT_PRIVATE_KEY;
+  if (!contractAddress || !privateKey) return { status: "skip" };
+  const decimals = getTokenDecimals(chain, opp.tokenA);
+  const priceUsd = getTokenPriceUsd(chain, opp.tokenA);
+  if (decimals == null || !priceUsd) return { status: "skip" };
+  const capUsd = getCurrentTradeCapUsd();
+  let amountIn = opp.amountIn;
+  if (opp.tradeAmountUsd > capUsd) {
+    amountIn = (amountIn * BigInt(Math.round((capUsd / opp.tradeAmountUsd) * 10000))) / 10000n;
+  }
+  if (!(amountIn > 0n)) return { status: "skip" };
+  const { wallet } = getSigner(chain, privateKey);
+  const version = await detectContractVersion(chain, contractAddress);
+  const legArgs = buildLegArgs(chain, opp, version.version);
+  const sim = await simulate(chain, contractAddress, wallet.address,
+    ethers.getAddress(opp.tokenA), amountIn, legArgs, version.iface);
+  if (sim.error) return { status: "rejected", error: String(sim.error).slice(0, 80) };
+  const profitRaw = sim.returned - sim.owed;
+  if (profitRaw <= 0n) return { status: "loss" };
+  const grossUsd = (Number(profitRaw) / Math.pow(10, decimals)) * priceUsd;
+  const gasUsd = await estimateGasCostUsd(chain, opp.kind);
+  const netUsd = grossUsd - gasUsd;
+  return { status: netUsd >= minProfitUsd() ? "real" : "gas_loss", netUsd, gasUsd };
+}
+
 const SKIP_STATE_NAME = "send-skips.json";
 const SKIP_STATE_VERSION = 1;
 const SKIP_SAVE_MIN_MS = 60 * 1000;

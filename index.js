@@ -49,6 +49,7 @@ import { updateRpcUsage, formatRpcUsageLine } from "./scripts/rpc-usage.js";
 import { alertOwner, getAlertStats, sendPendingQuestions } from "./scripts/owner-alert.js";
 import { verifyAaveChains, getAaveChains, sweepAll as aaveSweepAll, checkWatchAll as aaveCheckWatchAll, formatAaveLine, AAVE_SWEEP_INTERVAL_MS, AAVE_WATCH_INTERVAL_MS } from "./scripts/aave-liquidation.js";
 import { noteBigOutcome, formatBigLine, formatBigSummary, flushBigOpportunities } from "./scripts/big-opportunities.js";
+import { noteStormHit, noteStormSkip, formatStormLine, formatStormSummary, flushStormMode } from "./scripts/storm-mode.js";
 import { formatTierLine, formatTierBreakdown, formatMoveBreakdown, flushTiers } from "./scripts/opportunity-tiers.js";
 import { probeUniswapXOnce, formatUniswapXLine, formatUniswapXReport, getProbeChains, PROBE_INTERVAL_MS, formatMissingPairsLine } from "./scripts/uniswapx-probe.js";
 import { fillMissingPairsOnce, formatPairFillLine, flushPairFiller } from "./scripts/pair-filler.js";
@@ -1874,7 +1875,12 @@ async function handleOpportunity(opp, meta = {}) {
   noteV3PoolsUsed(opp);
   // **捨てる道すべてで大物を数える。** 記録の無い道があると、
   // 「大きな機会が消えた」を後から確かめられない(2026年9月21日に判明)。
-  if (hasDisabledPool(opp)) { reasons.disabled++; noteBigOutcome(opp, "disabled"); return; }
+  if (hasDisabledPool(opp)) {
+    reasons.disabled++; noteBigOutcome(opp, "disabled");
+    // 嵐の間だけ、送らずに聞き直して「無効にしたプールで取れたか」を数える
+    if (opp.profitable && opp.netProfitUsd >= minProfitUsd()) { noteStormHit(opp); noteStormSkip(opp, "disabled"); }
+    return;
+  }
   if (pruneTaxTokenPools(opp)) { reasons.taxToken++; record(opp, "tax_token"); noteBigOutcome(opp, "tax_token"); return; }
 
   const key = opp.poolAddresses.join("|").toLowerCase();
@@ -1882,6 +1888,7 @@ async function handleOpportunity(opp, meta = {}) {
   if (cool && Date.now() < cool.until) {
     reasons.cooldown++;
     noteBigOutcome(opp, "cooldown", `あと${Math.ceil((cool.until - Date.now()) / 1000)}秒${cool.sticky ? "(送信失敗)" : ""}`);
+    if (opp.profitable && opp.netProfitUsd >= minProfitUsd()) { noteStormHit(opp); noteStormSkip(opp, "cooldown"); }
     return;
   }
   if (cool) cooldownUntil.delete(key);
@@ -1904,7 +1911,9 @@ async function handleOpportunity(opp, meta = {}) {
     noteBigOutcome(opp, "below_min");
     return;
   }
-  if (executing.has(key)) { reasons.executing++; noteBigOutcome(opp, "executing"); return; }
+  // **嵐の判定。** 下限以上の黒字を数える(RPC は使わない)。
+  noteStormHit(opp);
+  if (executing.has(key)) { reasons.executing++; noteBigOutcome(opp, "executing"); noteStormSkip(opp, "executing"); return; }
   // 同じプールを使う送信が進行中か、同時送信の上限に達していれば見送る。
   const lockKeys = poolLockKeys(opp);
   const inFlight = inFlightByChain.get(opp.chain) || 0;
@@ -1915,6 +1924,7 @@ async function handleOpportunity(opp, meta = {}) {
     // **どちらで止まったのかを分けて数える。** 直し方が正反対のため。
     if (hitPool) reasons.sendBusyPool++; else reasons.sendBusyParallel++;
     noteBigOutcome(opp, "send_busy", hitPool ? "同じプールが使用中" : `同時${inFlight}本の上限`);
+    noteStormSkip(opp, "send_busy");
     return;
   }
   executing.add(key);
@@ -1940,6 +1950,8 @@ async function handleOpportunity(opp, meta = {}) {
       cooldownUntil.set(key, { until: Date.now() + 30 * 1000, sticky: false });
       record(opp, notSentOutcome(opp), meta);
       noteBigOutcome(opp, "not_sent", opp.shortfallBps != null ? `不足${opp.shortfallBps.toFixed(1)}bps` : "");
+      // 送信停止中のチェーンは別の影の確認(shadowCheck)が数えるので、ここでは送れるチェーンだけ
+      if (opp.sendResult !== "skipped_chain") noteStormSkip(opp, "not_sent");
       // **不足の実測は、V2の手数料の誤差を知っている唯一の情報。** 捨てない。
       try { learnV2FeeFromShortfall(opp); } catch (e) {}
     }
@@ -2174,7 +2186,7 @@ function heartbeat() {
   let v3Total = 0;
   for (const chain of chainReady) v3Total += getPoolsByKind(chain, KIND_V3).length;
   const rc = getRouteCalcStats();
-  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 税${reasons.taxToken} 冷却${reasons.cooldown} 罠${reasons.trap} 非黒字${reasons.notProfitable} 下限${reasons.belowMin} 同経路${reasons.executing} 送信中${reasons.sendBusy}(同時上限${reasons.sendBusyParallel}/同プール${reasons.sendBusyPool}) 見送${reasons.notSent} 失敗${reasons.failed}${reasonsResidual()}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${formatTierLine()}${formatSendBalanceLine()}${formatSendSkipLine()}${formatUniswapXLine()}${formatMissingPairsLine()}${formatSolanaLine()}${formatMainnetEdgeLine()}${formatAaveLine()}${formatLiquidationLine()}${formatMorphoLine()}${formatMorphoMainnetLine()}${formatCompoundLine()}${formatSparkLine()}${formatSpeedLine()}${alertLine}`);
+  console.log(`[生存 ${nowJst()}] 稼働${[...chainReady].join(",") || "なし"} 始点${countUsableStarts()} 価格表${countQuoteTables()}/${v3Total * 2}(待${stats.quoteTablesPending} 要求で作成${stats.quoteTablesOnDemand}/${getQuoteDemandTotal()} 定期で作り直し${stats.quoteRebuildsFromPolling}${QUOTE_TABLE_FILL_ALL ? "" : " 作り置き停止"}) スキャン${stats.scans} 経路計算${rc.computed.toLocaleString()}→粗利プラス${rc.grossProfitable}(上限張付${rc.hitCap.toLocaleString()}) 精査${stats.examined} 黒字${stats.profitableFound} 実行${stats.executed}/${stats.failed} 内訳[無効${reasons.disabled} 税${reasons.taxToken} 冷却${reasons.cooldown} 罠${reasons.trap} 非黒字${reasons.notProfitable} 下限${reasons.belowMin} 同経路${reasons.executing} 送信中${reasons.sendBusy}(同時上限${reasons.sendBusyParallel}/同プール${reasons.sendBusyPool}) 見送${reasons.notSent} 失敗${reasons.failed}${reasonsResidual()}]${belowMinSummary()} 失敗段階[${stageLine}] 受信[${ev}]${pendingLine ? ` 先読み[${pendingLine}]` : ""} 手数料${stats.feeProbed}(残${stats.feeProbePending}${stats.feeFixedOnchain ? ` 直読み${stats.feeFixedOnchain}` : ""}${stats.feeUnreadable ? ` 読めず${stats.feeUnreadable}` : ""}${stats.feeLearned ? ` 学習${stats.feeLearned}` : ""}${feeFixQueue.size ? ` 待${feeFixQueue.size}` : ""}) 行列[${queued || "空"}] 束ね[${mc.calls}回で${mc.subcalls}件]${usageLine}${v3TableLine()}${quarantineFeeLine()}${disableLine()}${formatTierLine()}${formatSendBalanceLine()}${formatSendSkipLine()}${formatUniswapXLine()}${formatMissingPairsLine()}${formatSolanaLine()}${formatMainnetEdgeLine()}${formatAaveLine()}${formatLiquidationLine()}${formatMorphoLine()}${formatMorphoMainnetLine()}${formatCompoundLine()}${formatSparkLine()}${formatSpeedLine()}${formatStormLine()}${alertLine}`);
 
   // 現在価格によるふるいの通過率。
   //
@@ -2254,6 +2266,7 @@ function heartbeat() {
     {
       const bigLine = formatBigSummary();
       if (bigLine) console.log(bigLine);
+      for (const line of formatStormSummary()) console.log(line);
     }
 
     // **利益の段と、引き金の大きさ別の成績。**
@@ -2967,6 +2980,7 @@ for (const sig of ["SIGTERM", "SIGINT"]) {
     shuttingDown = true;
     // **測っているものを全部書き出してから終わる。**
     for (const [name, fn] of [["大物", flushBigOpportunities],
+                              ["嵐", flushStormMode],
                               ["メインネット歪み", flushMainnetEdge],
                               ["送信停止", flushSendSkips],
                               ["段", flushTiers],
