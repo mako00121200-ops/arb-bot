@@ -136,9 +136,14 @@ function ensureStream() {
   streamDate = d;
   return stream;
 }
+const errorLastShown = new Map();
 function writeRow(type, obj) {
   counts[type] = (counts[type] || 0) + 1;
   const row = { t: Date.now(), type, ...obj };
+  if (type === 'error') {
+    const last = errorLastShown.get(obj.where) ?? 0;
+    if (row.t - last > 5 * 60000) { errorLastShown.set(obj.where, row.t); console.error(`[エラー] ${obj.where}: ${obj.msg}`); }
+  }
   try {
     ensureStream().write(JSON.stringify(row) + '\n');
   } catch (e) {
@@ -214,6 +219,30 @@ export function durationSecOf(kind) {
   return mm ? Number(mm[1]) * 60 : null;
 }
 
+// 市場JSONの「どこに行使価格があるか」を突き止めるため、種別ごとに1回だけ
+// キー一覧・価格らしきフィールド・説明文(HTMLを剥がしたもの)をログに出す
+const describedKinds = new Set();
+function describeMarketOnce(kind, raw) {
+  if (describedKinds.has(kind)) return;
+  describedKinds.add(kind);
+  const keys = Object.keys(raw ?? {});
+  const priceLike = {};
+  const walk = (o, prefix, depth) => {
+    if (!o || typeof o !== 'object' || depth > 2) return;
+    for (const [k, v] of Object.entries(o)) {
+      const name = prefix ? `${prefix}.${k}` : k;
+      if (/price|open|strike|start|twap|oracle|settle|resol|deadline|expir|created|window/i.test(k) && (typeof v !== 'object' || v === null)) priceLike[name] = v;
+      else if (v && typeof v === 'object' && !Array.isArray(v)) walk(v, name, depth + 1);
+    }
+  };
+  walk(raw, '', 0);
+  const desc = String(raw?.description ?? '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 1200);
+  console.log(`[市場JSON:${kind}] keys=${keys.join(',')}`);
+  console.log(`[市場JSON:${kind}] 価格らしき項目=${JSON.stringify(priceLike)}`);
+  console.log(`[市場JSON:${kind}] 説明=${desc}`);
+  writeRow('market_shape', { kind, keys, priceLike, description: desc });
+}
+
 function parseMarket(slug, raw) {
   const m = SLUG_RE.exec(slug);
   const asset = m ? m[1].toLowerCase() : null;
@@ -269,9 +298,10 @@ async function refreshMarket(m) {
     const raw = await getJson(`/markets/${m.slug}`);
     logRawOnce('rest:market', raw);
     const p = parseMarket(m.slug, raw);
+    describeMarketOnce(p.kind ?? 'unknown', raw);
     const openPriceWasNull = m.openPrice === null;
     Object.assign(m, { asset: p.asset ?? m.asset, kind: p.kind ?? m.kind, openTs: p.openTs ?? m.openTs, expiryTs: p.expiryTs ?? m.expiryTs, pythId: p.pythId ?? m.pythId, status: p.status, winningIndex: p.winningIndex });
-    if (p.openPrice !== null) m.openPrice = p.openPrice;
+    if (p.openPrice !== null) { m.openPrice = p.openPrice; m.openPriceSrc = 'api'; }
     writeRow('market', { slug: m.slug, ...p });
     if (openPriceWasNull && m.openPrice !== null) console.log(`[市場] ${m.slug} 始値確定 ${m.openPrice}`);
     if (m.asset && m.pythId && !PYTH_FEED_IDS[m.asset]) PYTH_FEED_IDS[m.asset] = m.pythId;
@@ -355,7 +385,14 @@ function connectLimitlessWs() {
     const asset = m?.asset ?? null;
     const price = Number(d?.value);
     const t = normTs(d?.timestamp) ?? Date.now();
-    writeRow('oracle', { slug: d?.marketSlug ?? null, asset, price, srcTs: t, marketAddress: d?.marketAddress ?? null });
+    writeRow('oracle', { slug: d?.marketSlug ?? null, asset, price, srcTs: t, source: d?.source ?? null, marketAddress: d?.marketAddress ?? null });
+    // APIに始値が無い市場: 開始時刻から±15秒以内で最初に届いたオラクル値を行使価格にする
+    if (m && m.openPrice === null && m.openTs && Number.isFinite(price) && Math.abs(t - m.openTs) <= 15000) {
+      m.openPrice = price;
+      m.openPriceSrc = 'oracle_at_open';
+      writeRow('open_price', { slug: m.slug, K: price, src: m.openPriceSrc, srcTs: t, offsetMs: t - m.openTs });
+      console.log(`[市場] ${m.slug} 行使価格=オラクル開始値 ${price} (開始から${((t - m.openTs) / 1000).toFixed(1)}s)`);
+    }
     if (asset && refs[asset] && Number.isFinite(price)) {
       refs[asset].lmts = { price, t: Date.now() };
       refs[asset].sigma.push(price, t);
@@ -471,7 +508,7 @@ function theoTick() {
     if (m.resolved || !m.asset || !m.expiryTs) continue;
     if (m.openPrice === null) {
       // 始値がまだ無い: 30秒ごとに取り直す(最大20回)
-      if (m.fetchTries < 20 && now - m.discoveredAt > m.fetchTries * 30000) refreshMarket(m);
+      if (m.fetchTries < 3 && now - m.discoveredAt > m.fetchTries * 30000) refreshMarket(m);
       continue;
     }
     const ref = pickRef(m.asset);
@@ -481,7 +518,7 @@ function theoTick() {
     const th = theoUp(ref.price, m.openPrice, sigma, tauSec);
     const bs = bookSummary(m);
     const row = {
-      slug: m.slug, S: ref.price, src: ref.src, K: m.openPrice, tauSec: Math.round(tauSec),
+      slug: m.slug, S: ref.price, src: ref.src, K: m.openPrice, Ksrc: m.openPriceSrc ?? null, tauSec: Math.round(tauSec),
       sigma1h: sigma, sigmaEst: refs[m.asset].sigma.sigma1h() !== null,
       z: th?.z ?? null, pTheo: th?.p ?? null,
       bid: bs?.bid ?? null, ask: bs?.ask ?? null, mid: bs?.mid ?? null,
@@ -509,7 +546,7 @@ function finishMarket(m, winningIndex, via) {
   const s5 = m.snapshots[5] ?? null;
   const openGapBps = s5 && m.openPrice ? Math.log(s5.S / m.openPrice) * 1e4 : null;
   const summary = {
-    slug: m.slug, asset: m.asset, kind: m.kind ?? null, K: m.openPrice, up, via,
+    slug: m.slug, asset: m.asset, kind: m.kind ?? null, K: m.openPrice, Ksrc: m.openPriceSrc ?? null, up, via,
     open5s: s5, open30s: m.snapshots[30] ?? null, open120s: m.snapshots[120] ?? null,
     openGapBps,
     // 寄り付き5秒時点の理論価格が正しい側を指していたか
