@@ -57,6 +57,7 @@ const CHAIN_WS_ENV_VARS = {
   optimism: "OPTIMISM_WSS_URL",
   polygon: "POLYGON_WSS_URL",
   avalanche: "AVALANCHE_WSS_URL",
+  hyperevm: "HYPEREVM_WSS_URL",
 };
 
 const DATA_TIMEOUT_MS = 120 * 1000;

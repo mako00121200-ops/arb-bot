@@ -210,7 +210,7 @@ const PRICE_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const SCAM_REVERT_PATTERNS = [/blacklist/i, /not allowed/i, /forbidden/i, /trading (is )?not (enabled|open)/i, /cooldown/i, /max ?tx/i, /max ?wallet/i, /antiwhale/i];
 
 // ===== ガス代 =====
-const FALLBACK_GAS = { base: 0.010, arbitrum: 0.035, optimism: 0.005, polygon: 0.014, avalanche: 0.001 };
+const FALLBACK_GAS = { base: 0.010, arbitrum: 0.035, optimism: 0.005, polygon: 0.014, avalanche: 0.001, hyperevm: 0.010 };
 const gasCostCache = new Map();
 function getGasCost(chain, kind = "2step") {
   return gasCostCache.get(`${chain}::${kind}`) ?? FALLBACK_GAS[chain] ?? 0.02;

@@ -55,6 +55,8 @@ const HELPERS = {
   polygon: "0x7Ba560eB735AbDCf9a3a5692272652A0cc81850d",
   optimism: "0x96329d66074EB8386Ae8bFD6698B2E3FDA87e15E",
   base: "0xC4E9B633685461E7B7A807D12a246C81f96F31B8",
+  // woonetwork/docs の references/readme/hyperevm.md(Router・WooPPV2 は他チェーンと同じ住所)
+  hyperevm: "0xEe8318E9d597Bf9DF6148E86D4e35a8Bc14EEA88",
 };
 
 const ROUTER_IFACE = new ethers.Interface(["function wooPool() view returns (address)"]);

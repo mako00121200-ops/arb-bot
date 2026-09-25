@@ -803,3 +803,20 @@ GeckoTerminal で39チェーン(cronos・moonbeam・iotex・telos は一覧に�
 追加に要るもの: そのチェーンの RPC(月額が増えるならオーナーに相談)、裁定コントラクトの設置(相談事項。
 DexArbFlashLoan はプール自身のフラッシュスワップで借りるので Aave は不要。一時記憶 EIP-1153 を使うので Cancun 対応かを先に確認)、
 ガス代の少額の入金、ネイティブ通貨の価格と DEX のファクトリー住所の登録。
+
+### 19-1. HyperEVM の取り入れ(2026年9月25日、オーナーの指示)
+
+- **段取り**: ① RPC(Chainstack、有料契約済み)を `HYPEREVM_RPC_URL` / `HYPEREVM_WSS_URL` に登録(パス末尾 `/evm`)→
+  ② 送らない見張り(SEND_CHAINS に入れない。コントラクト未設置なので送信経路はそもそも動かない)→
+  ③ コントラクトの設置(**相談事項**)→ ④ 送信。
+- コードは `HYPEREVM_RPC_URL` がある時だけ hyperevm を載せる(chain-config.js)。住所の出典:
+  Uniswap 公式 github.com/Uniswap/contracts deployments/999.md(V3Factory・QuoterV2)、WOOFi 公式 docs、
+  Multicall3 は mds1/multicall3 の deployments.json、WHYPE は Hyperliquid 公式文書、USDC/USDT0/UBTC/UETH は hyperevmscan。
+- **分かっている壁**:
+  - 流動性の大半は HyperSwap V3・Project X・Kittenswap(Algebra)などの**フォーク**。フォークの V3 は自前コントラクトの
+    quoteV3 が無いと値付けできない(ENABLE_FORK_QUOTER)。②の段階で見えるのは V2 と Uniswap 公式 V3 だけ。
+    → **フォークまで見るには③のコントラクト設置が要る**(設置自体は資金を置かない。eth_call の見積もりに使う)。
+  - コントラクトの設置は約400万ガス。HyperEVM の小ブロック(約1秒)は上限200万ガスなので、**大ブロック(約1分・3,000万)**を
+    使う設定(HyperCore の evmUserModify usingBigBlocks)がウォレットに要る。裁定の取引(約27万ガス)は小ブロックに入る。
+  - HyperSwap V3 のコールバック名は独自(hyperswapV3SwapCallback)だが、DexArbFlashLoan の fallback が受け付ける。
+    一時記憶(EIP-1153)は HyperEVM が Cancun 準拠なので使える(公式文書)。
