@@ -75,6 +75,9 @@ export const PAGE = `<!doctype html>
 <div class="card"><h2>板と理論価格の乖離(今日、UTC)</h2><p class="note">理論 − 板 の大きい方を秒ごとに数えたもの。2¢ 超が多いほどテイカーで取れる余地がある。</p>
   <div class="chart"><canvas id="edge"></canvas></div></div>
 
+<div class="card"><h2>検証: 案1(5分/15分・TWAP残差)と案2(1時間・理論価格)</h2><p class="note" id="btNote">Brier = 平均(確率−結果)²。小さいほど当たる。「板」より「TWAP」/「1点」が小さければ、板より正しく値付けできている。1時間ごとに再計算。</p>
+  <div class="tbl"><table id="bt1"></table></div><div class="tbl" style="margin-top:8px"><table id="bt2"></table></div><div class="tbl" style="margin-top:8px"><table id="bt3"></table></div></div>
+
 <div class="card"><h2>勝者(直近24時間、損益確定分)</h2><p class="note">Base 上の約定をアドレス別に集計。テイカー率・側・満期前秒数が「戦術」。</p><div class="tbl"><table id="lead24"></table></div></div>
 <div class="card"><h2>常連(直近7日)</h2><p class="note">日別トップ10に入った日数の多い順。連日出る人の型を真似る候補。</p><div class="tbl"><table id="lead7"></table></div></div>
 <div class="card"><h2>監視中の市場</h2><div class="tbl"><table id="markets"></table></div></div>
@@ -117,6 +120,21 @@ async function refresh(){
   const today = s.today; const kinds = Object.entries(today.markets);
   table('hitKind', ['種別(今日)','決済','判定可','理論の的中','板の的中'], kinds.map(([k,m])=>[k, m.n, m.judged, fmt.pct(m.judged?m.theoRight/m.judged:null), fmt.pct(m.judged?m.midRight/m.judged:null)]));
   barChart('edge', s.edgeLabels, [ {label:'秒数',data:today.edge,backgroundColor:css('--s1')} ]);
+  const bt = s.backtest;
+  if (bt) {
+    document.getElementById('btNote').textContent = '対象 '+bt.days+'日分 / 5分・15分市場 '+bt.short.markets+'件 / 1時間市場 '+bt.hourly.markets+'件 / 計算 '+fmt.t(bt.generatedAt)+'。Brier = 平均(確率−結果)²、小さいほど当たる。';
+    const bfmt = (v)=> v===null||v===undefined?'-':v.toFixed(3);
+    table('bt1', ['案1 残り秒','行数','板','1点','TWAP','2¢超'], Object.entries(bt.short.buckets).map(([k,v])=>[k, v.n, bfmt(v.brierMid), bfmt(v.brierPoint), el('span',{class:(v.brierTwap!==null&&v.brierMid!==null&&v.brierTwap<v.brierMid)?'up':''},bfmt(v.brierTwap)), fmt.pct(v.oppRate)]), '5分/15分市場の決済がまだありません');
+    table('bt2', ['案2 残り秒','行数','板','1点','2¢超'], Object.entries(bt.hourly.buckets).map(([k,v])=>[k, v.n, bfmt(v.brierMid), el('span',{class:(v.brierPoint!==null&&v.brierMid!==null&&v.brierPoint<v.brierMid)?'up':''},bfmt(v.brierPoint)), fmt.pct(v.oppRate)]), '1時間市場の決済がまだありません');
+    const t=bt.short.taker, mk=bt.short.maker.twap, h=bt.hourly.taker.point, hm=bt.hourly.maker.point;
+    table('bt3', ['模擬売買(1市場1回)','回数','約定(近似)','損益/株 合計','勝率'], [
+      ['案1 テイカー TWAP 2¢超', t.twap.n, '-', fmt.usd(t.twap.pnl), fmt.pct(t.twap.n?t.twap.wins/t.twap.n:null)],
+      ['案1 テイカー 1点 2¢超', t.point.n, '-', fmt.usd(t.point.pnl), fmt.pct(t.point.n?t.point.wins/t.point.n:null)],
+      ['案1 メイカー TWAP −3¢', mk.signals, mk.filled, fmt.usd(mk.pnl), fmt.pct(mk.filled?mk.wins/mk.filled:null)],
+      ['案2 テイカー 1点 2¢超', h.n, '-', fmt.usd(h.pnl), fmt.pct(h.n?h.wins/h.n:null)],
+      ['案2 メイカー 1点 −3¢', hm.signals, hm.filled, fmt.usd(hm.pnl), fmt.pct(hm.filled?hm.wins/hm.filled:null)],
+    ]);
+  }
   const mx24 = Math.max(...s.lead24.topByPnl.map(r=>Math.abs(r.pnl)), 0);
   table('lead24', ['アドレス','損益','約定','勝率','名目','テイカー','買YES','買NO','売','満期前'], s.lead24.topByPnl.map(r=>[who(r), pnlCell(r.pnl,mx24), r.n, fmt.pct(r.winRate), '$'+fmt.n(r.notional), fmt.pct(r.takerRate), fmt.pct(r.buyYesRate), fmt.pct(r.buyNoRate), fmt.pct(r.sellRate), r.avgSecToExpiry===null?'-':Math.round(r.avgSecToExpiry)+'s']));
   const mx7 = Math.max(...s.lead7.byConsistency.map(r=>Math.abs(r.pnl)), 0);

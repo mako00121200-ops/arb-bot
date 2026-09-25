@@ -40,6 +40,7 @@ import { startChainWatcher, decodeOrderFilled, TOPICS, CONTRACTS } from './oncha
 import { FillLedger, formatLeader } from './ledger.js';
 import { Stats, EDGE_LABELS } from './stats.js';
 import { startServer } from './server.js';
+import { runBacktest, formatBacktest } from './backtest.js';
 
 const env = (k, d) => (process.env[k] === undefined || process.env[k] === '' ? d : process.env[k]);
 const API_URL = env('LIMITLESS_API_URL', 'https://api.limitless.exchange').replace(/\/$/, '');
@@ -74,23 +75,8 @@ const SIGMA_CLAMP = [0.0015, 0.02];
 const OPEN_SNAPSHOT_OFFSETS_SEC = [5, 30, 120];
 
 // ---------------------------------------------------------------- 数学
-function erf(x) {
-  const sign = x < 0 ? -1 : 1;
-  x = Math.abs(x);
-  const t = 1 / (1 + 0.3275911 * x);
-  const y = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
-  return sign * y;
-}
-export function normCdf(z) {
-  return 0.5 * (1 + erf(z / Math.SQRT2));
-}
-// 1時間 Up/Down の理論価格。S=現在値, K=始値, sigma1h=1時間σ(対数), tauSec=残り秒
-export function theoUp(S, K, sigma1h, tauSec) {
-  if (!(S > 0) || !(K > 0) || !(sigma1h > 0)) return null;
-  const tauH = Math.max(tauSec, 1) / 3600;
-  const z = Math.log(S / K) / (sigma1h * Math.sqrt(tauH));
-  return { p: normCdf(z), z };
-}
+import { normCdf, theoUp } from './math.js';
+export { normCdf, theoUp };
 
 // 1秒足の対数収益率から EWMA で1時間σを推定する
 export class SigmaEstimator {
@@ -152,6 +138,9 @@ const LEADER_REPORT_MS = Number(env('LEADER_REPORT_MS', 3600000));
 const PORT = Number(env('PORT', 8080));
 const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN ?? '';
 const stats = new Stats({ dataDir: DATA_DIR, keepDays: 14 });
+const BACKTEST_INTERVAL_MS = Number(env('BACKTEST_INTERVAL_MS', 3600000));
+const BACKTEST_DAYS = Number(env('BACKTEST_DAYS', 3));
+let lastBacktest = null;
 let lowDiskWarnedAt = 0;
 // 前日分を gzip し、KEEP_DAYS より古いファイルを消す(失敗しても記録は止めない)
 function rotateFiles(prevDate) {
@@ -683,6 +672,18 @@ function theoTick() {
   }
 }
 
+// たまった JSONL で案1・案2を検証し、ログと画面に出す
+async function backtestOnce() {
+  try {
+    const rep = await runBacktest({ dataDir: DATA_DIR, days: BACKTEST_DAYS });
+    lastBacktest = rep;
+    console.log(formatBacktest(rep));
+    writeRow('backtest', { days: rep.days, rows: rep.rows, short: rep.short, hourly: rep.hourly });
+  } catch (e) {
+    writeRow('error', { where: 'backtest', msg: e.message });
+  }
+}
+
 // 画面(/api/state)に渡す状態
 function getState() {
   const now = Date.now();
@@ -704,6 +705,7 @@ function getState() {
     lead24: ledger.report({ hours: 24, top: 15 }), lead7: stats.leaderboard(7, 15, ledger.names),
     recentSummaries: stats.recentSummaries, recentFills: ledger.recent(50),
     sigma: Object.fromEntries(ASSETS.map((a) => [a, refs[a].sigma.sigma1h()])),
+    backtest: lastBacktest,
   };
 }
 
@@ -854,6 +856,25 @@ async function selftest() {
   if (!td || td.edge[3] !== 1 || td.edge[0] !== 1 || td.markets['5-min']?.theoRight !== 1 || td.markets['5-min']?.midRight !== 0) fails.push(`Stats ${JSON.stringify(td)}`);
   const lb = st.leaderboard(7, 5);
   if (lb.byConsistency[0]?.daysTop10 !== 1 || lb.addresses !== 2) fails.push(`Stats leaderboard ${JSON.stringify(lb)}`);
+  // 検証: 5分市場1つ(Up で決済)。満期前30秒に板が 0.90 で、TWAPモデルは ≈1 を出すはず
+  {
+    const dir = fs.mkdtempSync(path.join(process.env.TMPDIR ?? '/tmp', 'lmts-bt-'));
+    const T = 1790000000000; const K = 100000;
+    const rowsOut = [];
+    rowsOut.push({ t: T - 300000, type: 'market', slug: 'btc-up-or-down-5-min-x', kind: '5-min', asset: 'btc', expiryTs: T, openPrice: K });
+    for (let sec = -300; sec <= 0; sec++) rowsOut.push({ t: T + sec * 1000, type: 'cex', asset: 'btc', price: K + 300, srcTs: T + sec * 1000 });
+    for (let sec = -120; sec <= 0; sec += 1) rowsOut.push({ t: T + sec * 1000, type: 'oracle', slug: 'btc-up-or-down-5-min-x', asset: 'btc', price: K + 300, srcTs: T + sec * 1000 });
+    for (let sec = -120; sec < 0; sec += 1) rowsOut.push({ t: T + sec * 1000, type: 'theo', slug: 'btc-up-or-down-5-min-x', tauSec: -sec, S: K + 300, K, sigma1h: 0.004, pTheo: 0.95, bid: 0.89, ask: 0.9, mid: 0.895 });
+    rowsOut.push({ t: T - 20000, type: 'fill', slug: 'btc-up-or-down-5-min-x', outcome: 'YES', makerSide: 'SELL', price: 0.9, shares: 10, blockTime: T - 20000 });
+    rowsOut.push({ t: T + 60000, type: 'summary', slug: 'btc-up-or-down-5-min-x', kind: '5-min', up: 1, K });
+    fs.writeFileSync(path.join(dir, '2026-01-01.jsonl'), rowsOut.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    const rep = await runBacktest({ dataDir: dir, days: 3 });
+    const b = rep.short.buckets['30〜10s'];
+    if (rep.short.markets !== 1 || !b || b.brierTwap === null || b.brierTwap > 0.001 || b.brierMid < 0.01) fails.push(`backtest ${JSON.stringify(rep.short)}`);
+    if (rep.short.taker.twap.n !== 1 || rep.short.taker.twap.pnl < 0.09) fails.push(`backtest taker ${JSON.stringify(rep.short.taker)}`);
+    if (rep.short.maker.twap.signals !== 1 || rep.short.maker.twap.filled !== 1) fails.push(`backtest maker ${JSON.stringify(rep.short.maker)}`);
+    formatBacktest(rep);
+  }
   if (fails.length) { console.error('自己診断 失敗:', fails); process.exit(1); }
   console.log('自己診断 OK');
 }
@@ -866,6 +887,7 @@ async function main() {
   if (stats.load()) console.log(`[集計] stats.json を読込(${Object.keys(stats.days).length}日分)`);
   setInterval(() => stats.save(), 60000);
   startServer({ port: PORT, getState, token: DASHBOARD_TOKEN });
+  if (BACKTEST_INTERVAL_MS > 0) setTimeout(function bt() { backtestOnce().finally(() => setTimeout(bt, BACKTEST_INTERVAL_MS)); }, 60000);
   connectLimitlessWs();
   runHermes();
   runBinance();
