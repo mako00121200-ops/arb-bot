@@ -65,7 +65,8 @@ class Acc {
   }
 }
 
-export async function runBacktest({ dataDir, days = 3 }) {
+// since を渡すと、それ以降の理論行・約定・決済だけで集計する(購読修正後だけを見る等)
+export async function runBacktest({ dataDir, days = 3, since = 0 }) {
   const markets = new Map(); // slug -> { kind, asset, expiryTs, K, up, theo: [], fills: [] }
   const cex = { btc: new Map(), eth: new Map() }; // asset -> sec -> price
   const oracle = new Map(); // slug -> [{sec, v}]
@@ -82,7 +83,7 @@ export async function runBacktest({ dataDir, days = 3 }) {
       const m = markets.get(r.slug); if (m && m.K === null) m.K = r.K;
     } else if (r.type === 'theo') {
       const m = markets.get(r.slug);
-      if (m) {
+      if (m && r.t >= since) {
         // 見せ板(極小枚数)は無いものとして扱う。枚数が記録されていない古い行はそのまま
         const bid = r.bidSize !== null && r.bidSize !== undefined && r.bidSize / 1e6 < MIN_SIZE_SHARES ? null : r.bid;
         const ask = r.askSize !== null && r.askSize !== undefined && r.askSize / 1e6 < MIN_SIZE_SHARES ? null : r.ask;
@@ -95,7 +96,7 @@ export async function runBacktest({ dataDir, days = 3 }) {
       if (!r.slug) continue;
       const a = oracle.get(r.slug) ?? []; a.push({ sec: Math.floor((r.srcTs ?? r.t) / 1000), v: r.price }); oracle.set(r.slug, a);
     } else if (r.type === 'fill') {
-      const m = markets.get(r.slug); if (m && r.price !== null) m.fills.push({ t: r.blockTime ?? r.t, outcome: r.outcome, side: r.makerSide, price: r.price, shares: r.shares, usdc: r.usdc ?? 0, secToExpiry: r.secToExpiry ?? null, kind: r.kind ?? null });
+      const m = markets.get(r.slug); if (m && r.price !== null && (r.blockTime ?? r.t) >= since) m.fills.push({ t: r.blockTime ?? r.t, outcome: r.outcome, side: r.makerSide, price: r.price, shares: r.shares, usdc: r.usdc ?? 0, secToExpiry: r.secToExpiry ?? null, kind: r.kind ?? null });
     }
   }
 
@@ -117,7 +118,7 @@ export async function runBacktest({ dataDir, days = 3 }) {
     if (!label) continue;
     const b = d[label] ?? (d[label] = { n: 0, usdc: 0 }); b.n++; b.usdc += f.usdc;
   }
-  const report = { rows, days, generatedAt: Date.now(), samples: [], fillDist, makerByBucket: {}, short: { markets: 0, buckets: {}, taker: { twap: { n: 0, pnl: 0, wins: 0 }, point: { n: 0, pnl: 0, wins: 0 } }, maker: { twap: { signals: 0, filled: 0, pnl: 0, wins: 0 } } },
+  const report = { rows, days, since, generatedAt: Date.now(), samples: [], fillDist, makerByBucket: {}, short: { markets: 0, buckets: {}, taker: { twap: { n: 0, pnl: 0, wins: 0 }, point: { n: 0, pnl: 0, wins: 0 } }, maker: { twap: { signals: 0, filled: 0, pnl: 0, wins: 0 } } },
     hourly: { markets: 0, buckets: {}, taker: { point: { n: 0, pnl: 0, wins: 0 } }, maker: { point: { signals: 0, filled: 0, pnl: 0, wins: 0 } } } };
 
   for (const m of markets.values()) {

@@ -76,7 +76,7 @@ export const PAGE = `<!doctype html>
   <div class="chart"><canvas id="edge"></canvas></div></div>
 
 <div class="card"><h2>検証: 案1(5分/15分・TWAP残差)と案2(1時間・理論価格)</h2><p class="note" id="btNote">Brier = 平均(確率−結果)²。小さいほど当たる。「板」より「TWAP」/「1点」が小さければ、板より正しく値付けできている。1時間ごとに再計算。</p>
-  <div class="tbl"><table id="bt1"></table></div><div class="tbl" style="margin-top:8px"><table id="bt2"></table></div><div class="tbl" style="margin-top:8px"><table id="bt4"></table></div><div class="tbl" style="margin-top:8px"><table id="bt3"></table></div></div>
+  <div class="tbl"><table id="bt1"></table></div><div class="tbl" style="margin-top:8px"><table id="bt1r"></table></div><div class="tbl" style="margin-top:8px"><table id="bt2"></table></div><div class="tbl" style="margin-top:8px"><table id="bt4"></table></div><div class="tbl" style="margin-top:8px"><table id="bt3"></table></div></div>
 
 <div class="card"><h2>勝者(直近24時間、損益確定分)</h2><p class="note">Base 上の約定をアドレス別に集計。テイカー率・側・満期前秒数が「戦術」。</p><div class="tbl"><table id="lead24"></table></div></div>
 <div class="card"><h2>常連(直近7日)</h2><p class="note">日別トップ10に入った日数の多い順。連日出る人の型を真似る候補。</p><div class="tbl"><table id="lead7"></table></div></div>
@@ -125,6 +125,8 @@ async function refresh(){
     document.getElementById('btNote').textContent = '対象 '+bt.days+'日分 / 5分・15分市場 '+bt.short.markets+'件 / 1時間市場 '+bt.hourly.markets+'件 / 計算 '+fmt.t(bt.generatedAt)+'。Brier = 平均(確率−結果)²、小さいほど当たる。';
     const bfmt = (v)=> v===null||v===undefined?'-':v.toFixed(3);
     table('bt1', ['案1 残り秒','行数','板','1点','TWAP','2¢超','両側板','板0.98超','板の正解率'], Object.entries(bt.short.buckets).map(([k,v])=>[k, v.n, bfmt(v.brierMid), bfmt(v.brierPoint), el('span',{class:(v.brierTwap!==null&&v.brierMid!==null&&v.brierTwap<v.brierMid)?'up':''},bfmt(v.brierTwap)), fmt.pct(v.oppRate), fmt.pct(v.twoSided), fmt.pct(v.extreme), fmt.pct(v.midRight)]), '5分/15分市場の決済がまだありません');
+    const br = s.backtestRecent;
+    if (br) table('bt1r', ['案1 直近2hのみ','行数','板','1点','TWAP','2¢超','両側板','板0.98超','板の正解率'], Object.entries(br.short.buckets).map(([k,v])=>[k, v.n, bfmt(v.brierMid), bfmt(v.brierPoint), el('span',{class:(v.brierTwap!==null&&v.brierMid!==null&&v.brierTwap<v.brierMid)?'up':''},bfmt(v.brierTwap)), fmt.pct(v.oppRate), fmt.pct(v.twoSided), fmt.pct(v.extreme), fmt.pct(v.midRight)]), '直近2時間に決済がまだありません');
     table('bt2', ['案2 残り秒','行数','板','1点','2¢超','両側板','板の正解率'], Object.entries(bt.hourly.buckets).map(([k,v])=>[k, v.n, bfmt(v.brierMid), el('span',{class:(v.brierPoint!==null&&v.brierMid!==null&&v.brierPoint<v.brierMid)?'up':''},bfmt(v.brierPoint)), fmt.pct(v.oppRate), fmt.pct(v.twoSided), fmt.pct(v.midRight)]), '1時間市場の決済がまだありません');
     const fd = bt.fillDist||{}; const fdRows=[]; for(const [k,d] of Object.entries(fd)) fdRows.push([k==='short'?'5分/15分':'1時間', ...['300+s','300〜120s','120〜60s','60〜30s','30〜10s','10〜0s'].map(b=> d[b]? d[b].n+'件 / $'+Math.round(d[b].usdc) : '-')]);
     table('bt4', ['約定の満期前分布','300s+','300〜120','120〜60','60〜30','30〜10','10〜0'], fdRows, '約定がまだありません');

@@ -140,6 +140,8 @@ const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN ?? '';
 const stats = new Stats({ dataDir: DATA_DIR, keepDays: 14 });
 const BACKTEST_INTERVAL_MS = Number(env('BACKTEST_INTERVAL_MS', 3600000));
 const BACKTEST_DAYS = Number(env('BACKTEST_DAYS', 3));
+const BACKTEST_RECENT_HOURS = Number(env('BACKTEST_RECENT_HOURS', 2));
+let lastBacktestRecent = null;
 let lastBacktest = null;
 let lowDiskWarnedAt = 0;
 // 前日分を gzip し、KEEP_DAYS より古いファイルを消す(失敗しても記録は止めない)
@@ -686,6 +688,11 @@ async function backtestOnce() {
     lastBacktest = rep;
     console.log(formatBacktest(rep));
     writeRow('backtest', { days: rep.days, rows: rep.rows, short: rep.short, hourly: rep.hourly });
+    // 直近だけ(購読修正の後など、条件が変わった後の姿を見る)
+    const recent = await runBacktest({ dataDir: DATA_DIR, days: 1, since: Date.now() - BACKTEST_RECENT_HOURS * 3600000 });
+    recent.samples = [];
+    lastBacktestRecent = recent;
+    console.log(`[検証 直近${BACKTEST_RECENT_HOURS}時間だけ]\n` + formatBacktest(recent));
   } catch (e) {
     writeRow('error', { where: 'backtest', msg: e.message });
   }
@@ -713,6 +720,7 @@ function getState() {
     recentSummaries: stats.recentSummaries, recentFills: ledger.recent(50),
     sigma: Object.fromEntries(ASSETS.map((a) => [a, refs[a].sigma.sigma1h()])),
     backtest: lastBacktest,
+    backtestRecent: lastBacktestRecent,
   };
 }
 
