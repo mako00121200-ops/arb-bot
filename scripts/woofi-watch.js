@@ -352,9 +352,12 @@ export function formatWoofiLine() {
       .map(([rk, r]) => `${rk} 今${f(r.last)}/平時最良${f(r.calmBest)}/嵐最良${f(r.stormBest)}bps${r.positives ? ` 黒字${r.positives}回` : ""}`).join(" ");
     const d = [...st.durations].sort((a, b) => a - b);
     const durTxt = d.length ? ` 続いた秒数[中央${Math.round(d[Math.floor(d.length / 2)])} ${d.length}件]` : "";
-    const f = fast.get(chain);
-    const lag = f && f.lagMs.length ? [...f.lagMs].sort((a, b) => a - b)[Math.floor(f.lagMs.length / 2)] : null;
-    const fastTxt = f ? ` 速報[読み${f.reads} 候補${f.screens} 黒字${f.hits}${lag != null ? ` 反応中央${lag}ms` : ""}${f.noPair ? ` 地図に組なし${f.noPair}` : ""}]` : "";
+    // [2026年9月25日の障害] ここを `const f` と書き、上の書式関数 f を同じ区画で隠していた。
+    // 経路が1本でも記録されると f(...) が「初期化前の参照」で例外になり、生存ログの組み立てごと
+    // 本番が4〜5分ごとに落ちた(14:40〜15:40 JST)。名前を分ける。
+    const fq = fast.get(chain);
+    const lag = fq && fq.lagMs.length ? [...fq.lagMs].sort((a, b) => a - b)[Math.floor(fq.lagMs.length / 2)] : null;
+    const fastTxt = fq ? ` 速報[読み${fq.reads} 候補${fq.screens} 黒字${fq.hits}${lag != null ? ` 反応中央${lag}ms` : ""}${fq.noPair ? ` 地図に組なし${fq.noPair}` : ""}]` : "";
     parts.push(`${chain} 読み${st.reads}(嵐${st.stormReads})${fastTxt}${st.paused ? " **停止中**" : ""} ${routesTxt || "経路なし"}`
       + `${st.maxNetUsd != null ? ` 最大$${st.maxNetUsd.toFixed(3)}` : ""}${durTxt}`);
   }
