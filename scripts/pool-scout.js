@@ -40,6 +40,10 @@ import { getSyncStats } from "../dex-onchain-realtime.js";
 /// 意味がある(住所の分からないファクトリーのプールは公式Quoterで引けないため)。
 const SCOUT_CHAINS = (process.env.SCOUT_CHAINS ?? "optimism")
   .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+// [2026年9月25日] HyperEVM は手書きのプール名簿もファクトリーの一覧もほぼ無いので、
+// イベントからの発見が唯一の入口。稼働している時は必ず調べる(フォークの V3 は
+// 自前の見積もりが無い間は採用せず、候補として報告だけされる)。
+if (!SCOUT_CHAINS.includes("hyperevm")) SCOUT_CHAINS.push("hyperevm");
 
 /// **報告だけして、1本も地図に載せないチェーン。**
 ///

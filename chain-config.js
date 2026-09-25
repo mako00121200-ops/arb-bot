@@ -66,6 +66,20 @@ export const ALL_CHAIN_CONFIG = {
     contractAddressEnvVar: "MAINNET_CONTRACT_ADDRESS_AVALANCHE",
     explorerTxUrl: (hash) => `https://snowtrace.io/tx/${hash}`,
   },
+  // [2026年9月25日に追加、オーナーの指示「HyperEVM も取り入れたい」]
+  // 一晩の値動き調査(STRATEGY-RESEARCH §19)で、WHYPE/USDC が8つの DEX に分かれている
+  // = avalanche の夜と同じ形だったチェーン。**HYPEREVM_RPC_URL が設定されている時だけ載せる**
+  // (公開 RPC は1分100回までで WebSocket も無く、常時の監視には足りないため)。
+  // chain id 999(mds1/multicall3 の deployments.json でも HyperEVM = 999)。
+  ...((process.env.HYPEREVM_RPC_URL || "").trim() ? {
+    hyperevm: {
+      chainId: 999,
+      rpcUrls: withEnvFirst("HYPEREVM_RPC_URL", ["https://rpc.hyperliquid.xyz/evm"]),
+      aavePoolAddressesProvider: null,
+      contractAddressEnvVar: "MAINNET_CONTRACT_ADDRESS_HYPEREVM",
+      explorerTxUrl: (hash) => `https://hyperevmscan.io/tx/${hash}`,
+    },
+  } : {}),
 };
 
 function selectActiveChains() {

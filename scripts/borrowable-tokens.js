@@ -68,6 +68,17 @@ const KNOWN_TOKENS = {
     "0xb31f66aa3c1e785363f0875a1b74e27b85fd66c7": { symbol: "WAVAX", decimals: 18, priceHintUsd: 25 },
     "0x49d5c2bdffac6ce2bfdb6640f4f80f226bc10bab": { symbol: "WETH.e", decimals: 18, priceHintUsd: 2600 },
   },
+  // [2026年9月25日] HyperEVM(HYPEREVM_RPC_URL を設定した時だけ稼働)。
+  // WHYPE は Hyperliquid 公式文書のシステムコントラクト。USDC は hyperevmscan の表示名
+  // 「Circle: USDC Token」、USDT0・UBTC・UETH は hyperevmscan のトークン頁による。
+  // 桁数は起動時にチェーンと突き合わせる(違えば使われない)。
+  hyperevm: {
+    "0xb88339cb7199b77e23db6e890353e22632ba630f": { symbol: "USDC", decimals: 6, stable: true },
+    "0xb8ce59fc3717ada4c02eadf9682a9e934f625ebb": { symbol: "USDT0", decimals: 6, stable: true },
+    "0x5555555555555555555555555555555555555555": { symbol: "WHYPE", decimals: 18, priceHintUsd: 40 },
+    "0x9fdbda0a5e284c32744d2f17ee5c74b284993463": { symbol: "UBTC", decimals: 8, priceHintUsd: 95000 },
+    "0xbe6727b535545c67d5caa73dea54865b92cf7907": { symbol: "UETH", decimals: 18, priceHintUsd: 2600 },
+  },
 };
 
 export function getKnownTokens(chain) {
@@ -102,7 +113,7 @@ export function countUsableStarts(chain = null) {
 /// チェーンごとの「包んだ基軸通貨」の記号。**住所は上の表から引く**(二重に書かない)。
 const WRAPPED_NATIVE_SYMBOL = {
   base: "WETH", optimism: "WETH", arbitrum: "WETH",
-  polygon: "WMATIC", avalanche: "WAVAX", ethereum: "WETH",
+  polygon: "WMATIC", avalanche: "WAVAX", ethereum: "WETH", hyperevm: "WHYPE",
 };
 
 /// **ネイティブ通貨を表す住所。**

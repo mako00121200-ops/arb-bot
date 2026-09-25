@@ -32,6 +32,8 @@ export const QUOTER_V2_ADDRESS = {
   arbitrum: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
   optimism: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
   avalanche: "0xbe0F5544EC67e9B3b2D979aaA43f18Fd87E6257F",
+  // Uniswap 公式の HyperEVM 配置(github.com/Uniswap/contracts の deployments/999.md)
+  hyperevm: "0x7dfd4f31be6814d2906bde155c3e1b146eac1468",
 };
 
 /// V3型プールのファクトリー。
@@ -92,6 +94,12 @@ export const V3_FACTORIES = {
     // 0x5F1dddbf…(Algebra形式、1プール)は調査で「流動性=読めず」だった。
     // globalState には対応したが、監視中ペアのプールが1件だけで
     // 流動性も確認できていないため、今は足さない。
+  ],
+  // [2026年9月25日] 住所は Uniswap 公式の github.com/Uniswap/contracts の deployments/999.md。
+  // HyperSwap・Project X・Kittenswap などのフォークは公式の出典で住所を確認できていない。
+  // 監視を始めてから pool-scout のイベントで実在のファクトリーを逆算して足す(推測で書かない)。
+  hyperevm: [
+    { address: "0xf0db7b58379503491d857db50ac9ece64c653918", dexId: "uniswap-v3", style: "uniswap" },
   ],
 };
 

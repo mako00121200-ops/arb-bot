@@ -51,10 +51,11 @@ const NATIVE_TOKEN_FOR_PRICE = {
   polygon: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270",   // WMATIC(POL)
   avalanche: "0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7", // WAVAX
   arbitrum: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",  // WETH
+  hyperevm: "0x5555555555555555555555555555555555555555",  // WHYPE(Hyperliquid 公式のシステムコントラクト)
 };
 
 // 取得に失敗した時の保守的な既定値(35万ガス換算)。
-const FALLBACK_GAS_COST_USD = { base: 0.010, polygon: 0.012, optimism: 0.005, avalanche: 0.001, arbitrum: 0.015 };
+const FALLBACK_GAS_COST_USD = { base: 0.010, polygon: 0.012, optimism: 0.005, avalanche: 0.001, arbitrum: 0.015, hyperevm: 0.010 };
 
 const gasPriceCache = new Map();
 const nativePriceCache = new Map();
