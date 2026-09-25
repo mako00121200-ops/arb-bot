@@ -10,7 +10,8 @@
 
 ## 別テーマ: Limitless Exchange(予測市場)の調査
 - 2026年9月19日に調査メモ `docs/limitless-research.md` と観測スクリプト `limitless/` を追加。本番botとは無関係で、依存も起動も別
-- 第1段階(観測のみ・注文なし)。Railwayの別サービスとして動かす。手順は `limitless/README.md`
+- 第1段階(観測のみ・注文なし)。Railwayの別サービス `limitless-collector`(サービスID 3f8666b3-122a-4552-842f-05aaaa202b93、Volume `limitless-data` を /data に、監視パターン /limitless/** なので docs だけの push では再起動しない)として 2026年9月25日から稼働中。手順は `limitless/README.md`
+- 決済ルールは §12(1時間市場=Binanceの1時間足、5分/15分=Chainlink 60秒TWAP)。調査メモ前半の Pyth 前提は旧市場のもの
 
 ## 稼働環境
 - GitHub: mako00121200-ops/arb-bot(main にMergeするとRailwayが自動デプロイ)

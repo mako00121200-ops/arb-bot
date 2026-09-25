@@ -560,11 +560,9 @@ function theoTick() {
   const now = Date.now();
   for (const m of markets.values()) {
     if (m.resolved || !m.asset || !m.expiryTs) continue;
-    if (m.openPrice === null) {
-      // 始値がまだ無い: 30秒ごとに取り直す(最大20回)
-      if (m.fetchTries < 3 && now - m.discoveredAt > m.fetchTries * 30000) refreshMarket(m);
-      continue;
-    }
+    // 始値が無い、またはオラクル開始値で代用中なら、APIの正式値を30秒ごとに取り直す(最大3回)
+    if ((m.openPrice === null || m.openPriceSrc === 'oracle_at_open') && m.fetchTries < 3 && now - m.discoveredAt > m.fetchTries * 30000) refreshMarket(m);
+    if (m.openPrice === null) continue;
     const ref = pickRef(m.asset, m.kind);
     const tauSec = (m.expiryTs - now) / 1000;
     if (!ref || tauSec < 0) continue;
@@ -591,7 +589,8 @@ function theoTick() {
     if (m.openTs) {
       const since = (now - m.openTs) / 1000;
       for (const off of OPEN_SNAPSHOT_OFFSETS_SEC) {
-        if (!m.snapshots[off] && since >= off) m.snapshots[off] = { S: ref.price, mid: bs?.mid ?? null, pTheo: th?.p ?? null, z: th?.z ?? null, sinceSec: Math.round(since) };
+        // 途中から拾った市場に「寄付5s」として数分後の値が入らないよう、+10秒以内に取れた時だけ記録する
+        if (!m.snapshots[off] && since >= off && since <= off + 10) m.snapshots[off] = { S: ref.price, mid: bs?.mid ?? null, pTheo: th?.p ?? null, z: th?.z ?? null, sinceSec: Math.round(since) };
       }
     }
   }
