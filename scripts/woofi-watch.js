@@ -35,6 +35,7 @@ import { gasUnitsToUsd } from "./gas-cost.js";
 import { getKnownTokens } from "./borrowable-tokens.js";
 import { bestSellQuote } from "./onchain-quote.js";
 import { isStorm } from "./storm-mode.js";
+import { getPoolsForPair, getTokenDecimals, KIND_V3 } from "./pool-registry.js";
 import { nowJst } from "./jst.js";
 
 const ENABLED = process.env.WOOFI_WATCH !== "false";
@@ -94,7 +95,7 @@ async function prepare(chain) {
       const [, bases] = await view(chain, HELPERS[chain], HELPER_IFACE, "getSupportTokens");
       // 桁数の分かっている(手書きにある)トークンだけ。ステーブル同士は動かないので外す
       const list = [...bases].map(String).filter((b) => known[b.toLowerCase()] && !known[b.toLowerCase()].stable && !same(b, quote))
-        .slice(0, MAX_BASES).map((addr) => ({ addr, symbol: known[addr.toLowerCase()].symbol }));
+        .slice(0, MAX_BASES).map((addr) => ({ addr, symbol: known[addr.toLowerCase()].symbol, dec: known[addr.toLowerCase()].decimals }));
       ctx = { pool, quote, qDec: qk.decimals, qSym: qk.symbol, bases: list };
       console.log(`[WOOFi計測] ${chain}: プール ${pool} 見積もり通貨 ${qk.symbol} 対象 ${list.map((b) => b.symbol).join(",") || "なし"}`
         + `(WOOFi の扱い${bases.length}種のうち手書きにあるもの)`);
@@ -167,24 +168,144 @@ async function measure(chain, ctx, storm) {
   st.paused = !!paused;
   if (paused) return;
   const gasUsd = (await gasUnitsToUsd(chain, GAS_UNITS).catch(() => null)) ?? 0.05;
-  for (const route of routes(chain, ctx)) {
-    let r;
-    try { r = await route.eval(); } catch (e) { r = { out: null }; }
-    if (r.out == null) { st.noDex++; continue; }
-    const bps = Number(((r.out - r.x) * 100000n) / r.x) / 10;
-    const netUsd = Number(r.out - r.x) / 10 ** ctx.qDec - gasUsd;
-    const rr = st.byRoute[route.key] || { calmBest: null, stormBest: null, last: null, positives: 0 };
-    rr.last = bps;
-    const k = storm ? "stormBest" : "calmBest";
-    if (rr[k] == null || bps > rr[k]) rr[k] = bps;
-    st.byRoute[route.key] = rr;
-    if (netUsd > 0) {
-      rr.positives++;
-      if (st.maxNetUsd == null || netUsd > st.maxNetUsd) st.maxNetUsd = netUsd;
-      console.log(`[WOOFi計測/機会 ${nowJst()}] ${chain}${storm ? "(嵐)" : ""} ${route.key} $${SIZE_USD}: 差${bps.toFixed(1)}bps 純利$${netUsd.toFixed(3)}`
-        + `(DEX ${r.label} / ガス$${gasUsd.toFixed(3)})。**送っていません**`);
-      track(st, chain, ctx, route, gasUsd, netUsd).catch(() => {});
+  for (const route of routes(chain, ctx)) await evalRoute(st, chain, ctx, route, storm, gasUsd, "");
+}
+
+function statsOf(chain) {
+  const st = stats.get(chain) || { reads: 0, stormReads: 0, byRoute: {}, noDex: 0, maxNetUsd: null, durations: [], tracking: new Set() };
+  stats.set(chain, st);
+  return st;
+}
+
+/// 1本の経路をチェーンに試算させて記録する。黒字なら持続を追う。戻り値: 純利(読めなければ null)
+async function evalRoute(st, chain, ctx, route, storm, gasUsd, tag) {
+  let r;
+  try { r = await route.eval(); } catch (e) { r = { out: null }; }
+  if (r.out == null) { st.noDex++; return null; }
+  const bps = Number(((r.out - r.x) * 100000n) / r.x) / 10;
+  const netUsd = Number(r.out - r.x) / 10 ** ctx.qDec - gasUsd;
+  const rr = st.byRoute[route.key] || { calmBest: null, stormBest: null, last: null, positives: 0 };
+  rr.last = bps;
+  const k = storm ? "stormBest" : "calmBest";
+  if (rr[k] == null || bps > rr[k]) rr[k] = bps;
+  st.byRoute[route.key] = rr;
+  if (netUsd > 0) {
+    rr.positives++;
+    if (st.maxNetUsd == null || netUsd > st.maxNetUsd) st.maxNetUsd = netUsd;
+    console.log(`[WOOFi計測/機会 ${nowJst()}] ${chain}${storm ? "(嵐)" : ""}${tag} ${route.key} $${SIZE_USD}: 差${bps.toFixed(1)}bps 純利$${netUsd.toFixed(3)}`
+      + `(DEX ${r.label} / ガス$${gasUsd.toFixed(3)})。**送っていません**`);
+    track(st, chain, ctx, route, gasUsd, netUsd).catch(() => {});
+  }
+  return netUsd;
+}
+
+// ===== 速報: DEX が動いた瞬間に WOOFi を読み直す(2026年9月25日、オーナーの指示「最低でも1秒ごと」) =====
+//
+// [なぜ] 11:53 の optimism WBTC は、差が開いてから14秒で閉じた(過去ブロックの再現、#193)。
+// 平時60秒ごとの読み取りでは4回に1回しか見つからない。かといって5チェーンを毎秒読むと
+// 1日43万回(月1,300万回)で RPC の枠(月2,000万、今36%)を超える。
+// 再現では**差は DEX が動いて WOOFi が遅れた時に開いた**。DEX の値動きは WebSocket で
+// 既に受け取っている(RPC を使わない)。そこで **WOOFi の対象トークンのプールが動いた時だけ**、
+// 同じチェーンで**最短1秒おき**に WOOFi の値段を2回(買い・売り)だけ読み、地図の DEX の値段と比べる。
+// 差が手数料を超えていそうな時だけ、いつもの経路の試算(bestSellQuote)まで進む。
+// 静かな時は RPC を使わず、動いている間は1秒以内に反応する。
+const FAST_ENABLED = process.env.WOOFI_FAST !== "false";
+const FAST_MIN_MS = parseInt(process.env.WOOFI_FAST_MIN_MS || "1000", 10);
+/// 地図の中値で見た差がこれ(bps)を超えたら、チェーンで試算する(DEX の手数料と滑りの分の余裕)
+const FAST_SCREEN_BPS = parseFloat(process.env.WOOFI_FAST_SCREEN_BPS || "5");
+const fast = new Map(); // chain -> { dirty: Map(base -> receivedAt), busy, lastAt, reads, screens, hits, lagMs: [] }
+
+function fastOf(chain) {
+  let f = fast.get(chain);
+  if (!f) { f = { dirty: new Map(), busy: false, lastAt: 0, reads: 0, screens: 0, hits: 0, lagMs: [] }; fast.set(chain, f); }
+  return f;
+}
+
+/// index.js のプール更新(WebSocket)から呼ぶ。RPC は使わない。
+export function noteDexMove(chain, pool, receivedAt = Date.now()) {
+  if (!FAST_ENABLED || !pool) return;
+  const ctx = setup.get(chain);
+  if (!ctx) return;
+  for (const b of ctx.bases) {
+    const a = b.addr.toLowerCase();
+    // 相手が見積もり通貨でなくても、base の値段が動いたことに変わりはない
+    if (pool.token0 === a || pool.token1 === a) {
+      const f = fastOf(chain);
+      if (!f.dirty.has(a)) f.dirty.set(a, receivedAt);
     }
+  }
+}
+
+/// 地図にある base/見積もり通貨 のプールから、中値(見積もり通貨 / base 1枚)と最小手数料を出す。
+export function mapMid(chain, ctx, base) {
+  const pools = getPoolsForPair(chain, base.addr, ctx.quote) || [];
+  const mids = [];
+  let minFee = null;
+  const bDec = base.dec ?? getTokenDecimals(chain, base.addr);
+  if (bDec == null) return null;
+  for (const p of pools) {
+    const baseIs0 = p.token0 === base.addr.toLowerCase();
+    const [d0, d1] = baseIs0 ? [bDec, ctx.qDec] : [ctx.qDec, bDec];
+    let p1per0 = null; // token1 / token0(人の単位)
+    if (p.kind === KIND_V3) {
+      if (!(p.sqrtPriceX96 > 0n)) continue;
+      const r = Number(p.sqrtPriceX96) / 2 ** 96;
+      p1per0 = r * r * 10 ** (d0 - d1);
+    } else {
+      if (!(p.raw0 > 0n && p.raw1 > 0n)) continue;
+      p1per0 = (Number(p.raw1) / 10 ** d1) / (Number(p.raw0) / 10 ** d0);
+    }
+    if (!(p1per0 > 0) || !isFinite(p1per0)) continue;
+    mids.push(baseIs0 ? p1per0 : 1 / p1per0);
+    const fee = Number(p.feeBps);
+    if (Number.isFinite(fee)) minFee = minFee == null ? fee : Math.min(minFee, fee);
+  }
+  if (mids.length === 0) return null;
+  mids.sort((a, b) => a - b);
+  return { mid: mids[Math.floor(mids.length / 2)], feeBps: minFee ?? 30, n: mids.length };
+}
+
+async function fastTick(chain) {
+  const f = fastOf(chain);
+  if (f.busy || f.dirty.size === 0 || Date.now() - f.lastAt < FAST_MIN_MS) return;
+  const ctx = setup.get(chain);
+  if (!ctx) { f.dirty.clear(); return; }
+  f.busy = true; f.lastAt = Date.now();
+  const dirty = [...f.dirty.entries()];
+  f.dirty.clear();
+  try {
+    const x = BigInt(SIZE_USD) * 10n ** BigInt(ctx.qDec);
+    const storm = isStorm(chain);
+    for (const [addr, movedAt] of dirty) {
+      const base = ctx.bases.find((b) => b.addr.toLowerCase() === addr);
+      if (!base) continue;
+      const m = mapMid(chain, ctx, base);
+      if (!m) { f.noPair = (f.noPair || 0) + 1; continue; }
+      const bDec = base.dec ?? getTokenDecimals(chain, base.addr);
+      // WOOFi の買い値・売り値(手数料・スプレッド込み)。RPC 2回だけ
+      const baseForX = BigInt(Math.max(1, Math.floor((SIZE_USD / m.mid) * 10 ** bDec)));
+      const [gotBase, gotQuote] = await Promise.all([
+        view(chain, ctx.pool, POOL_IFACE, "tryQuery", [ctx.quote, base.addr, x]).catch(() => 0n),
+        view(chain, ctx.pool, POOL_IFACE, "tryQuery", [base.addr, ctx.quote, baseForX]).catch(() => 0n),
+      ]);
+      f.reads++;
+      const lag = Date.now() - movedAt;
+      f.lagMs.push(lag); if (f.lagMs.length > 300) f.lagMs.shift();
+      // A: WOOFi で買って DEX で売る / B: DEX で買って WOOFi で売る(地図の中値で概算)
+      const aBps = gotBase > 0n ? ((Number(gotBase) / 10 ** bDec) * m.mid / SIZE_USD - 1) * 1e4 - m.feeBps : -1e9;
+      const bBps = gotQuote > 0n ? ((Number(gotQuote) / 10 ** ctx.qDec) / ((Number(baseForX) / 10 ** bDec) * m.mid) - 1) * 1e4 - m.feeBps : -1e9;
+      if (Math.max(aBps, bBps) < FAST_SCREEN_BPS) continue;
+      f.screens++;
+      const gasUsd = (await gasUnitsToUsd(chain, GAS_UNITS).catch(() => null)) ?? 0.05;
+      const want = aBps >= bBps ? `${base.symbol} WOOFi→DEX` : `${base.symbol} DEX→WOOFi`;
+      const route = routes(chain, ctx).find((r) => r.key === want);
+      if (!route) continue;
+      const net = await evalRoute(statsOf(chain), chain, ctx, route, storm, gasUsd, `(速報 値動きから${lag}ms)`);
+      if (net != null && net > 0) f.hits++;
+    }
+  } catch (e) {
+  } finally {
+    f.busy = false;
   }
 }
 
@@ -212,6 +333,10 @@ export function startWoofiWatch(activeChains) {
     };
     // 起動直後の混雑を避けて、チェーンごとにずらして始める
     setTimeout(tick, 3 * 60 * 1000 + i * 7000);
+    if (FAST_ENABLED) {
+      const fi = setInterval(() => { fastTick(chain).catch(() => {}); }, 200);
+      if (typeof fi.unref === "function") fi.unref();
+    }
   }
 }
 
@@ -227,7 +352,10 @@ export function formatWoofiLine() {
       .map(([rk, r]) => `${rk} 今${f(r.last)}/平時最良${f(r.calmBest)}/嵐最良${f(r.stormBest)}bps${r.positives ? ` 黒字${r.positives}回` : ""}`).join(" ");
     const d = [...st.durations].sort((a, b) => a - b);
     const durTxt = d.length ? ` 続いた秒数[中央${Math.round(d[Math.floor(d.length / 2)])} ${d.length}件]` : "";
-    parts.push(`${chain} 読み${st.reads}(嵐${st.stormReads})${st.paused ? " **停止中**" : ""} ${routesTxt || "経路なし"}`
+    const f = fast.get(chain);
+    const lag = f && f.lagMs.length ? [...f.lagMs].sort((a, b) => a - b)[Math.floor(f.lagMs.length / 2)] : null;
+    const fastTxt = f ? ` 速報[読み${f.reads} 候補${f.screens} 黒字${f.hits}${lag != null ? ` 反応中央${lag}ms` : ""}${f.noPair ? ` 地図に組なし${f.noPair}` : ""}]` : "";
+    parts.push(`${chain} 読み${st.reads}(嵐${st.stormReads})${fastTxt}${st.paused ? " **停止中**" : ""} ${routesTxt || "経路なし"}`
       + `${st.maxNetUsd != null ? ` 最大$${st.maxNetUsd.toFixed(3)}` : ""}${durTxt}`);
   }
   return ` WOOFi[${parts.join(" / ")}]`;

@@ -62,7 +62,7 @@ import { startMorphoLiquidation, formatMorphoLine } from "./scripts/morpho-liqui
 import { startCompoundMonitor, formatCompoundLine } from "./scripts/compound-buy-monitor.js";
 import { startMorphoMainnetWatch, formatMorphoMainnetLine } from "./scripts/morpho-mainnet-watch.js";
 import { startSparkMonitor, formatSparkLine } from "./scripts/spark-psm-monitor.js";
-import { startWoofiWatch, formatWoofiLine } from "./scripts/woofi-watch.js";
+import { startWoofiWatch, formatWoofiLine, noteDexMove } from "./scripts/woofi-watch.js";
 import { readPoolFeeOnchain } from "./scripts/pool-fee-onchain.js";
 import { minProfitUsd, describeMinProfit, noteSendOutcome, formatSendBalanceLine } from "./scripts/min-profit.js";
 // 画面とログの時刻は**すべて日本時間**に揃える(保存は UTC のまま)。
@@ -1990,6 +1990,8 @@ function reactToPoolChange(chain, poolAddress, pool, receivedAt, source) {
   const movePct = pool.lastMovePct || 0;
   // **このプールが動いた。** 価格が理由で寝かせていた経路は、もう寝かせる理由がない。
   clearPriceCooldownForPool(poolAddress);
+  // WOOFi の速報: 対象トークンのプールが動いたら、1秒以内に WOOFi を読み直す印を付ける(RPC は使わない)
+  try { noteDexMove(chain, pool, receivedAt); } catch (e) {}
   try {
     const opp = scanForChangedPool({
       chain, poolAddress, capUsd: getCurrentTradeCapUsd(),
