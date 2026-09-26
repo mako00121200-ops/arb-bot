@@ -2,6 +2,7 @@
 //
 // [なぜこの戦略か(2026年9月25〜26日の実測)]
 //   - TWAPモデルの Brier は満期30〜10秒前で 0.001(ほぼ外さない)
+//   - Polymarket でも同じ型(98%前後の確定側を満期直前に買う)が公開されている代表的な手法
 //   - 勝っていた大口 0x6731…19c5 が、5分市場の平均満期21秒前にメイカーで確定側を買い、名目$1,409で+$34
 //   - 相手は満期直前に外れ側を2¢で買う人(大穴好き)。その注文が確定側の買い指値と突き合わされる
 //
@@ -17,15 +18,16 @@
 //   実際の注文は一切出さない。mode は 'paper' 固定。
 import fs from 'node:fs';
 import path from 'node:path';
-import { normCdf } from './math.js';
+import { normCdf, theoUp } from './math.js';
 
 export const ENDGAME_DEFAULTS = {
-  kinds: ['5-min', '15-min'],
-  startSec: 90,        // 満期の何秒前から指値を置くか
+  kinds: ['5-min', '15-min', 'hourly-p'],
+  // 満期の何秒前から指値を置くか(種別ごと)。1時間市場は終値1点で決まるので少し早めから見る
+  startSecByKind: { '5-min': 90, '15-min': 90, 'hourly-p': 120 },
   minP: 0.995,         // TWAPモデルの確率がこれ以上の側だけ
   cancelBelowP: 0.99,  // 置いた後、これを割ったら取り消す
   margin: 0.005,       // 指値 = min(上限, 確率 − margin)
-  sizeUsd: 20,         // 1市場あたりの上限(紙上)
+  sizeUsd: 1,          // 1市場あたりの上限(紙上)。オーナー方針「1回1ドル前後で数を打つ」
   sigmaMult: 2,        // 検証で自信過剰だったので σ を2倍にして使う
   queueShare: 0.5,
   latencyMs: 400,      // 実測: 板取得の往復 p50 約290ms + 署名
@@ -69,17 +71,23 @@ export class EndgameMaker {
     this.exchanges = new Set(exchangeAddresses.map((a) => a.toLowerCase()));
     this.book = new Map(); // `${variant}|${slug}` -> 市場ごとの紙上注文
     this.totals = Object.fromEntries(this.o.variants.map((v) => [String(v), this.emptyTotals()]));
+    this.byDay = {}; // 'YYYY-MM-DD' -> { variant -> { filled, pnl, wins, losses, cost } }
     this.recent = []; // 決済済み(新しい順、最大100)
     this.startedAt = Date.now();
   }
   emptyTotals() { return { markets: 0, placed: 0, filledMarkets: 0, shares: 0, cost: 0, pnl: 0, wins: 0, losses: 0, byKind: {} }; }
   key(v, slug) { return `${v}|${slug}`; }
 
-  // 毎秒呼ぶ。ctx = { slug, kind, tauSec, K, tw, secs, pNow, nowSec, sigma1h, bid, ask }(bid/ask は YES の板)
+  // 毎秒呼ぶ。ctx = { slug, kind, model, tauSec, K, tw, secs, pNow, nowSec, sigma1h, bid, ask }(bid/ask は YES の板)
+  //   model = 'twap'  … 5分/15分市場(Chainlink 60秒平均で決済)
+  //   model = 'point' … 1時間市場(Binance 1時間足の終値1点で決済)。pNow を現在値として使う
   onTick(ctx, now = Date.now()) {
     if (!this.o.kinds.includes(ctx.kind)) return;
-    if (ctx.tauSec > this.o.startSec || ctx.tauSec <= 0) return;
-    const pr = twapProb({ ...ctx, sigmaMult: this.o.sigmaMult });
+    const startSec = this.o.startSecByKind[ctx.kind] ?? 90;
+    if (ctx.tauSec > startSec || ctx.tauSec <= 0) return;
+    const pr = ctx.model === 'point'
+      ? theoUp(ctx.pNow, ctx.K, ctx.sigma1h * this.o.sigmaMult, ctx.tauSec)
+      : twapProb({ ...ctx, sigmaMult: this.o.sigmaMult });
     for (const v of this.o.variants) {
       const k = this.key(v, ctx.slug);
       let st = this.book.get(k);
@@ -173,6 +181,11 @@ export class EndgameMaker {
     T.filledMarkets++; T.shares += st.filled; T.cost += st.cost; T.pnl += pnl; if (win) T.wins++; else T.losses++;
     const bk = T.byKind[st.kind] ?? (T.byKind[st.kind] = { filledMarkets: 0, pnl: 0, cost: 0, losses: 0 });
     bk.filledMarkets++; bk.pnl += pnl; bk.cost += st.cost; if (!win) bk.losses++;
+    const day = new Date().toISOString().slice(0, 10);
+    const D = (this.byDay[day] ??= {});
+    const dv = (D[String(v)] ??= { filled: 0, pnl: 0, wins: 0, losses: 0, cost: 0 });
+    dv.filled++; dv.pnl += pnl; dv.cost += st.cost; if (win) dv.wins++; else dv.losses++;
+    const days = Object.keys(this.byDay).sort(); while (days.length > 30) delete this.byDay[days.shift()];
     const rec = { t: Date.now(), variant: v, slug, kind: st.kind, side: st.side, q: st.segments[0]?.q ?? null, tau: st.segments[0]?.tau ?? null, pAtPlace: st.pAtPlace, shares: +st.filled.toFixed(3), cost: +st.cost.toFixed(4), win, pnl: +pnl.toFixed(4) };
     this.recent.unshift(rec); if (this.recent.length > 100) this.recent.length = 100;
     this.writeRow('paper', { ev: 'settle', ...rec });
@@ -183,18 +196,19 @@ export class EndgameMaker {
     const out = {};
     for (const [v, T] of Object.entries(this.totals)) out[v] = { ...T, fillRate: T.placed ? T.filledMarkets / T.placed : null, roi: T.cost ? T.pnl / T.cost : null, winRate: T.filledMarkets ? T.wins / T.filledMarkets : null };
     const open = [...this.book.values()].filter((s) => s.segments.some((x) => x.to === null)).map((s) => ({ variant: s.variant, slug: s.slug, side: s.side, q: s.segments[0]?.q, filled: +s.filled.toFixed(3) }));
-    return { mode: 'paper', startedAt: this.startedAt, opts: { ...this.o }, variants: out, open, recent: this.recent.slice(0, 40) };
+    const today = this.byDay[new Date().toISOString().slice(0, 10)] ?? {};
+    return { mode: 'paper', startedAt: this.startedAt, opts: { ...this.o }, variants: out, today, byDay: this.byDay, open, recent: this.recent.slice(0, 40) };
   }
   save() {
     if (!this.file) return;
-    try { fs.writeFileSync(this.file + '.tmp', JSON.stringify({ totals: this.totals, recent: this.recent, startedAt: this.startedAt })); fs.renameSync(this.file + '.tmp', this.file); } catch (e) { console.error('[紙上の保存失敗]', e.message); }
+    try { fs.writeFileSync(this.file + '.tmp', JSON.stringify({ totals: this.totals, recent: this.recent, byDay: this.byDay, startedAt: this.startedAt })); fs.renameSync(this.file + '.tmp', this.file); } catch (e) { console.error('[紙上の保存失敗]', e.message); }
   }
   load() {
     if (!this.file || !fs.existsSync(this.file)) return false;
     try {
       const j = JSON.parse(fs.readFileSync(this.file, 'utf8'));
       for (const v of Object.keys(this.totals)) if (j.totals?.[v]) this.totals[v] = { ...this.emptyTotals(), ...j.totals[v] };
-      this.recent = j.recent ?? []; this.startedAt = j.startedAt ?? this.startedAt;
+      this.recent = j.recent ?? []; this.byDay = j.byDay ?? {}; this.startedAt = j.startedAt ?? this.startedAt;
       return true;
     } catch (e) { console.error('[紙上の読込失敗]', e.message); return false; }
   }

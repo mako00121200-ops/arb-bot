@@ -61,7 +61,8 @@ export const PAGE = `<!doctype html>
 <body>
 <h1>Limitless 観測(実弾なし)</h1>
 <div class="sub" id="sub">読み込み中…</div>
-<div class="grid" id="kpi"></div>
+<div class="grid" id="goal"></div>
+<div class="grid" id="kpi" style="margin-top:10px"></div>
 
 <div class="card"><h2>遅延の推移(直近24時間、p50)</h2><p class="note">板取得の HTTP 往復が「注文を送れる速さ」の代理。WS は板の更新が届くまでの遅れ。</p>
   <div class="legend"><span><i style="background:var(--s1)"></i>HTTP 板取得</span><span><i style="background:var(--s2)"></i>WS 板</span><span><i style="background:var(--s3)"></i>Binance</span></div>
@@ -77,6 +78,9 @@ export const PAGE = `<!doctype html>
 
 <div class="card"><h2>終盤メイカー(紙上・実際の注文なし)</h2><p class="note" id="egNote">5分/15分市場の満期90秒前から、TWAPモデルで99.5%以上の側に買い指値。上限を 0.96 / 0.97 / 0.98 の3通り同時に試す。約定は Base 上の実際の約定から判定。</p>
   <div class="tbl"><table id="eg1"></table></div><div class="tbl" style="margin-top:8px"><table id="eg2"></table></div></div>
+
+<div class="card"><h2>両側買い(紙上・gabagool型)</h2><p class="note">同じ市場で YES と NO を別の時刻に公正価格の3¢下で買い、1組の原価を$0.98以下にそろえる。そろえば結果に関係なく利益。リスクは片側だけ買って決済を迎えること。</p>
+  <div class="tbl"><table id="pr1"></table></div><div class="tbl" style="margin-top:8px"><table id="pr2"></table></div></div>
 
 <div class="card"><h2>検証: 案1(5分/15分・TWAP残差)と案2(1時間・理論価格)</h2><p class="note" id="btNote">Brier = 平均(確率−結果)²。小さいほど当たる。「板」より「TWAP」/「1点」が小さければ、板より正しく値付けできている。1時間ごとに再計算。</p>
   <div class="tbl"><table id="bt1"></table></div><div class="tbl" style="margin-top:8px"><table id="bt1r"></table></div><div class="tbl" style="margin-top:8px"><table id="bt2"></table></div><div class="tbl" style="margin-top:8px"><table id="bt4"></table></div><div class="tbl" style="margin-top:8px"><table id="bt3"></table></div></div>
@@ -123,6 +127,25 @@ async function refresh(){
   const today = s.today; const kinds = Object.entries(today.markets);
   table('hitKind', ['種別(今日)','決済','判定可','理論の的中','板の的中'], kinds.map(([k,m])=>[k, m.n, m.judged, fmt.pct(m.judged?m.theoRight/m.judged:null), fmt.pct(m.judged?m.midRight/m.judged:null)]));
   barChart('edge', s.edgeLabels, [ {label:'秒数',data:today.edge,backgroundColor:css('--s1')} ]);
+  // 目標(1日 $50)に対する今日の紙上成績
+  const GOAL = 50;
+  const egT = s.endgame?.today ?? {}; const prT = s.pair?.today ?? null;
+  let bestV = null; for (const [v,d] of Object.entries(egT)) if (!bestV || d.pnl > egT[bestV].pnl) bestV = v;
+  const egBest = bestV ? egT[bestV] : { pnl: 0, wins: 0, losses: 0, filled: 0 };
+  const todayPnl = (egBest.pnl||0) + (prT?.pnl||0);
+  const goalTiles = [
+    ['今日の紙上損益(UTC)', fmt.usd(todayPnl), '目標 $'+GOAL+' の '+Math.round(todayPnl/GOAL*100)+'%'],
+    ['終盤メイカー 今日', fmt.usd(egBest.pnl||0), (bestV?'上限'+bestV+' ':'')+'約定'+(egBest.filled||0)+'回'],
+    ['終盤 負け回数/率 今日', (egBest.losses||0)+'回', egBest.filled? '負け率 '+((egBest.losses/egBest.filled)*100).toFixed(1)+'%(損益ゼロは約3%)' : 'まだ約定なし'],
+    ['両側買い 今日', fmt.usd(prT?.pnl||0), prT? prT.markets+'市場 / 負け'+prT.losses : 'まだ約定なし'],
+  ];
+  document.getElementById('goal').replaceChildren(...goalTiles.map(([k,v,d])=>el('div',{class:'tile'},el('div',{class:'k'},k),el('div',{class:'v'},v),el('div',{class:'d'},d))));
+  const pr = s.pair;
+  if (pr) {
+    const T = pr.totals;
+    table('pr1', ['累計','見た市場','指値','約定市場','そろった市場','組にできた割合','投入','損益','利回り','勝','負','最悪の1市場'], [['全体', T.markets, T.quotes, T.marketsFilled, T.pairs, fmt.pct(T.hedgeRatio), '$'+fmt.n(T.cost,2), fmt.usd(T.pnl), T.roi===null?'-':(T.roi*100).toFixed(2)+'%', T.wins, el('span',{class:T.losses?'dn':''},String(T.losses)), fmt.usd(T.worst)]]);
+    table('pr2', ['時刻','市場','結果','YES枚@平均','NO枚@平均','組原価','投入','損益'], pr.recent.map(r=>[fmt.t(r.t), (r.slug||'').replace(/-up-or-down-/,' ').replace(/-\\d+$/,''), r.up===1?'Up':'Down', fmt.n(r.yes,2)+'@'+(r.avgYes===null?'-':r.avgYes.toFixed(3)), fmt.n(r.no,2)+'@'+(r.avgNo===null?'-':r.avgNo.toFixed(3)), r.pairCost===null?'片側のみ':r.pairCost.toFixed(3), '$'+fmt.n(r.cost,2), el('span',{class:r.pnl>=0?'up':'dn'}, fmt.usd(r.pnl))]), 'まだ約定した紙上注文がありません');
+  }
   const eg = s.endgame;
   if (eg) {
     const mx = Math.max(...Object.values(eg.variants).map(v=>Math.abs(v.pnl)), 0);
@@ -153,7 +176,7 @@ async function refresh(){
   table('lead24', ['アドレス','損益','約定','勝率','名目','テイカー','買YES','買NO','売','満期前'], s.lead24.topByPnl.map(r=>[who(r), pnlCell(r.pnl,mx24), r.n, fmt.pct(r.winRate), '$'+fmt.n(r.notional), fmt.pct(r.takerRate), fmt.pct(r.buyYesRate), fmt.pct(r.buyNoRate), fmt.pct(r.sellRate), r.avgSecToExpiry===null?'-':Math.round(r.avgSecToExpiry)+'s']));
   const mx7 = Math.max(...s.lead7.byConsistency.map(r=>Math.abs(r.pnl)), 0);
   table('lead7', ['アドレス','Top10入り','損益7日','約定','勝率','テイカー','買YES','買NO','売','満期前'], s.lead7.byConsistency.map(r=>[who(r), r.daysTop10+'/'+r.days+'日', pnlCell(r.pnl,mx7), r.n, fmt.pct(r.winRate), fmt.pct(r.takerRate), fmt.pct(r.buyYesRate), fmt.pct(r.buyNoRate), fmt.pct(r.sellRate), r.avgSecToExpiry===null?'-':Math.round(r.avgSecToExpiry)+'s']));
-  table('markets', ['市場','行使価格','現在値','残り','理論','買値','売値','乖離(買YES)','乖離(売YES)'], s.markets.map(m=>[m.slug.replace(/-up-or-down-/,' ').replace(/-\\d+$/,''), fmt.n(m.K,2), m.S===null?'-':fmt.n(m.S,2)+' ('+(m.src??'')+')', m.tauSec===null?'-':Math.floor(m.tauSec/60)+'分'+(m.tauSec%60)+'秒', m.pTheo===null?'-':m.pTheo.toFixed(3), m.bid??'-', m.ask??'-', m.edgeBuyYes===null?'-':el('span',{class:m.edgeBuyYes>0.02?'up':''},(m.edgeBuyYes*100).toFixed(1)+'¢'), m.edgeSellYes===null?'-':el('span',{class:m.edgeSellYes>0.02?'up':''},(m.edgeSellYes*100).toFixed(1)+'¢')]));
+  table('markets', ['市場','最低枚数','行使価格','現在値','残り','理論','買値','売値','乖離(買YES)','乖離(売YES)'], s.markets.map(m=>[m.slug.replace(/-up-or-down-/,' ').replace(/-\\d+$/,''), m.minSize===null||m.minSize===undefined?'-':String(m.minSize), fmt.n(m.K,2), m.S===null?'-':fmt.n(m.S,2)+' ('+(m.src??'')+')', m.tauSec===null?'-':Math.floor(m.tauSec/60)+'分'+(m.tauSec%60)+'秒', m.pTheo===null?'-':m.pTheo.toFixed(3), m.bid??'-', m.ask??'-', m.edgeBuyYes===null?'-':el('span',{class:m.edgeBuyYes>0.02?'up':''},(m.edgeBuyYes*100).toFixed(1)+'¢'), m.edgeSellYes===null?'-':el('span',{class:m.edgeSellYes>0.02?'up':''},(m.edgeSellYes*100).toFixed(1)+'¢')]));
   table('recent', ['時刻','市場','結果','始値','寄付乖離','理論5s','板5s','理論','板'], s.recentSummaries.map(r=>[fmt.t(r.t), (r.slug||'').replace(/-up-or-down-/,' ').replace(/-\\d+$/,''), el('span',{class:r.up===1?'up':r.up===0?'dn':''}, r.up===1?'Up':r.up===0?'Down':'?'), fmt.n(r.K,2), r.gapBps===null?'-':fmt.n(r.gapBps,1)+'bps', r.theo5===null?'-':r.theo5.toFixed(3), r.mid5===null?'-':r.mid5.toFixed(3), r.theoRight===null?'-':el('span',{class:r.theoRight?'ok up':'ng dn'},''), r.midRight===null?'-':el('span',{class:r.midRight?'ok up':'ng dn'},'')]));
   table('fills', ['時刻','アドレス','役割','側','市場','価格','枚数','満期前','損益'], s.recentFills.map(f=>[fmt.t(f.t), who({owner:f.owner,name:f.name}), f.role==='taker'?'テイカー':'メイカー', (f.side==='BUY'?'買':'売')+' '+f.outcome, (f.slug||'').replace(/-up-or-down-/,' ').replace(/-\\d+$/,''), f.price===null?'-':f.price.toFixed(3), fmt.n(f.shares,1), f.secToExpiry===null?'-':f.secToExpiry+'s', f.pnl===null?el('span',{class:'tag'},'未確定'):el('span',{class:f.pnl>=0?'up':'dn'},fmt.usd(f.pnl))]));
 }

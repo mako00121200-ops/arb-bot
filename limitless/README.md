@@ -19,6 +19,12 @@ Up/Down どちらかが 99.5% 以上になった側に、postOnly の買い指�
 - 結果は画面の「終盤メイカー」カード、ログの `[紙上 0.98]` 行、JSONL の `paper` 行(place / cancel / fill / settle)
 - 累計は `DATA_DIR/endgame.json` に毎分保存。`ENDGAME=off` で止まる
 
+## 両側買い(紙上、2026年9月26日〜、gabagool 型)
+
+同じ市場で YES と NO を別の時刻に公正価格の3¢下で買い、1組の原価を $0.98 以下にそろえる(そろえば結果に関係なく利益)。
+5分/15分市場、1回 $1・1市場 $6 まで、片寄り $2 まで、満期60秒前で停止。約定判定は終盤メイカーと同じ。
+結果は画面の「両側買い」カード、ログの `[両側]` 行、JSONL の `pair` 行。累計は `pair.json`。`PAIR=off` で止まる。
+
 ## 画面(ダッシュボード)
 
 https://limitless-collector-production.up.railway.app (読み取り専用。`DASHBOARD_TOKEN` を設定すれば `?token=…` が要るようになる)
@@ -84,13 +90,13 @@ https://limitless-collector-production.up.railway.app (読み取り専用。`DAS
 | 変数 | 既定 | 用途 |
 |---|---|---|
 | `DATA_DIR` | `./data` | JSONL 保存先 |
-| `ASSETS` | `btc,eth` | 対象 |
+| `ASSETS` | `btc,eth,xrp,solana,doge,bnb` | 対象(XRP 以降は1時間市場のみ) |
 | `HOURLY_SLUG_PATTERN` | `^(btc\|eth)-up-or-down-(hourly-p\|hourly\|\d+-min)-(\d+)$` | 2026年9月25日の実測では 1時間市場は `-hourly-p-<ミリ秒>`、5分/15分市場は `-5-min-<秒>`。合わなかった「それっぽい」slugは `raw_sample` に残る |
 | `THEO_INTERVAL_MS` | `1000` | 理論価格の記録間隔。容量が気になれば `2000` |
 | `BOOK_DEPTH` | `5` | 板の記録段数 |
 | `BINANCE_WS_URL` | `wss://data-stream.binance.vision/stream` | 空文字で無効 |
 | `SIGMA_FALLBACK_1H` | `0.0045` | σ推定が育つまでの仮の1時間σ(0.45%) |
-| `KEEP_DAYS` | `14` | JSONLを何日分残すか。前日分は自動でgzip、それより古いものは削除 |
+| `KEEP_DAYS` | `7` | JSONLを何日分残すか。前日分は自動でgzip、それより古いものは削除 |
 | `MIN_FREE_MB` | `50` | Volumeの空きがこれを下回ったら記録を止める(ログ出力は続く) |
 | `PYTH_HERMES_URL` | (無効) | 2026年9月25日に401(キー必須)を確認。URLを入れると有効 |
 | `BASE_RPC_URL` | (無効) | Base の RPC。Railway では本番サービスの値を `${{secure-amazement.BASE_RPC_URL}}` で参照。設定すると約定・払い戻しを読む |
