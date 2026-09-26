@@ -23,8 +23,8 @@ import { normCdf, theoUp } from './math.js';
 export const ENDGAME_DEFAULTS = {
   kinds: ['5-min', '15-min', 'hourly-p'],
   // 満期の何秒前から指値を置くか(種別ごと)。1時間市場は終値1点で決まるので少し早めから見る
-  startSecByKind: { '5-min': 90, '15-min': 90, 'hourly-p': 120 },
-  minP: 0.995,         // TWAPモデルの確率がこれ以上の側だけ
+  startSecByKind: { '5-min': 120, '15-min': 120, 'hourly-p': 150 }, // 9/26: 約定が少ないので早めから(90→120)
+  minP: 0.99,          // TWAPモデルの確率がこれ以上の側だけ(9/26: 0.995→0.99。σは2倍で見ているので実質はより厳しい)
   cancelBelowP: 0.99,  // 置いた後、これを割ったら取り消す
   margin: 0.005,       // 指値 = min(上限, 確率 − margin)
   sizeUsd: 1,          // 1市場あたりの上限(紙上)。オーナー方針「1回1ドル前後で数を打つ」
@@ -32,7 +32,8 @@ export const ENDGAME_DEFAULTS = {
   queueShare: 0.5,
   latencyMs: 400,      // 実測: 板取得の往復 p50 約290ms + 署名
   settleDelayMs: 180000, // 決済後、遅れて届く約定を待つ時間
-  variants: [0.96, 0.97, 0.98], // 指値の上限を3通り同時に試す
+  // 指値の上限を3通り同時に試す。9/26: 10時間で 0.96/0.97 は約定0、0.98 は3勝0敗だったので上に寄せる
+  variants: [0.98, 0.985, 0.99],
   tick: 0.001,
 };
 

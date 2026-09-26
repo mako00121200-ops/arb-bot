@@ -145,7 +145,8 @@ const ENDGAME = (process.env.ENDGAME ?? 'paper').toLowerCase();
 const endgame = new EndgameMaker({ dataDir: DATA_DIR, writeRow: (t, o) => writeRow(t, o), exchangeAddresses: CONTRACTS.exchanges });
 const LEDGER_FILE = path.join(DATA_DIR, 'ledger.json');
 // 両側買い(紙上)。PAIR=off で止める
-const PAIR = (process.env.PAIR ?? 'paper').toLowerCase();
+// 2026年9月26日: 紙上で 26市場 −$11.80(修正後も 6市場で組がそろったのは0)。オーナー判断で停止。PAIR=paper で再開できる
+const PAIR = (process.env.PAIR ?? 'off').toLowerCase();
 const pair = new PairMaker({ dataDir: DATA_DIR, writeRow: (t, o) => writeRow(t, o), exchangeAddresses: CONTRACTS.exchanges });
 const minSizeLogged = new Set();
 // 測り方の点検(30分ごと)。チェーンの約定がどれだけ遅れて届いているか等
@@ -471,6 +472,8 @@ function applyBook(m, ob, src) {
       minSizeLogged.add(k);
       const raw = Number(book.minSize);
       console.log(`[最低枚数] ${k}: 板の minSize=${book.minSize}(1e6単位なら ${Number.isFinite(raw) ? raw / 1e6 : '-'} 枚)/ 市場設定の minSize=${m.settings?.minSize ?? '-'} / maxSpread=${book.maxSpread ?? '-'}`);
+      // LP報酬・リベートの設定(次の戦略候補「報酬狙いのメイカー」の判断材料)
+      console.log(`[市場設定] ${k}: ${JSON.stringify(m.settings ?? null)}`);
       writeRow('min_size', { kind: k, slug: m.slug, bookMinSize: book.minSize, settingsMinSize: m.settings?.minSize ?? null, maxSpread: book.maxSpread ?? null });
     }
   }
@@ -1011,7 +1014,8 @@ async function selftest() {
     const now = T0 * 1000;
     eg.onTick({ slug: 'm5', kind: '5-min', tauSec: 30, K: 100000, tw: 100300, secs, pNow: 100300, nowSec: T0, sigma1h: 0.004, bid: 0.95, ask: 0.99 }, now);
     const placed = rowsW.filter((r) => r.ev === 'place').map((r) => r.q).sort();
-    if (JSON.stringify(placed) !== JSON.stringify([0.96, 0.97, 0.98])) fails.push(`endgame place ${JSON.stringify(placed)}`);
+    // 上限 0.99 は最良売り値 0.99 より下(0.989)に置かれる
+    if (JSON.stringify(placed) !== JSON.stringify([0.98, 0.985, 0.989])) fails.push(`endgame place ${JSON.stringify(placed)}`);
     // 他人のメイカー「YES 買い」が 0.975 で約定 → 0.98 の指値だけ価格優先で全量
     eg.onFill({ slug: 'm5', outcome: 'YES', makerSide: 'BUY', price: 0.975, shares: 10, maker: '0x1', taker: '0x2', tx: 'a', blockTime: now + 1000 });
     // テイカーが NO を 0.035 で買った(= YES の買い指値 0.965 以下を叩いた)→ 0.97 と 0.98 に待ち行列の半分
@@ -1019,8 +1023,8 @@ async function selftest() {
     eg.onResolve('m5', 1, now + 60000);
     await new Promise((r) => setTimeout(r, 10));
     const sm = eg.summary().variants;
-    // 0.98: 10 + 4 = 14枚、損益 14×0.02 = 0.28 / 0.97: 4枚、0.12 / 0.96: 約定なし
-    if (Math.abs(sm['0.98'].shares - 14) > 1e-9 || Math.abs(sm['0.98'].pnl - 0.28) > 1e-9 || Math.abs(sm['0.97'].shares - 4) > 1e-9 || Math.abs(sm['0.97'].pnl - 0.12) > 1e-9 || sm['0.96'].filledMarkets !== 0) fails.push(`endgame fills ${JSON.stringify(sm)}`);
+    // どの上限も 0.975 より上なので 10枚 + 待ち行列の半分 4枚 = 14枚。損益は 14×(1−指値)
+    if (Math.abs(sm['0.98'].shares - 14) > 1e-9 || Math.abs(sm['0.98'].pnl - 0.28) > 1e-9 || Math.abs(sm['0.985'].pnl - 0.21) > 1e-9 || Math.abs(sm['0.99'].pnl - 14 * 0.011) > 1e-9) fails.push(`endgame fills ${JSON.stringify(sm)}`);
     // 板が逆を向いていたら置かない
     const eg2 = new EndgameMaker({ writeRow: () => {}, opts: { latencyMs: 0 } });
     eg2.onTick({ slug: 'm6', kind: '5-min', tauSec: 30, K: 100000, tw: 100300, secs, pNow: 100300, nowSec: T0, sigma1h: 0.004, bid: 0.2, ask: 0.3 }, now);
