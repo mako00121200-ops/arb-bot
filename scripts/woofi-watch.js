@@ -37,6 +37,7 @@ import { bestSellQuote } from "./onchain-quote.js";
 import { isStorm } from "./storm-mode.js";
 import { getPoolsForPair, getTokenDecimals, KIND_V3 } from "./pool-registry.js";
 import { nowJst } from "./jst.js";
+import { tryWoofiSend } from "./woofi-execute.js";
 
 const ENABLED = process.env.WOOFI_WATCH !== "false";
 const CALM_INTERVAL_MS = parseInt(process.env.WOOFI_INTERVAL_MS || String(60 * 1000), 10);
@@ -114,17 +115,18 @@ function routes(chain, ctx) {
   const x = BigInt(SIZE_USD) * 10n ** BigInt(ctx.qDec);
   const list = [];
   for (const b of ctx.bases) {
-    list.push({ key: `${b.symbol} WOOFi→DEX`, eval: async () => {
+    // got と path は送信(woofi-execute.js)で段を組むのに使う
+    list.push({ key: `${b.symbol} WOOFi→DEX`, dir: "A", base: b, eval: async () => {
       const got = BigInt(await view(chain, ctx.pool, POOL_IFACE, "tryQuery", [ctx.quote, b.addr, x]));
       if (got === 0n) return { out: null, x };
       const s = await bestSellQuote(chain, b.addr, ctx.quote, got, hubs);
-      return { out: s ? s.out : null, x, label: s?.label || "" };
+      return { out: s ? s.out : null, x, label: s?.label || "", got, path: s?.path };
     } });
-    list.push({ key: `${b.symbol} DEX→WOOFi`, eval: async () => {
+    list.push({ key: `${b.symbol} DEX→WOOFi`, dir: "B", base: b, eval: async () => {
       const d = await bestSellQuote(chain, ctx.quote, b.addr, x, hubs);
       if (!d) return { out: null, x };
       const out = BigInt(await view(chain, ctx.pool, POOL_IFACE, "tryQuery", [b.addr, ctx.quote, d.out]));
-      return { out: out > 0n ? out : null, x, label: d.label };
+      return { out: out > 0n ? out : null, x, label: d.label, path: d.path };
     } });
   }
   return list;
@@ -139,13 +141,14 @@ async function track(st, chain, ctx, route, gasUsd, firstNet) {
   try {
     while (Date.now() - started < TRACK_MAX_MS) {
       await new Promise((r) => setTimeout(r, TRACK_EVERY_MS));
-      let net = null;
+      let net = null, r = null;
       try {
-        const r = await route.eval();
+        r = await route.eval();
         if (r.out != null) net = Number(r.out - r.x) / 10 ** ctx.qDec - gasUsd;
       } catch (e) {}
       reads++;
       if (net == null || net <= 0) break;
+      sendIfAble(chain, ctx, route, r, net);
       if (net > maxNet) maxNet = net;
     }
   } finally {
@@ -194,9 +197,21 @@ async function evalRoute(st, chain, ctx, route, storm, gasUsd, tag) {
     if (st.maxNetUsd == null || netUsd > st.maxNetUsd) st.maxNetUsd = netUsd;
     console.log(`[WOOFi計測/機会 ${nowJst()}] ${chain}${storm ? "(嵐)" : ""}${tag} ${route.key} $${SIZE_USD}: 差${bps.toFixed(1)}bps 純利$${netUsd.toFixed(3)}`
       + `(DEX ${r.label} / ガス$${gasUsd.toFixed(3)})。**送っていません**`);
+    sendIfAble(chain, ctx, route, r, netUsd);
     track(st, chain, ctx, route, gasUsd, netUsd).catch(() => {});
   }
   return netUsd;
+}
+
+/// 黒字の経路を送信の係(woofi-execute.js)へ渡す。待たない(計測の周期を止めない)。
+/// 送るかどうか・額・安全装置は向こうで決める(チェーン上の確認で黒字の時だけ送る)。
+function sendIfAble(chain, ctx, route, r, netUsd) {
+  if (!r?.path?.length || !route.dir) return;
+  tryWoofiSend({
+    chain, key: route.key, dir: route.dir, wooPool: ctx.pool, quote: ctx.quote, qDec: ctx.qDec,
+    base: { addr: route.base.addr, symbol: route.base.symbol, dec: route.base.dec ?? getTokenDecimals(chain, route.base.addr) },
+    x: r.x, got: r.got, dexPath: r.path, netUsd, label: r.label,
+  }).catch(() => {});
 }
 
 // ===== 速報: DEX が動いた瞬間に WOOFi を読み直す(2026年9月25日、オーナーの指示「最低でも1秒ごと」) =====
@@ -314,7 +329,7 @@ export function startWoofiWatch(activeChains) {
   const chains = activeChains.filter((c) => HELPERS[c]);
   if (chains.length === 0) return;
   console.log(`[WOOFi計測] 平時${CALM_INTERVAL_MS / 1000}秒・嵐の間${STORM_INTERVAL_MS / 1000}秒ごとに、WOOFi と DEX のずれを $${SIZE_USD} で読みます`
-    + `(${chains.join(",")})。黒字なら何秒続くかも測ります。**送信はしません**`);
+    + `(${chains.join(",")})。黒字なら何秒続くかも測り、コントラクトが WOOFi に対応していれば**確認のうえ送ります**(woofi-execute.js)`);
   for (const [i, chain] of chains.entries()) {
     let lastAt = 0;
     const tick = async () => {
