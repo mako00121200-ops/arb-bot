@@ -393,6 +393,42 @@ function isScamRevert(message) {
   return SCAM_REVERT_PATTERNS.some((re) => re.test(message || ""));
 }
 
+// ===== 持ち主しか交換できないプール(2026年9月26日) =====
+//
+// [なぜ] avalanche で「HcSwap: NOT OWNER」の取り消しが1日に約90回起きていた(送信前の確認で止まるので損は無い)。
+// 取り消しの文面からは**経路のどのプールが原因か分からない**ので、「3回失敗で60分外す」が経路の全プールに掛かり、
+// 巻き込まれた正常なプール(0x02ecd6bc… 等6本)まで60分ずつ外れ、戻るとまた同じ失敗を繰り返していた。
+// そこで、この文面が出たら**経路の各プールに「V2 の swap を他人として呼んだら何と言うか」を1回だけ聞く**(eth_call。送信しない)。
+// 同じ「NOT OWNER」を返したプールだけを永久に外す。正常なプールは別の理由で取り消すので外れない。
+const OWNER_ONLY_IFACE = new ethers.Interface(["function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes data)"]);
+const ownerProbeDone = new Set();
+function isOwnerOnlyRevert(message) {
+  const m = String(message || "");
+  return /not owner/i.test(m) && !/DexArbFlashLoan/i.test(m);
+}
+async function findOwnerOnlyPools(opp) {
+  const stranger = "0x000000000000000000000000000000000000dEaD";
+  for (const address of opp.poolAddresses) {
+    const key = poolKeyOf(opp.chain, address);
+    if (ownerProbeDone.has(key) || disabledPools.has(key)) continue;
+    ownerProbeDone.add(key);
+    let why = "";
+    try {
+      await callWithRpc(opp.chain, (p) => p.call({ to: address, from: stranger, data: OWNER_ONLY_IFACE.encodeFunctionData("swap", [0n, 1n, stranger, "0x"]) }), false);
+    } catch (e) {
+      const d = e?.data ?? e?.info?.error?.data ?? e?.error?.data ?? null;
+      if (typeof d === "string" && d.startsWith("0x08c379a0")) {
+        try { why = ethers.AbiCoder.defaultAbiCoder().decode(["string"], "0x" + d.slice(10))[0]; } catch (inner) {}
+      }
+      if (!why) why = e?.shortMessage || e?.message || "";
+    }
+    if (isOwnerOnlyRevert(why)) {
+      console.log(`[持ち主専用] ${opp.chain} ${address.slice(0, 10)}…: 他人の交換を「${String(why).slice(0, 60)}」で拒むプールでした。永久に外します`);
+      disablePool(opp.chain, address, `持ち主しか交換できないプール(${String(why).slice(0, 40)})`, { permanent: true });
+    }
+  }
+}
+
 function noteExecutionFailure(opp, error) {
   const reason = error?.message || String(error);
   const stage = error instanceof ExecutionError ? error.stage : "unknown";
@@ -443,6 +479,9 @@ function noteExecutionFailure(opp, error) {
     stats.raceLost++;
     return; // 冷却(上で設定済み)だけで十分。失敗回数には数えない
   }
+
+  // 持ち主専用のプールが経路にある時は、どれかを突き止めて永久に外す(裏で。待たない)
+  if (isOwnerOnlyRevert(reason)) findOwnerOnlyPools(opp).catch(() => {});
 
   const scam = isScamRevert(reason);
   const now = Date.now();
