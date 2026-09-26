@@ -775,20 +775,22 @@ function audit() {
   if (eg && eg.late > 0) warn.push(`終盤: 損益確定後に届いた約定 ${eg.late}件`);
   if (eg && eg.priceOkOutside > eg.credited && eg.priceOkOutside >= 3) warn.push(`終盤: 値段は合うのに有効時間外の約定 ${eg.priceOkOutside}件(数えた ${eg.credited}件)`);
   if (pr && pr.late > 0) warn.push(`両側: 損益確定後に届いた約定 ${pr.late}件`);
-  if (pr && pr.oneSided > pr.hedged && pr.oneSided >= 2) warn.push(`両側: 片側だけの市場 ${pr.oneSided} > そろった市場 ${pr.hedged}`);
+  // 片側だけが多いのは「戦略の成績」であって測り方の誤りではない(上限超えが0なら判定は正しい)。警告ではなく所見として出す
+  const notes = [];
+  if (pr && pr.oneSided > pr.hedged && pr.oneSided >= 2) notes.push(`両側: 片側だけの市場 ${pr.oneSided} > そろった市場 ${pr.hedged}`);
   if (pr && pr.overLimit > 0) warn.push(`両側: 上限を超えて約定した市場 ${pr.overLimit}(紙上のルール判定が壊れている)`);
   const row = {
     windowMin: Math.round(AUDIT_INTERVAL_MS / 60000), activeMarkets: active.length, byKind, staleBooks, noBook, noK,
     chainFills: auditWin.chainFills, ingestLagAvgSec: auditWin.chainFills ? +(auditWin.ingestLagSum / auditWin.chainFills / 1000).toFixed(1) : null, ingestLagMaxSec: +(auditWin.ingestLagMax / 1000).toFixed(1),
     latency: { http: L.http_orderbook?.p50 ?? null, wsBook: L.ws_book_lag?.p50 ?? null, oracle: L.ws_oracle_lag?.p50 ?? null, binance: L.binance_lag?.p50 ?? null },
-    endgame: eg, pair: pr, warn,
+    endgame: eg, pair: pr, warn, notes,
   };
   lastAudit = { t: now, ...row };
   writeRow('audit', row);
   console.log(`[点検 ${row.windowMin}分] 市場=${active.length} ${JSON.stringify(byKind)} 板古い/無し=${staleBooks}/${noBook} 行使価格なし=${noK} | チェーン約定=${row.chainFills}件 到着遅れ 平均${row.ingestLagAvgSec ?? '-'}s 最大${row.ingestLagMaxSec}s | 遅延 http=${row.latency.http}ms 板WS=${row.latency.wsBook}ms Binance=${row.latency.binance}ms` +
     (eg ? ` | 終盤 指値=${eg.places} 取消=${eg.cancels} 届いた約定=${eg.tracked} 値段一致=${eg.priceOk} 時間外=${eg.priceOkOutside} 数えた=${eg.credited} 遅着=${eg.late}` : '') +
     (pr ? ` | 両側 新規=${pr.quotes} 置直し=${pr.requotes} 約定=${pr.fills} 規則で除外=${pr.blocked} そろった=${pr.hedged} 片側=${pr.oneSided} 上限超え=${pr.overLimit} 遅着=${pr.late}` : '') +
-    ` | 警告: ${warn.length ? warn.join(' / ') : 'なし'}`);
+    ` | 警告: ${warn.length ? warn.join(' / ') : 'なし'}` + (notes.length ? ` | 所見: ${notes.join(' / ')}` : ''));
   auditWin = { chainFills: 0, ingestLagMax: 0, ingestLagSum: 0 };
   if (ENDGAME !== 'off') endgame.resetDiag();
   if (PAIR !== 'off') pair.resetDiag();
