@@ -51,6 +51,21 @@ interface IAmmPoolV3 {
     function token0() external view returns (address);
 }
 
+// WOOFi の取引所(WooPPV2)。値段は運営の価格係(Wooracle)が外の相場から書き込む。
+// 先に投入通貨をプールへ送ってから swap を呼ぶ(プールは「準備量を超えて届いた分」を投入とみなす)。
+// 関数の形は woonetwork/WooPoolV2 の contracts/interfaces/IWooPPV2.sol から写した。
+// swap に呼び出し元の制限は無い(本体 WooPPV2.sol の注記「OKAY to be public method」)。
+interface IWooPP {
+    function swap(
+        address fromToken,
+        address toToken,
+        uint256 fromAmount,
+        uint256 minToAmount,
+        address to,
+        address rebateTo
+    ) external returns (uint256 realToAmount);
+}
+
 /// @title DexArbFlashLoan
 /// @notice フラッシュスワップ方式のDEXアービトラージ実行コントラクト。
 ///
@@ -101,6 +116,11 @@ contract DexArbFlashLoan {
     uint8 public constant FLAG_V3 = 1;           // V3形式(集中流動性)。無ければV2形式
     uint8 public constant FLAG_IN_IS_TOKEN0 = 2; // 投入通貨がそのプールの token0
     uint8 public constant FLAG_HAS_QUOTE = 4;    // プールが getAmountOut を持つ(Solidly系・Camelot等)
+    /// WOOFi(WooPPV2)の段。2段目以降だけ(WOOFi はフラッシュで先に受け取れないので1段目には置けない)。
+    /// [なぜ(2026年9月26日、オーナーの指示「実際の送信を試みながら利益を取れるように」)]
+    /// WOOFi の値段は価格係の書き込みで動くので、相場が急に動くと DEX より遅れる。
+    /// 実測で optimism WBTC が +155.8bps・約14秒開いた(9/25 11:53 JST)。
+    uint8 public constant FLAG_WOOFI = 8;
 
     /// @dev 経路の1段。投入通貨は「前の段の出力通貨」(1段目は asset)なので持たない。
     /// feeBps はV2の手数料(実測値)。V3では使わない。
@@ -267,6 +287,7 @@ contract DexArbFlashLoan {
         require(!inFlashSwap, "DexArbFlashLoan: reentrant");
 
         Leg calldata first = legs[0];
+        require(first.flags & FLAG_WOOFI == 0, "DexArbFlashLoan: WOOFi cannot be first leg");
         bool firstV3 = first.flags & FLAG_V3 != 0;
         Context memory ctx = Context({
             amountIn: amount,
@@ -426,7 +447,14 @@ contract DexArbFlashLoan {
     function _swapLeg(Leg memory leg, address tokenIn, uint256 amountIn) internal returns (uint256 received) {
         require(amountIn > 0, "DexArbFlashLoan: zero input");
         bool inIsToken0 = leg.flags & FLAG_IN_IS_TOKEN0 != 0;
-        if (leg.flags & FLAG_V3 != 0) {
+        if (leg.flags & FLAG_WOOFI != 0) {
+            // 先に送り、プールに受取量を計算させる。受取量は残高の差で測る(戻り値を信じない)。
+            // 最低受取量は0にする。利益の判定は経路の最後(returned >= owed + minProfit)が守る。
+            uint256 before = IERC20(leg.tokenOut).balanceOf(address(this));
+            _safeTransfer(tokenIn, leg.pool, amountIn);
+            IWooPP(leg.pool).swap(tokenIn, leg.tokenOut, amountIn, 0, address(this), address(0));
+            received = IERC20(leg.tokenOut).balanceOf(address(this)) - before;
+        } else if (leg.flags & FLAG_V3 != 0) {
             address prevPool = activePool;
             address prevToken = activePayToken;
             bool prevV3 = activeIsV3;

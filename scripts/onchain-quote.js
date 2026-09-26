@@ -101,7 +101,8 @@ function quoterAddress(chain) {
 }
 
 /// tokenIn を amountIn だけ売った時の最良の受取量(1段と、中継通貨を挟んだ2段)。
-/// @returns { out, label } / 売れる経路が無ければ null
+/// @returns { out, label, path } / 売れる経路が無ければ null
+///   path は通ったプールの列 [{ pool, tokenIn, tokenOut, kind: "v3" | "solidly" }](WOOFi の送信で段を組むのに使う)
 export async function bestSellQuote(chain, tokenIn, tokenOut, amountIn, hubs = [], blockTag = null) {
   const quoter = quoterAddress(chain);
   if (!quoter || !(amountIn > 0n)) return null;
@@ -111,13 +112,17 @@ export async function bestSellQuote(chain, tokenIn, tokenOut, amountIn, hubs = [
   if (direct.length > 0) {
     const outs = await quoteV3ByPoolBatch(chain, quoter,
       direct.map((p) => ({ pool: p.address, tokenIn: from, amountIn })), false, blockTag);
-    outs.forEach((o, i) => { if (o != null && (!best || o > best.out)) best = { out: o, label: direct[i].dexId }; });
+    outs.forEach((o, i) => {
+      if (o != null && (!best || o > best.out)) best = { out: o, label: direct[i].dexId, path: [{ pool: direct[i].address, tokenIn: from, tokenOut: to, kind: "v3" }] };
+    });
   }
   // Solidly 型(1段だけ)
   const sol = await findSolidlyPools(chain, from, to);
   if (sol.length > 0) {
     const outs = await solidlyQuotes(chain, sol, from, amountIn, blockTag);
-    outs.forEach((o, i) => { if (o != null && o > 0n && (!best || o > best.out)) best = { out: o, label: sol[i].dexId }; });
+    outs.forEach((o, i) => {
+      if (o != null && o > 0n && (!best || o > best.out)) best = { out: o, label: sol[i].dexId, path: [{ pool: sol[i].address, tokenIn: from, tokenOut: to, kind: "solidly" }] };
+    });
   }
   for (const hub of hubs) {
     const mid = String(hub).toLowerCase();
@@ -128,13 +133,18 @@ export async function bestSellQuote(chain, tokenIn, tokenOut, amountIn, hubs = [
     if (seconds.length === 0) continue;
     const o1 = await quoteV3ByPoolBatch(chain, quoter,
       firsts.map((p) => ({ pool: p.address, tokenIn: from, amountIn })), false, blockTag);
-    let m = null, mLabel = "";
-    o1.forEach((o, i) => { if (o != null && (m == null || o > m)) { m = o; mLabel = firsts[i].dexId; } });
+    let m = null, mLabel = "", mPool = null;
+    o1.forEach((o, i) => { if (o != null && (m == null || o > m)) { m = o; mLabel = firsts[i].dexId; mPool = firsts[i].address; } });
     if (m == null) continue;
     const o2 = await quoteV3ByPoolBatch(chain, quoter,
       seconds.map((p) => ({ pool: p.address, tokenIn: mid, amountIn: m })), false, blockTag);
     o2.forEach((o, i) => {
-      if (o != null && (!best || o > best.out)) best = { out: o, label: `${mLabel}→${seconds[i].dexId}` };
+      if (o != null && (!best || o > best.out)) {
+        best = { out: o, label: `${mLabel}→${seconds[i].dexId}`, path: [
+          { pool: mPool, tokenIn: from, tokenOut: mid, kind: "v3" },
+          { pool: seconds[i].address, tokenIn: mid, tokenOut: to, kind: "v3" },
+        ] };
+      }
     });
   }
   return best;
