@@ -768,15 +768,16 @@ function audit() {
   const eg = ENDGAME !== 'off' ? { ...endgame.diag } : null;
   const pr = PAIR !== 'off' ? { ...pair.diag } : null;
   const warn = [];
+  const notes = [];
   if (auditWin.chainFills === 0) warn.push('チェーンの約定が30分間0件(読み取り停止の疑い)');
   if (auditWin.ingestLagMax > 150000) warn.push(`約定の到着遅れが最大${Math.round(auditWin.ingestLagMax / 1000)}秒(損益確定の待ち180秒に迫る)`);
   if (staleBooks + noBook > active.length / 2) warn.push(`板が古い/無い市場が ${staleBooks + noBook}/${active.length}`);
   if (staleRefs.length) warn.push(`Binance 価格が止まっている: ${staleRefs.join(',')}`);
   if (eg && eg.late > 0) warn.push(`終盤: 損益確定後に届いた約定 ${eg.late}件`);
-  if (eg && eg.priceOkOutside > eg.credited && eg.priceOkOutside >= 3) warn.push(`終盤: 値段は合うのに有効時間外の約定 ${eg.priceOkOutside}件(数えた ${eg.credited}件)`);
+  // 「置く前」「取消後」の約定は実弾でも取れないので測り方の誤りではない。所見として内訳を出す
+  if (eg && eg.priceOkOutside >= 3) notes.push(`終盤: 値段は合うが自分の指値が無かった約定 ${eg.priceOkOutside}件(置く前${eg.outsideBefore}/遅延窓${eg.outsideLatency}/取消後${eg.outsideAfter}、数えた${eg.credited})`);
   if (pr && pr.late > 0) warn.push(`両側: 損益確定後に届いた約定 ${pr.late}件`);
   // 片側だけが多いのは「戦略の成績」であって測り方の誤りではない(上限超えが0なら判定は正しい)。警告ではなく所見として出す
-  const notes = [];
   if (pr && pr.oneSided > pr.hedged && pr.oneSided >= 2) notes.push(`両側: 片側だけの市場 ${pr.oneSided} > そろった市場 ${pr.hedged}`);
   if (pr && pr.overLimit > 0) warn.push(`両側: 上限を超えて約定した市場 ${pr.overLimit}(紙上のルール判定が壊れている)`);
   const row = {
@@ -788,7 +789,7 @@ function audit() {
   lastAudit = { t: now, ...row };
   writeRow('audit', row);
   console.log(`[点検 ${row.windowMin}分] 市場=${active.length} ${JSON.stringify(byKind)} 板古い/無し=${staleBooks}/${noBook} 行使価格なし=${noK} | チェーン約定=${row.chainFills}件 到着遅れ 平均${row.ingestLagAvgSec ?? '-'}s 最大${row.ingestLagMaxSec}s | 遅延 http=${row.latency.http}ms 板WS=${row.latency.wsBook}ms Binance=${row.latency.binance}ms` +
-    (eg ? ` | 終盤 指値=${eg.places} 取消=${eg.cancels} 届いた約定=${eg.tracked} 値段一致=${eg.priceOk} 時間外=${eg.priceOkOutside} 数えた=${eg.credited} 遅着=${eg.late}` : '') +
+    (eg ? ` | 終盤 指値=${eg.places} 置直し=${eg.replaces} 取消=${eg.cancels} 届いた約定=${eg.tracked} 値段一致=${eg.priceOk} 指値なし=${eg.priceOkOutside}(前${eg.outsideBefore}/遅延${eg.outsideLatency}/後${eg.outsideAfter}) 数えた=${eg.credited} 遅着=${eg.late}` : '') +
     (pr ? ` | 両側 新規=${pr.quotes} 置直し=${pr.requotes} 約定=${pr.fills} 規則で除外=${pr.blocked} そろった=${pr.hedged} 片側=${pr.oneSided} 上限超え=${pr.overLimit} 遅着=${pr.late}` : '') +
     ` | 警告: ${warn.length ? warn.join(' / ') : 'なし'}` + (notes.length ? ` | 所見: ${notes.join(' / ')}` : ''));
   auditWin = { chainFills: 0, ingestLagMax: 0, ingestLagSum: 0 };
@@ -1070,6 +1071,18 @@ async function selftest() {
     pm2.onFill({ slug: 'p2', outcome: 'NO', makerSide: 'BUY', price: 0.50, shares: 10, taker: '0xT', tx: 'n3', blockTime: 12000 });
     const st2 = pm2.mk.get('p2');
     if (Math.abs(st2.pos.NO.cost - 1) > 1e-9 || st2.pos.YES.qty !== 0 || pm2.diag.blocked !== 2) fails.push(`pair 遅着で買い増し ${JSON.stringify(st2.pos)} ${JSON.stringify(pm2.diag)}`);
+  }
+  // 終盤メイカー: 取消 → 条件が戻る → 置き直す
+  {
+    const rows6 = [];
+    const eg6 = new EndgameMaker({ writeRow: (t, o) => rows6.push(o), opts: { latencyMs: 0 } });
+    const T0 = 1790000000; const secs = new Map(); for (let x = T0 - 150; x <= T0; x++) secs.set(x, 100300);
+    const base = { slug: 'r1', kind: '5-min', model: 'twap', K: 100000, tw: 100300, secs, pNow: 100300, nowSec: T0, sigma1h: 0.004, bid: 0.95, ask: 0.99 };
+    eg6.onTick({ ...base, tauSec: 60 }, T0 * 1000);
+    eg6.onTick({ ...base, tauSec: 55, bid: 0.5 }, T0 * 1000 + 5000);   // 板が逆 → 取消
+    eg6.onTick({ ...base, tauSec: 50 }, T0 * 1000 + 10000);            // 戻った → 置き直し
+    const st6 = eg6.book.get('0.98|r1');
+    if (!st6 || st6.segments.length !== 2 || st6.segments[0].to === null || st6.segments[1].to !== null || eg6.diag.replaces !== 3) fails.push(`endgame replace ${JSON.stringify(st6?.segments)} ${JSON.stringify(eg6.diag)}`);
   }
   // 点検カウンタ: 値段は合うが有効時間外の約定を数える
   {

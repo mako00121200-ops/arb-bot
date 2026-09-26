@@ -83,7 +83,10 @@ export class EndgameMaker {
   //   priceOkOutside … 値段は満たすのに、指値の有効時間の外だったもの(多ければ有効時間の決め方を疑う)
   //   credited     … 実際に紙上約定として数えたもの
   //   late         … 損益確定の後に届いた約定(多ければ待ち時間 settleDelayMs が短すぎる)
-  resetDiag() { this.diag = { tracked: 0, priceOk: 0, priceOkOutside: 0, credited: 0, late: 0, places: 0, cancels: 0 }; }
+  //   outsideBefore  … 置く前(条件を満たす前)に起きた約定。多ければ「置き始めが遅い(minP/startSec)」の所見
+  //   outsideLatency … 置いてから有効になるまでの 400ms の間の約定。実弾でも取れないので正しく除外
+  //   outsideAfter   … 取消の後(置き直す前)の約定。多ければ取消の条件が厳しすぎる
+  resetDiag() { this.diag = { tracked: 0, priceOk: 0, priceOkOutside: 0, outsideBefore: 0, outsideLatency: 0, outsideAfter: 0, credited: 0, late: 0, places: 0, cancels: 0, replaces: 0 }; this.outsideLogged = 0; }
   emptyTotals() { return { markets: 0, placed: 0, filledMarkets: 0, shares: 0, cost: 0, pnl: 0, wins: 0, losses: 0, byKind: {} }; }
   key(v, slug) { return `${v}|${slug}`; }
 
@@ -112,9 +115,11 @@ export class EndgameMaker {
         : (ctx.ask ?? 1) <= 0.2 || (ctx.ask === null && (ctx.bid ?? 1) <= 0.1);
       if (open) {
         if (open.side !== side || pSide < this.o.cancelBelowP || !agree) this.cancel(st, open, now, open.side !== side ? '向きが反転' : !agree ? '板と不一致' : '確率低下');
-        continue; // 置き直しはしない(同じ市場で一度置いたらそれを使う)
+        continue;
       }
-      if (st.segments.length > 0) continue; // 一度取り消した市場には置き直さない
+      // 取消の後、条件が戻れば置き直す(9/26: 置き直さない設計だと、実弾のボットより約定を少なく数えてしまう)
+      if (st.target > 0 && st.filled >= st.target - 1e-9) continue; // 目標枚数まで埋まった
+      if (st.side && st.side !== side && st.filled > 0) continue; // 持っている側と逆には置かない
       if (pSide < this.o.minP || !agree || ctx.tauSec < 2) continue;
       // 指値: 上限と「確率 − margin」の小さい方。postOnly なので相手の最良売り値より下に置く
       let q = Math.min(v, floorTick(pSide - this.o.margin, this.o.tick));
@@ -122,11 +127,12 @@ export class EndgameMaker {
       if (bestOpp !== null && q >= bestOpp) q = floorTick(bestOpp - this.o.tick, this.o.tick);
       if (q < 0.9) continue;
       q = +q.toFixed(3);
-      st.side = side; st.target = this.o.sizeUsd / q; st.pAtPlace = pSide;
+      st.side = side; if (!st.target) { st.target = this.o.sizeUsd / q; st.pAtPlace = pSide; }
       const seg = { side, q, placedAt: now, from: now + this.o.latencyMs, to: null, tau: Math.round(ctx.tauSec) };
+      const isReplace = st.segments.length > 0;
       st.segments.push(seg);
-      this.totals[String(v)].placed++;
-      this.diag.places++;
+      if (!isReplace) this.totals[String(v)].placed++;
+      if (isReplace) this.diag.replaces++; else this.diag.places++;
       this.writeRow('paper', { ev: 'place', variant: v, slug: st.slug, kind: st.kind, side, q, pSide: +pSide.toFixed(5), tauSec: seg.tau, bid: ctx.bid, ask: ctx.ask });
     }
   }
@@ -154,7 +160,17 @@ export class EndgameMaker {
       if (pOk) this.diag.priceOk++;
       if (st.filled >= st.target - 1e-9) continue;
       const seg = st.segments.find((s) => t >= s.from && (s.to === null || t <= s.to));
-      if (!seg) { if (pOk) this.diag.priceOkOutside++; continue; }
+      if (!seg) {
+        if (pOk) {
+          this.diag.priceOkOutside++;
+          const first = st.segments[0], last = st.segments[st.segments.length - 1];
+          const reason = t < first.placedAt ? 'before' : t < first.from ? 'latency' : (last.to !== null && t > last.to) ? 'after' : 'gap';
+          if (reason === 'before') this.diag.outsideBefore++; else if (reason === 'latency') this.diag.outsideLatency++; else this.diag.outsideAfter++;
+          // 見本を残す(点検の窓ごとに最大20件)
+          if (this.outsideLogged < 20) { this.outsideLogged++; this.writeRow('paper', { ev: 'outside', variant: v, slug: st.slug, reason, side: first.side, q: first.q, fillOutcome: f.outcome, fillSide: f.makerSide, fillPrice: f.price, fillShares: f.shares, secToExpiry: f.secToExpiry ?? null, placedTau: first.tau, via: isTakerRecord ? 'taker' : 'maker' }); }
+        }
+        continue;
+      }
       const W = seg.side, q = seg.q;
       let avail = 0;
       if (!isTakerRecord) {
