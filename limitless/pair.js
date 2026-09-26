@@ -7,9 +7,13 @@
 //   相手側がそろわないまま決済を迎えると、その片側の分だけ負ける(これが唯一の主なリスク)。
 //
 // [ルール(紙上)]
-//   1. 公正価格(YES の確率)は collector の理論価格。YES 買い指値 = 公正 − h、NO 買い指値 = (1 − 公正) − h
-//   2. すでに片側を持っているなら、反対側の指値は「組の原価 ≤ 1 − margin」を守る上限で頭打ち
-//   3. 片寄り(多い側 − 少ない側)が maxImbalanceUsd を超えたら、多い側はもう買わない
+//   1. 公正価格(YES の確率)は Binance + Chainlink 基差の TWAP モデル(毎秒更新)。
+//      1本目: YES = 公正 − h、NO = (1 − 公正) − h
+//   2. 片側を持ったら、多い側はそろうまで買い増さない。反対側は「公正 − hComplete」まで寄せて早くそろえる
+//      (ただし組の原価 ≤ 1 − margin を超えない)
+//   3. 1本目は満期 firstStopSec 秒前まで(そろえる時間を残す)
+//   [2026年9月26日の紙上結果] 旧版は14市場中11市場が片側のみで −$6.44。指値の更新が5秒ごと・公正価格が
+//   Chainlink(約1.3秒遅れ)だったため古い指値が拾われた。更新を毎秒・Binance基準に、2本目を寄せる形に直した
 //   4. 1市場の投入は maxPerMarketUsd まで、1回の指値は clipUsd
 //   5. 満期 stopSec 秒前からは新しく置かない(勝敗がほぼ決まり、安い側は外れ側になるため)
 //   6. すべて postOnly(メイカー)。Limitless のメイカー手数料は0
@@ -19,13 +23,15 @@ import path from 'node:path';
 
 export const PAIR_DEFAULTS = {
   kinds: ['5-min', '15-min'],
-  h: 0.03,               // 公正価格から何¢下に置くか
+  h: 0.04,               // 1本目(まだ何も持っていない時)を公正価格から何¢下に置くか
+  hComplete: 0.01,       // 2本目(反対側をそろえる時)は公正価格の何¢下まで寄せるか
   margin: 0.02,          // 組の原価の上限 = 1 − margin
   clipUsd: 1,            // 1回の指値
   maxPerMarketUsd: 6,    // 1市場の投入上限
-  maxImbalanceUsd: 2,    // 片寄りの上限(ドル換算)
+  maxImbalanceUsd: 1.5,  // 片寄りの上限(ドル換算)
   stopSec: 60,           // 満期の何秒前から新しく置かないか
-  requoteCents: 0.01,    // 望む価格がこれ以上動いたら置き直す
+  firstStopSec: 180,     // 1本目はこれより満期に近いと置かない(そろえる時間が足りない)
+  requoteCents: 0.005,   // 望む価格がこれ以上動いたら置き直す(9/26: 1¢では古い指値が拾われた)
   queueShare: 0.5,
   latencyMs: 400,
   settleDelayMs: 180000,
@@ -64,13 +70,19 @@ export class PairMaker {
     for (const side of ['YES', 'NO']) {
       const fair = side === 'YES' ? ctx.pUp : 1 - ctx.pUp;
       const mine = st.pos[side], other = st.pos[OTHER[side]];
-      let want = floorTick(fair - this.o.h, this.o.tick);
-      // 反対側を持っているなら、組の原価が 1 − margin を超えない価格まで
       const oAvg = this.avg(other);
-      if (oAvg !== null && other.qty > mine.qty) want = Math.min(want, floorTick(1 - this.o.margin - oAvg, this.o.tick));
-      // 片寄り: この側が多すぎるなら置かない
+      // 反対側の方が多い = この側は「そろえる側」。公正価格の近くまで寄せて早くそろえる(ただし組の原価 ≤ 1 − margin)
+      const completing = oAvg !== null && other.qty > mine.qty + 1e-9;
+      let want = completing
+        ? Math.min(floorTick(fair - this.o.hComplete, this.o.tick), floorTick(1 - this.o.margin - oAvg, this.o.tick))
+        : floorTick(fair - this.o.h, this.o.tick);
+      // 片寄り: この側がすでに多いなら、もう買わない
       const imbalanceUsd = (mine.qty - other.qty) * Math.max(want, 0.01);
-      let ok = ctx.tauSec > this.o.stopSec && spent < this.o.maxPerMarketUsd && want >= this.o.minPrice && imbalanceUsd < this.o.maxImbalanceUsd;
+      const tooMuch = mine.qty > other.qty + 1e-9 && imbalanceUsd >= this.o.maxImbalanceUsd;
+      const startingNew = !completing && mine.qty <= other.qty + 1e-9; // 組がそろっている状態から1本目を足す
+      let ok = ctx.tauSec > this.o.stopSec && spent < this.o.maxPerMarketUsd && want >= this.o.minPrice && !tooMuch
+        && !(mine.qty > other.qty + 1e-9) // 多い側はそろうまで買い増さない
+        && !(startingNew && ctx.tauSec <= this.o.firstStopSec);
       // postOnly: この側の最良売り値より下
       const bestAskSide = side === 'YES' ? ctx.ask : (ctx.bid !== null && ctx.bid !== undefined ? 1 - ctx.bid : null);
       if (ok && bestAskSide !== null && bestAskSide !== undefined && want >= bestAskSide) want = floorTick(bestAskSide - this.o.tick, this.o.tick);

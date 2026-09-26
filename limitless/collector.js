@@ -41,7 +41,7 @@ import { FillLedger, formatLeader } from './ledger.js';
 import { Stats, EDGE_LABELS } from './stats.js';
 import { startServer } from './server.js';
 import { runBacktest, formatBacktest } from './backtest.js';
-import { EndgameMaker } from './endgame.js';
+import { EndgameMaker, twapProb } from './endgame.js';
 import { PairMaker } from './pair.js';
 
 const env = (k, d) => (process.env[k] === undefined || process.env[k] === '' ? d : process.env[k]);
@@ -682,10 +682,10 @@ function theoTick() {
     const ref = pickRef(m.asset, m.kind);
     const tauSec = (m.expiryTs - now) / 1000;
     if (!ref || tauSec < 0) continue;
-    // 記録量を抑える: 寄り付き60秒と満期前120秒は毎秒、それ以外は5秒に1回
+    // 記録量を抑える: 寄り付き60秒と満期前120秒は毎秒、それ以外は5秒に1回(theo 行の記録だけ。戦略の判定は毎秒)
     const sinceOpen = m.openTs ? (now - m.openTs) / 1000 : Infinity;
     const dense = sinceOpen <= 60 || tauSec <= 120;
-    if (!dense && m.lastTheo && now - m.lastTheo.t < 5000) continue;
+    const skipLog = !dense && m.lastTheo && now - m.lastTheo.t < 5000;
     const sigma = sigmaFor(m.asset);
     const th = theoUp(ref.price, m.openPrice, sigma, tauSec);
     const bs = bookSummary(m);
@@ -697,8 +697,17 @@ function theoTick() {
       } catch (e) { writeRow('error', { where: 'endgame', msg: e.message }); }
     }
     if (PAIR !== 'off' && th) {
-      try { pair.onTick({ slug: m.slug, kind: m.kind, tauSec, pUp: th.p, bid: bs?.bid ?? null, ask: bs?.ask ?? null }, now); } catch (e) { writeRow('error', { where: 'pair', msg: e.message }); }
+      try {
+        // 公正価格は Binance(受信遅れ約56ms)+ Chainlink との基差から。Chainlink だけだと約1.3秒遅れで、古い指値が拾われる
+        let pUp = th.p;
+        if (!isHourly && cexFresh && m.oracle && now - m.oracle.t < 5000) {
+          const tp = twapProb({ tw: m.oracle.v, secs: refs[m.asset].secs, pNow: refs[m.asset].cex.price, nowSec: Math.floor(now / 1000), tauSec, K: m.openPrice, sigma1h: sigma, sigmaMult: 1 });
+          if (tp && Number.isFinite(tp.p)) pUp = tp.p;
+        }
+        pair.onTick({ slug: m.slug, kind: m.kind, tauSec, pUp, bid: bs?.bid ?? null, ask: bs?.ask ?? null }, now);
+      } catch (e) { writeRow('error', { where: 'pair', msg: e.message }); }
     }
+    if (skipLog) continue;
     const row = {
       t: now, slug: m.slug, kind: m.kind ?? null, S: ref.price, src: ref.src, K: m.openPrice, Ksrc: m.openPriceSrc ?? null, tauSec: Math.round(tauSec),
       sigma1h: sigma, sigmaEst: refs[m.asset].sigma.sigma1h() !== null,
@@ -978,23 +987,25 @@ async function selftest() {
     eg4.onTick({ slug: 'h2', kind: 'hourly-p', model: 'point', tauSec: 60, K: 84000, pNow: 84030, sigma1h: 0.003, bid: 0.7, ask: 0.8 }, 1e12);
     if (rows2.some((r) => r.ev === 'place')) fails.push('endgame hourly 僅差でも置いた');
   }
-  // 両側買い: 公正 0.5 → YES 0.47 / NO 0.47 に指値。両方そろえば組原価 0.94、どちらが勝っても +0.06/組
+  // 両側買い: 公正 0.5 → 1本目は YES 0.46 / NO 0.46 に指値
   {
     const pm = new PairMaker({ exchangeAddresses: ['0xEX'], opts: { latencyMs: 0, settleDelayMs: 0 } });
     pm.onTick({ slug: 'p1', kind: '15-min', tauSec: 600, pUp: 0.5, bid: 0.49, ask: 0.51 }, 1000);
     const q0 = pm.mk.get('p1').quotes;
-    if (q0.YES?.q !== 0.47 || q0.NO?.q !== 0.47) fails.push(`pair quote ${JSON.stringify(q0)}`);
-    // 他人の YES 買い指値が 0.46 で約定 → 自分の 0.47 が先に全量(1ドル分 = 2.1277枚)
+    if (q0.YES?.q !== 0.46 || q0.NO?.q !== 0.46) fails.push(`pair quote ${JSON.stringify(q0)}`);
+    // 他人の YES 買い指値が 0.46 で約定 → 同値なので待ち行列の半分(5枚)、1ドル分(2.174枚)で頭打ち
     pm.onFill({ slug: 'p1', outcome: 'YES', makerSide: 'BUY', price: 0.46, shares: 10, taker: '0xT', tx: 'x1', blockTime: 2000 });
-    // 価格が動いて公正 0.6 に。NO は 0.37 に置き直し、YES を持っているので上限 1−0.02−0.47=0.51 は効かない
+    // 価格が動いて公正 0.6 に。YES を持っているので NO は「そろえに行く」値: min(0.4 − 0.01, 1 − 0.02 − 0.46) = 0.39
     pm.onTick({ slug: 'p1', kind: '15-min', tauSec: 500, pUp: 0.6, bid: 0.59, ask: 0.61 }, 3000);
-    if (pm.mk.get('p1').quotes.NO?.q !== 0.37) fails.push(`pair requote ${JSON.stringify(pm.mk.get('p1').quotes.NO)}`);
-    // テイカーが NO を売った(0.36)→ NO 0.37 に待ち行列の半分(10枚×0.5 → 上限 2.7027枚)
+    if (pm.mk.get('p1').quotes.NO?.q !== 0.39) fails.push(`pair requote ${JSON.stringify(pm.mk.get('p1').quotes.NO)}`);
+    // YES はもう多いので置かない
+    if (pm.mk.get('p1').quotes.YES) fails.push('pair 多い側をまだ買っている');
+    // テイカーが NO を売った(0.36)→ NO 0.39 に待ち行列の半分
     pm.onFill({ slug: 'p1', outcome: 'NO', makerSide: 'SELL', price: 0.36, shares: 10, taker: '0xEX', tx: 'x2', blockTime: 4000 });
     pm.onResolve('p1', 0, 5000);
     await new Promise((r) => setTimeout(r, 10));
     const T = pm.summary().totals;
-    const expect = (1 / 0.37) - (1 + 1); // NO 勝ち: NO 枚数 − 投入 $2
+    const expect = (1 / 0.39) - (1 + 1); // NO 勝ち: NO 枚数 − 投入 $2
     if (T.marketsFilled !== 1 || Math.abs(T.pnl - expect) > 1e-6 || T.pairs !== 1) fails.push(`pair settle ${JSON.stringify(T)} expect ${expect}`);
   }
   if (fails.length) { console.error('自己診断 失敗:', fails); process.exit(1); }
