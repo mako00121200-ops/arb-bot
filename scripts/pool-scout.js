@@ -29,7 +29,7 @@
 import { ethers } from "ethers";
 import { callWithRpc } from "./onchain-reserves.js";
 import { MULTICALL3_ADDRESS } from "./multicall-reserves.js";
-import { registerPool, getPool, getPoolsForPair, KIND_V2, KIND_V3 } from "./pool-registry.js";
+import { registerPool, getPool, getPoolsForPair, getTokenPriceUsd, KIND_V2, KIND_V3 } from "./pool-registry.js";
 import { getKnownTokens } from "./borrowable-tokens.js";
 import { isForkFactory, isForkQuoterEnabled, V3_FACTORIES, feeTierToBps } from "./v3-pools.js";
 import { isKnownIncompatiblePool } from "./incompatible-pools.js";
@@ -107,11 +107,27 @@ const SCOUT_ONE_KNOWN_TOP = parseInt(process.env.SCOUT_ONE_KNOWN_TOP || "50", 10
 /// (「再試行する仕組みを作ったら止め方も作る」と同じ)。
 const SCOUT_QUOTA_STOP_PCT = parseFloat(process.env.SCOUT_QUOTA_STOP_PCT || "70");
 
+/// **広げるチェーン**(2026年9月26日、オーナーの指示「avalanche をより良くしていけばもっと利益を取れる。監視する対象も広げてほしい」)。
+///
+/// [実測] avalanche は100分で702プールが動くのに、地図に載るのは1回あたり数本だった。
+///   見送り: 既に地図にある175 / 過去に不適合46 / **新しいペア(両方とも未知)67** / 片方だけ既知5
+/// 「未知」は**手書きの通貨一覧に無い**という意味で、地図の上では値段が分かっている通貨(既知の通貨と組んだ
+/// プールから導いたもの)も未知扱いだった。そのため、既に載っている通貨同士をつなぐプール(三角の経路が増える)を捨てていた。
+/// また枠の月末見込が70%を超えると採用が全部止まり、73%の今は avalanche に1本も足していなかった。
+///
+/// ここに挙げたチェーンでは
+///   ・地図で値段が分かっている通貨も「既知」とみなす
+///   ・採用を止める枠の境目を SCOUT_WIDE_QUOTA_STOP_PCT(既定80%)にする(枠を使い切ると bot ごと止まるので上限は残す)
+const SCOUT_WIDE_CHAINS = (process.env.SCOUT_WIDE_CHAINS ?? "avalanche")
+  .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+const SCOUT_WIDE_QUOTA_STOP_PCT = parseFloat(process.env.SCOUT_WIDE_QUOTA_STOP_PCT || "80");
+
 /// 枠が危なければ true。採用を見送る。
-function quotaTooTight() {
+function quotaTooTight(chain) {
   const u = getLastRpcUsage();
   if (!u || !u.reliable) return false;   // まだ測れていないうちは止めない
-  return u.projectedPercent >= SCOUT_QUOTA_STOP_PCT;
+  const stop = SCOUT_WIDE_CHAINS.includes(chain) ? SCOUT_WIDE_QUOTA_STOP_PCT : SCOUT_QUOTA_STOP_PCT;
+  return u.projectedPercent >= stop;
 }
 
 // Uniswap V3形式の Swap。Ramses系・Slipstream系のCLプールも同じ形。
@@ -277,8 +293,10 @@ function decide(chain, address, entry, knownSet, rank) {
   if (entry.kind === KIND_V3 && isForkFactory(chain, entry.factory) && !isForkQuoterEnabled(chain)) {
     return { take: false, why: "自前の見積もりが無効" };
   }
-  const k0 = knownSet.has(entry.token0);
-  const k1 = knownSet.has(entry.token1);
+  // 広げるチェーンでは、地図で値段が分かっている通貨も既知とみなす(上の SCOUT_WIDE_CHAINS)
+  const wide = SCOUT_WIDE_CHAINS.includes(chain);
+  const k0 = knownSet.has(entry.token0) || (wide && getTokenPriceUsd(chain, entry.token0) != null);
+  const k1 = knownSet.has(entry.token1) || (wide && getTokenPriceUsd(chain, entry.token1) != null);
   if (k0 && k1) return { take: true, why: "両方が手書きの通貨" };
   if (k0 || k1) {
     // 片方だけの時は、そのペアが既に地図にあれば載せる(比べる相手が増える)。
@@ -322,9 +340,10 @@ export async function scoutChain(chain, { reportOnly = false } = {}) {
   // **枠が危なければ、今回は1本も採らない。** 増やす前に止められるようにする。
   // 報告だけのチェーンは元々1本も採らないので、この歯止めは素通りしてよい
   // (むしろ枠が苦しい時ほど「どれを載せる価値があるか」の材料が要る)。
-  if (!reportOnly && quotaTooTight()) {
+  if (!reportOnly && quotaTooTight(key)) {
     const u = getLastRpcUsage();
-    console.warn(`[プール発見] ${key}: 枠の月末見込が${u.projectedPercent.toFixed(0)}%(上限${SCOUT_QUOTA_STOP_PCT}%)のため、**今回は新しいプールを採りません**`);
+    const stop = SCOUT_WIDE_CHAINS.includes(key) ? SCOUT_WIDE_QUOTA_STOP_PCT : SCOUT_QUOTA_STOP_PCT;
+    console.warn(`[プール発見] ${key}: 枠の月末見込が${u.projectedPercent.toFixed(0)}%(上限${stop}%)のため、**今回は新しいプールを採りません**`);
     return { added: 0, scanned, active: counts.size, skipped: { "枠が危ない": ranked.length } };
   }
 
