@@ -58,7 +58,9 @@ export class PairMaker {
   }
   // 測り方の点検(30分ごと)。quotes=新しく置いた指値、requotes=置き直し、fills=紙上約定、
   // hedged/oneSided=決済時に組がそろっていた市場/片側だけの市場、late=損益確定後に届いた約定
-  resetDiag() { this.diag = { quotes: 0, requotes: 0, fills: 0, hedged: 0, oneSided: 0, late: 0 }; }
+  // blocked = 約定の時刻の時点で上限・片寄りのルールに当たり、数えなかった約定
+  // overLimit = 決済時に投入上限や片寄り上限を超えていた市場(0 でなければ紙上のルール判定が壊れている)
+  resetDiag() { this.diag = { quotes: 0, requotes: 0, fills: 0, hedged: 0, oneSided: 0, late: 0, blocked: 0, overLimit: 0 }; }
   state(slug, kind) {
     let st = this.mk.get(slug);
     if (!st) { st = { slug, kind, pos: { YES: { qty: 0, cost: 0 }, NO: { qty: 0, cost: 0 } }, quotes: { YES: null, NO: null }, segments: [], credited: {}, up: null }; this.mk.set(slug, st); this.totals.markets++; }
@@ -127,9 +129,19 @@ export class PairMaker {
         if (soldW || boughtOpp) avail = f.shares * this.o.queueShare;
       }
       if (avail <= 0) continue;
+      // 約定はチェーンから平均17秒遅れて届く。その間に置き直した指値にも次々と割り当てると、
+      // 実際のボットなら起きない「同じ側の買い増し」が紙上で起きる(9/26 06:14 に NO だけ $3 分)。
+      // そこで「その約定の時刻の時点での持ち高」でルールを判定する:
+      //   - すでにこの側の方が多ければ(=そろっていない)、もう数えない
+      //   - 1市場の投入上限を超える分は数えない
+      const mine = st.pos[W], other = st.pos[OTHER[W]];
+      if (mine.qty > other.qty + 1e-9) { this.diag.blocked++; continue; }
+      if (mine.cost + other.cost >= this.o.maxPerMarketUsd - 1e-9) { this.diag.blocked++; continue; }
       const key = `${f.tx ?? t}|${W}|${q}`;
       const prev = st.credited[key] ?? 0;
-      const add = Math.min(Math.max(prev, avail) - prev, seg.shares - seg.filled);
+      let add = Math.min(Math.max(prev, avail) - prev, seg.shares - seg.filled);
+      // 反対側が多い(=そろえる側)なら、そろう枚数+1回分までに抑える
+      if (other.qty > mine.qty) add = Math.min(add, other.qty - mine.qty + this.o.clipUsd / q);
       if (add <= 0) continue;
       st.credited[key] = prev + add;
       seg.filled += add; st.pos[W].qty += add; st.pos[W].cost += add * q;
@@ -155,6 +167,8 @@ export class PairMaker {
     const cost = Y.cost + N.cost;
     if (cost <= 0) return;
     if (Math.min(Y.qty, N.qty) > 0) this.diag.hedged++; else this.diag.oneSided++;
+    const imbUsd = Math.abs(Y.cost - N.cost);
+    if (cost > this.o.maxPerMarketUsd + this.o.clipUsd + 1e-6 || (Math.min(Y.qty, N.qty) === 0 && cost > this.o.clipUsd + 1e-6)) this.diag.overLimit++;
     const payout = st.up === 1 ? Y.qty : N.qty;
     const pnl = payout - cost;
     const hedged = Math.min(Y.qty, N.qty);

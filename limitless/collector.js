@@ -775,7 +775,8 @@ function audit() {
   if (eg && eg.late > 0) warn.push(`終盤: 損益確定後に届いた約定 ${eg.late}件`);
   if (eg && eg.priceOkOutside > eg.credited && eg.priceOkOutside >= 3) warn.push(`終盤: 値段は合うのに有効時間外の約定 ${eg.priceOkOutside}件(数えた ${eg.credited}件)`);
   if (pr && pr.late > 0) warn.push(`両側: 損益確定後に届いた約定 ${pr.late}件`);
-  if (pr && pr.oneSided > pr.hedged && pr.oneSided >= 3) warn.push(`両側: 片側だけの市場 ${pr.oneSided} > そろった市場 ${pr.hedged}`);
+  if (pr && pr.oneSided > pr.hedged && pr.oneSided >= 2) warn.push(`両側: 片側だけの市場 ${pr.oneSided} > そろった市場 ${pr.hedged}`);
+  if (pr && pr.overLimit > 0) warn.push(`両側: 上限を超えて約定した市場 ${pr.overLimit}(紙上のルール判定が壊れている)`);
   const row = {
     windowMin: Math.round(AUDIT_INTERVAL_MS / 60000), activeMarkets: active.length, byKind, staleBooks, noBook, noK,
     chainFills: auditWin.chainFills, ingestLagAvgSec: auditWin.chainFills ? +(auditWin.ingestLagSum / auditWin.chainFills / 1000).toFixed(1) : null, ingestLagMaxSec: +(auditWin.ingestLagMax / 1000).toFixed(1),
@@ -786,7 +787,7 @@ function audit() {
   writeRow('audit', row);
   console.log(`[点検 ${row.windowMin}分] 市場=${active.length} ${JSON.stringify(byKind)} 板古い/無し=${staleBooks}/${noBook} 行使価格なし=${noK} | チェーン約定=${row.chainFills}件 到着遅れ 平均${row.ingestLagAvgSec ?? '-'}s 最大${row.ingestLagMaxSec}s | 遅延 http=${row.latency.http}ms 板WS=${row.latency.wsBook}ms Binance=${row.latency.binance}ms` +
     (eg ? ` | 終盤 指値=${eg.places} 取消=${eg.cancels} 届いた約定=${eg.tracked} 値段一致=${eg.priceOk} 時間外=${eg.priceOkOutside} 数えた=${eg.credited} 遅着=${eg.late}` : '') +
-    (pr ? ` | 両側 新規=${pr.quotes} 置直し=${pr.requotes} 約定=${pr.fills} そろった=${pr.hedged} 片側=${pr.oneSided} 遅着=${pr.late}` : '') +
+    (pr ? ` | 両側 新規=${pr.quotes} 置直し=${pr.requotes} 約定=${pr.fills} 規則で除外=${pr.blocked} そろった=${pr.hedged} 片側=${pr.oneSided} 上限超え=${pr.overLimit} 遅着=${pr.late}` : '') +
     ` | 警告: ${warn.length ? warn.join(' / ') : 'なし'}`);
   auditWin = { chainFills: 0, ingestLagMax: 0, ingestLagSum: 0 };
   if (ENDGAME !== 'off') endgame.resetDiag();
@@ -1053,6 +1054,20 @@ async function selftest() {
     const T = pm.summary().totals;
     const expect = (1 / 0.39) - (1 + 1); // NO 勝ち: NO 枚数 − 投入 $2
     if (T.marketsFilled !== 1 || Math.abs(T.pnl - expect) > 1e-6 || T.pairs !== 1) fails.push(`pair settle ${JSON.stringify(T)} expect ${expect}`);
+  }
+  // 両側買い: 約定が遅れて届いても、同じ側を $1 を超えて買わない(9/26 06:14 の NO $3 の再発防止)
+  {
+    const pm2 = new PairMaker({ exchangeAddresses: ['0xEX'], opts: { latencyMs: 0, settleDelayMs: 0 } });
+    // 公正 0.5 → NO 0.46 に指値。約定が届かないまま公正が 0.45 に動き、NO を 0.51 に置き直し、さらに 0.56 へ
+    pm2.onTick({ slug: 'p2', kind: '5-min', tauSec: 250, pUp: 0.5, bid: 0.4, ask: 0.6 }, 1000);
+    pm2.onTick({ slug: 'p2', kind: '5-min', tauSec: 245, pUp: 0.45, bid: 0.4, ask: 0.6 }, 6000);
+    pm2.onTick({ slug: 'p2', kind: '5-min', tauSec: 240, pUp: 0.4, bid: 0.3, ask: 0.5 }, 11000);
+    // あとから3件の約定がまとめて届く(それぞれ別の指値の時間帯)
+    pm2.onFill({ slug: 'p2', outcome: 'NO', makerSide: 'BUY', price: 0.40, shares: 10, taker: '0xT', tx: 'n1', blockTime: 2000 });
+    pm2.onFill({ slug: 'p2', outcome: 'NO', makerSide: 'BUY', price: 0.45, shares: 10, taker: '0xT', tx: 'n2', blockTime: 7000 });
+    pm2.onFill({ slug: 'p2', outcome: 'NO', makerSide: 'BUY', price: 0.50, shares: 10, taker: '0xT', tx: 'n3', blockTime: 12000 });
+    const st2 = pm2.mk.get('p2');
+    if (Math.abs(st2.pos.NO.cost - 1) > 1e-9 || st2.pos.YES.qty !== 0 || pm2.diag.blocked !== 2) fails.push(`pair 遅着で買い増し ${JSON.stringify(st2.pos)} ${JSON.stringify(pm2.diag)}`);
   }
   // 点検カウンタ: 値段は合うが有効時間外の約定を数える
   {
