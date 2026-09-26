@@ -53,7 +53,12 @@ export class PairMaker {
     this.byDay = {};
     this.recent = [];
     this.startedAt = Date.now();
+    this.settledSlugs = new Map();
+    this.resetDiag();
   }
+  // 測り方の点検(30分ごと)。quotes=新しく置いた指値、requotes=置き直し、fills=紙上約定、
+  // hedged/oneSided=決済時に組がそろっていた市場/片側だけの市場、late=損益確定後に届いた約定
+  resetDiag() { this.diag = { quotes: 0, requotes: 0, fills: 0, hedged: 0, oneSided: 0, late: 0 }; }
   state(slug, kind) {
     let st = this.mk.get(slug);
     if (!st) { st = { slug, kind, pos: { YES: { qty: 0, cost: 0 }, NO: { qty: 0, cost: 0 } }, quotes: { YES: null, NO: null }, segments: [], credited: {}, up: null }; this.mk.set(slug, st); this.totals.markets++; }
@@ -91,7 +96,7 @@ export class PairMaker {
       const cur = st.quotes[side];
       if (!ok) { if (cur) this.close(st, side, now, 'stop'); continue; }
       if (cur && Math.abs(cur.q - want) < this.o.requoteCents - 1e-9) continue;
-      if (cur) this.close(st, side, now, 'requote');
+      if (cur) { this.close(st, side, now, 'requote'); this.diag.requotes++; } else this.diag.quotes++;
       const seg = { side, q: want, from: now + this.o.latencyMs, to: null, shares: this.o.clipUsd / want, filled: 0 };
       st.quotes[side] = seg; st.segments.push(seg);
       this.totals.quotes++;
@@ -105,6 +110,7 @@ export class PairMaker {
 
   onFill(f) {
     if (!f?.slug || !f.outcome || !(f.shares > 0) || f.price === null || f.price === undefined) return;
+    if (this.settledSlugs.has(f.slug)) this.diag.late++;
     const st = this.mk.get(f.slug);
     if (!st || st.up !== null) return;
     const t = f.blockTime ?? f.t;
@@ -127,6 +133,7 @@ export class PairMaker {
       if (add <= 0) continue;
       st.credited[key] = prev + add;
       seg.filled += add; st.pos[W].qty += add; st.pos[W].cost += add * q;
+      this.diag.fills++;
       this.writeRow('pair', { ev: 'fill', slug: st.slug, side: W, q, shares: +add.toFixed(3), yes: +st.pos.YES.qty.toFixed(3), no: +st.pos.NO.qty.toFixed(3), secToExpiry: f.secToExpiry ?? null });
     }
   }
@@ -142,9 +149,12 @@ export class PairMaker {
     const st = this.mk.get(slug);
     if (!st) return;
     this.mk.delete(slug);
+    this.settledSlugs.set(slug, Date.now());
+    if (this.settledSlugs.size > 500) for (const key of this.settledSlugs.keys()) { this.settledSlugs.delete(key); if (this.settledSlugs.size <= 400) break; }
     const Y = st.pos.YES, N = st.pos.NO;
     const cost = Y.cost + N.cost;
     if (cost <= 0) return;
+    if (Math.min(Y.qty, N.qty) > 0) this.diag.hedged++; else this.diag.oneSided++;
     const payout = st.up === 1 ? Y.qty : N.qty;
     const pnl = payout - cost;
     const hedged = Math.min(Y.qty, N.qty);

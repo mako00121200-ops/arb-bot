@@ -61,7 +61,8 @@ export const PAGE = `<!doctype html>
 <body>
 <h1>Limitless 観測(実弾なし)</h1>
 <div class="sub" id="sub">読み込み中…</div>
-<div class="grid" id="goal"></div>
+<div class="card" id="auditCard" style="margin-top:0"><h2>測り方の点検(30分ごと)</h2><p class="note" id="auditLine">まだ点検していません(起動30分後に1回目)</p></div>
+<div class="grid" id="goal" style="margin-top:10px"></div>
 <div class="grid" id="kpi" style="margin-top:10px"></div>
 
 <div class="card"><h2>遅延の推移(直近24時間、p50)</h2><p class="note">板取得の HTTP 往復が「注文を送れる速さ」の代理。WS は板の更新が届くまでの遅れ。</p>
@@ -127,6 +128,15 @@ async function refresh(){
   const today = s.today; const kinds = Object.entries(today.markets);
   table('hitKind', ['種別(今日)','決済','判定可','理論の的中','板の的中'], kinds.map(([k,m])=>[k, m.n, m.judged, fmt.pct(m.judged?m.theoRight/m.judged:null), fmt.pct(m.judged?m.midRight/m.judged:null)]));
   barChart('edge', s.edgeLabels, [ {label:'秒数',data:today.edge,backgroundColor:css('--s1')} ]);
+  const au = s.audit;
+  if (au) {
+    const w = au.warn||[];
+    const line = fmt.t(au.t)+' / チェーン約定 '+au.chainFills+'件(到着遅れ 最大'+au.ingestLagMaxSec+'秒) / 板古い '+au.staleBooks+' / '
+      + (au.endgame? '終盤: 指値'+au.endgame.places+' 値段一致'+au.endgame.priceOk+' 数えた'+au.endgame.credited+' 時間外'+au.endgame.priceOkOutside+' / ' : '')
+      + (au.pair? '両側: 約定'+au.pair.fills+' そろった'+au.pair.hedged+' 片側'+au.pair.oneSided : '');
+    const box = document.getElementById('auditLine');
+    box.replaceChildren(el('div',{},line), el('div',{class: w.length?'dn':'up', style:'margin-top:4px;font-weight:600'}, w.length? '⚠ '+w.join(' / ') : '✓ 警告なし'));
+  }
   // 目標(1日 $50)に対する今日の紙上成績
   const GOAL = 50;
   const egT = s.endgame?.today ?? {}; const prT = s.pair?.today ?? null;

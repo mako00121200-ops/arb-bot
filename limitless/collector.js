@@ -148,6 +148,9 @@ const LEDGER_FILE = path.join(DATA_DIR, 'ledger.json');
 const PAIR = (process.env.PAIR ?? 'paper').toLowerCase();
 const pair = new PairMaker({ dataDir: DATA_DIR, writeRow: (t, o) => writeRow(t, o), exchangeAddresses: CONTRACTS.exchanges });
 const minSizeLogged = new Set();
+// 測り方の点検(30分ごと)。チェーンの約定がどれだけ遅れて届いているか等
+const AUDIT_INTERVAL_MS = Number(env('AUDIT_INTERVAL_MS', 30 * 60000));
+let auditWin = { chainFills: 0, ingestLagMax: 0, ingestLagSum: 0 };
 let zeroSumWarnedAt = 0;
 const PORT = Number(env('PORT', 8080));
 const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN ?? '';
@@ -748,6 +751,48 @@ async function backtestOnce() {
   }
 }
 
+// 測り方の点検。30分ごとに1行で出し、JSONL の audit 行にも残す
+let lastAudit = null;
+function audit() {
+  const now = Date.now();
+  const active = [...markets.values()].filter((m) => !m.resolved && m.expiryTs && m.expiryTs > now);
+  const byKind = {};
+  let staleBooks = 0, noBook = 0, noK = 0;
+  for (const m of active) {
+    byKind[m.kind ?? '?'] = (byKind[m.kind ?? '?'] || 0) + 1;
+    if (!m.bookTs) noBook++; else if (now - m.bookTs > 30000) staleBooks++;
+    if (m.openPrice === null) noK++;
+  }
+  const L = latency.summary();
+  const staleRefs = ASSETS.filter((a) => !refs[a].cex || now - refs[a].cex.t > 10000);
+  const eg = ENDGAME !== 'off' ? { ...endgame.diag } : null;
+  const pr = PAIR !== 'off' ? { ...pair.diag } : null;
+  const warn = [];
+  if (auditWin.chainFills === 0) warn.push('チェーンの約定が30分間0件(読み取り停止の疑い)');
+  if (auditWin.ingestLagMax > 150000) warn.push(`約定の到着遅れが最大${Math.round(auditWin.ingestLagMax / 1000)}秒(損益確定の待ち180秒に迫る)`);
+  if (staleBooks + noBook > active.length / 2) warn.push(`板が古い/無い市場が ${staleBooks + noBook}/${active.length}`);
+  if (staleRefs.length) warn.push(`Binance 価格が止まっている: ${staleRefs.join(',')}`);
+  if (eg && eg.late > 0) warn.push(`終盤: 損益確定後に届いた約定 ${eg.late}件`);
+  if (eg && eg.priceOkOutside > eg.credited && eg.priceOkOutside >= 3) warn.push(`終盤: 値段は合うのに有効時間外の約定 ${eg.priceOkOutside}件(数えた ${eg.credited}件)`);
+  if (pr && pr.late > 0) warn.push(`両側: 損益確定後に届いた約定 ${pr.late}件`);
+  if (pr && pr.oneSided > pr.hedged && pr.oneSided >= 3) warn.push(`両側: 片側だけの市場 ${pr.oneSided} > そろった市場 ${pr.hedged}`);
+  const row = {
+    windowMin: Math.round(AUDIT_INTERVAL_MS / 60000), activeMarkets: active.length, byKind, staleBooks, noBook, noK,
+    chainFills: auditWin.chainFills, ingestLagAvgSec: auditWin.chainFills ? +(auditWin.ingestLagSum / auditWin.chainFills / 1000).toFixed(1) : null, ingestLagMaxSec: +(auditWin.ingestLagMax / 1000).toFixed(1),
+    latency: { http: L.http_orderbook?.p50 ?? null, wsBook: L.ws_book_lag?.p50 ?? null, oracle: L.ws_oracle_lag?.p50 ?? null, binance: L.binance_lag?.p50 ?? null },
+    endgame: eg, pair: pr, warn,
+  };
+  lastAudit = { t: now, ...row };
+  writeRow('audit', row);
+  console.log(`[点検 ${row.windowMin}分] 市場=${active.length} ${JSON.stringify(byKind)} 板古い/無し=${staleBooks}/${noBook} 行使価格なし=${noK} | チェーン約定=${row.chainFills}件 到着遅れ 平均${row.ingestLagAvgSec ?? '-'}s 最大${row.ingestLagMaxSec}s | 遅延 http=${row.latency.http}ms 板WS=${row.latency.wsBook}ms Binance=${row.latency.binance}ms` +
+    (eg ? ` | 終盤 指値=${eg.places} 取消=${eg.cancels} 届いた約定=${eg.tracked} 値段一致=${eg.priceOk} 時間外=${eg.priceOkOutside} 数えた=${eg.credited} 遅着=${eg.late}` : '') +
+    (pr ? ` | 両側 新規=${pr.quotes} 置直し=${pr.requotes} 約定=${pr.fills} そろった=${pr.hedged} 片側=${pr.oneSided} 遅着=${pr.late}` : '') +
+    ` | 警告: ${warn.length ? warn.join(' / ') : 'なし'}`);
+  auditWin = { chainFills: 0, ingestLagMax: 0, ingestLagSum: 0 };
+  if (ENDGAME !== 'off') endgame.resetDiag();
+  if (PAIR !== 'off') pair.resetDiag();
+}
+
 // 画面(/api/state)に渡す状態
 function getState() {
   const now = Date.now();
@@ -772,6 +817,7 @@ function getState() {
     backtest: lastBacktest,
     endgame: ENDGAME !== 'off' ? endgame.summary() : null,
     pair: PAIR !== 'off' ? pair.summary() : null,
+    audit: lastAudit,
     backtestRecent: lastBacktestRecent,
   };
 }
@@ -1008,6 +1054,14 @@ async function selftest() {
     const expect = (1 / 0.39) - (1 + 1); // NO 勝ち: NO 枚数 − 投入 $2
     if (T.marketsFilled !== 1 || Math.abs(T.pnl - expect) > 1e-6 || T.pairs !== 1) fails.push(`pair settle ${JSON.stringify(T)} expect ${expect}`);
   }
+  // 点検カウンタ: 値段は合うが有効時間外の約定を数える
+  {
+    const eg5 = new EndgameMaker({ writeRow: () => {}, exchangeAddresses: ['0xEX'], opts: { latencyMs: 5000 } });
+    const T0 = 1790000000; const secs = new Map(); for (let x = T0 - 150; x <= T0; x++) secs.set(x, 100300);
+    eg5.onTick({ slug: 'a1', kind: '5-min', model: 'twap', tauSec: 30, K: 100000, tw: 100300, secs, pNow: 100300, nowSec: T0, sigma1h: 0.004, bid: 0.95, ask: 0.99 }, T0 * 1000);
+    eg5.onFill({ slug: 'a1', outcome: 'YES', makerSide: 'BUY', price: 0.95, shares: 5, taker: '0xT', tx: 't1', blockTime: T0 * 1000 + 1000 }); // 有効になる前
+    if (eg5.diag.priceOkOutside !== 3 || eg5.diag.credited !== 0 || eg5.diag.places !== 3) fails.push(`endgame diag ${JSON.stringify(eg5.diag)}`);
+  }
   if (fails.length) { console.error('自己診断 失敗:', fails); process.exit(1); }
   console.log('自己診断 OK');
 }
@@ -1035,13 +1089,15 @@ async function main() {
   setInterval(theoTick, THEO_INTERVAL_MS);
   setInterval(() => pollExpired().catch((e) => writeRow('error', { where: 'pollExpired', msg: e.message })), 60000);
   setInterval(heartbeat, 5 * 60000);
+  if (AUDIT_INTERVAL_MS > 0) setInterval(audit, AUDIT_INTERVAL_MS);
   if (LATENCY_PROBE_MS > 0) setInterval(latencyProbe, LATENCY_PROBE_MS);
   if (EVENTS_INTERVAL_MS > 0) setInterval(() => pollMarketEvents().catch((e) => writeRow('error', { where: 'events-loop', msg: e.message })), EVENTS_INTERVAL_MS);
   if (BASE_RPC_URL) {
     console.log('[チェーン] Base の約定・払い戻しの監視を開始');
     startChainWatcher({
       rpcUrl: BASE_RPC_URL, logRawOnce, resolveToken, resolveCondition, onLatency: (k, ms) => latency.push(k, ms),
-      writeRow: (type, obj) => { const row = writeRow(type, obj); if (type === 'fill') { ledger.addFill(row); if (ENDGAME !== 'off') endgame.onFill(row); if (PAIR !== 'off') pair.onFill(row); } return row; },
+      writeRow: (type, obj) => { const row = writeRow(type, obj); if (type === 'fill') {
+        if (row.blockTime) { const lag = Date.now() - row.blockTime; auditWin.chainFills++; auditWin.ingestLagSum += lag; auditWin.ingestLagMax = Math.max(auditWin.ingestLagMax, lag); } ledger.addFill(row); if (ENDGAME !== 'off') endgame.onFill(row); if (PAIR !== 'off') pair.onFill(row); } return row; },
     });
     setTimeout(function rep() { leaderReport(); setTimeout(rep, LEADER_REPORT_MS); }, 10 * 60000);
   } else {

@@ -73,8 +73,17 @@ export class EndgameMaker {
     this.totals = Object.fromEntries(this.o.variants.map((v) => [String(v), this.emptyTotals()]));
     this.byDay = {}; // 'YYYY-MM-DD' -> { variant -> { filled, pnl, wins, losses, cost } }
     this.recent = []; // 決済済み(新しい順、最大100)
+    this.settledSlugs = new Map(); // slug -> 決済確定時刻(遅れて届いた約定の検出用)
+    this.resetDiag();
     this.startedAt = Date.now();
   }
+  // 測り方の点検(30分ごとに collector が読み出してリセット)
+  //   tracked      … 紙上注文のある市場に届いた約定行
+  //   priceOk      … そのうち「値段の条件は満たす」もの(時刻は問わない)
+  //   priceOkOutside … 値段は満たすのに、指値の有効時間の外だったもの(多ければ有効時間の決め方を疑う)
+  //   credited     … 実際に紙上約定として数えたもの
+  //   late         … 損益確定の後に届いた約定(多ければ待ち時間 settleDelayMs が短すぎる)
+  resetDiag() { this.diag = { tracked: 0, priceOk: 0, priceOkOutside: 0, credited: 0, late: 0, places: 0, cancels: 0 }; }
   emptyTotals() { return { markets: 0, placed: 0, filledMarkets: 0, shares: 0, cost: 0, pnl: 0, wins: 0, losses: 0, byKind: {} }; }
   key(v, slug) { return `${v}|${slug}`; }
 
@@ -117,11 +126,13 @@ export class EndgameMaker {
       const seg = { side, q, placedAt: now, from: now + this.o.latencyMs, to: null, tau: Math.round(ctx.tauSec) };
       st.segments.push(seg);
       this.totals[String(v)].placed++;
+      this.diag.places++;
       this.writeRow('paper', { ev: 'place', variant: v, slug: st.slug, kind: st.kind, side, q, pSide: +pSide.toFixed(5), tauSec: seg.tau, bid: ctx.bid, ask: ctx.ask });
     }
   }
   cancel(st, seg, now, reason) {
     seg.to = now;
+    this.diag.cancels++;
     this.writeRow('paper', { ev: 'cancel', variant: st.variant, slug: st.slug, side: seg.side, q: seg.q, reason, filled: +st.filled.toFixed(3) });
   }
 
@@ -130,11 +141,20 @@ export class EndgameMaker {
     if (!f?.slug || !f.outcome || !(f.shares > 0) || f.price === null || f.price === undefined) return;
     const t = f.blockTime ?? f.t;
     const isTakerRecord = this.exchanges.has(String(f.taker ?? '').toLowerCase());
+    if (this.settledSlugs.has(f.slug)) this.diag.late++;
+    const priceOkFor = (W, q) => (!isTakerRecord
+      ? f.outcome === W && f.makerSide === 'BUY' && f.price <= q + 1e-9
+      : (f.outcome === W && f.makerSide === 'SELL' && f.price <= q + 1e-9) || (f.outcome !== W && f.makerSide === 'BUY' && f.price >= 1 - q - 1e-9));
     for (const v of this.o.variants) {
       const st = this.book.get(this.key(v, f.slug));
-      if (!st || !st.side || st.filled >= st.target - 1e-9) continue;
+      if (!st || !st.side) continue;
+      this.diag.tracked++;
+      const anySeg = st.segments[0];
+      const pOk = anySeg ? priceOkFor(anySeg.side, anySeg.q) : false;
+      if (pOk) this.diag.priceOk++;
+      if (st.filled >= st.target - 1e-9) continue;
       const seg = st.segments.find((s) => t >= s.from && (s.to === null || t <= s.to));
-      if (!seg) continue;
+      if (!seg) { if (pOk) this.diag.priceOkOutside++; continue; }
       const W = seg.side, q = seg.q;
       let avail = 0;
       if (!isTakerRecord) {
@@ -154,6 +174,7 @@ export class EndgameMaker {
       if (add <= 0) continue;
       st.credited[tx] = prev + add;
       st.filled += add; st.cost += add * q;
+      this.diag.credited++;
       this.writeRow('paper', { ev: 'fill', variant: v, slug: st.slug, side: W, q, shares: +add.toFixed(3), total: +st.filled.toFixed(3), tx, via: isTakerRecord ? 'taker' : 'maker', secToExpiry: f.secToExpiry ?? null });
     }
   }
@@ -174,6 +195,8 @@ export class EndgameMaker {
     const st = this.book.get(k);
     if (!st) return;
     this.book.delete(k);
+    this.settledSlugs.set(slug, Date.now());
+    if (this.settledSlugs.size > 500) for (const key of this.settledSlugs.keys()) { this.settledSlugs.delete(key); if (this.settledSlugs.size <= 400) break; }
     const T = this.totals[String(v)];
     if (st.filled <= 0) return;
     const win = (st.side === 'YES') === (st.up === 1);
