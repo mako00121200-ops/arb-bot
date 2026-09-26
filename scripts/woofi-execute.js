@@ -300,3 +300,10 @@ export function formatWoofiSendLine() {
   }
   return parts.length ? ` WOOFi送信[${parts.join(" / ")} 今日の損$${lossToday().toFixed(3)}/上限$${DAILY_LOSS_USD}]` : "";
 }
+
+/// 画面用。チェーンごとの集計(確認・送信・勝敗・純利)と今日の損。
+export function getWoofiSendStats() {
+  const chains = {};
+  for (const [chain, s] of stats) chains[chain] = { ...s };
+  return { enabled: ENABLED, chains, lossTodayUsd: lossToday(), dailyLossCapUsd: DAILY_LOSS_USD };
+}
