@@ -75,6 +75,9 @@ export const PAGE = `<!doctype html>
 <div class="card"><h2>板と理論価格の乖離(今日、UTC)</h2><p class="note">理論 − 板 の大きい方を秒ごとに数えたもの。2¢ 超が多いほどテイカーで取れる余地がある。</p>
   <div class="chart"><canvas id="edge"></canvas></div></div>
 
+<div class="card"><h2>終盤メイカー(紙上・実際の注文なし)</h2><p class="note" id="egNote">5分/15分市場の満期90秒前から、TWAPモデルで99.5%以上の側に買い指値。上限を 0.96 / 0.97 / 0.98 の3通り同時に試す。約定は Base 上の実際の約定から判定。</p>
+  <div class="tbl"><table id="eg1"></table></div><div class="tbl" style="margin-top:8px"><table id="eg2"></table></div></div>
+
 <div class="card"><h2>検証: 案1(5分/15分・TWAP残差)と案2(1時間・理論価格)</h2><p class="note" id="btNote">Brier = 平均(確率−結果)²。小さいほど当たる。「板」より「TWAP」/「1点」が小さければ、板より正しく値付けできている。1時間ごとに再計算。</p>
   <div class="tbl"><table id="bt1"></table></div><div class="tbl" style="margin-top:8px"><table id="bt1r"></table></div><div class="tbl" style="margin-top:8px"><table id="bt2"></table></div><div class="tbl" style="margin-top:8px"><table id="bt4"></table></div><div class="tbl" style="margin-top:8px"><table id="bt3"></table></div></div>
 
@@ -120,6 +123,12 @@ async function refresh(){
   const today = s.today; const kinds = Object.entries(today.markets);
   table('hitKind', ['種別(今日)','決済','判定可','理論の的中','板の的中'], kinds.map(([k,m])=>[k, m.n, m.judged, fmt.pct(m.judged?m.theoRight/m.judged:null), fmt.pct(m.judged?m.midRight/m.judged:null)]));
   barChart('edge', s.edgeLabels, [ {label:'秒数',data:today.edge,backgroundColor:css('--s1')} ]);
+  const eg = s.endgame;
+  if (eg) {
+    const mx = Math.max(...Object.values(eg.variants).map(v=>Math.abs(v.pnl)), 0);
+    table('eg1', ['指値上限','見た市場','指値','約定市場','約定率','枚数','投入','損益','利回り','勝','負'], Object.entries(eg.variants).map(([k,v])=>[k, v.markets, v.placed, v.filledMarkets, fmt.pct(v.fillRate), fmt.n(v.shares,1), '$'+fmt.n(v.cost,2), pnlCell(v.pnl, mx), v.roi===null?'-':(v.roi*100).toFixed(2)+'%', v.wins, el('span',{class:v.losses?'dn':''},String(v.losses))]));
+    table('eg2', ['時刻','上限','市場','側','指値','置いた時の残り','確率','枚数','結果','損益'], eg.recent.map(r=>[fmt.t(r.t), r.variant, (r.slug||'').replace(/-up-or-down-/,' ').replace(/-\d+$/,''), r.side, r.q, r.tau===null?'-':r.tau+'s', r.pAtPlace===null?'-':r.pAtPlace.toFixed(4), fmt.n(r.shares,1), el('span',{class:r.win?'up':'dn'}, r.win?'勝':'負'), el('span',{class:r.pnl>=0?'up':'dn'}, fmt.usd(r.pnl))]), 'まだ約定した紙上注文がありません');
+  }
   const bt = s.backtest;
   if (bt) {
     document.getElementById('btNote').textContent = '対象 '+bt.days+'日分 / 5分・15分市場 '+bt.short.markets+'件 / 1時間市場 '+bt.hourly.markets+'件 / 計算 '+fmt.t(bt.generatedAt)+'。Brier = 平均(確率−結果)²、小さいほど当たる。';

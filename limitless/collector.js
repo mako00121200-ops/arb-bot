@@ -41,6 +41,7 @@ import { FillLedger, formatLeader } from './ledger.js';
 import { Stats, EDGE_LABELS } from './stats.js';
 import { startServer } from './server.js';
 import { runBacktest, formatBacktest } from './backtest.js';
+import { EndgameMaker } from './endgame.js';
 
 const env = (k, d) => (process.env[k] === undefined || process.env[k] === '' ? d : process.env[k]);
 const API_URL = env('LIMITLESS_API_URL', 'https://api.limitless.exchange').replace(/\/$/, '');
@@ -135,6 +136,11 @@ const LATENCY_PROBE_MS = Number(env('LATENCY_PROBE_MS', 15000));
 const latency = new LatencyStats();
 const ledger = new FillLedger({ exchangeAddresses: CONTRACTS.exchanges });
 const LEADER_REPORT_MS = Number(env('LEADER_REPORT_MS', 3600000));
+// 終盤メイカー(紙上)。ENDGAME=off で止める。実際の注文は出さない
+const ENDGAME = (process.env.ENDGAME ?? 'paper').toLowerCase();
+const endgame = new EndgameMaker({ dataDir: DATA_DIR, writeRow: (t, o) => writeRow(t, o), exchangeAddresses: CONTRACTS.exchanges });
+const LEDGER_FILE = path.join(DATA_DIR, 'ledger.json');
+let zeroSumWarnedAt = 0;
 const PORT = Number(env('PORT', 8080));
 const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN ?? '';
 const stats = new Stats({ dataDir: DATA_DIR, keepDays: 14 });
@@ -228,6 +234,7 @@ const refs = Object.fromEntries(ASSETS.map((a) => [a, {
   lmtsSource: null,
   sigma: new SigmaEstimator(), // Binance の約定だけから作る。TWAPを混ぜると基差が偽の収益率になる
   cexLastLogSec: 0,
+  secs: new Map(), // 秒 -> その秒の最後の Binance 約定(直近180秒)。TWAPモデル用
 }]));
 // slug -> 市場
 const markets = new Map();
@@ -532,6 +539,7 @@ function connectLimitlessWs() {
       writeRow('open_price', { slug: m.slug, K: price, src: m.openPriceSrc, srcTs: t, offsetMs: t - m.openTs });
       console.log(`[市場] ${m.slug} 行使価格=オラクル開始値 ${price} (開始から${((t - m.openTs) / 1000).toFixed(1)}s)`);
     }
+    if (m && Number.isFinite(price)) m.oracle = { v: price, t: Date.now() };
     if (asset && refs[asset] && Number.isFinite(price)) {
       refs[asset].lmts = { price, t: Date.now() };
       refs[asset].lmtsSource = d?.source ?? null;
@@ -627,6 +635,10 @@ function runBinance() {
       if (d?.E) latency.push('binance_lag', Date.now() - Number(d.E));
       refs[asset].cex = { price, t: Date.now() };
       refs[asset].sigma.push(price, t);
+      const secMap = refs[asset].secs;
+      const s0 = Math.floor(t / 1000);
+      secMap.set(s0, price);
+      if (secMap.size > 200) for (const k of secMap.keys()) { if (k < s0 - 180) secMap.delete(k); else break; }
       // 約定は多いので記録は秒に1回まで
       const sec = Math.floor(t / 1000);
       if (sec !== refs[asset].cexLastLogSec) {
@@ -658,6 +670,11 @@ function theoTick() {
     const sigma = sigmaFor(m.asset);
     const th = theoUp(ref.price, m.openPrice, sigma, tauSec);
     const bs = bookSummary(m);
+    if (ENDGAME !== 'off' && tauSec <= 120 && m.oracle && now - m.oracle.t < 5000 && refs[m.asset].cex && now - refs[m.asset].cex.t < 5000) {
+      try {
+        endgame.onTick({ slug: m.slug, kind: m.kind, tauSec, K: m.openPrice, tw: m.oracle.v, secs: refs[m.asset].secs, pNow: refs[m.asset].cex.price, nowSec: Math.floor(now / 1000), sigma1h: sigma, bid: bs?.bid ?? null, ask: bs?.ask ?? null }, now);
+      } catch (e) { writeRow('error', { where: 'endgame', msg: e.message }); }
+    }
     const row = {
       t: now, slug: m.slug, kind: m.kind ?? null, S: ref.price, src: ref.src, K: m.openPrice, Ksrc: m.openPriceSrc ?? null, tauSec: Math.round(tauSec),
       sigma1h: sigma, sigmaEst: refs[m.asset].sigma.sigma1h() !== null,
@@ -720,6 +737,7 @@ function getState() {
     recentSummaries: stats.recentSummaries, recentFills: ledger.recent(50),
     sigma: Object.fromEntries(ASSETS.map((a) => [a, refs[a].sigma.sigma1h()])),
     backtest: lastBacktest,
+    endgame: ENDGAME !== 'off' ? endgame.summary() : null,
     backtestRecent: lastBacktestRecent,
   };
 }
@@ -742,6 +760,15 @@ function finishMarket(m, winningIndex, via) {
   const settled = ledger.resolve(m.slug, up);
   for (const r of settled) stats.onResolvedFill(r);
   if (settled.length) console.log(`[台帳] ${m.slug} の約定${settled.length}件の損益を確定`);
+  if (ENDGAME !== 'off') endgame.onResolve(m.slug, up);
+  // 予測市場は勝ち負けの差し引きがほぼゼロ(手数料分だけ負)。ずれた市場は約定の読み方か取りこぼしを疑う
+  if (settled.length) {
+    const gap = settled.reduce((a, r) => a + r.pnl + r.fee, 0);
+    if (Math.abs(gap) > 0.5) {
+      writeRow('zero_sum_gap', { slug: m.slug, gap: +gap.toFixed(4), n: settled.length, fills: settled.slice(0, 40) });
+      if (Date.now() - zeroSumWarnedAt > 3600000) { zeroSumWarnedAt = Date.now(); console.log(`[点検] ${m.slug} の損益合計が ${gap.toFixed(2)} ドルずれている(約定${settled.length}件)。JSONL の zero_sum_gap 行に全件を残した`); }
+    }
+  }
   const s5 = m.snapshots[5] ?? null;
   const openGapBps = s5 && m.openPrice ? Math.log(s5.S / m.openPrice) * 1e4 : null;
   const summary = {
@@ -890,6 +917,29 @@ async function selftest() {
     if (rep.short.maker.twap.signals < 1 || rep.short.maker.twap.filled !== rep.short.maker.twap.signals) fails.push(`backtest maker ${JSON.stringify(rep.short.maker)}`);
     formatBacktest(rep);
   }
+  // 終盤メイカー(紙上): 5分市場、満期30秒前に Up がほぼ確定。上限 0.96/0.97/0.98 の3通り
+  {
+    const rowsW = [];
+    const eg = new EndgameMaker({ writeRow: (t, o) => rowsW.push({ t, ...o }), exchangeAddresses: ['0x05c748E2f4DcDe0ec9Fa8DDc40DE6b867f923fa5'], opts: { settleDelayMs: 0, latencyMs: 0 } });
+    const T0 = 1790000000; const secs = new Map(); for (let x = T0 - 150; x <= T0; x++) secs.set(x, 100300);
+    const now = T0 * 1000;
+    eg.onTick({ slug: 'm5', kind: '5-min', tauSec: 30, K: 100000, tw: 100300, secs, pNow: 100300, nowSec: T0, sigma1h: 0.004, bid: 0.95, ask: 0.99 }, now);
+    const placed = rowsW.filter((r) => r.ev === 'place').map((r) => r.q).sort();
+    if (JSON.stringify(placed) !== JSON.stringify([0.96, 0.97, 0.98])) fails.push(`endgame place ${JSON.stringify(placed)}`);
+    // 他人のメイカー「YES 買い」が 0.975 で約定 → 0.98 の指値だけ価格優先で全量
+    eg.onFill({ slug: 'm5', outcome: 'YES', makerSide: 'BUY', price: 0.975, shares: 10, maker: '0x1', taker: '0x2', tx: 'a', blockTime: now + 1000 });
+    // テイカーが NO を 0.035 で買った(= YES の買い指値 0.965 以下を叩いた)→ 0.97 と 0.98 に待ち行列の半分
+    eg.onFill({ slug: 'm5', outcome: 'NO', makerSide: 'BUY', price: 0.035, shares: 8, maker: '0x3', taker: '0x05c748E2f4DcDe0ec9Fa8DDc40DE6b867f923fa5', tx: 'b', blockTime: now + 2000 });
+    eg.onResolve('m5', 1, now + 60000);
+    await new Promise((r) => setTimeout(r, 10));
+    const sm = eg.summary().variants;
+    // 0.98: 10 + 4 = 14枚、損益 14×0.02 = 0.28 / 0.97: 4枚、0.12 / 0.96: 約定なし
+    if (Math.abs(sm['0.98'].shares - 14) > 1e-9 || Math.abs(sm['0.98'].pnl - 0.28) > 1e-9 || Math.abs(sm['0.97'].shares - 4) > 1e-9 || Math.abs(sm['0.97'].pnl - 0.12) > 1e-9 || sm['0.96'].filledMarkets !== 0) fails.push(`endgame fills ${JSON.stringify(sm)}`);
+    // 板が逆を向いていたら置かない
+    const eg2 = new EndgameMaker({ writeRow: () => {}, opts: { latencyMs: 0 } });
+    eg2.onTick({ slug: 'm6', kind: '5-min', tauSec: 30, K: 100000, tw: 100300, secs, pNow: 100300, nowSec: T0, sigma1h: 0.004, bid: 0.2, ask: 0.3 }, now);
+    if (eg2.summary().variants['0.98'].placed !== 0) fails.push('endgame 板と不一致でも置いた');
+  }
   if (fails.length) { console.error('自己診断 失敗:', fails); process.exit(1); }
   console.log('自己診断 OK');
 }
@@ -900,7 +950,11 @@ async function main() {
   console.log(`[起動] API=${API_URL} WS=${WS_URL} 保存先=${DATA_DIR} 対象=${ASSETS.join(',')} パターン=${SLUG_RE}`);
   writeRow('start', { apiUrl: API_URL, wsUrl: WS_URL, assets: ASSETS, pattern: String(SLUG_RE), node: process.version });
   if (stats.load()) console.log(`[集計] stats.json を読込(${Object.keys(stats.days).length}日分)`);
-  setInterval(() => stats.save(), 60000);
+  const nLedger = ledger.load(LEDGER_FILE);
+  if (nLedger) console.log(`[台帳] ledger.json を読込(約定${nLedger}件)`);
+  if (ENDGAME !== 'off' && endgame.load()) console.log('[紙上] endgame.json を読込');
+  console.log(`[紙上] 終盤メイカー: ${ENDGAME === 'off' ? '停止' : '紙上で稼働(実際の注文は出さない)'} 指値上限=${endgame.o.variants.join('/')} 満期${endgame.o.startSec}秒前から 確率≥${endgame.o.minP}`);
+  setInterval(() => { stats.save(); ledger.save(LEDGER_FILE); if (ENDGAME !== 'off') endgame.save(); }, 60000);
   startServer({ port: PORT, getState, token: DASHBOARD_TOKEN });
   if (BACKTEST_INTERVAL_MS > 0) setTimeout(function bt() { backtestOnce().finally(() => setTimeout(bt, BACKTEST_INTERVAL_MS)); }, 60000);
   connectLimitlessWs();
@@ -917,7 +971,7 @@ async function main() {
     console.log('[チェーン] Base の約定・払い戻しの監視を開始');
     startChainWatcher({
       rpcUrl: BASE_RPC_URL, logRawOnce, resolveToken, resolveCondition, onLatency: (k, ms) => latency.push(k, ms),
-      writeRow: (type, obj) => { const row = writeRow(type, obj); if (type === 'fill') ledger.addFill(row); return row; },
+      writeRow: (type, obj) => { const row = writeRow(type, obj); if (type === 'fill') { ledger.addFill(row); if (ENDGAME !== 'off') endgame.onFill(row); } return row; },
     });
     setTimeout(function rep() { leaderReport(); setTimeout(rep, LEADER_REPORT_MS); }, 10 * 60000);
   } else {
@@ -927,6 +981,6 @@ async function main() {
 }
 
 process.on('unhandledRejection', (e) => writeRow('error', { where: 'unhandledRejection', msg: e?.message ?? String(e) }));
-process.on('SIGTERM', () => { writeRow('stop', {}); stats.save(); if (stream) stream.end(() => process.exit(0)); else process.exit(0); });
+process.on('SIGTERM', () => { writeRow('stop', {}); stats.save(); ledger.save(LEDGER_FILE); endgame.save(); if (stream) stream.end(() => process.exit(0)); else process.exit(0); });
 
 main().catch((e) => { console.error('[致命的]', e); process.exit(1); });

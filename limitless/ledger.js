@@ -12,6 +12,8 @@
 //   YES を価格 p で s 枚売った: YES勝ち → −s(1−p) / 負け → +sp
 // NO トークンも同じ(NO勝ち = Down)。手数料はその注文の持ち主が払ったものを引く。
 
+import fs from 'node:fs';
+
 export class FillLedger {
   constructor({ keepMs = 48 * 3600000, exchangeAddresses = [] } = {}) {
     this.keepMs = keepMs;
@@ -50,6 +52,25 @@ export class FillLedger {
       done.push(r);
     }
     return done;
+  }
+  // 再起動で台帳が消えないようにファイルへ保存する(2026年9月26日: 再デプロイのたびに24h集計が消えていた)
+  save(file) {
+    if (!file) return;
+    try {
+      this.prune();
+      fs.writeFileSync(file + '.tmp', JSON.stringify({ fills: this.fills, names: [...this.names] }));
+      fs.renameSync(file + '.tmp', file);
+    } catch (e) { console.error('[台帳の保存失敗]', e.message); }
+  }
+  load(file) {
+    if (!file || !fs.existsSync(file)) return 0;
+    try {
+      const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+      this.fills = Array.isArray(j.fills) ? j.fills : [];
+      this.names = new Map(j.names ?? []);
+      this.prune();
+      return this.fills.length;
+    } catch (e) { console.error('[台帳の読込失敗]', e.message); return 0; }
   }
   // 最近の約定(新しい順)
   recent(n = 50) {
