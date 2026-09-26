@@ -63,9 +63,9 @@ import { startCompoundMonitor, formatCompoundLine } from "./scripts/compound-buy
 import { startMorphoMainnetWatch, formatMorphoMainnetLine } from "./scripts/morpho-mainnet-watch.js";
 import { startSparkMonitor, formatSparkLine } from "./scripts/spark-psm-monitor.js";
 import { startWoofiWatch, formatWoofiLine, noteDexMove } from "./scripts/woofi-watch.js";
-import { formatWoofiSendLine } from "./scripts/woofi-execute.js";
+import { formatWoofiSendLine, getWoofiSendStats } from "./scripts/woofi-execute.js";
 import { readPoolFeeOnchain } from "./scripts/pool-fee-onchain.js";
-import { minProfitUsd, describeMinProfit, noteSendOutcome, formatSendBalanceLine } from "./scripts/min-profit.js";
+import { minProfitUsd, describeMinProfit, noteSendOutcome, formatSendBalanceLine, getSendBalanceStats } from "./scripts/min-profit.js";
 // 画面とログの時刻は**すべて日本時間**に揃える(保存は UTC のまま)。
 import { TZ_LABEL, formatJst as formatLocalTime, nowJst } from "./scripts/jst.js";
 import {
@@ -2434,6 +2434,9 @@ function botAddress() {
   return cachedBotAddress;
 }
 
+/// 画面用に、最後に読んだガス残高を覚えておく。chain -> { native, usd, remaining, at }
+const lastGasBalances = {};
+
 /// 各チェーンの送信用ウォレットのガス残高を「あと何回送れるか」で確かめる。
 /// **ログにも必ず出す**(通知が未設定でも見えるように)。
 async function checkGasBalances() {
@@ -2454,6 +2457,7 @@ async function checkGasBalances() {
         continue;
       }
       const remaining = Math.floor(balanceUsd / perSendUsd);
+      lastGasBalances[chain] = { native: parseFloat(ethers.formatEther(wei)), usd: balanceUsd, remaining, at: Date.now() };
       parts.push(`${chain}:${parseFloat(ethers.formatEther(wei)).toFixed(5)}(約$${balanceUsd.toFixed(2)} あと約${remaining}回)`);
       if (remaining < ALERT_MIN_REMAINING_SENDS) {
         const native = parseFloat(ethers.formatEther(wei));
@@ -2488,44 +2492,48 @@ async function checkGasBalances() {
 // table-layout:fixed にすると列幅が中身に引きずられなくなるので、
 // 長い文字列が入っても表が広がらない。折り返しは overflow-wrap で行う。
 const STYLE = `*{box-sizing:border-box}
-body{font-family:-apple-system,sans-serif;background:#0d100c;color:#e8e6d8;margin:0;padding:18px 12px;overflow-x:hidden}
-h1{font-size:17px;margin:0 0 4px}h2{font-size:13px;margin:0 0 10px;font-weight:600}
-.sub{color:#888;font-size:11px;margin-bottom:16px}
-.card{background:#14180f;border:1px solid #2a331d;border-radius:8px;padding:13px;margin-bottom:13px;overflow:hidden}
-.card.real{border-color:#2ecc71}
-table{width:100%;table-layout:fixed;border-collapse:collapse;font-size:11px}
-th{text-align:left;color:#888;font-weight:500;font-size:9.5px;padding:5px 3px;border-bottom:1px solid #2a331d}
-td{padding:6px 3px;border-bottom:1px solid #1c1c1c}
+:root{--bg:#f4faff;--card:#ffffff;--line:#d7ecf9;--line2:#e9f5fc;--ink:#1e3a4c;--muted:#6b8799;--accent:#0ea5e9;--accent2:#e0f4fd;--good:#16a34a;--bad:#dc2626;--warn:#d97706}
+body{font-family:-apple-system,"Hiragino Sans",sans-serif;background:var(--bg);color:var(--ink);margin:0;padding:18px 12px;overflow-x:hidden}
+.wrap{max-width:760px;margin:0 auto}
+h1{font-size:18px;margin:0 0 4px;color:var(--ink)}h2{font-size:13.5px;margin:0 0 10px;font-weight:700;color:var(--ink)}
+.sub{color:var(--muted);font-size:11px;margin-bottom:16px;line-height:1.7}
+.chip{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10.5px;margin:2px 3px 2px 0;background:var(--accent2);color:#0369a1}
+.chip.off{background:#fff4e5;color:var(--warn)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px;overflow:hidden;box-shadow:0 1px 3px rgba(14,165,233,.06)}
+.card.real{border-top:4px solid var(--accent)}
+table{width:100%;table-layout:fixed;border-collapse:collapse;font-size:11.5px}
+th{text-align:left;color:var(--muted);font-weight:600;font-size:10px;padding:6px 4px;border-bottom:1px solid var(--line);background:#f7fcff}
+td{padding:7px 4px;border-bottom:1px solid var(--line2)}
 th,td{overflow-wrap:anywhere;word-break:break-word}
+.num{text-align:right}
 /* 実際の取引結果。日時と経路に幅を寄せ、右の数字列は詰める */
 .t-real th:nth-child(1),.t-real td:nth-child(1){width:21%}
 .t-real th:nth-child(2),.t-real td:nth-child(2){width:29%}
 .t-real th:nth-child(3),.t-real td:nth-child(3){width:15%}
 .t-real th:nth-child(4),.t-real td:nth-child(4){width:24%}
 .t-real th:nth-child(5),.t-real td:nth-child(5){width:11%}
-/* 連番つきの表(取り逃し・黒字の機会)。#は最小限にし、経路に幅を回す */
+/* 連番つきの表(黒字の機会)。#は最小限にし、経路に幅を回す */
 .t-num th:nth-child(1),.t-num td:nth-child(1){width:7%}
 .t-num th:nth-child(2),.t-num td:nth-child(2){width:33%}
-/* 惜しかった分布: 目盛り・棒・件数 */
-.t-miss th:nth-child(1),.t-miss td:nth-child(1){width:38%}
-.t-miss th:nth-child(3),.t-miss td:nth-child(3){width:22%}
-/* 壁を下げた試算 */
-.t-whatif th:nth-child(1),.t-whatif td:nth-child(1){width:26%}
-.t-whatif th:nth-child(2),.t-whatif td:nth-child(2){width:18%}
 /* 2列の表は左を広く */
 .t-two th:nth-child(2),.t-two td:nth-child(2){width:32%}
-.note{font-size:10px;color:#888;line-height:1.6;margin-top:9px;padding-top:9px;border-top:1px solid #222;overflow-wrap:anywhere}
-/* 幅140pxを下限にすると、iPhoneの縦画面では2列×2段に落ちる。
-   4列のままだと1枠が約90pxしかなく、金額が数字の途中で折り返してしまう。 */
-.stat{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:6px;margin-bottom:13px}
-/* 直接の子だけに枠を付ける。.stat div にすると中の .v と .l(どちらもdiv)
-   にも枠が付き、枠が二重に見えて縦にも間延びする */
-.stat > div{background:#14180f;border:1px solid #2a331d;border-radius:8px;padding:11px 6px;text-align:center;min-width:0;
-display:flex;flex-direction:column;justify-content:center;gap:3px}
-/* 金額は途中で折り返させない。入り切らない時は字を縮める */
-.stat .v{font-size:17px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.stat .l{font-size:9px;color:#888}
-a{color:#6fae62}.footerlink{margin-top:18px;font-size:11px}`;
+.note{font-size:10.5px;color:var(--muted);line-height:1.7;margin-top:10px;padding-top:10px;border-top:1px solid var(--line2);overflow-wrap:anywhere}
+/* 幅140pxを下限にすると、iPhoneの縦画面では2列×2段に落ちる。 */
+.stat{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:13px}
+/* 直接の子だけに枠を付ける(中の .v と .l にまで枠が付かないように) */
+.stat > div{background:#f7fcff;border:1px solid var(--line);border-radius:10px;padding:12px 6px;text-align:center;min-width:0;
+display:flex;flex-direction:column;justify-content:center;gap:4px}
+/* 金額は途中で折り返させない */
+.stat .v{font-size:18px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink)}
+.stat .l{font-size:9.5px;color:var(--muted)}
+details.more{background:var(--card);border:1px solid var(--line);border-radius:12px;margin-bottom:14px}
+details.more > summary{cursor:pointer;padding:12px 14px;font-size:13px;font-weight:700;color:#0369a1;list-style:none}
+details.more > summary::-webkit-details-marker{display:none}
+details.more > summary::before{content:"▸ ";color:var(--accent)}
+details.more[open] > summary::before{content:"▾ "}
+details.more > .inner{padding:0 10px 4px}
+details.more .card{box-shadow:none}
+a{color:#0284c7}.footerlink{margin-top:18px;font-size:11px}`;
 
 /// 経路の表示を短くする。未知のプールは dexId がアドレスそのものになるため、
 /// そのまま出すと42文字が1列を占めて読みづらい。先頭だけ残す。
@@ -2571,8 +2579,8 @@ function renderPage() {
   };
   const realRows = real.recent.map((e) => `<tr><td>${formatLocalTime(e.timestamp)}</td><td style="font-size:9px">${shortenLabel(e.pairLabel)}</td>
     <td style="text-align:right">$${e.tradeAmountUsd.toFixed(2)}</td>
-    <td style="text-align:right;color:#2ecc71;font-weight:600">${netOf(e) != null ? `+$${netOf(e).toFixed(4)}` : '-'}<br><span style="color:#888;font-weight:400;font-size:9px">粗${e.actualProfitUsd != null ? `$${e.actualProfitUsd.toFixed(4)}` : '-'} ガス${gasOf(e) != null ? `$${gasOf(e).toFixed(4)}` : '-'}</span></td>
-    <td><a href="${e.explorerUrl}" target="_blank">確認</a></td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ実際の取引はありません</td></tr>`;
+    <td style="text-align:right;color:#16a34a;font-weight:600">${netOf(e) != null ? `+$${netOf(e).toFixed(4)}` : '-'}<br><span style="color:#6b8799;font-weight:400;font-size:9px">粗${e.actualProfitUsd != null ? `$${e.actualProfitUsd.toFixed(4)}` : '-'} ガス${gasOf(e) != null ? `$${gasOf(e).toFixed(4)}` : '-'}</span></td>
+    <td><a href="${e.explorerUrl}" target="_blank">確認</a></td></tr>`).join('') || `<tr><td colspan="5" style="color:#6b8799">まだ実際の取引はありません</td></tr>`;
 
   // 記録簿の outcome を日本語にする。なぜ取れなかったかを一目で読めるように。
   const OUTCOME_LABEL = {
@@ -2588,97 +2596,118 @@ function renderPage() {
     .join(' / ') || '記録なし';
 
   const oppRows = stats.recent.slice(0, 10).map((o, i) => `<tr><td>${i+1}</td>
-    <td style="font-size:9px">${o.kind} ${o.chain}${o.hasV3 ? ' <span style="color:#6fae62">V3</span>' : ''}<br>${shortenLabel(o.label)}</td>
+    <td style="font-size:9px">${o.kind} ${o.chain}${o.hasV3 ? ' <span style="color:#0284c7">V3</span>' : ''}<br>${shortenLabel(o.label)}</td>
     <td style="text-align:right">${o.feeWallPercent.toFixed(2)}%</td>
     <td style="text-align:right">$${o.tradeAmountUsd.toFixed(2)}</td>
-    <td style="text-align:right;color:#2ecc71;font-weight:600">+$${o.netProfitUsd.toFixed(4)}</td></tr>`).join('') || `<tr><td colspan="5" style="color:#888">まだ黒字の機会が見つかっていません</td></tr>`;
+    <td style="text-align:right;color:#16a34a;font-weight:600">+$${o.netProfitUsd.toFixed(4)}</td></tr>`).join('') || `<tr><td colspan="5" style="color:#6b8799">まだ黒字の機会が見つかっていません</td></tr>`;
 
   const reasonRows = Object.entries(reasons).filter(([, v]) => v > 0).sort((a,b)=>b[1]-a[1]).map(([k, v]) =>
-    `<tr><td>${REASON_LABEL[k] || k}</td><td style="text-align:right">${v.toLocaleString()}件</td></tr>`).join('') || `<tr><td colspan="2" style="color:#888">まだ記録がありません</td></tr>`;
+    `<tr><td>${REASON_LABEL[k] || k}</td><td style="text-align:right">${v.toLocaleString()}件</td></tr>`).join('') || `<tr><td colspan="2" style="color:#6b8799">まだ記録がありません</td></tr>`;
 
   const stageRows = Object.entries(failStages).sort((a,b)=>b[1]-a[1]).map(([k, v]) =>
-    `<tr><td>${STAGE_LABEL[k] || k}</td><td style="text-align:right">${v.toLocaleString()}件</td></tr>`).join('') || `<tr><td colspan="2" style="color:#888">送信の失敗はありません</td></tr>`;
+    `<tr><td>${STAGE_LABEL[k] || k}</td><td style="text-align:right">${v.toLocaleString()}件</td></tr>`).join('') || `<tr><td colspan="2" style="color:#6b8799">送信の失敗はありません</td></tr>`;
 
   const verifyRows = stats.v3VerifyRecent.map((v) => `<tr>
     <td style="font-size:9px">${v.chain}<br>${v.address.slice(0, 10)}…(${(v.feeBps/100).toFixed(2)}%)</td>
-    <td style="text-align:right;color:${Math.abs(v.diffPercent) > 5 ? '#e74c3c' : Math.abs(v.diffPercent) > 1 ? '#e8a33d' : '#2ecc71'}">${v.diffPercent > 0 ? '+' : ''}${v.diffPercent.toFixed(3)}%</td>
-    </tr>`).join('') || `<tr><td colspan="2" style="color:#888">まだ検証していません</td></tr>`;
+    <td style="text-align:right;color:${Math.abs(v.diffPercent) > 5 ? '#dc2626' : Math.abs(v.diffPercent) > 1 ? '#d97706' : '#16a34a'}">${v.diffPercent > 0 ? '+' : ''}${v.diffPercent.toFixed(3)}%</td>
+    </tr>`).join('') || `<tr><td colspan="2" style="color:#6b8799">まだ検証していません</td></tr>`;
 
   const balanceLine = Object.entries(contractBalances).map(([c, held]) =>
     `${c}: ${held.map((h) => `${h.symbol} ${h.amount.toFixed(4)}(${h.unpriced ? "価格不明" : `$${h.usd.toFixed(2)}`})`).join(" / ")}`).join('<br>') || '残高なし';
 
   const syncLine = Object.entries(syncStats).map(([c, v]) =>
-    `${c}: ${v.watched.toLocaleString()}プールを${v.subscriptions}回で購読 / 受信 V2 ${v.v2.toLocaleString()}・V3 ${v.v3.toLocaleString()}・流動性 ${v.liquidity.toLocaleString()} ${v.healthy ? '<span style="color:#2ecc71">正常</span>' : `<span style="color:#e74c3c">不達</span>`}`
+    `${c}: ${v.watched.toLocaleString()}プールを${v.subscriptions}回で購読 / 受信 V2 ${v.v2.toLocaleString()}・V3 ${v.v3.toLocaleString()}・流動性 ${v.liquidity.toLocaleString()} ${v.healthy ? '<span style="color:#16a34a">正常</span>' : `<span style="color:#dc2626">不達</span>`}`
   ).join('<br>') || 'WebSocket未設定';
 
   const gasLine = Object.entries(gas).map(([c, g]) => `${c}: $${g.costUsd}`).join(' / ') || '取得中';
-  const readyLine = Object.keys(CHAIN_CONFIG).map((c) => `${c}: ${isReady(c) ? '<span style="color:#2ecc71">稼働中</span>' : '<span style="color:#e8a33d">準備中</span>'}`).join(' / ');
+  const readyLine = Object.keys(CHAIN_CONFIG).map((c) => `${c}: ${isReady(c) ? '<span style="color:#16a34a">稼働中</span>' : '<span style="color:#d97706">準備中</span>'}`).join(' / ');
   const startsLine = Object.keys(CHAIN_CONFIG).map((c) => `${c}:${countUsableStarts(c)}`).join(' / ');
 
+  // ===== 画面の構成(2026年9月26日、オーナーの指示「項目を整理したい・白と水色を基調に」) =====
+  // 上から「お金(収支・残高)」→「新しい戦略」→「清算」の順に、オーナーが毎回見るものだけを出す。
+  // 技術的な細かい数字は消さずに、最後の「詳しい情報」に折りたたむ。
+  const money = (v, d = 4) => `${v >= 0 ? "+" : "-"}$${Math.abs(v).toFixed(d)}`;
+  const tone = (v) => (v > 0 ? "var(--good)" : v < 0 ? "var(--bad)" : "var(--muted)");
+  const sendStats = getSendBalanceStats();
+  const sendChains = [...new Set([...Object.keys(sendStats), ...Object.keys(lastGasBalances)])];
+  const sendTotal = Object.values(sendStats).reduce((a, v) => a + (v.netUsd || 0), 0);
+  const chainRows = sendChains.map((c) => {
+    const v = sendStats[c];
+    const g = lastGasBalances[c];
+    return `<tr><td>${c}${isReady(c) ? "" : ' <span style="color:var(--warn)">準備中</span>'}</td>
+    <td class="num">${v ? `${Math.round(v.wins)}勝 / ${Math.round(v.losses)}敗` : "-"}</td>
+    <td class="num" style="color:${tone(v?.netUsd || 0)};font-weight:600">${v ? money(v.netUsd) : "-"}</td>
+    <td class="num">${g ? `$${g.usd.toFixed(2)}<br><span style="color:var(--muted);font-size:9.5px">あと約${g.remaining.toLocaleString()}回</span>` : "-"}</td></tr>`;
+  }).join("") || `<tr><td colspan="4" style="color:var(--muted)">まだ記録がありません</td></tr>`;
+
+  const woofi = getWoofiSendStats();
+  const woofiRows = Object.entries(woofi.chains).filter(([, v]) => v.sims || v.sent).map(([c, v]) => `<tr><td>${c}</td>
+    <td class="num">${v.sims.toLocaleString()}回<br><span style="color:var(--muted);font-size:9.5px">黒字${v.simPlus} / 失敗${v.simErr}</span></td>
+    <td class="num">${v.sent}回<br><span style="color:var(--muted);font-size:9.5px">${v.won}勝 / ${v.lost}敗</span></td>
+    <td class="num" style="color:${tone(v.netUsd)};font-weight:600">${money(v.netUsd)}</td></tr>`).join("")
+    || `<tr><td colspan="4" style="color:var(--muted)">まだ WOOFi の黒字は来ていません(黒字を見つけたら、チェーン上で確かめてから送ります)</td></tr>`;
+
+  const chainChips = Object.keys(CHAIN_CONFIG).map((c) => `<span class="chip${isReady(c) ? "" : " off"}">${c} ${isReady(c) ? "稼働中" : "準備中"}</span>`).join("");
+
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="refresh" content="20">
-<title>DEXアービトラージ</title><style>${STYLE}</style></head><body>
-<h1>🔍 DEXアービトラージ</h1><div class="sub">フラッシュスワップ方式 / V2 + V3 / ${readyLine}<br>表示はすべて${TZ_LABEL}(いま ${nowJst()})</div>
+<title>DEXアービトラージ</title><style>${STYLE}</style></head><body><div class="wrap">
+<h1>DEXアービトラージ</h1><div class="sub">${chainChips}<br>表示はすべて${TZ_LABEL}(いま ${nowJst()})・20秒ごとに更新</div>
 
-<div class="card real"><h2>💰 実際の取引結果</h2>
-<div class="stat"><div><div class="v">${real.count}</div><div class="l">実行回数</div></div>
-<div><div class="v" style="color:#2ecc71">$${heldProfitUsd().toFixed(4)}</div><div class="l">累積利益(コントラクトに貯まった額)</div></div>
-<div><div class="v">$${getCurrentTradeCapUsd()}</div><div class="l">取引上限</div></div>
-<div><div class="v" style="color:${isLive?'#2ecc71':'#888'}">${isLive?'稼働中':'停止中'}</div><div class="l">自動売買</div></div></div>
-<table class="t-real"><thead><tr><th>日時(${TZ_LABEL})</th><th>経路</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table>
-<div class="note">累積利益は、コントラクトに貯まっている利益の<b>実際の残高</b>です(一度も引き出していないので、これが貯めてきた利益の全部。旧コントラクトの分も含む。今の価格で換算、${contractBalancesAt ? formatLocalTime(contractBalancesAt) : "まだ読んでいない"}時点)。<br>
-内訳: ${balanceLine}<br>
-ガス代はウォレットから払っているので、この額には含まれていません。</div></div></div>
+<div class="card real"><h2>💰 収支のまとめ</h2>
+<div class="stat"><div><div class="v" style="color:var(--good)">$${heldProfitUsd().toFixed(4)}</div><div class="l">貯まった利益(コントラクトの残高)</div></div>
+<div><div class="v" style="color:${tone(sendTotal)}">${money(sendTotal)}</div><div class="l">送信の収支(利益 − 失敗のガス代)</div></div>
+<div><div class="v">${real.count.toLocaleString()}</div><div class="l">成立した取引</div></div>
+<div><div class="v" style="color:${isLive ? "var(--good)" : "var(--muted)"}">${isLive ? "稼働中" : "停止中"}</div><div class="l">自動売買(上限$${getCurrentTradeCapUsd()})</div></div></div>
+<table><thead><tr><th>チェーン</th><th class="num">勝ち / 負け</th><th class="num">収支</th><th class="num">ガス残高</th></tr></thead><tbody>${chainRows}</tbody></table>
+<div class="note">送信の収支は「成立した取引の利益 − 先を越されて失ったガス代」です(記録が400件を超えると件数と金額を半分に縮めるので、率を見る数字です)。<br>
+貯まった利益の内訳: ${balanceLine}<br>ガス代はウォレットから払っているので、貯まった利益には含まれていません。</div></div>
 
-<div class="card"><h2>📐 V3の価格表(公式Quoter)</h2>
-<div class="stat"><div><div class="v" style="color:#6fae62">${countQuoteTables().toLocaleString()}</div><div class="l">作成済みの表</div></div>
-<div><div class="v">${stats.quoteTablesPending.toLocaleString()}</div><div class="l">作成待ち</div></div>
-<div><div class="v" style="color:${stats.v3VerifyWorst && Math.abs(stats.v3VerifyWorst.diffPercent) > 5 ? '#e74c3c' : '#2ecc71'}">${stats.v3VerifyWorst ? stats.v3VerifyWorst.diffPercent.toFixed(2) + '%' : '-'}</div><div class="l">補間の最大誤差</div></div>
-<div><div class="v">${stats.v3Opportunities}</div><div class="l">V3を含む機会</div></div></div>
-<table class="t-two"><thead><tr><th>プール</th><th style="text-align:right">補間と公式の差</th></tr></thead><tbody>${verifyRows}</tbody></table>
-<div class="note">V3は価格帯ごとに流動性が分かれるため、独自の近似式では最大2,184%も過大な値になりました。今はプールごとに公式Quoterで「代表的な投入額での受取量」を取得して表にし、判定はそこから補間しています。価格が動いた表は作り直します(WebSocketの無いチェーンでも、定期読み直しで価格の動きを検知して作り直します。これまでに${stats.quoteRebuildsFromPolling}回)。<br>表が無いV3プールは判定に使いません(幻の機会を防ぐため)。</div></div>
+<div class="card"><h2>🧾 直近の取引</h2>
+<table class="t-real"><thead><tr><th>日時</th><th>経路</th><th class="num">投入</th><th class="num">純利益</th><th></th></tr></thead><tbody>${realRows}</tbody></table></div>
 
-<div class="card"><h2>🔎 機会がどこで止まっているか</h2>
-<div class="stat"><div><div class="v">${stats.examined.toLocaleString()}</div><div class="l">精査した経路</div></div>
-<div><div class="v" style="color:${stats.profitableFound>0?'#2ecc71':'#888'}">${stats.profitableFound}</div><div class="l">黒字と判定</div></div>
-<div><div class="v" style="color:${stats.executed>0?'#2ecc71':'#888'}">${stats.executed}</div><div class="l">送信成功</div></div>
-<div><div class="v" style="color:${stats.failed>0?'#e74c3c':'#888'}">${stats.failed}</div><div class="l">送信失敗</div></div></div>
-<table class="t-two"><thead><tr><th>止まった理由</th><th style="text-align:right">件数</th></tr></thead><tbody>${reasonRows}</tbody></table>
-<div class="note"><strong>送信に失敗した段階</strong></div>
-<table class="t-two"><thead><tr><th>段階</th><th style="text-align:right">件数</th></tr></thead><tbody>${stageRows}</tbody></table></div>
-
-<div class="card"><h2>📡 監視対象と始点</h2>
-<div class="stat"><div><div class="v" style="color:#6fae62">${stats.prunedKept.toLocaleString()}</div><div class="l">監視中プール</div></div>
-<div><div class="v">${countUsableStarts().toLocaleString()}</div><div class="l">始点に使える通貨</div></div>
-<div><div class="v">${totalEvents.toLocaleString()}</div><div class="l">受信イベント</div></div>
-<div><div class="v">${s.arbitragablePairs.toLocaleString()}</div><div class="l">裁定候補ペア</div></div></div>
-<div class="note">${syncLine}<br>始点の内訳: ${startsLine}</div></div>
-
-<div class="card"><h2>🩺 システムの健全性</h2>
-<div class="stat"><div><div class="v" style="color:${hbAge != null && hbAge < 120 ? '#2ecc71' : '#e74c3c'}">${hbAge != null ? hbAge + '秒前' : '-'}</div><div class="l">最終生存確認</div></div>
-<div><div class="v" style="color:${maxQueue > 500 ? '#e74c3c' : maxQueue > 100 ? '#e8a33d' : '#2ecc71'}">${maxQueue.toLocaleString()}</div><div class="l">待ち行列</div></div>
-<div><div class="v">${lat != null ? lat + 'ms' : '-'}</div><div class="l">判定時間</div></div>
-<div><div class="v">${stats.feeProbed.toLocaleString()}</div><div class="l">手数料実測済み</div></div></div>
-<div class="note">実測ガス代(2step): ${gasLine}<br>
-問い合わせの束ね: ${mc.calls.toLocaleString()}回の呼び出しで${mc.subcalls.toLocaleString()}件を処理(分割再試行${mc.splits}回)<br>
-プール: V2 ${s.byKind.v2.toLocaleString()} / V3 ${s.byKind.v3.toLocaleString()}(V2とV3が共存${s.mixedPairs}ペア)<br>
-チェーン別: ${Object.entries(s.byChain).map(([c, n]) => `${c}:${n.toLocaleString()}`).join(' / ') || '構築中'}<br>
-無効化${stats.disabled}件(過去の記録${stats.disabledFromFile} / 今回${stats.disabledRuntime})<br>
-手数料の未実測: 残${stats.feeProbePending.toLocaleString()}プール</div></div>
+<div class="card"><h2>🧪 WOOFi(価格の遅れを取る新しい戦略)</h2>
+<table><thead><tr><th>チェーン</th><th class="num">チェーン上の確認</th><th class="num">送信</th><th class="num">収支</th></tr></thead><tbody>${woofiRows}</tbody></table>
+<div class="note">${woofi.enabled ? "送信: 有効" : "送信: 停止中"} / 今日の損 $${woofi.lossTodayUsd.toFixed(3)}(上限 $${woofi.dailyLossCapUsd}。超えたらその日は送りません)。元手は使わず、失うのは失敗した時のガス代だけです。</div></div>
 
 ${renderLiquidationCard()}
 
-<div class="card"><h2>📒 24時間の記録簿</h2>
-<div class="stat"><div><div class="v" style="color:#2ecc71">+$${sum.realizedUsd.toFixed(4)}</div><div class="l">実際に得た利益</div></div>
-<div><div class="v">${sum.count.toLocaleString()}</div><div class="l">記録件数</div></div>
-<div><div class="v" style="color:${sum.phantomCount ? '#e74c3c' : '#888'}">${sum.phantomCount.toLocaleString()}</div><div class="l">計算が壊れた経路</div></div></div>
-<div class="note">なぜそうなったか: ${outcomeLine}<br>
-「取れた可能性がある額」「直せば取れる額」「あと何bpsで黒字だったか」は外しました(2026年9月23日、オーナーの指示)。
-検証の結果、大口の機会は本物0/10で、判定上の利益は取り逃した金ではなかったためです。</div>
+<details class="more"><summary>詳しい情報(技術的な数字)</summary><div class="inner">
 
+<div class="card"><h2>🔎 機会がどこで止まっているか</h2>
+<div class="stat"><div><div class="v">${stats.examined.toLocaleString()}</div><div class="l">精査した経路</div></div>
+<div><div class="v" style="color:${stats.profitableFound>0?'#16a34a':'#6b8799'}">${stats.profitableFound}</div><div class="l">黒字と判定</div></div>
+<div><div class="v" style="color:${stats.executed>0?'#16a34a':'#6b8799'}">${stats.executed}</div><div class="l">送信成功</div></div>
+<div><div class="v" style="color:${stats.failed>0?'#dc2626':'#6b8799'}">${stats.failed}</div><div class="l">送信失敗</div></div></div>
+<table class="t-two"><thead><tr><th>止まった理由</th><th class="num">件数</th></tr></thead><tbody>${reasonRows}</tbody></table>
+<div class="note"><strong>送信に失敗した段階</strong></div>
+<table class="t-two"><thead><tr><th>段階</th><th class="num">件数</th></tr></thead><tbody>${stageRows}</tbody></table>
 <h2 style="margin-top:14px">直近に検知した機会</h2>
-<table class="t-num"><thead><tr><th>#</th><th>経路</th><th style="text-align:right">壁</th><th style="text-align:right">投入</th><th style="text-align:right">純利益</th></tr></thead><tbody>${oppRows}</tbody></table></div>
+<table class="t-num"><thead><tr><th>#</th><th>経路</th><th class="num">壁</th><th class="num">投入</th><th class="num">純利益</th></tr></thead><tbody>${oppRows}</tbody></table>
+<div class="note">24時間の記録 ${sum.count.toLocaleString()}件: ${outcomeLine}</div></div>
 
-<div class="footerlink"><a href="/about">→ 仕組みについて</a></div></body></html>`;
+<div class="card"><h2>📡 監視対象</h2>
+<div class="stat"><div><div class="v" style="color:#0284c7">${stats.prunedKept.toLocaleString()}</div><div class="l">監視中プール</div></div>
+<div><div class="v">${countUsableStarts().toLocaleString()}</div><div class="l">始点に使える通貨</div></div>
+<div><div class="v">${totalEvents.toLocaleString()}</div><div class="l">受信イベント</div></div>
+<div><div class="v">${s.arbitragablePairs.toLocaleString()}</div><div class="l">裁定候補ペア</div></div></div>
+<div class="note">${syncLine}<br>始点の内訳: ${startsLine}<br>
+プール: V2 ${s.byKind.v2.toLocaleString()} / V3 ${s.byKind.v3.toLocaleString()}(V2とV3が共存${s.mixedPairs}ペア) / チェーン別: ${Object.entries(s.byChain).map(([c, n]) => `${c}:${n.toLocaleString()}`).join(' / ') || '構築中'}<br>
+無効化${stats.disabled}件(過去の記録${stats.disabledFromFile} / 今回${stats.disabledRuntime})</div></div>
+
+<div class="card"><h2>🩺 システムの健全性</h2>
+<div class="stat"><div><div class="v" style="color:${hbAge != null && hbAge < 120 ? '#16a34a' : '#dc2626'}">${hbAge != null ? hbAge + '秒前' : '-'}</div><div class="l">最終生存確認</div></div>
+<div><div class="v" style="color:${maxQueue > 500 ? '#dc2626' : maxQueue > 100 ? '#d97706' : '#16a34a'}">${maxQueue.toLocaleString()}</div><div class="l">待ち行列</div></div>
+<div><div class="v">${lat != null ? lat + 'ms' : '-'}</div><div class="l">判定時間</div></div>
+<div><div class="v">${countQuoteTables().toLocaleString()}</div><div class="l">V3の価格表</div></div></div>
+<div class="note">実測ガス代(2step): ${gasLine}<br>
+問い合わせの束ね: ${mc.calls.toLocaleString()}回の呼び出しで${mc.subcalls.toLocaleString()}件を処理(分割再試行${mc.splits}回)<br>
+V3の価格表: 作成待ち${stats.quoteTablesPending.toLocaleString()} / 補間の最大誤差 ${stats.v3VerifyWorst ? stats.v3VerifyWorst.diffPercent.toFixed(2) + '%' : '-'} / 作り直し${stats.quoteRebuildsFromPolling}回<br>
+手数料: 実測済み${stats.feeProbed.toLocaleString()} / 未実測${stats.feeProbePending.toLocaleString()}プール</div>
+<table class="t-two"><thead><tr><th>V3プール(補間の検証)</th><th class="num">公式との差</th></tr></thead><tbody>${verifyRows}</tbody></table></div>
+
+</div></details>
+
+<div class="footerlink"><a href="/about">→ 仕組みについて</a></div></div></body></html>`;
 }
 
 /// Aave 清算の見張り(LIQUIDATION_CHAIN のチェーン)の状態。画面の1枚。
@@ -2688,15 +2717,15 @@ function renderLiquidationCard() {
   const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const ago = (ms) => (ms ? `${Math.round((Date.now() - ms) / 1000)}秒前` : "まだ");
   const watchRows = d.watching.length
-    ? d.watching.map((w) => `<tr><td>${esc(w.user.slice(0, 10))}…</td><td style="text-align:right;color:${w.hf < 1 ? "#e74c3c" : "#e8a33d"}">${w.hf.toFixed(4)}</td><td style="text-align:right">$${w.debtUsd.toFixed(2)}</td></tr>`).join("")
-    : `<tr><td colspan="3" style="color:#888">HF&lt;1.05 の人はいません</td></tr>`;
+    ? d.watching.map((w) => `<tr><td>${esc(w.user.slice(0, 10))}…</td><td style="text-align:right;color:${w.hf < 1 ? "#dc2626" : "#d97706"}">${w.hf.toFixed(4)}</td><td style="text-align:right">$${w.debtUsd.toFixed(2)}</td></tr>`).join("")
+    : `<tr><td colspan="3" style="color:#6b8799">HF&lt;1.05 の人はいません</td></tr>`;
   const recentRows = d.recent.length
     ? d.recent.map((r) => `<tr><td>${esc(formatLocalTime(r.at))}</td><td>${esc(r.user.slice(0, 10))}…</td><td>${esc(r.pair)}</td><td style="text-align:right">${r.hf.toFixed(4)}</td><td style="text-align:right">$${r.coverUsd.toFixed(2)}</td><td style="text-align:right">$${r.grossUsd.toFixed(2)}</td><td>${esc(r.result)}</td></tr>`).join("")
-    : `<tr><td colspan="7" style="color:#888">まだ候補はありません</td></tr>`;
-  return `<div class="card"><h2>🏦 Aave 清算(${LIQUIDATION_CHAIN})${d.dryRun ? ' <span style="color:#e8a33d;font-size:0.8em">DRY_RUN(送信しない)</span>' : ' <span style="color:#e74c3c;font-size:0.8em">本番送信</span>'}</h2>
+    : `<tr><td colspan="7" style="color:#6b8799">まだ候補はありません</td></tr>`;
+  return `<div class="card"><h2>🏦 Aave 清算(${LIQUIDATION_CHAIN})${d.dryRun ? ' <span style="color:#d97706;font-size:0.8em">DRY_RUN(送信しない)</span>' : ' <span style="color:#dc2626;font-size:0.8em">本番送信</span>'}</h2>
 <div class="stat"><div><div class="v">${d.roster.toLocaleString()}</div><div class="l">借り手の名簿(遡り${d.backfillPct}%)</div></div>
-<div><div class="v" style="color:#e8a33d">${d.watch}</div><div class="l">要注意(HF&lt;1.05)</div></div>
-<div><div class="v" style="color:#e74c3c">${d.found}</div><div class="l">清算できた候補</div></div>
+<div><div class="v" style="color:#d97706">${d.watch}</div><div class="l">要注意(HF&lt;1.05)</div></div>
+<div><div class="v" style="color:#dc2626">${d.found}</div><div class="l">清算できた候補</div></div>
 <div><div class="v">${d.priceEvents.toLocaleString()}</div><div class="l">価格更新の受信</div></div></div>
 <div class="note">${d.verified ? "Pool 応答あり" : "Pool 応答なし"} / WebSocket ${d.wsUrlSet ? (d.wsConnected ? "接続中" : "切断") : "未設定"} / 価格フィード${d.feeds}件(辿れず${d.feedsUnresolved}) / Pool イベント受信${d.poolEvents.toLocaleString()} / 他者が先に清算${d.takenByOthers} / 自力で回復${d.recovered} / 確認${d.simulated} 送信${d.sent}(成功${d.sentOk})<br>
 最低利益$${d.minProfitUsd} / 肩代わりの上限$${d.maxDebtUsd} / 全員の測定 ${ago(d.lastSweepAt)} / 最後の価格更新 ${ago(d.lastPriceEventAt)} / RPC${d.rpcCalls.toLocaleString()}回${d.errors ? ` / 失敗${d.errors}(${esc(d.lastError)})` : ""}</div>
@@ -2740,9 +2769,9 @@ function startServer() {
       console.error(`[ダッシュボード] 表示に失敗(botは動き続けます): ${e.message}`);
       try {
         res.writeHead(500, { "Content-Type": "text/html; charset=utf-8" });
-        res.end(`<meta charset="utf-8"><body style="font-family:sans-serif;background:#111;color:#eee;padding:20px">
+        res.end(`<meta charset="utf-8"><body style="font-family:sans-serif;background:#f4faff;color:#1e3a4c;padding:20px">
 <h2>画面の表示に失敗しました</h2><p>botの判定と売買は動き続けています。</p>
-<pre style="color:#e74c3c;white-space:pre-wrap">${String(e && e.message).slice(0, 300)}</pre></body>`);
+<pre style="color:#dc2626;white-space:pre-wrap">${String(e && e.message).slice(0, 300)}</pre></body>`);
       } catch (inner) {}
     }
   }).listen(port, () => console.log(`ダッシュボード: ポート${port}`));
